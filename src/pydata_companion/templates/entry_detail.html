@@ -7,8 +7,15 @@
     </ul>
   </aside>
   <section class="panel detail">
-    <h2>{{ manifest.content_hash }}</h2>
+    <h2>
+      {% if alias %}
+        {{ alias }} <span class="vchip">V{{ version }}</span>
+      {% else %}
+        {{ manifest.content_hash }}
+      {% endif %}
+    </h2>
     <div class="meta">
+      <span class="pill">{{ manifest.content_hash }}</span>
       <span class="pill">{{ manifest.row_count }} rows</span>
       <span class="pill">{{ manifest.execute_seconds }}s</span>
       <span class="pill">{{ manifest.created_at }}</span>
@@ -42,6 +49,19 @@
 
     <h3>code</h3>
     <pre class="code">{{ code }}</pre>
+
+    {% if forensic_history and forensic_history|length > 1 %}
+      <div class="forensic-history">
+        <strong>forensic history for {{ alias }}</strong>
+        <ol>
+          {% for h in forensic_history %}
+            <li class="{% if h.is_current %}current{% endif %}">
+              <a href="/catalog/{{ h.hash }}">V{{ h.version }} · {{ h.hash }}{% if h.is_current %} (current){% endif %}</a>
+            </li>
+          {% endfor %}
+        </ol>
+      </div>
+    {% endif %}
   </section>
 </div>
 {% endblock %}

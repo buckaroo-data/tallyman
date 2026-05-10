@@ -55,5 +55,32 @@ def run_mcp(project: str | None) -> None:
     mcp_main()
 
 
+@cli.command("serve")
+@click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
+@click.option("--port", default=7860, type=int)
+@click.option("--host", default="127.0.0.1")
+def serve_project(project_dir: str, port: int, host: str) -> None:
+    """Serve a project directory READ-ONLY (no MCP, no edit affordances).
+
+    This is the "hand off the artifact" mode. The recipient runs this against
+    a project directory you tarballed up. They see exactly what you saw — same
+    catalog, same Buckaroo (when present), same forensic history. No tools
+    that mutate state are exposed.
+    """
+    from pathlib import Path
+
+    abs_path = Path(project_dir).resolve()
+    project_name = abs_path.name
+    os.environ["PYDATA_PROJECT"] = project_name
+    os.environ["PYDATA_PROJECT_PATH"] = str(abs_path)
+    click.echo(f"pydata serve · project={project_name} · path={abs_path} · http://{host}:{port}")
+    click.echo("  read-only — mutation routes return 403.")
+
+    from pydata_companion import create_app
+
+    app = create_app(project_name, read_only=True)
+    uvicorn.run(app, host=host, port=port, log_level="info")
+
+
 if __name__ == "__main__":
     cli()

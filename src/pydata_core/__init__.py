@@ -1,3 +1,16 @@
+from pydata_core.aliases import (
+    AliasExists,
+    AliasNotFound,
+    alias_for_hash,
+    get_alias,
+    history_for,
+    load_aliases,
+    load_history,
+    remove_alias,
+    rename_alias,
+    set_alias,
+    version_of_hash,
+)
 from pydata_core.errors import get_error, list_errors, record_error
 from pydata_core.manifest import Manifest, read_manifest, write_manifest
 from pydata_core.paths import (
@@ -8,22 +21,35 @@ from pydata_core.paths import (
     entry_dir,
     project_dir,
     projects_root,
+    pydata_home,
     resolve_project,
 )
 
 __all__ = [
+    "AliasExists",
+    "AliasNotFound",
     "Manifest",
+    "alias_for_hash",
     "catalog_dir",
     "data_dir",
     "ensure_project",
     "entries_dir",
     "entry_dir",
+    "get_alias",
     "get_error",
+    "history_for",
     "list_errors",
+    "load_aliases",
+    "load_history",
     "project_dir",
     "projects_root",
+    "pydata_home",
     "read_manifest",
     "record_error",
+    "remove_alias",
+    "rename_alias",
     "resolve_project",
+    "set_alias",
+    "version_of_hash",
     "write_manifest",
 ]

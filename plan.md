@@ -201,7 +201,7 @@ Buckaroo runs as a **live Tornado server** managed by the companion subprocess g
 | Source | What | Destination |
 |---|---|---|
 | `~/code/xorq-mcp/xorq_web/metadata.py` | Lineage extraction from xorq DAG; expression decompile helper | `pydata_xorq/lineage.py`, `pydata_xorq/decompile.py` |
-| `~/code/xorq-mcp/xorq_mcp_tool.py` | Patterns for `xo.build_expr` invocation, hash → cache path conventions, Buckaroo session bootstrap | `pydata_xorq/build.py`, `pydata_companion/buckaroo_lifecycle.py` |
+| `~/code/xorq-mcp/xorq_mcp_tool.py` | Patterns for `xo.build_expr` invocation, hash → cache path conventions, Buckaroo session bootstrap. **Caveat:** xorq-mcp pins `xorq>=0.3.8`; xorq 0.3.23 renamed `xo.read_parquet` → `xo.deferred_read_parquet` and made the former resolve through ibis backend loading (which errors). Use the deferred names. | `pydata_xorq/build.py`, `pydata_companion/buckaroo_lifecycle.py` |
 | `~/code/xorq-cloud-planning/packages/app/templates/entry_detail.html` | Tab structure, prompt block layout, build-metadata grid, Pygments highlighting setup | `pydata_companion/templates/_entry_detail.html` (adapted; not literal copy) |
 | `~/code/xorq-cloud-planning/packages/app/templates/base.html` | Base template scaffolding (head, nav, includes) | `pydata_companion/templates/base.html` |
 | `~/code/xorq-cloud-planning/packages/app/static/` (if present) | Pygments CSS, base CSS | `pydata_companion/static/` |
@@ -284,6 +284,7 @@ Smaller, mostly tactical:
 
 | Risk | Mitigation |
 |---|---|
+| **Project-as-artifact is not yet portable** — xorq embeds absolute filesystem paths in build artifacts; `pydata serve` on a colleague's machine would fail unless paths are rewritten. Surfaced by the V0 spike. | Build-time path rewriting: replace `$PYDATA_HOME/projects/<name>/...` with a `${PYDATA_PROJECT_ROOT}` placeholder when writing the build to disk; expand at load time. Verify with a portability test that swaps PYDATA_HOME and re-runs the entry. |
 | Buckaroo build environment breaks on demo machine | Pin buckaroo version; commit a working build of static assets; smoke test the full stack on the actual demo laptop two weeks out |
 | Agent picks wrong tool (e.g. `catalog_create` when you wanted scratch, or vice versa) | Tool descriptions written carefully; prompts in the rehearsal use unambiguous phrasing ("name this X" → create; no name in prompt → run) |
 | MCP reconnect loses session state | All state on disk, never in MCP process memory. Reconnect re-reads. (Avoids xorq-mcp's known bug.) |

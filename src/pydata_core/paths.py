@@ -3,15 +3,31 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-PYDATA_HOME = Path(os.environ.get("PYDATA_HOME", Path.home() / ".pydata-app"))
 DEFAULT_PROJECT = "spike"
 
 
+def pydata_home() -> Path:
+    """Resolve PYDATA_HOME at call time so test fixtures can override via env."""
+    return Path(os.environ.get("PYDATA_HOME", Path.home() / ".pydata-app"))
+
+
 def projects_root() -> Path:
-    return PYDATA_HOME / "projects"
+    return pydata_home() / "projects"
 
 
 def project_dir(name: str) -> Path:
+    """Resolve the project directory for `name`.
+
+    Standard layout is `<PYDATA_HOME>/projects/<name>/`. For the `pydata serve`
+    use case (where a colleague's project tree is sitting in some arbitrary
+    location), PYDATA_PROJECT_PATH can override this — but only for the
+    project named by PYDATA_PROJECT, since override-by-name doesn't compose
+    with multi-project queries.
+    """
+    override = os.environ.get("PYDATA_PROJECT_PATH")
+    active = os.environ.get("PYDATA_PROJECT", DEFAULT_PROJECT)
+    if override and name == active:
+        return Path(override)
     return projects_root() / name
 
 

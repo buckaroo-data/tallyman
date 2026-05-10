@@ -16,8 +16,10 @@ from pydata_core import (
     ensure_project,
     entries_dir,
     entry_dir,
+    project_dir,
     write_manifest,
 )
+from pydata_xorq.portable import make_portable_inplace
 
 
 def _append_prompt(entry_path: Path, prompt: str | None) -> None:
@@ -132,8 +134,13 @@ def build_and_persist(
         for item in build_path.iterdir():
             (xorq_build_dir / item.name).write_bytes(item.read_bytes())
 
-        # Persist the user's source.
-        (target / "expr.py").write_text(code)
+        # Rewrite project-root substrings to a portable placeholder so the
+        # build is loadable on any machine with the same project laid out.
+        make_portable_inplace(xorq_build_dir, project_dir(project))
+
+        # Persist the user's source, also rewriting any project-root paths.
+        code_persisted = code.replace(str(project_dir(project)), "${PYDATA_PROJECT_ROOT}")
+        (target / "expr.py").write_text(code_persisted)
 
         # Load + execute.
         try:
@@ -198,3 +205,21 @@ def list_entries(project: str) -> list[dict]:
         if meta_path.exists():
             out.append(json.loads(meta_path.read_text()))
     return out
+
+
+def load_entry(project: str, content_hash: str):
+    """Reload an existing catalog entry's xorq expression on the current host.
+
+    The persisted build is portable (paths use a `${PYDATA_PROJECT_ROOT}`
+    placeholder). This expands placeholders against the current machine's
+    project root before handing the build to xorq.
+    """
+    from xorq.common.utils.caching_utils import get_xorq_cache_dir
+
+    from pydata_xorq.portable import load_expr_portable
+
+    target = entry_dir(project, content_hash)
+    build_dir = target / "xorq_build"
+    if not build_dir.is_dir():
+        raise FileNotFoundError(f"no xorq_build dir for {content_hash} in project {project}")
+    return load_expr_portable(build_dir, project_dir(project), cache_dir=get_xorq_cache_dir())

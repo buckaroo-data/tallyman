@@ -1,0 +1,96 @@
+{% extends "base.html" %}
+{% block content %}
+<section style="padding: 12px 16px;">
+  <h2 style="margin: 8px 16px;">notebook · {{ project }}</h2>
+  <p class="meta" style="margin: 0 16px 8px;">
+    {{ cells|length }} cell{{ '' if cells|length == 1 else 's' }}.
+    Cells are anchored on aliases; revising an alias updates the cell in place
+    and keeps prior versions in forensic history (visible from the catalog tab).
+  </p>
+
+  {% if not cells %}
+    <div class="nb-empty">no named entries yet. Use <code>catalog_create</code> to add a cell.</div>
+  {% endif %}
+
+  {% for c in cells %}
+    <article class="nb-cell" id="cell-{{ c.cell_id }}" data-cell-id="{{ c.cell_id }}">
+      <div class="nb-head">
+        <span class="alias">{{ c.alias }}</span>
+        {% if c.version %}<span class="vchip">V{{ c.version }}</span>{% endif %}
+        {% if c.latest_hash %}<a class="pill" href="/catalog/{{ c.latest_hash }}">{{ c.latest_hash }}</a>{% endif %}
+        {% if not read_only %}
+        <span class="nb-actions">
+          <button type="button" onclick="nbMove('{{ c.cell_id }}', {{ loop.index0 - 1 }})" {% if loop.first %}disabled{% endif %}>↑</button>
+          <button type="button" onclick="nbMove('{{ c.cell_id }}', {{ loop.index0 + 1 }})" {% if loop.last %}disabled{% endif %}>↓</button>
+          <button type="button" onclick="nbEdit('{{ c.cell_id }}')">edit</button>
+          <button type="button" onclick="nbRemove('{{ c.cell_id }}')">×</button>
+        </span>
+        {% endif %}
+      </div>
+
+      <pre class="nb-markdown" id="md-{{ c.cell_id }}">{{ c.markdown or "(no markdown — click edit to add a note)" }}</pre>
+
+      {% if c.preview_html %}
+        <div class="nb-preview">{{ c.preview_html|safe }}</div>
+      {% elif c.latest_hash %}
+        <div class="nb-empty">no result.parquet for {{ c.latest_hash }}</div>
+      {% else %}
+        <div class="nb-empty">alias <code>{{ c.alias }}</code> has no current entry (was it pruned?)</div>
+      {% endif %}
+
+      {% if c.entry_meta %}
+        <div class="nb-meta">
+          {{ c.entry_meta.row_count }} rows · {{ c.entry_meta.execute_seconds }}s ·
+          first prompt: <em>{{ c.entry_meta.prompt or '(none)' }}</em>
+        </div>
+      {% endif %}
+    </article>
+  {% endfor %}
+</section>
+
+{% if not read_only %}
+<script>
+async function nbMove(cellId, newIndex) {
+  if (newIndex < 0) return;
+  const resp = await fetch('/api/notebook', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'reorder', cell_id: cellId, new_index: newIndex})
+  });
+  if (resp.ok) window.location.reload();
+}
+async function nbRemove(cellId) {
+  if (!confirm('remove this cell from the notebook? (the catalog entry stays.)')) return;
+  const resp = await fetch('/api/notebook', {
+    method: 'PATCH',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({action: 'remove', cell_id: cellId})
+  });
+  if (resp.ok) window.location.reload();
+}
+function nbEdit(cellId) {
+  const pre = document.getElementById('md-' + cellId);
+  const original = pre.textContent;
+  const placeholder = "(no markdown — click edit to add a note)";
+  const ta = document.createElement('textarea');
+  ta.className = 'nb-markdown-edit';
+  ta.value = original === placeholder ? '' : original;
+  pre.replaceWith(ta);
+  ta.focus();
+  const save = async () => {
+    const resp = await fetch('/api/markdown/' + cellId, {
+      method: 'PUT',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({markdown: ta.value})
+    });
+    if (resp.ok) window.location.reload();
+  };
+  ta.addEventListener('blur', save, {once: true});
+  ta.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save();
+    if (e.key === 'Escape') window.location.reload();
+  });
+}
+</script>
+{% endif %}
+{% endblock %}

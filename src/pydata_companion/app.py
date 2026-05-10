@@ -20,10 +20,19 @@ from pydata_core import (
     history_for,
     list_errors,
     load_aliases,
+    notebook,
     resolve_project,
     version_of_hash,
 )
-from pydata_xorq import list_entries, read_prompts
+from pydata_core.notebook import CellNotFound
+from pydata_xorq import (
+    catalog_dag,
+    full_diff,
+    list_entries,
+    read_internal_lineage,
+    read_prompts,
+)
+from pydata_xorq.layout import layered_positions
 
 PKG_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PKG_DIR / "templates"
@@ -199,6 +208,200 @@ def create_app(project: str | None = None, *, read_only: bool = False) -> FastAP
             "project": project_name,
             "entries": _annotate_entries(project_name, list_entries(project_name)),
         }
+
+    @app.get("/lineage", response_class=HTMLResponse)
+    def lineage_overview(request: Request):
+        dag = catalog_dag(project_name)
+        node_id = lambda n: n["hash"]  # noqa: E731
+        nodes_for_layout = [{"id": node_id(n), **n} for n in dag["nodes"]]
+        # Heuristic root: any node with no incoming edges.
+        targets = {e["to"] for e in dag["edges"]}
+        roots = [n["id"] for n in nodes_for_layout if n["id"] not in targets]
+        root = roots[0] if roots else (nodes_for_layout[0]["id"] if nodes_for_layout else None)
+        # Catalog DAG: edges point from parent (data source) to child, so the
+        # natural left-to-right layered layout fits without inversion.
+        layout = layered_positions(
+            nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80
+        )
+        # Annotate nodes with their alias if any (for nicer labels in the SVG).
+        aliases = load_aliases(project_name)
+        by_latest = {h: a for a, h in aliases.items()}
+        annotated_by_hash: dict[str, dict] = {}
+        for n in dag["nodes"]:
+            h = n["hash"]
+            info = version_of_hash(project_name, h)
+            annotated_by_hash[h] = {
+                "alias": by_latest.get(h) or (info[0] if info else None),
+                "version": info[1] if info else None,
+            }
+        return templates.TemplateResponse(
+            request,
+            "lineage.html",
+            {
+                "project": project_name,
+                "nodes": dag["nodes"],
+                "edges": dag["edges"],
+                "positions": layout["positions"],
+                "width": layout["width"],
+                "height": layout["height"],
+                "annotated": annotated_by_hash,
+                "kind": "catalog",
+            },
+        )
+
+    @app.get("/lineage/{content_hash}", response_class=HTMLResponse)
+    def lineage_entry(request: Request, content_hash: str):
+        aliases = load_aliases(project_name)
+        if content_hash in aliases:
+            content_hash = aliases[content_hash]
+        if not entry_dir(project_name, content_hash).exists():
+            raise HTTPException(404, f"entry {content_hash} not found")
+        lin = read_internal_lineage(project_name, content_hash)
+        # xorq edges point from consumer → producer; for left-to-right
+        # data-flow display we want producer on the left. BFS from a *leaf*
+        # gives us that — but the most reliable display is: BFS from the
+        # root (consumer at the right by inverting later).
+        layout = layered_positions(
+            lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70
+        )
+        return templates.TemplateResponse(
+            request,
+            "lineage_entry.html",
+            {
+                "project": project_name,
+                "content_hash": content_hash,
+                "lineage": lin,
+                "positions": layout["positions"],
+                "width": layout["width"],
+                "height": layout["height"],
+            },
+        )
+
+    @app.get("/api/lineage/{content_hash}")
+    def api_lineage(content_hash: str):
+        if not entry_dir(project_name, content_hash).exists():
+            raise HTTPException(404)
+        return {
+            "internal": read_internal_lineage(project_name, content_hash),
+        }
+
+    @app.get("/api/catalog_dag")
+    def api_catalog_dag():
+        return {"project": project_name, **catalog_dag(project_name)}
+
+    @app.get("/notebook", response_class=HTMLResponse)
+    def notebook_view(request: Request):
+        data = notebook.load(project_name)
+        aliases = load_aliases(project_name)
+        rendered_cells = []
+        for c in data["cells"]:
+            latest = aliases.get(c["alias"])
+            entry_meta = None
+            preview_html = ""
+            schema = None
+            if latest is not None:
+                entry = entry_dir(project_name, latest)
+                if (entry / "manifest.json").exists():
+                    entry_meta = json.loads((entry / "manifest.json").read_text())
+                    schema = json.loads((entry / "schema.json").read_text())
+                if (entry / "result.parquet").exists():
+                    table = pq.read_table(entry / "result.parquet")
+                    df = table.to_pandas()
+                    n = min(20, len(df))
+                    preview_html = df.head(n).to_html(
+                        classes="data-table", index=False, border=0
+                    )
+            info = version_of_hash(project_name, latest) if latest else None
+            rendered_cells.append(
+                {
+                    **c,
+                    "latest_hash": latest,
+                    "version": info[1] if info else None,
+                    "entry_meta": entry_meta,
+                    "schema": schema,
+                    "preview_html": preview_html,
+                }
+            )
+        return templates.TemplateResponse(
+            request,
+            "notebook.html",
+            {"project": project_name, "cells": rendered_cells},
+        )
+
+    @app.patch("/api/notebook")
+    async def patch_notebook(payload: dict):
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        action = payload.get("action")
+        cell_id = payload.get("cell_id", "")
+        try:
+            if action == "reorder":
+                notebook.reorder(project_name, cell_id, int(payload["new_index"]))
+            elif action == "remove":
+                notebook.remove(project_name, cell_id)
+            else:
+                raise HTTPException(400, f"unknown action {action!r}")
+        except CellNotFound:
+            raise HTTPException(404, f"cell {cell_id!r} not found")
+        await publish({"kind": "notebook_changed"})
+        return {"ok": True}
+
+    @app.put("/api/markdown/{cell_id}")
+    async def put_markdown(cell_id: str, payload: dict):
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        markdown = payload.get("markdown", "")
+        try:
+            cell = notebook.edit_markdown(project_name, cell_id, markdown)
+        except CellNotFound:
+            raise HTTPException(404, f"cell {cell_id!r} not found")
+        await publish({"kind": "notebook_changed"})
+        return cell
+
+    @app.get("/api/notebook")
+    def api_notebook():
+        return {"project": project_name, **notebook.load(project_name)}
+
+    @app.get("/diff/{alias}", response_class=HTMLResponse)
+    def diff_default(request: Request, alias: str):
+        hashes = history_for(project_name, alias)
+        if not hashes:
+            raise HTTPException(404, f"alias {alias!r} has no history")
+        if len(hashes) < 2:
+            raise HTTPException(
+                400, f"alias {alias!r} only has one version — nothing to diff"
+            )
+        return _render_diff(request, alias, len(hashes) - 1, len(hashes))
+
+    @app.get("/diff/{alias}/{va:int}/{vb:int}", response_class=HTMLResponse)
+    def diff_versions(request: Request, alias: str, va: int, vb: int):
+        return _render_diff(request, alias, va, vb)
+
+    def _render_diff(request: Request, alias: str, va: int, vb: int):
+        hashes = history_for(project_name, alias)
+        if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
+            raise HTTPException(404, "version out of range")
+        a_hash = hashes[va - 1]
+        b_hash = hashes[vb - 1]
+        a_dir = entry_dir(project_name, a_hash)
+        b_dir = entry_dir(project_name, b_hash)
+        if not a_dir.exists() or not b_dir.exists():
+            raise HTTPException(404, "one or both entries missing")
+        diff = full_diff(a_dir, b_dir, a_label=f"V{va}", b_label=f"V{vb}")
+        return templates.TemplateResponse(
+            request,
+            "diff.html",
+            {
+                "project": project_name,
+                "alias": alias,
+                "va": va,
+                "vb": vb,
+                "a_hash": a_hash,
+                "b_hash": b_hash,
+                "hashes": hashes,
+                "diff": diff,
+            },
+        )
 
     @app.get("/api/aliases")
     def api_aliases():

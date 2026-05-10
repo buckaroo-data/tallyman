@@ -12,36 +12,37 @@ to a browser companion via SSE.
 What's working:
 
 - **MCP tools:**
-  - `catalog_run(code, prompt)` — execute a xorq expression, persist as a scratch entry.
-  - `catalog_load_parquet(rel_path, prompt)` — load `<project>/data/<rel_path>` as a catalog
-    entry without writing any xorq dialect (the recommended way to start).
-  - `catalog_create(name, code, prompt)` — execute and persist with an *alias*. Errors if
-    the alias already exists.
-  - `catalog_revise(name, code, prompt)` — bump an existing alias to a new content hash.
-    The previous version stays in the catalog as a forensic artifact.
-  - `catalog_alias(hash, name)` — promote a scratch entry to named.
-  - `catalog_rename(old, new)` — rename an alias.
-  - `catalog_list()` — flat listing, named entries with `alias`/`version` annotations.
+  - Catalog: `catalog_run`, `catalog_load_parquet`, `catalog_create`,
+    `catalog_revise`, `catalog_alias`, `catalog_rename`, `catalog_unalias`,
+    `catalog_list`, `catalog_diff`.
+  - Notebook: `notebook_reorder`, `notebook_remove`, `notebook_edit_markdown`.
 - **Companion** (FastAPI on `:7860`):
-  - `/catalog` — entry list (named first with V_n chip, forensic versions, then scratch).
-  - `/catalog/<hash>` or `/catalog/<alias>` — entry detail + forensic history.
+  - `/catalog`, `/catalog/<hash>` or `/catalog/<alias>` — entry list and detail
+    with V_n chips, forensic history, and a link to internal lineage.
+  - `/notebook` — curated narrative: cells anchored on aliases, vertical layout,
+    inline markdown editor, ↑/↓ reorder, × remove.
+  - `/lineage` and `/lineage/<hash>` — catalog DAG (cross-entry parents derived
+    from `from_catalog`) and per-entry internal expression DAG. Pure SVG, no
+    Cytoscape dep.
+  - `/diff/<alias>[/<va>/<vb>]` — version diff with code diff, schema diff,
+    per-column stats, key-joined side-by-side, and head() side-by-side.
   - `/errors/<id>` — build-failure detail.
-  - `/api/{entries,aliases,errors}` — JSON.
-  - `/api/sse` — live updates (`new_entry`, `build_failed`, `alias_changed`).
-- **Build artifacts are portable.** xorq's absolute filesystem paths are rewritten
-  to `${PYDATA_PROJECT_ROOT}` on write and expanded back on load. A project directory
-  is a hand-offable artifact.
-- **`pydata serve <project_dir>`** — read-only companion against a project directory
-  that may live anywhere on disk. Mutation routes return 403. The artifact mode for
-  the talk's closing beat.
+  - `/api/{entries,aliases,errors,notebook,lineage,catalog_dag}` — JSON.
+  - `/api/sse` — live updates (`new_entry`, `build_failed`, `alias_changed`,
+    `notebook_changed`).
+- **Build artifacts are portable.** xorq's absolute filesystem paths are
+  rewritten to `${PYDATA_PROJECT_ROOT}` on write and expanded back on load.
+- **`pydata serve <project_dir>`** — read-only companion against a project
+  directory that may live anywhere on disk. Mutation routes return 403.
 
 What's NOT in V0 (deferred to later spikes, in this order):
 
-1. Buckaroo iframe + Tornado subprocess.
-2. Notebook tab + drag-reorder + markdown editor.
-3. Lineage view (Cytoscape).
-4. Diff view.
-5. Vega-Lite charts.
+1. Buckaroo iframe + Tornado subprocess (replace the `pandas.to_html` previews).
+2. SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
+   accessibility fallback; drag is the headline UX).
+3. Vega-Lite charts attached to entries.
+4. Column-level lineage (xorq has the data; current view is op-level only).
+5. `pydata pack` / tar handoff (today's hand-off is `cp -r`).
 
 ## Running the spike
 

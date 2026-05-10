@@ -1,3 +1,4 @@
+from pydata_core import notebook
 from pydata_core.aliases import (
     AliasExists,
     AliasNotFound,
@@ -12,6 +13,7 @@ from pydata_core.aliases import (
     version_of_hash,
 )
 from pydata_core.errors import get_error, list_errors, record_error
+from pydata_core.notebook import CellNotFound
 from pydata_core.manifest import Manifest, read_manifest, write_manifest
 from pydata_core.paths import (
     catalog_dir,
@@ -28,6 +30,7 @@ from pydata_core.paths import (
 __all__ = [
     "AliasExists",
     "AliasNotFound",
+    "CellNotFound",
     "Manifest",
     "alias_for_hash",
     "catalog_dir",
@@ -41,6 +44,7 @@ __all__ = [
     "list_errors",
     "load_aliases",
     "load_history",
+    "notebook",
     "project_dir",
     "projects_root",
     "pydata_home",

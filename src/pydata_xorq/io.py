@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydata_core import data_dir, resolve_project
+from pydata_core import data_dir, entry_dir, get_alias, resolve_project
 
 
 class ProjectDataNotFound(FileNotFoundError):
@@ -44,3 +44,32 @@ def from_project(rel_path: str, project: str | None = None):
     import xorq.api as xo
 
     return xo.deferred_read_parquet(str(project_path(rel_path, project)))
+
+
+def from_catalog(alias_or_hash: str, project: str | None = None):
+    """Load an existing catalog entry's result as a xorq expression.
+
+    This is how you chain catalog entries: build A, then build B from A's result.
+    The resulting build's `expr.yaml` references A's `result.parquet`, which
+    `pydata_xorq.lineage` uses to derive catalog-level parent links.
+
+    Args:
+        alias_or_hash: An alias (e.g. "shoe_sales") or a content hash. Aliases
+            resolve to their *current* latest hash.
+        project: Project name override (defaults to active PYDATA_PROJECT).
+    """
+    import xorq.api as xo
+
+    proj = resolve_project(project)
+    target = entry_dir(proj, alias_or_hash)
+    if not target.exists():
+        latest = get_alias(proj, alias_or_hash)
+        if latest is None:
+            raise ProjectDataNotFound(
+                f"catalog entry {alias_or_hash!r} not found in project {proj!r}"
+            )
+        target = entry_dir(proj, latest)
+    parquet = target / "result.parquet"
+    if not parquet.exists():
+        raise ProjectDataNotFound(f"{parquet} not found")
+    return xo.deferred_read_parquet(str(parquet))

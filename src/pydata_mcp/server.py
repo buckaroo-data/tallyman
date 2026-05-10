@@ -10,15 +10,19 @@ from fastmcp import FastMCP
 from pydata_core import (
     AliasExists,
     AliasNotFound,
+    CellNotFound,
     alias_for_hash,
     entry_dir,
     get_alias,
+    notebook,
     record_error,
+    remove_alias,
     rename_alias,
     resolve_project,
     set_alias,
 )
-from pydata_xorq import BuildError, build_and_persist, list_entries
+from pydata_core import history_for
+from pydata_xorq import BuildError, build_and_persist, full_diff, list_entries
 
 log = logging.getLogger("pydata_mcp")
 COMPANION_URL = os.environ.get("PYDATA_COMPANION_URL", "http://127.0.0.1:7860")
@@ -139,10 +143,12 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     if "error" in out:
         return out
     info = set_alias(project, name, out["hash"], expect_exists=False)
+    notebook.append(project, name, markdown=prompt or "")
     out.pop("_build", None)
     out["alias"] = info["name"]
     out["version"] = info["version"]
     _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
+    _notify("notebook_changed")
     return out
 
 
@@ -185,13 +191,15 @@ def catalog_alias(hash: str, name: str) -> dict:
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists"}
     info = set_alias(project, name, hash, expect_exists=False)
+    notebook.append(project, name)
     _notify("alias_changed", content_hash=hash, alias=name, version=info["version"])
+    _notify("notebook_changed")
     return {"hash": hash, "alias": name, "version": info["version"]}
 
 
 @mcp.tool()
 def catalog_rename(old_name: str, new_name: str) -> dict:
-    """Rename an existing alias. Preserves version history."""
+    """Rename an existing alias. Preserves version history and notebook position."""
     project = resolve_project()
     try:
         info = rename_alias(project, old_name, new_name)
@@ -199,8 +207,113 @@ def catalog_rename(old_name: str, new_name: str) -> dict:
         return {"error": f"alias {old_name!r} does not exist"}
     except AliasExists:
         return {"error": f"alias {new_name!r} already exists"}
+    notebook.rename_alias_in_cells(project, old_name, new_name)
     _notify("alias_renamed", old=old_name, new=new_name, content_hash=info["hash"])
+    _notify("notebook_changed")
     return info
+
+
+@mcp.tool()
+def catalog_unalias(name: str) -> dict:
+    """Remove an alias (the named entries become scratch again).
+
+    Catalog entries themselves remain; only the named handle is dropped. Any
+    notebook cells anchored on this alias are removed.
+    """
+    project = resolve_project()
+    if get_alias(project, name) is None:
+        return {"error": f"alias {name!r} does not exist"}
+    remove_alias(project, name)
+    n = notebook.remove_alias_from_cells(project, name)
+    _notify("alias_changed", alias=name)
+    if n:
+        _notify("notebook_changed")
+    return {"removed_alias": name, "notebook_cells_removed": n}
+
+
+@mcp.tool()
+def notebook_reorder(cell_id: str, new_index: int) -> dict:
+    """Move a notebook cell to a new position (0-based)."""
+    project = resolve_project()
+    try:
+        cell = notebook.reorder(project, cell_id, new_index)
+    except CellNotFound:
+        return {"error": f"no cell with id {cell_id!r}"}
+    _notify("notebook_changed")
+    return {"cell": cell, "new_index": new_index}
+
+
+@mcp.tool()
+def notebook_remove(cell_id: str) -> dict:
+    """Remove a cell from the notebook. The underlying catalog entry is unaffected."""
+    project = resolve_project()
+    try:
+        notebook.remove(project, cell_id)
+    except CellNotFound:
+        return {"error": f"no cell with id {cell_id!r}"}
+    _notify("notebook_changed")
+    return {"removed": cell_id}
+
+
+@mcp.tool()
+def notebook_edit_markdown(cell_id: str, markdown: str) -> dict:
+    """Replace the markdown text shown above a cell."""
+    project = resolve_project()
+    try:
+        cell = notebook.edit_markdown(project, cell_id, markdown)
+    except CellNotFound:
+        return {"error": f"no cell with id {cell_id!r}"}
+    _notify("notebook_changed")
+    return {"cell": cell}
+
+
+@mcp.tool()
+def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
+    """Diff two versions of an alias.
+
+    Default compares the previous version to the current one (V_{n-1} vs V_n).
+    Returns code/schema/stats/head/keyed diff summaries.
+
+    Args:
+        name: An existing alias.
+        va, vb: 1-based version indices, or negative for from-end (-1 = latest).
+    """
+    project = resolve_project()
+    hashes = history_for(project, name)
+    if not hashes:
+        return {"error": f"alias {name!r} has no history"}
+
+    def resolve(v):
+        if v < 0:
+            v = len(hashes) + v + 1  # -1 -> last, -2 -> penultimate
+        if v < 1 or v > len(hashes):
+            return None
+        return v, hashes[v - 1]
+
+    a = resolve(va)
+    b = resolve(vb)
+    if a is None or b is None:
+        return {"error": f"version out of range; alias has {len(hashes)} versions"}
+    a_idx, a_hash = a
+    b_idx, b_hash = b
+    a_dir = entry_dir(project, a_hash)
+    b_dir = entry_dir(project, b_hash)
+    if not a_dir.exists() or not b_dir.exists():
+        return {"error": "one or both entries are missing on disk"}
+
+    diff = full_diff(a_dir, b_dir, a_label=f"V{a_idx}", b_label=f"V{b_idx}")
+    return {
+        "alias": name,
+        "before": {"version": a_idx, "hash": a_hash},
+        "after": {"version": b_idx, "hash": b_hash},
+        "schema": diff["schema"],
+        "stats": diff["stats"],
+        "keyed_summary": (
+            {k: v for k, v in diff["keyed"].items() if k != "table_html"}
+            if diff["keyed"]
+            else None
+        ),
+    }
 
 
 @mcp.tool()

@@ -51,6 +51,26 @@
     .forensic-history { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px 12px; margin-top: 12px; }
     .forensic-history ol { margin: 4px 0 0 0; padding-left: 20px; }
     .forensic-history .current { color: var(--accent); font-weight: 500; }
+    .dag { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px; overflow: auto; }
+    .dag .node-box { fill: var(--panel); stroke: var(--line); }
+    .dag .node-box.named { stroke: var(--accent); }
+    .dag .node-box.root { stroke: var(--accent); fill: var(--accent-soft); }
+    .dag .node-label { fill: var(--fg); font-family: ui-monospace, monospace; font-size: 11px; }
+    .dag .node-sublabel { fill: var(--muted); font-family: ui-monospace, monospace; font-size: 10px; }
+    .dag .edge { stroke: var(--muted); stroke-width: 1.5; fill: none; opacity: 0.7; }
+    .dag a:hover .node-box { stroke: var(--accent); }
+    .dag-empty { color: var(--muted); padding: 12px; }
+    .nb-cell { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 14px 16px; }
+    .nb-cell .nb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .nb-cell .nb-head .alias { font-weight: 600; }
+    .nb-cell .nb-head .nb-actions { margin-left: auto; display: flex; gap: 6px; }
+    .nb-cell .nb-head button { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: inherit; }
+    .nb-cell .nb-head button:hover { color: var(--fg); border-color: var(--accent); }
+    .nb-cell .nb-markdown { color: var(--muted); margin: 4px 0 10px; white-space: pre-wrap; }
+    .nb-cell .nb-markdown-edit { width: 100%; min-height: 60px; background: #0a0c12; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 12px; }
+    .nb-cell .nb-preview { overflow: auto; max-height: 240px; }
+    .nb-cell .nb-meta { color: var(--muted); font-size: 11px; margin-top: 8px; }
+    .nb-empty { color: var(--muted); padding: 16px; }
   </style>
 </head>
 <body>
@@ -59,6 +79,8 @@
     <span class="project">project: {{ project }}</span>
     <nav>
       <a href="/catalog">catalog</a>
+      <a href="/notebook">notebook</a>
+      <a href="/lineage">lineage</a>
     </nav>
     {% if read_only %}<span class="pill" style="color: var(--muted)">read-only · serve mode</span>{% endif %}
     <span id="sse-status" class="pill">connecting…</span>
@@ -79,6 +101,10 @@
     sse.addEventListener('build_failed', () => {
       // Reload the current page so the failure banner re-renders.
       window.location.reload();
+    });
+    sse.addEventListener('notebook_changed', () => {
+      // Only reload if we're actually on the notebook view.
+      if (window.location.pathname === '/notebook') window.location.reload();
     });
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
   </script>

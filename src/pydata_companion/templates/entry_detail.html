@@ -47,7 +47,7 @@
       {% endfor %}
     </ul>
 
-    <h3>code</h3>
+    <h3>code <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a></h3>
     <pre class="code">{{ code }}</pre>
 
     {% if forensic_history and forensic_history|length > 1 %}
@@ -60,6 +60,14 @@
             </li>
           {% endfor %}
         </ol>
+        <p class="meta">
+          diff:
+          {% for h in forensic_history %}
+            {% if not loop.last %}
+              <a href="/diff/{{ alias }}/{{ h.version }}/{{ h.version + 1 }}">V{{ h.version }}→V{{ h.version + 1 }}</a>{% if not loop.last %} · {% endif %}
+            {% endif %}
+          {% endfor %}
+        </p>
       </div>
     {% endif %}
   </section>

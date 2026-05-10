@@ -1,0 +1,79 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel detail" style="margin: 12px 16px;">
+  <h2>diff · {{ alias }} <span class="vchip">V{{ va }}</span> → <span class="vchip">V{{ vb }}</span></h2>
+  <p class="meta">
+    {{ a_hash }} → {{ b_hash }}.
+    {% if hashes|length > 2 %}
+      Compare other pairs:
+      {% for i in range(1, hashes|length + 1) %}
+        {% for j in range(1, hashes|length + 1) %}
+          {% if i != j %}
+            <a href="/diff/{{ alias }}/{{ i }}/{{ j }}">V{{ i }}→V{{ j }}</a>{% if not loop.last %}, {% endif %}
+          {% endif %}
+        {% endfor %}{% if not loop.last %}; {% endif %}
+      {% endfor %}
+    {% endif %}
+  </p>
+
+  <h3>schema</h3>
+  <ul>
+    <li>rows: {{ diff.schema.row_count.before }} → {{ diff.schema.row_count.after }}</li>
+    {% if diff.schema.added %}<li>added: {{ diff.schema.added|join(", ") }}</li>{% endif %}
+    {% if diff.schema.removed %}<li>removed: {{ diff.schema.removed|join(", ") }}</li>{% endif %}
+    {% for c in diff.schema.changed_type %}
+      <li>type change: <code>{{ c.name }}</code> {{ c.before }} → {{ c.after }}</li>
+    {% endfor %}
+    {% if not diff.schema.added and not diff.schema.removed and not diff.schema.changed_type %}
+      <li class="meta">no schema changes</li>
+    {% endif %}
+  </ul>
+
+  <h3>stats per column</h3>
+  <table class="data-table">
+    <thead>
+      <tr><th>column</th><th>rows V{{ va }}</th><th>rows V{{ vb }}</th><th>nulls V{{ va }}</th><th>nulls V{{ vb }}</th><th>distinct V{{ va }}</th><th>distinct V{{ vb }}</th><th>mean V{{ va }}</th><th>mean V{{ vb }}</th></tr>
+    </thead>
+    <tbody>
+    {% for s in diff.stats %}
+      <tr>
+        <td><code>{{ s.name }}</code></td>
+        <td>{{ s.before.count if s.before else '—' }}</td>
+        <td>{{ s.after.count if s.after else '—' }}</td>
+        <td>{{ s.before.nulls if s.before else '—' }}</td>
+        <td>{{ s.after.nulls if s.after else '—' }}</td>
+        <td>{{ s.before.distinct if s.before else '—' }}</td>
+        <td>{{ s.after.distinct if s.after else '—' }}</td>
+        <td>{% if s.before and s.before.numeric %}{{ "%.3f"|format(s.before.numeric.mean) }}{% else %}—{% endif %}</td>
+        <td>{% if s.after and s.after.numeric %}{{ "%.3f"|format(s.after.numeric.mean) }}{% else %}—{% endif %}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+
+  {% if diff.keyed %}
+    <h3>keyed diff on {{ diff.keyed["keys"]|join(", ") }}</h3>
+    <p class="meta">
+      {{ diff.keyed.matched }} keys in both,
+      {{ diff.keyed.only_before }} only in V{{ va }},
+      {{ diff.keyed.only_after }} only in V{{ vb }}.
+    </p>
+    <div style="overflow:auto; max-height: 40vh;">{{ diff.keyed.table_html|safe }}</div>
+  {% endif %}
+
+  <h3>head — side by side</h3>
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 12px;">
+    <div>
+      <div class="meta">V{{ va }} (first {{ diff.head.n }} of {{ diff.head.a_total }})</div>
+      {{ diff.head.before|safe }}
+    </div>
+    <div>
+      <div class="meta">V{{ vb }} (first {{ diff.head.n }} of {{ diff.head.b_total }})</div>
+      {{ diff.head.after|safe }}
+    </div>
+  </div>
+
+  <h3>code diff</h3>
+  <div style="overflow:auto;">{{ diff.code|safe }}</div>
+</section>
+{% endblock %}

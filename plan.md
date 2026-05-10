@@ -2,6 +2,34 @@
 
 The xorq MCP app that backs the PyData London 2026 talk *"The Future of Notebooks in a Claude Code World"* (see `proposal.md`). This document is the result of a grilling pass; it supersedes earlier drafts. Decisions baked in from the grilling are stated; remaining open questions are listed at the end.
 
+> **V0.5 implementation status (2026-05-10).** Working end-to-end on branch
+> `spike/catalog-run-loop` with 151 passing tests:
+>
+> - All 13 MCP tools listed below — including `catalog_chart`, `catalog_diff`,
+>   `catalog_unalias`, and the three `notebook_*` tools.
+> - Catalog tab (named/forensic/scratch ordering, V_n chips, forensic history,
+>   build-failure banner with detail page).
+> - Notebook tab (cells anchored on aliases, ↑/↓ reorder, click-to-edit
+>   markdown, × remove; auto-append on `catalog_create`/`catalog_alias`).
+> - Lineage tab (catalog DAG via `from_catalog` parent edges, plus per-entry
+>   internal expression DAG; pure SVG, no Cytoscape dep yet).
+> - Diff tab (`/diff/<alias>[/<va>/<vb>]`): code diff (difflib unified),
+>   schema diff (added/removed/changed-type), per-column stats, key-joined
+>   side-by-side, head() side-by-side. All five flavors shown together.
+> - Vega-Lite charts attached to entries via `catalog_chart`; entry-detail
+>   embeds vega-embed and pulls data via `/api/data/<hash>`.
+> - **`pydata serve <project_dir>`** read-only artifact mode. Project
+>   directories are portable across machines/users via build-time
+>   `${PYDATA_PROJECT_ROOT}` placeholder rewriting.
+> - MCP-over-stdio proven by `tests/test_mcp_stdio.py` (spawns the CLI as a
+>   subprocess and round-trips real tool calls).
+>
+> **Not yet built (V1):** Buckaroo iframe + Tornado lifecycle (beat 2 of
+> the storyboard — replaces the `pandas.to_html` table previews);
+> SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
+> accessibility fallback); column-level lineage; ML training pipeline
+> (beats 7-8); `pydata pack` (today's hand-off is `cp -r` or `tar`).
+
 ---
 
 ## What we're building
@@ -115,35 +143,37 @@ Single `pyproject.toml` at the repo root, src-layout, uv-managed. Python 3.13.
 
 ## MCP tool surface
 
-Roughly 13 tools. Names use `catalog_*`, `notebook_*`, `viewer_*` prefixes for legibility.
+13 tools implemented as of V0.5; names use `catalog_*`, `notebook_*`, `viewer_*` prefixes for legibility. The plan-original `viewer_*` row is still V1 because the demo so far does not need it (the agent's tool choice + SSE auto-focus covers the cases).
 
 **Catalog mutation:**
 | Tool | Behavior |
 |---|---|
-| `catalog_run(code)` | Execute, persist as scratch (no alias). Returns content hash. Companion auto-focuses on the new entry in the catalog tab. |
-| `catalog_create(name, code)` | Execute, persist with alias. Auto-appends to active notebook. Errors if alias exists. |
-| `catalog_revise(name, code)` | Execute, persist as new version of an existing alias. Cell updates in place; older versions become forensic. Errors if alias doesn't exist. |
-| `catalog_alias(hash, name)` | Promote a scratch entry to a named entry post-hoc. Errors if alias exists. |
-| `catalog_rename(old_name, new_name)` | Change an alias name. |
-| `catalog_prune(hash_or_alias)` | Remove an entry from the catalog. Removes from notebook if present. |
-| `catalog_chart(hash_or_alias, vega_spec)` | Attach a Vega-Lite chart spec to an entry. Companion renders it above the table. |
+| `catalog_run(code)` | Execute, persist as scratch (no alias). Returns content hash. Companion auto-focuses on the new entry in the catalog tab. ✅ |
+| `catalog_load_parquet(rel_path)` | Convenience: load `<project>/data/<rel_path>` as a scratch entry without writing xorq dialect. ✅ |
+| `catalog_create(name, code)` | Execute, persist with alias. Auto-appends to active notebook. Errors if alias exists. ✅ |
+| `catalog_revise(name, code)` | Execute, persist as new version of an existing alias. Cell updates in place; older versions become forensic. Errors if alias doesn't exist. ✅ |
+| `catalog_alias(hash, name)` | Promote a scratch entry to a named entry post-hoc. Errors if alias exists. ✅ |
+| `catalog_rename(old_name, new_name)` | Change an alias name. Notebook follows. ✅ |
+| `catalog_unalias(name)` | Drop an alias; entries remain, notebook cell is removed. ✅ |
+| `catalog_chart(hash_or_alias, vega_spec)` | Attach a Vega-Lite chart spec to an entry. Companion renders it above the table. ✅ |
+| `catalog_prune(hash_or_alias)` | Remove an entry from the catalog. Removes from notebook if present. *(V1 — not yet implemented)* |
 
 **Notebook mutation:**
 | Tool | Behavior |
 |---|---|
-| `notebook_reorder(cell_id, new_index)` | Move a cell. Mirrors browser drag-and-drop. |
-| `notebook_remove(cell_id)` | Remove a cell from the notebook. Catalog entry untouched. |
-| `notebook_edit_markdown(cell_id, markdown)` | Replace the markdown above a cell. |
+| `notebook_reorder(cell_id, new_index)` | Move a cell. Mirrors browser drag-and-drop. ✅ |
+| `notebook_remove(cell_id)` | Remove a cell from the notebook. Catalog entry untouched. ✅ |
+| `notebook_edit_markdown(cell_id, markdown)` | Replace the markdown above a cell. ✅ |
 
 **Inspection / control:**
 | Tool | Behavior |
 |---|---|
-| `catalog_list(filter?)` | List entries (named first, then scratch by recency). |
-| `catalog_show(hash_or_alias)` | Manifest + schema + head() preview. |
-| `catalog_diff(alias, va, vb)` | Forensic diff between two versions. Code/schema/data-sample. |
-| `catalog_lineage(hash_or_alias)` | Lineage graph as JSON. Companion renders Cytoscape DAG on the lineage tab. |
-| `viewer_focus(hash_or_alias)` | Tell the companion to switch the catalog tab's focus to this entry. |
-| `viewer_open_notebook()` | Tell the companion to switch to the notebook tab. |
+| `catalog_list()` | List entries (named first, then forensic, then scratch). Each annotated with `alias` and `version` when applicable. ✅ |
+| `catalog_diff(name, va=-2, vb=-1)` | Forensic diff between two versions of an alias. Returns code/schema/stats/keyed-summary; the companion's `/diff/<alias>` page renders the full HTML. ✅ |
+| `catalog_show(hash_or_alias)` | Manifest + schema + head() preview. *(V1 — `/api/data/<hash>` + `/catalog/<hash>` cover this for now)* |
+| `catalog_lineage(hash_or_alias)` | Lineage graph as JSON. *(V1 — `/api/lineage/<hash>` and `/api/catalog_dag` cover this from the companion)* |
+| `viewer_focus(hash_or_alias)` | Switch the catalog tab's focus to this entry. *(V1 — currently handled by the SSE `new_entry` auto-focus)* |
+| `viewer_open_notebook()` | Switch to the notebook tab. *(V1 — same justification)* |
 
 The agent's choice between `catalog_run`, `catalog_create`, and `catalog_revise` is the visible signal of its intent — communicated and overrideable. If the agent picks `catalog_run` when you wanted a named entry, you (or the agent on a follow-up) call `catalog_alias` to promote.
 

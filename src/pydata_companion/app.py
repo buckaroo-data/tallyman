@@ -16,6 +16,7 @@ from sse_starlette.sse import EventSourceResponse
 from pydata_core import (
     alias_for_hash,
     entry_dir,
+    get_chart,
     get_error,
     history_for,
     list_errors,
@@ -150,6 +151,7 @@ def create_app(project: str | None = None, *, read_only: bool = False) -> FastAP
         )
 
         prompt_history = read_prompts(entry)
+        chart_spec = get_chart(project_name, content_hash)
         return templates.TemplateResponse(
             request,
             "entry_detail.html",
@@ -165,8 +167,20 @@ def create_app(project: str | None = None, *, read_only: bool = False) -> FastAP
                 "alias": alias,
                 "version": version,
                 "forensic_history": forensic_history,
+                "chart_spec": chart_spec,
             },
         )
+
+    @app.get("/api/data/{content_hash}")
+    def api_data(content_hash: str, limit: int = 5000):
+        """Return result.parquet as JSON for vega-embed to consume."""
+        entry = entry_dir(project_name, content_hash)
+        result_path = entry / "result.parquet"
+        if not result_path.exists():
+            raise HTTPException(404, "no result.parquet")
+        table = pq.read_table(result_path)
+        df = table.to_pandas().head(limit)
+        return {"data": df.to_dict(orient="records")}
 
     @app.get("/api/sse")
     async def sse(request: Request):

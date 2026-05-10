@@ -11,6 +11,7 @@ from pydata_core import (
     AliasExists,
     AliasNotFound,
     CellNotFound,
+    ChartSpecError,
     alias_for_hash,
     entry_dir,
     get_alias,
@@ -20,6 +21,7 @@ from pydata_core import (
     rename_alias,
     resolve_project,
     set_alias,
+    set_chart,
 )
 from pydata_core import history_for
 from pydata_xorq import BuildError, build_and_persist, full_diff, list_entries
@@ -265,6 +267,40 @@ def notebook_edit_markdown(cell_id: str, markdown: str) -> dict:
         return {"error": f"no cell with id {cell_id!r}"}
     _notify("notebook_changed")
     return {"cell": cell}
+
+
+@mcp.tool()
+def catalog_chart(hash_or_alias: str, vega_spec: dict | str) -> dict:
+    """Attach a Vega-Lite spec to a catalog entry.
+
+    The spec is rendered above the table on the entry's detail page via
+    vega-embed in the browser. The spec is stored as-is — no server-side
+    validation. Use the entry's columns by name; vega-embed will load the
+    parquet's data automatically (companion serves it as JSON to the chart).
+
+    Args:
+        hash_or_alias: Target entry. Aliases resolve to their latest hash.
+        vega_spec: A Vega-Lite v5 JSON spec (dict or JSON string).
+
+    Example spec::
+
+        {"mark": "bar",
+         "encoding": {"x": {"field": "region", "type": "nominal"},
+                      "y": {"field": "total", "type": "quantitative"}}}
+    """
+    project = resolve_project()
+    target_hash = hash_or_alias
+    if not entry_dir(project, target_hash).exists():
+        resolved = get_alias(project, hash_or_alias)
+        if resolved is None:
+            return {"error": f"no entry for {hash_or_alias!r}"}
+        target_hash = resolved
+    try:
+        path = set_chart(project, target_hash, vega_spec)
+    except ChartSpecError as exc:
+        return {"error": str(exc)}
+    _notify("chart_attached", content_hash=target_hash)
+    return {"hash": target_hash, "spec_path": str(path)}
 
 
 @mcp.tool()

@@ -1,5 +1,5 @@
 from pydata_core import notebook
-from pydata_core.aliases import (
+from pydata_core.aliases import (  # noqa: I001 (keep notebook import first)
     AliasExists,
     AliasNotFound,
     alias_for_hash,
@@ -12,6 +12,7 @@ from pydata_core.aliases import (
     set_alias,
     version_of_hash,
 )
+from pydata_core.charts import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
 from pydata_core.errors import get_error, list_errors, record_error
 from pydata_core.notebook import CellNotFound
 from pydata_core.manifest import Manifest, read_manifest, write_manifest
@@ -31,6 +32,7 @@ __all__ = [
     "AliasExists",
     "AliasNotFound",
     "CellNotFound",
+    "ChartSpecError",
     "Manifest",
     "alias_for_hash",
     "catalog_dir",
@@ -39,8 +41,10 @@ __all__ = [
     "entries_dir",
     "entry_dir",
     "get_alias",
+    "get_chart",
     "get_error",
     "history_for",
+    "list_charts",
     "list_errors",
     "load_aliases",
     "load_history",
@@ -51,9 +55,11 @@ __all__ = [
     "read_manifest",
     "record_error",
     "remove_alias",
+    "remove_chart",
     "rename_alias",
     "resolve_project",
     "set_alias",
+    "set_chart",
     "version_of_hash",
     "write_manifest",
 ]

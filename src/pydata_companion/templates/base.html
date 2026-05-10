@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{% block title %}pydata · {{ project }}{% endblock %}</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --panel: #161922;
+      --line: #232838;
+      --fg: #e6e8ef;
+      --muted: #8b93a7;
+      --accent: #6ea8fe;
+      --accent-soft: #1e2a44;
+    }
+    html, body { background: var(--bg); color: var(--fg); margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace; }
+    body { font-size: 14px; }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    header { border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; align-items: center; gap: 16px; }
+    header .brand { font-weight: 600; }
+    header .project { color: var(--muted); }
+    header nav a { margin-right: 12px; }
+    main { padding: 16px; }
+    .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; height: calc(100vh - 60px); }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; }
+    .entry-list { list-style: none; margin: 0; padding: 0; }
+    .entry-list li { border-bottom: 1px solid var(--line); }
+    .entry-list a { display: block; padding: 10px 12px; color: var(--fg); }
+    .entry-list a:hover { background: var(--accent-soft); }
+    .entry-list .hash { font-family: ui-monospace, monospace; color: var(--muted); font-size: 12px; }
+    .entry-list .prompt { display: block; margin-top: 2px; }
+    .detail { padding: 16px; }
+    .detail h2 { margin-top: 0; }
+    .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+    pre.code { background: #0a0c12; border: 1px solid var(--line); border-radius: 4px; padding: 10px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; }
+    table.data-table { border-collapse: collapse; width: 100%; font-size: 12px; }
+    table.data-table th, table.data-table td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; }
+    table.data-table th { background: #0a0c12; position: sticky; top: 0; }
+    .pill { display: inline-block; padding: 2px 6px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-size: 11px; margin-right: 6px; }
+    .live { color: var(--accent); }
+  </style>
+</head>
+<body>
+  <header>
+    <span class="brand">pydata</span>
+    <span class="project">project: {{ project }}</span>
+    <nav>
+      <a href="/catalog">catalog</a>
+    </nav>
+    <span id="sse-status" class="pill">connecting…</span>
+  </header>
+  <main>
+    {% block content %}{% endblock %}
+  </main>
+  <script>
+    const status = document.getElementById('sse-status');
+    const sse = new EventSource('/api/sse');
+    sse.addEventListener('hello', () => { status.textContent = 'live'; status.classList.add('live'); });
+    sse.addEventListener('ping', () => {});
+    sse.addEventListener('new_entry', (e) => {
+      const data = JSON.parse(e.data);
+      // V0: full reload on any new entry. Cheap and reliable.
+      window.location.assign('/catalog/' + data.hash);
+    });
+    sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
+  </script>
+</body>
+</html>

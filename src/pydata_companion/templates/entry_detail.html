@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <aside class="panel">
+    <ul class="entry-list">
+      <li><a href="/catalog">← back to catalog</a></li>
+    </ul>
+  </aside>
+  <section class="panel detail">
+    <h2>{{ manifest.content_hash }}</h2>
+    <div class="meta">
+      <span class="pill">{{ manifest.row_count }} rows</span>
+      <span class="pill">{{ manifest.execute_seconds }}s</span>
+      <span class="pill">{{ manifest.created_at }}</span>
+    </div>
+    {% if manifest.prompt %}
+      <p><strong>prompt:</strong> {{ manifest.prompt }}</p>
+    {% endif %}
+
+    <h3>result {% if total_rows > preview_rows %}<span class="meta">(showing first {{ preview_rows }} of {{ total_rows }})</span>{% endif %}</h3>
+    <div style="overflow:auto; max-height: 50vh;">
+      {{ table_html|safe }}
+    </div>
+
+    <h3>schema</h3>
+    <ul>
+      {% for f in schema.fields %}
+        <li><code>{{ f.name }}</code> · {{ f.type }}</li>
+      {% endfor %}
+    </ul>
+
+    <h3>code</h3>
+    <pre class="code">{{ code }}</pre>
+  </section>
+</div>
+{% endblock %}

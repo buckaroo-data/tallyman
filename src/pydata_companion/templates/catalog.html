@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <aside class="panel">
+    <ul class="entry-list">
+      {% for e in entries %}
+        <li>
+          <a href="/catalog/{{ e.content_hash }}">
+            <span class="hash">{{ e.content_hash }}</span>
+            <span class="prompt">{{ e.prompt or "(no prompt)" }}</span>
+            <span class="meta">{{ e.row_count }} rows · {{ e.execute_seconds }}s</span>
+          </a>
+        </li>
+      {% else %}
+        <li><a href="#"><em>no entries yet — drive Claude with a tool call</em></a></li>
+      {% endfor %}
+    </ul>
+  </aside>
+  <section class="panel detail">
+    <h2>catalog</h2>
+    <p class="meta">{{ entries|length }} entries in project <code>{{ project }}</code>. Pick one on the left.</p>
+  </section>
+</div>
+{% endblock %}

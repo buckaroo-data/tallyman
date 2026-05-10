@@ -40,6 +40,9 @@
     table.data-table th { background: #0a0c12; position: sticky; top: 0; }
     .pill { display: inline-block; padding: 2px 6px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-size: 11px; margin-right: 6px; }
     .live { color: var(--accent); }
+    .error-banner { background: #2a1b1b; border: 1px solid #5a3a3a; color: #ffb4b4; padding: 10px 12px; border-radius: 4px; margin: 0 16px 12px; }
+    .error-banner ul { margin: 6px 0 0 0; padding-left: 20px; }
+    .error-banner code { color: #ffd1d1; }
   </style>
 </head>
 <body>
@@ -63,6 +66,10 @@
       const data = JSON.parse(e.data);
       // V0: full reload on any new entry. Cheap and reliable.
       window.location.assign('/catalog/' + data.hash);
+    });
+    sse.addEventListener('build_failed', () => {
+      // Reload the current page so the failure banner re-renders.
+      window.location.reload();
     });
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
   </script>

@@ -17,6 +17,17 @@
       <p><strong>prompt:</strong> {{ manifest.prompt }}</p>
     {% endif %}
 
+    {% if prompt_history and prompt_history|length > 1 %}
+      <details>
+        <summary class="meta">{{ prompt_history|length }} prompts seen for this hash</summary>
+        <ul>
+          {% for p in prompt_history %}
+            <li><span class="meta">{{ p.at }}</span> — {{ p.prompt }}</li>
+          {% endfor %}
+        </ul>
+      </details>
+    {% endif %}
+
     <h3>result {% if total_rows > preview_rows %}<span class="meta">(showing first {{ preview_rows }} of {{ total_rows }})</span>{% endif %}</h3>
     <div style="overflow:auto; max-height: 50vh;">
       {{ table_html|safe }}

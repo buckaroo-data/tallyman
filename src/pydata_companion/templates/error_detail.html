@@ -1,0 +1,25 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <aside class="panel">
+    <ul class="entry-list">
+      <li><a href="/catalog">← back to catalog</a></li>
+    </ul>
+  </aside>
+  <section class="panel detail">
+    <h2>build failure · {{ error.id }}</h2>
+    <div class="meta">
+      <span class="pill">{{ error.created_at }}</span>
+    </div>
+    {% if error.prompt %}
+      <p><strong>prompt:</strong> {{ error.prompt }}</p>
+    {% endif %}
+
+    <h3>error</h3>
+    <pre class="code">{{ error.message }}</pre>
+
+    <h3>code</h3>
+    <pre class="code">{{ error.code }}</pre>
+  </section>
+</div>
+{% endblock %}

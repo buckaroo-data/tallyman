@@ -13,8 +13,8 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from pydata_core import entries_dir, entry_dir, resolve_project
-from pydata_xorq import list_entries
+from pydata_core import entry_dir, get_error, list_errors, resolve_project
+from pydata_xorq import list_entries, read_prompts
 
 PKG_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PKG_DIR / "templates"
@@ -52,10 +52,11 @@ def create_app(project: str | None = None) -> FastAPI:
     @app.get("/catalog", response_class=HTMLResponse)
     def catalog(request: Request):
         entries = list_entries(project_name)
+        errors = list_errors(project_name, limit=5)
         return templates.TemplateResponse(
             request,
             "catalog.html",
-            {"project": project_name, "entries": entries},
+            {"project": project_name, "entries": entries, "errors": errors},
         )
 
     @app.get("/catalog/{content_hash}", response_class=HTMLResponse)
@@ -75,6 +76,7 @@ def create_app(project: str | None = None) -> FastAPI:
             classes="data-table", index=False, border=0
         )
 
+        prompt_history = read_prompts(entry)
         return templates.TemplateResponse(
             request,
             "entry_detail.html",
@@ -86,6 +88,7 @@ def create_app(project: str | None = None) -> FastAPI:
                 "table_html": table_html,
                 "preview_rows": preview_rows,
                 "total_rows": len(df),
+                "prompt_history": prompt_history,
             },
         )
 
@@ -124,5 +127,20 @@ def create_app(project: str | None = None) -> FastAPI:
     @app.get("/api/entries")
     def api_entries():
         return {"project": project_name, "entries": list_entries(project_name)}
+
+    @app.get("/api/errors")
+    def api_errors(limit: int = 20):
+        return {"project": project_name, "errors": list_errors(project_name, limit=limit)}
+
+    @app.get("/errors/{error_id}", response_class=HTMLResponse)
+    def error_detail(request: Request, error_id: str):
+        rec = get_error(project_name, error_id)
+        if rec is None:
+            raise HTTPException(404, f"error {error_id} not found")
+        return templates.TemplateResponse(
+            request,
+            "error_detail.html",
+            {"project": project_name, "error": rec},
+        )
 
     return app

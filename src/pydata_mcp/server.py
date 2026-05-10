@@ -7,7 +7,7 @@ import sys
 import httpx
 from fastmcp import FastMCP
 
-from pydata_core import resolve_project
+from pydata_core import record_error, resolve_project
 from pydata_xorq import BuildError, build_and_persist, list_entries
 
 log = logging.getLogger("pydata_mcp")
@@ -54,7 +54,44 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     try:
         result = build_and_persist(project=project, code=code, prompt=prompt or None)
     except BuildError as exc:
-        return {"error": str(exc)}
+        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None)
+        _notify("build_failed", error_id=rec["id"])
+        return {"error": str(exc), "error_id": rec["id"]}
+    _notify("new_entry", content_hash=result.content_hash)
+    return {
+        "hash": result.content_hash,
+        "row_count": result.row_count,
+        "execute_seconds": result.execute_seconds,
+        "schema": result.schema,
+        "entry_path": str(result.entry_path),
+    }
+
+
+@mcp.tool()
+def catalog_load_parquet(rel_path: str, prompt: str = "") -> dict:
+    """Register a parquet file from the project's data/ directory as a catalog entry.
+
+    Use this for simple "load this file" steps. The agent does not need to write
+    any xorq code — pass a path relative to the project's `data/` directory.
+
+    Args:
+        rel_path: Path relative to `<project>/data/`. Example: "orders.parquet".
+        prompt: Optional human-readable description (the user's intent).
+
+    Returns:
+        Same shape as catalog_run.
+    """
+    project = resolve_project()
+    code = (
+        "from pydata_xorq.io import from_project\n"
+        f"expr = from_project({rel_path!r}, project={project!r})\n"
+    )
+    try:
+        result = build_and_persist(project=project, code=code, prompt=prompt or None)
+    except BuildError as exc:
+        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None)
+        _notify("build_failed", error_id=rec["id"])
+        return {"error": str(exc), "error_id": rec["id"]}
     _notify("new_entry", content_hash=result.content_hash)
     return {
         "hash": result.content_hash,

@@ -8,6 +8,7 @@ import time
 import traceback
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 from pydata_core import (
@@ -17,6 +18,27 @@ from pydata_core import (
     entry_dir,
     write_manifest,
 )
+
+
+def _append_prompt(entry_path: Path, prompt: str | None) -> None:
+    """Append a prompt event to the entry's prompts.jsonl."""
+    if not prompt:
+        return
+    record = {
+        "prompt": prompt,
+        "at": datetime.now(timezone.utc).isoformat(),
+    }
+    with (entry_path / "prompts.jsonl").open("a") as fh:
+        fh.write(json.dumps(record) + "\n")
+
+
+def read_prompts(entry_path: Path) -> list[dict]:
+    """Return every prompt seen for this entry, oldest first."""
+    p = entry_path / "prompts.jsonl"
+    if not p.exists():
+        return []
+    with p.open() as fh:
+        return [json.loads(line) for line in fh if line.strip()]
 
 
 @dataclass
@@ -89,9 +111,11 @@ def build_and_persist(
 
         if target.exists():
             # Same content hash already on disk — nothing to do beyond return.
+            # Record this invocation's prompt as a re-run event.
             manifest_path = target / "manifest.json"
             if manifest_path.exists():
                 meta = json.loads(manifest_path.read_text())
+                _append_prompt(target, prompt)
                 return BuildResult(
                     content_hash=content_hash,
                     entry_path=target,
@@ -146,6 +170,7 @@ def build_and_persist(
         execute_seconds=execute_seconds,
     )
     write_manifest(target, manifest)
+    _append_prompt(target, prompt)
 
     # Best-effort: drop the temp script.
     try:

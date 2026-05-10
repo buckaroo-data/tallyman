@@ -22,6 +22,12 @@ dependencies = [
 [project.scripts]
 pydata = "pydata_cli.main:cli"
 
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
@@ -41,3 +47,10 @@ target-version = "py313"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = [
+    "ignore::UserWarning:xorq.ibis_yaml.translate",
+]

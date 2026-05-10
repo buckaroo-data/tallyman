@@ -1,5 +1,20 @@
 {% extends "base.html" %}
 {% block content %}
+{% if errors %}
+<div class="error-banner">
+  <strong>recent build failures:</strong>
+  <ul>
+    {% for err in errors %}
+      <li>
+        <a href="/errors/{{ err.id }}">{{ err.id }}</a>
+        <span class="meta"> · {{ err.created_at }}</span>
+        {% if err.prompt %} · <em>{{ err.prompt }}</em>{% endif %}
+        — <code>{{ err.message.splitlines()[0][:120] }}</code>
+      </li>
+    {% endfor %}
+  </ul>
+</div>
+{% endif %}
 <div class="layout">
   <aside class="panel">
     <ul class="entry-list">

@@ -30,18 +30,37 @@ def init_project(name: str, with_fixture: bool) -> None:
 @click.option("--project", default=None, help="Project name (defaults to PYDATA_PROJECT env or 'spike').")
 @click.option("--port", default=7860, type=int)
 @click.option("--host", default="127.0.0.1")
-def run_companion(project: str | None, port: int, host: str) -> None:
+@click.option("--buckaroo/--no-buckaroo", default=True, help="Manage a Buckaroo subprocess on :8700 for in-table recon.")
+@click.option("--buckaroo-port", default=8700, type=int)
+def run_companion(
+    project: str | None, port: int, host: str, buckaroo: bool, buckaroo_port: int
+) -> None:
     """Start the companion FastAPI app."""
     project_name = resolve_project(project)
     if not project_dir(project_name).exists():
         raise click.ClickException(f"project '{project_name}' not found. Run `pydata init {project_name}` first.")
     os.environ.setdefault("PYDATA_PROJECT", project_name)
     click.echo(f"pydata run · project={project_name} · http://{host}:{port}")
-    # Lazy import so `pydata mcp` doesn't load FastAPI just to spawn an MCP.
-    from pydata_companion import create_app
 
-    app = create_app(project_name)
-    uvicorn.run(app, host=host, port=port, log_level="info")
+    from pydata_companion import create_app
+    from pydata_companion.buckaroo_lifecycle import BuckarooManager, BuckarooUnavailable
+
+    bk: BuckarooManager | None = None
+    if buckaroo:
+        bk = BuckarooManager(project_name, port=buckaroo_port)
+        try:
+            bk.start()
+            click.echo(f"  buckaroo · {bk.base_url}")
+        except BuckarooUnavailable as exc:
+            click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
+            bk = None
+
+    app = create_app(project_name, buckaroo=bk)
+    try:
+        uvicorn.run(app, host=host, port=port, log_level="info")
+    finally:
+        if bk is not None:
+            bk.stop()
 
 
 @cli.command("mcp")

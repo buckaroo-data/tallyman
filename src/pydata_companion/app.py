@@ -26,6 +26,7 @@ from pydata_core import (
     version_of_hash,
 )
 from pydata_core.notebook import CellNotFound
+from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_xorq import (
     catalog_dag,
     full_diff,
@@ -83,7 +84,12 @@ def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
     return sorted(entries, key=_bucket)
 
 
-def create_app(project: str | None = None, *, read_only: bool = False) -> FastAPI:
+def create_app(
+    project: str | None = None,
+    *,
+    read_only: bool = False,
+    buckaroo: "BuckarooManager | None" = None,
+) -> FastAPI:
     project_name = resolve_project(project)
     app = FastAPI(title="pydata companion")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
@@ -152,6 +158,10 @@ def create_app(project: str | None = None, *, read_only: bool = False) -> FastAP
 
         prompt_history = read_prompts(entry)
         chart_spec = get_chart(project_name, content_hash)
+        buckaroo_session = (
+            buckaroo.ensure_session(content_hash) if buckaroo is not None else None
+        )
+        buckaroo_base = buckaroo.base_url if buckaroo and buckaroo.is_running else None
         return templates.TemplateResponse(
             request,
             "entry_detail.html",
@@ -168,6 +178,8 @@ def create_app(project: str | None = None, *, read_only: bool = False) -> FastAP
                 "version": version,
                 "forensic_history": forensic_history,
                 "chart_spec": chart_spec,
+                "buckaroo_session": buckaroo_session,
+                "buckaroo_base": buckaroo_base,
             },
         )
 

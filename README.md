@@ -30,19 +30,24 @@ What's working:
   - `/api/{entries,aliases,errors,notebook,lineage,catalog_dag}` — JSON.
   - `/api/sse` — live updates (`new_entry`, `build_failed`, `alias_changed`,
     `notebook_changed`).
+- **Buckaroo subprocess** — `pydata run` spawns `python -m buckaroo.server`
+  on `:8700` (falls back to a random port if busy), watches for the
+  `BUCKAROO_PORT=...` handshake, and lazily creates per-entry sessions on
+  first view. Sessions are persisted under `catalog/buckaroo_sessions.json`
+  and invalidated by start-time when Buckaroo restarts. Tear-down rides
+  along with the companion. Disable with `--no-buckaroo`.
 - **Build artifacts are portable.** xorq's absolute filesystem paths are
   rewritten to `${PYDATA_PROJECT_ROOT}` on write and expanded back on load.
 - **`pydata serve <project_dir>`** — read-only companion against a project
   directory that may live anywhere on disk. Mutation routes return 403.
 
-What's NOT in V0 (deferred to later spikes, in this order):
+What's NOT yet implemented (see `TICKETS.md` for the full punchlist):
 
-1. Buckaroo iframe + Tornado subprocess (replace the `pandas.to_html` previews).
-2. SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
+1. SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
    accessibility fallback; drag is the headline UX).
-3. Vega-Lite charts attached to entries.
-4. Column-level lineage (xorq has the data; current view is op-level only).
-5. `pydata pack` / tar handoff (today's hand-off is `cp -r`).
+2. Column-level lineage (xorq has the data; current view is op-level only).
+3. `pydata pack` / `pydata replay` (today's hand-off is `cp -r` / `tar`).
+4. ML training pipeline (storyboard beats 7-8).
 
 ## Running the spike
 

@@ -44,6 +44,7 @@ def _client(project_name: str, pydata_home: Path) -> Client:
     return Client(transport)
 
 
+@pytest.mark.integration
 @needs_uv
 def test_stdio_lists_tools(isolated_home: Path, project: str):
     async def go():
@@ -70,6 +71,7 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
         assert required in names, f"missing tool over stdio: {required}"
 
 
+@pytest.mark.integration
 @needs_uv
 def test_stdio_round_trips_catalog_load_parquet(
     isolated_home: Path, project: str, orders_parquet: Path
@@ -87,6 +89,7 @@ def test_stdio_round_trips_catalog_load_parquet(
     assert out["row_count"] == 200  # the conftest fixture size
 
 
+@pytest.mark.integration
 @needs_uv
 def test_stdio_create_revise_diff_round_trip(
     isolated_home: Path, project: str, orders_parquet: Path

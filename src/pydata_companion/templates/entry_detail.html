@@ -53,10 +53,25 @@
       </script>
     {% endif %}
 
-    <h3>result {% if total_rows > preview_rows %}<span class="meta">(showing first {{ preview_rows }} of {{ total_rows }})</span>{% endif %}</h3>
-    <div style="overflow:auto; max-height: 50vh;">
-      {{ table_html|safe }}
-    </div>
+    {% if buckaroo_session and buckaroo_base %}
+      <h3>result <span class="meta">· buckaroo · {{ manifest.row_count }} rows</span></h3>
+      <iframe
+        class="buckaroo-frame"
+        src="{{ buckaroo_base }}/s/{{ buckaroo_session }}"
+        style="width: 100%; height: 60vh; border: 1px solid var(--line); border-radius: 4px; background: #fff;"
+      ></iframe>
+      <details class="meta" style="margin-top: 6px;">
+        <summary>plain pandas preview (fallback)</summary>
+        <div style="overflow:auto; max-height: 40vh; margin-top: 6px;">
+          {{ table_html|safe }}
+        </div>
+      </details>
+    {% else %}
+      <h3>result {% if total_rows > preview_rows %}<span class="meta">(showing first {{ preview_rows }} of {{ total_rows }})</span>{% endif %}</h3>
+      <div style="overflow:auto; max-height: 50vh;">
+        {{ table_html|safe }}
+      </div>
+    {% endif %}
 
     <h3>schema</h3>
     <ul>

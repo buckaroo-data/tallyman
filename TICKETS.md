@@ -171,17 +171,14 @@ instead"). xorq has `xorq.ml` helpers — haven't explored.
   model="logistic")` or expect Claude to write the xorq.ml call.
 - **Verify:** beats 7–8 of the storyboard execute end-to-end.
 
-### T-19 — `pydata replay <storyboard.json>` (plan Open Q10)
+### ~~T-19 — `pydata replay <storyboard.json>`~~ ✅ 2026-05-11
 
-Deterministic demo replay; useful as a stage fallback and as a CI'able
-demo-regression test.
-
-- **Fix:** `pydata_cli/main.py` adds a `replay` command that reads a
-  JSON list of `{tool, args}` and drives them through the in-process
-  MCP tools.
-- **Verify:** the storyboard JSON in `demo/storyboard.json` (to be
-  written) replays from a fresh `pydata init` and lands on the same
-  catalog state every time.
+`pydata replay <file.json>` reads `{project, steps: [{tool, args,
+narration?, skip?}]}` and drives the MCP tools in order. `--delay N`
+paces between steps; `--continue-on-error` pushes through failures
+for stage fallback. `demo/storyboard.json` exercises beats 1, 3, 4,
+5, plus a chart attach — a regression test asserts it replays to a
+known state under an isolated PYDATA_HOME.
 
 ### T-20 — `/api/data/<hash>` has no pagination
 

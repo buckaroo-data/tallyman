@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import os
 
+from pathlib import Path
+
 import click
 import uvicorn
 
@@ -81,6 +83,93 @@ def run_mcp(project: str | None) -> None:
     from pydata_mcp import main as mcp_main
 
     mcp_main()
+
+
+@cli.command("replay")
+@click.argument("storyboard", type=click.Path(exists=True, dir_okay=False))
+@click.option("--project", default=None, help="Project name override.")
+@click.option("--delay", default=0.0, type=float, help="Seconds to sleep between steps (for stage pacing).")
+@click.option("--stop-on-error/--continue-on-error", default=True)
+def replay_storyboard(storyboard: str, project: str | None, delay: float, stop_on_error: bool) -> None:
+    """Replay a storyboard JSON file by calling MCP tools in order.
+
+    The storyboard is a JSON object of shape:
+
+        {
+          "project": "spike",
+          "steps": [
+            {"tool": "catalog_load_parquet", "args": {...}, "narration": "..."},
+            ...
+          ]
+        }
+
+    Each step calls the named tool from pydata_mcp.server with `args` as
+    kwargs. Use this for stage rehearsal, fallback recordings, or as a
+    deterministic regression test of the full storyboard.
+    """
+    import importlib
+    import json
+    import time
+
+    sb = json.loads(Path(storyboard).read_text())
+    sb_project = project or sb.get("project")
+    if sb_project:
+        os.environ["PYDATA_PROJECT"] = sb_project
+
+    mcp_module = importlib.import_module("pydata_mcp.server")
+    steps = sb.get("steps", [])
+    if not steps:
+        click.echo("storyboard has no steps; nothing to do.")
+        return
+
+    click.echo(f"replaying {len(steps)} step{'' if len(steps)==1 else 's'} (project={sb_project!r})")
+    failures = 0
+    for i, step in enumerate(steps, start=1):
+        if step.get("skip"):
+            click.echo(f"[{i}/{len(steps)}] (skipped: {step.get('tool')})")
+            continue
+        tool_name = step.get("tool")
+        args = step.get("args", {})
+        narration = step.get("narration", "")
+        tool_fn = getattr(mcp_module, tool_name, None)
+        if not callable(tool_fn):
+            click.echo(f"[{i}/{len(steps)}] {tool_name}: NO SUCH TOOL")
+            failures += 1
+            if stop_on_error:
+                raise click.ClickException(f"unknown tool {tool_name!r}")
+            continue
+        click.echo(f"[{i}/{len(steps)}] {tool_name}({', '.join(f'{k}=…' for k in args)})")
+        if narration:
+            click.echo(f"    {narration}")
+        result = tool_fn(**args)
+        if isinstance(result, dict) and "error" in result:
+            click.echo(f"    ERROR: {result['error'][:120]}")
+            failures += 1
+            if stop_on_error:
+                raise click.ClickException("step failed (use --continue-on-error to push through)")
+        else:
+            summary = _summarise(result)
+            click.echo(f"    → {summary}")
+        if delay > 0 and i < len(steps):
+            time.sleep(delay)
+
+    if failures:
+        click.echo(f"replay finished with {failures} failure{'' if failures==1 else 's'}")
+    else:
+        click.echo("replay complete; no failures.")
+
+
+def _summarise(result):
+    if isinstance(result, dict):
+        bits = []
+        for key in ("alias", "version", "hash", "row_count", "execute_seconds"):
+            if key in result:
+                bits.append(f"{key}={result[key]}")
+        if bits:
+            return " ".join(bits)
+    if isinstance(result, list):
+        return f"{len(result)} items"
+    return str(result)[:120]
 
 
 @cli.command("pack")

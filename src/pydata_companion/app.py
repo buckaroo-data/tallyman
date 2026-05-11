@@ -415,6 +415,43 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {"ok": True}
 
+    @app.put("/api/code/{alias}")
+    async def put_code(alias: str, payload: dict):
+        """Build a new revision of `alias` from edited code.
+
+        T-16: lets the user fix a typo or tweak an expression from the
+        browser without having to round-trip through Claude. The new
+        revision becomes V_{n+1}; V_n stays in forensic history.
+        """
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        from pydata_core import get_alias as _get_alias, set_alias as _set_alias
+        from pydata_xorq import build_and_persist as _build_and_persist
+        from pydata_xorq.build import BuildError
+
+        if _get_alias(project_name, alias) is None:
+            raise HTTPException(404, f"alias {alias!r} not found")
+        code = payload.get("code", "")
+        if not code.strip():
+            raise HTTPException(400, "code is empty")
+        try:
+            res = _build_and_persist(project_name, code, prompt=payload.get("prompt") or None)
+        except BuildError as exc:
+            from pydata_core import record_error as _record_error
+            rec = _record_error(
+                project_name, code=code, message=str(exc), tool="api_code"
+            )
+            await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
+            raise HTTPException(400, str(exc))
+        info = _set_alias(project_name, alias, res.content_hash, expect_exists=True)
+        await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
+        return {
+            "hash": res.content_hash,
+            "alias": alias,
+            "version": info["version"],
+            "row_count": res.row_count,
+        }
+
     @app.put("/api/markdown/{cell_id}")
     async def put_markdown(cell_id: str, payload: dict):
         if read_only:

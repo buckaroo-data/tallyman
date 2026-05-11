@@ -139,16 +139,17 @@ page shows "tool: …". Tests assert both `catalog_run` and
 
 ## P2 — V1 / planned-but-missing
 
-### T-16 — Browser-side code edit
+### ~~T-16 — Browser-side code edit~~ ✅ 2026-05-11
 
-Plan resolved-decision 7 calls for browser-primary curation. Today
-fixing a typo in a cell's code requires going back to Claude.
+`PUT /api/code/<alias>` builds + revises an alias from edited code. New
+revision lands as V_{n+1}; V_n stays forensic. Errors are recorded via
+`record_error(tool="api_code")` and 400'd back, with the catalog banner
+picking them up via SSE.
 
-- **Fix:** add `PUT /api/code/<cell_id>` that runs the new code through
-  `build_and_persist` and re-points the alias. Add an "edit code"
-  button to notebook cells.
-- **Verify:** edit code in browser, hit save, new V_n appears, table
-  updates.
+UI: `/catalog/<hash>` of a named entry now has an "edit + revise"
+button next to the code header (hidden for scratch entries and in
+serve mode). Click swaps the `<pre>` for a textarea + save/cancel
+toolbar; save redirects to the new V_{n+1} on success.
 
 ### ~~T-17 — Column-level lineage~~ ✅ 2026-05-11
 

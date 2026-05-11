@@ -80,8 +80,64 @@
       {% endfor %}
     </ul>
 
-    <h3>code <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a></h3>
-    <pre class="code">{{ code }}</pre>
+    <h3>
+      code
+      <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a>
+      {% if alias and not read_only %}
+        <button type="button" class="edit-code-btn" onclick="editCode()">edit + revise</button>
+      {% endif %}
+    </h3>
+    <pre class="code" id="code-block" data-raw="{{ code|e }}">{{ code }}</pre>
+    {% if alias and not read_only %}
+      <div id="code-edit-status" class="meta" style="display:none;"></div>
+      <script>
+        function editCode() {
+          const block = document.getElementById('code-block');
+          const raw = block.dataset.raw || '';
+          const btn = document.querySelector('.edit-code-btn');
+          const status = document.getElementById('code-edit-status');
+          const ta = document.createElement('textarea');
+          ta.className = 'nb-markdown-edit';
+          ta.style.minHeight = '200px';
+          ta.style.fontFamily = 'ui-monospace, monospace';
+          ta.style.fontSize = '12px';
+          ta.value = raw;
+          block.style.display = 'none';
+          btn.style.display = 'none';
+          block.insertAdjacentElement('afterend', ta);
+          ta.focus();
+          // Save bar.
+          const bar = document.createElement('div');
+          bar.style.cssText = 'margin: 6px 0; display: flex; gap: 8px;';
+          const save = document.createElement('button');
+          save.type = 'button';
+          save.textContent = 'save → revise';
+          const cancel = document.createElement('button');
+          cancel.type = 'button';
+          cancel.textContent = 'cancel';
+          bar.append(save, cancel);
+          ta.insertAdjacentElement('afterend', bar);
+          const teardown = () => { ta.remove(); bar.remove(); block.style.display = ''; btn.style.display = ''; status.style.display = 'none'; };
+          cancel.addEventListener('click', teardown);
+          save.addEventListener('click', async () => {
+            status.style.display = '';
+            status.textContent = 'building…';
+            const resp = await fetch('/api/code/{{ alias }}', {
+              method: 'PUT',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({code: ta.value, prompt: 'edited in browser'})
+            });
+            if (resp.ok) {
+              const body = await resp.json();
+              window.location.assign('/catalog/' + body.hash);
+            } else {
+              const msg = await resp.text();
+              status.textContent = 'build failed: ' + msg.slice(0, 200);
+            }
+          });
+        }
+      </script>
+    {% endif %}
 
     {% if build_artifacts %}
       <details>

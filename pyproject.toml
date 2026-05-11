@@ -24,6 +24,7 @@ dependencies = [
     "polars",
     "buckaroo",
     "markdown>=3.10.2",
+    "pygments>=2.20.0",
 ]
 
 [project.scripts]

@@ -166,6 +166,17 @@ def create_app(
 
         prompt_history = read_prompts(entry)
         chart_spec = get_chart(project_name, content_hash)
+        build_artifacts = []
+        build_dir = entry / "xorq_build"
+        if build_dir.is_dir():
+            for f in sorted(build_dir.iterdir()):
+                if not f.is_file():
+                    continue
+                try:
+                    text = f.read_text()
+                except UnicodeDecodeError:
+                    text = f"(binary, {f.stat().st_size} bytes)"
+                build_artifacts.append({"name": f.name, "text": text})
         buckaroo_session = (
             buckaroo.ensure_session(content_hash) if buckaroo is not None else None
         )
@@ -188,6 +199,7 @@ def create_app(
                 "chart_spec": chart_spec,
                 "buckaroo_session": buckaroo_session,
                 "buckaroo_base": buckaroo_base,
+                "build_artifacts": build_artifacts,
             },
         )
 

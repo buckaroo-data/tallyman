@@ -75,15 +75,11 @@ Known follow-ups not in scope of this ticket:
 
 ## P1 — visible polish
 
-### T-08 — `difflib.HtmlDiff` output is ugly
+### ~~T-08 — `difflib.HtmlDiff` output is ugly~~ ✅ 2026-05-11
 
-`src/pydata_xorq/diff.py::code_diff` returns `difflib.HtmlDiff().make_table(...)`.
-No styling, narrow columns, embedded `<legend>`.
-
-- **Fix:** either CSS-rewrite the diff table in `base.html`, or swap to
-  Pygments + the `HtmlFormatter`'s diff lexer.
-- **Verify:** `/diff/<alias>` code-diff section looks consistent with
-  the rest of the dark theme.
+Swapped to `difflib.unified_diff` → Pygments DiffLexer + HtmlFormatter
+(monokai style, inline `noclasses=True` so it doesn't require a global
+CSS file). Identical inputs short-circuit to "(identical)" sentinel.
 
 ### T-09 — No SortableJS drag-reorder for the notebook
 
@@ -120,16 +116,14 @@ Catalog list now buckets into named / forensic / scratch sections,
 each with a header showing the count. Item rendering factored into
 `_entry_list_item.html` to keep the list-building loop readable.
 
-### T-14 — No way to view raw `expr.yaml` from the UI
+### ~~T-14 — Raw expr.yaml viewer~~ ✅ 2026-05-11
 
-The internal-lineage page shows the op DAG; the underlying YAML (with
-`${PYDATA_PROJECT_ROOT}` placeholder visible — load-bearing for the
-portability story) isn't accessible.
-
-- **Fix:** add a "build artifacts" tab/section on `/catalog/<hash>`
-  that dumps `xorq_build/*` as syntax-highlighted text.
-- **Verify:** can see `expr.yaml`, `build_metadata.json`, and the
-  `${PYDATA_PROJECT_ROOT}` substitution at work.
+Entry detail now has a "build artifacts" disclosure that lists every
+file under the entry's `xorq_build/` (expr.yaml, expr_metadata.json,
+build_metadata.json, profiles.yaml). The `${PYDATA_PROJECT_ROOT}`
+placeholder is visible in the displayed text — useful for showing the
+portability story to an audience. Test asserts the placeholder is
+present in the rendered page.
 
 ### ~~T-15 — Error banner doesn't name the failing tool~~ ✅ 2026-05-11
 

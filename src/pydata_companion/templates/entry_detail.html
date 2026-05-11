@@ -83,6 +83,16 @@
     <h3>code <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a></h3>
     <pre class="code">{{ code }}</pre>
 
+    {% if build_artifacts %}
+      <details>
+        <summary class="meta">build artifacts ({{ build_artifacts|length }} files — xorq's raw output, with ${PYDATA_PROJECT_ROOT} placeholders visible)</summary>
+        {% for f in build_artifacts %}
+          <h4 style="margin-bottom: 4px;">{{ f.name }}</h4>
+          <pre class="code">{{ f.text }}</pre>
+        {% endfor %}
+      </details>
+    {% endif %}
+
     {% if forensic_history and forensic_history|length > 1 %}
       <div class="forensic-history">
         <strong>forensic history for {{ alias }}</strong>

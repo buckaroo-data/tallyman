@@ -25,16 +25,30 @@ import pyarrow.parquet as pq
 
 
 def code_diff(a: str, b: str, *, a_label: str = "before", b_label: str = "after") -> str:
-    """Return a unified-diff HTML string. Plain styling, no external CSS."""
-    differ = difflib.HtmlDiff(wrapcolumn=80)
-    return differ.make_table(
-        a.splitlines(),
-        b.splitlines(),
-        fromdesc=a_label,
-        todesc=b_label,
-        context=True,
-        numlines=2,
+    """Return a Pygments-rendered unified diff as HTML.
+
+    Embeds Pygments' "monokai" style inline so the output matches the
+    rest of the dark theme without requiring a global CSS file.
+    """
+    from pygments import highlight
+    from pygments.formatters import HtmlFormatter
+    from pygments.lexers import DiffLexer
+
+    diff_text = "\n".join(
+        difflib.unified_diff(
+            a.splitlines(),
+            b.splitlines(),
+            fromfile=a_label,
+            tofile=b_label,
+            lineterm="",
+            n=3,
+        )
     )
+    if not diff_text.strip():
+        return '<pre class="code">(identical)</pre>'
+
+    formatter = HtmlFormatter(noclasses=True, style="monokai", cssstyles="padding: 12px; border-radius: 4px;")
+    return highlight(diff_text, DiffLexer(), formatter)
 
 
 def schema_diff(a_schema: dict, b_schema: dict) -> dict:

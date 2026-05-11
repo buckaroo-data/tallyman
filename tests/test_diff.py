@@ -37,9 +37,16 @@ expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filte
 # pure-function diffs (no xorq build needed)
 # ---------------------------------------------------------------------------
 
-def test_code_diff_html_has_both_versions():
+def test_code_diff_html_has_pygments_highlight():
     out = code_diff("a = 1\nb = 2\n", "a = 1\nb = 3\n")
-    assert "<table" in out
+    assert "highlight" in out  # Pygments wraps in <div class="highlight">
+    assert "+b = 3" in out
+    assert "-b = 2" in out
+
+
+def test_code_diff_identical_returns_sentinel():
+    out = code_diff("a = 1\n", "a = 1\n")
+    assert "identical" in out.lower()
 
 
 def test_schema_diff_added_removed_changed():
@@ -101,7 +108,7 @@ def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
     from pydata_core import entry_dir
 
     diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash))
-    assert "<table" in diff["code"]
+    assert "highlight" in diff["code"]
     assert diff["schema"]["row_count"]["before"] == 4
     assert "stats" in diff
     assert diff["keyed"] is not None  # region is a shared key

@@ -1,16 +1,30 @@
 from __future__ import annotations
 
+import os
+import tempfile
 from pathlib import Path
 
-import pytest
+# Redirect xorq's cache dir BEFORE any xorq import. xorq freezes
+# XORQ_CACHE_DIR at module-load time (caching_utils.py notes
+# "modifying env var XORQ_CACHE_DIR won't have any impact after first import"),
+# so this has to happen here at conftest module level — before any test or
+# helper imports xorq. Without this, tests pollute the user's ~/.cache/xorq/.
+_TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="pydata_xorq_cache_"))
+os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 
-from pydata_cli.fixtures import write_shoe_orders
-from pydata_core import data_dir, ensure_project
+import pytest  # noqa: E402
+
+from pydata_cli.fixtures import write_shoe_orders  # noqa: E402
+from pydata_core import data_dir, ensure_project  # noqa: E402
 
 
 @pytest.fixture
 def isolated_home(tmp_path: Path, monkeypatch) -> Path:
-    """Point PYDATA_HOME at a tmp dir for the duration of the test."""
+    """Point PYDATA_HOME at a tmp dir for the duration of the test.
+
+    xorq's cache is redirected at conftest module load (see top of file)
+    because XORQ_CACHE_DIR is frozen at first xorq import.
+    """
     monkeypatch.setenv("PYDATA_HOME", str(tmp_path))
     return tmp_path
 

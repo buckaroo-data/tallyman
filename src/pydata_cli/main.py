@@ -17,10 +17,19 @@ def cli() -> None:
 @cli.command("init")
 @click.argument("name")
 @click.option("--with-fixture/--no-fixture", default=True, help="Generate a synthetic shoe-orders parquet under data/.")
-def init_project(name: str, with_fixture: bool) -> None:
+@click.option("--force", is_flag=True, help="Re-run init even if the project already exists. Overwrites the fixture if --with-fixture; never touches catalog entries or aliases.")
+def init_project(name: str, with_fixture: bool, force: bool) -> None:
     """Initialize a new project under ~/.pydata-app/projects/<name>/."""
+    from pydata_core import project_dir
+
+    already_exists = project_dir(name).exists()
+    if already_exists and not force:
+        raise click.ClickException(
+            f"project {name!r} already exists at {project_dir(name)}. "
+            "Use --force to re-init (preserves catalog; overwrites the fixture)."
+        )
     p = ensure_project(name)
-    click.echo(f"created {p}")
+    click.echo(f"{'re-initialised' if already_exists else 'created'} {p}")
     if with_fixture:
         out = write_shoe_orders(data_dir(name) / "orders.parquet")
         click.echo(f"wrote fixture {out} ({out.stat().st_size} bytes)")

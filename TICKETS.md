@@ -193,10 +193,11 @@ bad for raw 2k+ row scratch loads.
 
 ## P3 — engineering hygiene
 
-### T-21 — xorq cache (`~/.cache/xorq/`) is shared across test runs
+### ~~T-21 — xorq cache shared across test runs~~ ✅ 2026-05-11
 
-Could let stale results leak into a test. Conftest should set
-`XORQ_CACHE_DIR=<tmp_path>` per test.
+Conftest now sets `XORQ_CACHE_DIR` to a session-scoped `mkdtemp` at
+module load (xorq freezes the env var at first import, so the env tweak
+has to happen before any test or helper imports xorq).
 
 ### T-22 — Slow stdio tests aren't marked
 
@@ -205,9 +206,11 @@ Could let stale results leak into a test. Conftest should set
 default in `pyproject.toml` with explicit `pytest -m integration` for
 the full run.
 
-### T-23 — `pydata init` silently re-runs against an existing project
+### ~~T-23 — `pydata init` silently re-runs~~ ✅ 2026-05-11
 
-Re-creates dirs, overwrites fixture. Should error or accept `--force`.
+`pydata init` now errors if the project already exists. `--force`
+proceeds (re-initialises dirs that may already be there; preserves
+catalog entries and aliases). Tests cover both paths.
 
 ### ~~T-24 — `catalog_load_parquet` hard-codes the project name~~ ✅ 2026-05-11
 
@@ -215,9 +218,11 @@ Fixed alongside T-03. The synthesized code now reads `from_project(rel_path)`
 without an explicit `project=` argument, so a project rename or rehome
 no longer breaks the build.
 
-### T-25 — Dead dep: `sse-starlette`
+### ~~T-25 — Dead dep: `sse-starlette`~~ ✗ wrong-headed 2026-05-11
 
-`pyproject.toml` includes it but I rolled my own SSE response. Drop.
+The companion's `/api/sse` route returns `EventSourceResponse` from
+`sse_starlette.sse`. My V0.5 description was wrong — I don't roll my
+own SSE, the dep is in use. Closed without action.
 
 ### T-26 — No CI
 

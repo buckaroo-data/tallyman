@@ -1,0 +1,42 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "spike/**"]
+  pull_request:
+    branches: [main]
+
+# NOTE: this workflow is provisional. The buckaroo dependency is a path
+# source under `../../buckaroo` (see pyproject.toml [tool.uv.sources]) which
+# doesn't compose with actions/checkout — `path:` is relative to
+# $GITHUB_WORKSPACE and resolves *inside* it, not as a sibling. Before this
+# workflow runs green the path source needs to be changed to either a git
+# ref (`buckaroo = { git = "https://github.com/paddymul/buckaroo", rev = "..." }`)
+# or a published PyPI version. See TICKETS.md T-26 / T-07 follow-ups.
+
+jobs:
+  fast:
+    name: fast suite (excludes integration)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: sync deps
+        run: uv sync
+      - name: pytest
+        run: uv run pytest
+
+  integration:
+    name: integration suite
+    runs-on: ubuntu-latest
+    needs: fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run pytest -m integration

@@ -204,15 +204,34 @@ def create_app(
         )
 
     @app.get("/api/data/{content_hash}")
-    def api_data(content_hash: str, limit: int = 5000):
-        """Return result.parquet as JSON for vega-embed to consume."""
+    def api_data(content_hash: str, offset: int = 0, limit: int = 200):
+        """Return a paginated slice of `result.parquet` as JSON.
+
+        Defaults (offset=0, limit=200) keep payloads small for vega-embed
+        on typical aggregate results. Set `limit` higher when feeding a
+        chart that needs more rows; the response always reports `total` and
+        `offset` so the caller can decide whether to fetch more.
+        """
+        if limit < 0:
+            raise HTTPException(400, "limit must be >= 0")
         entry = entry_dir(project_name, content_hash)
         result_path = entry / "result.parquet"
         if not result_path.exists():
             raise HTTPException(404, "no result.parquet")
-        table = pq.read_table(result_path)
-        df = table.to_pandas().head(limit)
-        return {"data": df.to_dict(orient="records")}
+        pf = pq.ParquetFile(result_path)
+        total = pf.metadata.num_rows
+        # Cheap path for small results: read whole table, slice in memory.
+        # We don't bother with row-group seek for V0 since aggregates are
+        # tiny; this becomes worth optimising once Buckaroo handles the
+        # bulk-data case (T-07, now done).
+        df = pf.read().to_pandas()
+        slice_ = df.iloc[offset : offset + limit] if limit > 0 else df.iloc[:0]
+        return {
+            "data": slice_.to_dict(orient="records"),
+            "offset": offset,
+            "limit": limit,
+            "total": total,
+        }
 
     @app.get("/api/sse")
     async def sse(request: Request):

@@ -180,14 +180,12 @@ for stage fallback. `demo/storyboard.json` exercises beats 1, 3, 4,
 5, plus a chart attach — a regression test asserts it replays to a
 known state under an isolated PYDATA_HOME.
 
-### T-20 — `/api/data/<hash>` has no pagination
+### ~~T-20 — `/api/data/<hash>` pagination~~ ✅ 2026-05-11
 
-Serves up to 5000 rows synchronously as JSON. Fine for aggregates,
-bad for raw 2k+ row scratch loads.
-
-- **Fix:** add cursor-based pagination (`?offset=&limit=`); cap the
-  default to 200; let Buckaroo handle the "full data" case once T-07
-  lands.
+Cursor-style pagination via `?offset=&limit=`. Default limit dropped
+from 5000 → 200 (demo-safe; Buckaroo handles the full-data case
+in-iframe via T-07). Response shape now includes `offset`, `limit`,
+and `total` for clients that need to fetch more.
 
 ---
 
@@ -224,10 +222,14 @@ The companion's `/api/sse` route returns `EventSourceResponse` from
 `sse_starlette.sse`. My V0.5 description was wrong — I don't roll my
 own SSE, the dep is in use. Closed without action.
 
-### T-26 — No CI
+### ~~T-26 — No CI~~ ⚠ partial 2026-05-11
 
-Nothing prevents a broken commit from landing on `main`. Should set up
-GitHub Actions running `uv sync && uv run pytest` once we push.
+`.github/workflows/tests.yml` shipped as a starting point. Two jobs:
+fast suite (default `-m 'not integration'`) and integration. Will not
+work as-is until the buckaroo path source is replaced with a git ref
+or a published PyPI version — `[tool.uv.sources] buckaroo = { path =
+"../../buckaroo" }` can't resolve under `$GITHUB_WORKSPACE`. Workflow
+text documents the constraint.
 
 ---
 

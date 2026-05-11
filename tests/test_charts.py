@@ -141,8 +141,8 @@ def test_api_data_endpoint(fresh_companion_app, project: str, orders_parquet: Pa
     assert r.status_code == 200
     body = r.json()
     assert "data" in body
-    # 4 regions in the aggregate result
-    assert len(body["data"]) == 4
+    assert body["total"] == 4
+    assert body["offset"] == 0
     assert {row["region"] for row in body["data"]} == {"NE", "MW", "S", "W"}
 
 
@@ -153,8 +153,48 @@ def test_api_data_404_on_missing(fresh_companion_app):
 
 def test_api_data_limit_truncates(fresh_companion_app, project: str, orders_parquet: Path):
     """Sanity-check that limit is plumbed through."""
-    # 4 rows in aggregate; limit=2 should return 2.
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/api/data/{res.content_hash}?limit=2")
-    assert len(r.json()["data"]) == 2
+    body = r.json()
+    assert len(body["data"]) == 2
+    assert body["total"] == 4
+    assert body["limit"] == 2
+
+
+def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_parquet: Path):
+    """T-20: offset+limit cursor pagination."""
+    res = build_and_persist(project, _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    a = c.get(f"/api/data/{res.content_hash}?offset=0&limit=2").json()
+    b = c.get(f"/api/data/{res.content_hash}?offset=2&limit=2").json()
+    # All 4 regions across the two pages, no overlap.
+    seen = {row["region"] for row in a["data"]} | {row["region"] for row in b["data"]}
+    assert seen == {"NE", "MW", "S", "W"}
+    assert a["offset"] == 0 and b["offset"] == 2
+
+
+def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orders_parquet: Path):
+    res = build_and_persist(project, _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/api/data/{res.content_hash}?limit=-1")
+    assert r.status_code == 400
+
+
+def test_api_data_default_limit_is_200(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """Defaults are demo-safe: aggregate fits, raw 2k-row loads cap at 200."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    # Use a passthrough expression (raw orders, 200 rows in the fixture).
+    code = """
+from pydata_xorq.io import from_project
+expr = from_project("orders.parquet")
+"""
+    res = build_and_persist(project, code)
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/api/data/{res.content_hash}")  # no offset/limit
+    body = r.json()
+    assert body["total"] == 200  # the test fixture
+    assert len(body["data"]) == 200  # the test fixture is the same size as default cap
+    assert body["limit"] == 200

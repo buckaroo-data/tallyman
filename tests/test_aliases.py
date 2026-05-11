@@ -233,6 +233,23 @@ def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, 
     assert v1.content_hash in r.text
 
 
+def test_catalog_renders_section_headers(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """T-13: named / forensic / scratch each get their own section."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create, catalog_revise, catalog_run
+
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))  # V1 becomes forensic
+    catalog_run(_filter_code(project), prompt="scratch")  # though may match a hash above
+    c = TestClient(fresh_companion_app)
+    r = c.get("/catalog")
+    assert r.status_code == 200
+    assert "named (" in r.text
+    assert "forensic (" in r.text
+
+
 def test_api_aliases_returns_history(fresh_companion_app, project: str):
     set_alias(project, "a", "h1")
     set_alias(project, "a", "h2")

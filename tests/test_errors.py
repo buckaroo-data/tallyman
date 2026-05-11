@@ -74,3 +74,43 @@ def test_companion_api_errors(fresh_companion_app, project: str):
     body = r.json()
     assert body["project"] == project
     assert len(body["errors"]) == 2
+
+
+def test_record_error_persists_tool_field(project: str):
+    rec = record_error(project, code="x", message="m", tool="catalog_revise")
+    assert rec["tool"] == "catalog_revise"
+    rows = list_errors(project)
+    assert rows[0]["tool"] == "catalog_revise"
+
+
+def test_catalog_run_records_tool_name(project: str, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    out = catalog_run("expr = nope", prompt="broken")
+    assert "error" in out
+    rec = list_errors(project)[0]
+    assert rec["tool"] == "catalog_run"
+
+
+def test_catalog_create_failure_records_tool_name(project: str, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create
+
+    out = catalog_create("x", "expr = oops", prompt="bad")
+    assert "error" in out
+    rec = list_errors(project)[0]
+    assert rec["tool"] == "catalog_create"
+
+
+def test_catalog_banner_shows_tool_pill(fresh_companion_app, project: str):
+    record_error(project, code="x", message="boom", tool="catalog_revise")
+    c = TestClient(fresh_companion_app)
+    r = c.get("/catalog")
+    assert r.status_code == 200
+    assert "catalog_revise" in r.text
+
+
+def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
+    rec = record_error(project, code="x", message="boom", tool="catalog_run")
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/errors/{rec['id']}")
+    assert "tool: catalog_run" in r.text

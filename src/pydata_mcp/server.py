@@ -67,7 +67,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         dict with keys: hash, row_count, execute_seconds, schema, entry_path.
     """
     project = resolve_project()
-    out = _run_and_record(project, code, prompt)
+    out = _run_and_record(project, code, prompt, tool="catalog_run")
     if "error" in out:
         return out
     out.pop("_build", None)
@@ -101,7 +101,7 @@ def catalog_load_parquet(
         "from pydata_xorq.io import from_project\n"
         f"expr = from_project({rel_path!r})\n"
     )
-    out = _run_and_record(project, code, prompt)
+    out = _run_and_record(project, code, prompt, tool="catalog_load_parquet")
     if "error" in out:
         return out
     out.pop("_build", None)
@@ -117,13 +117,15 @@ def catalog_load_parquet(
     return out
 
 
-def _run_and_record(project: str, code: str, prompt: str) -> dict:
+def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
     """Shared body for tools that compile-and-persist; returns the tool reply dict."""
     try:
         result = build_and_persist(project=project, code=code, prompt=prompt or None)
     except BuildError as exc:
-        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None)
-        _notify("build_failed", error_id=rec["id"])
+        rec = record_error(
+            project, code=code, message=str(exc), prompt=prompt or None, tool=tool
+        )
+        _notify("build_failed", error_id=rec["id"], tool=tool)
         return {"error": str(exc), "error_id": rec["id"]}
     return {
         "_build": result,
@@ -156,7 +158,7 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     project = resolve_project()
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
-    out = _run_and_record(project, code, prompt)
+    out = _run_and_record(project, code, prompt, tool="catalog_create")
     if "error" in out:
         return out
     info = set_alias(project, name, out["hash"], expect_exists=False)
@@ -184,7 +186,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     project = resolve_project()
     if get_alias(project, name) is None:
         return {"error": f"alias {name!r} does not exist. Use catalog_create to create it."}
-    out = _run_and_record(project, code, prompt)
+    out = _run_and_record(project, code, prompt, tool="catalog_revise")
     if "error" in out:
         return out
     info = set_alias(project, name, out["hash"], expect_exists=True)

@@ -12,7 +12,13 @@ def _errors_path(project: str) -> Path:
     return project_dir(project) / "errors.jsonl"
 
 
-def record_error(project: str, code: str, message: str, prompt: str | None = None) -> dict:
+def record_error(
+    project: str,
+    code: str,
+    message: str,
+    prompt: str | None = None,
+    tool: str | None = None,
+) -> dict:
     """Append a build-failure record. Returns the recorded entry (with id)."""
     ensure_project(project)
     entry = {
@@ -21,6 +27,7 @@ def record_error(project: str, code: str, message: str, prompt: str | None = Non
         "prompt": prompt,
         "code": code,
         "message": message,
+        "tool": tool,
     }
     p = _errors_path(project)
     with p.open("a") as fh:

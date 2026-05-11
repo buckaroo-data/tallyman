@@ -9,6 +9,7 @@
   <section class="panel detail">
     <h2>build failure · {{ error.id }}</h2>
     <div class="meta">
+      {% if error.tool %}<span class="pill">tool: {{ error.tool }}</span>{% endif %}
       <span class="pill">{{ error.created_at }}</span>
     </div>
     {% if error.prompt %}

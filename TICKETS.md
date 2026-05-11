@@ -104,33 +104,21 @@ return JSON, but the client does `window.location.reload()` after.
   without reload for markdown.
 - **Verify:** drag-reorder feels smooth; markdown save doesn't flash.
 
-### T-11 — Diff page's "compare other pairs" link list is O(N²)
+### ~~T-11 — Diff page's compare-pairs link list~~ ✅ 2026-05-11
 
-`templates/diff.html` emits every i→j combo. Fine at V1→V2, bad at V5.
+Capped to adjacent (V_n→V_n+1) pairs plus a V_1→V_n bookend when
+n > 3. For 5 versions: 4 adjacent + 1 bookend = 5 links instead of 20.
 
-- **Fix:** cap the list to V_{n-1}→V_n adjacents plus V_1→V_n bookend.
-- **Verify:** create an alias with 5 revisions; the diff page shows
-  at most ~6 nav links, not 20.
+### ~~T-12 — Notebook serve-mode placeholder text~~ ✅ 2026-05-11
 
-### T-12 — Notebook in serve mode shows the placeholder edit text
+Fixed in the T-04 template rewrite — placeholder only rendered when
+`not read_only`.
 
-`"(no markdown — click edit to add a note)"` is shown to read-only
-viewers who can't edit. Confusing.
+### ~~T-13 — `/catalog` section headers~~ ✅ 2026-05-11
 
-- **Fix:** in `templates/notebook.html`, suppress the placeholder when
-  `read_only` is true; just show an empty section.
-- **Verify:** `pydata serve` of a project with empty markdown cells
-  shows no "click edit" copy.
-
-### T-13 — `/catalog` doesn't visually section named vs scratch
-
-Named first, then forensic, then scratch — but no header break. With
->5 entries the boundaries blur.
-
-- **Fix:** in `templates/catalog.html`, group by the same buckets as
-  `_annotate_entries`'s sort key and emit `<h3>` separators.
-- **Verify:** a project with 1 named + 1 forensic + 3 scratch shows
-  three section headers.
+Catalog list now buckets into named / forensic / scratch sections,
+each with a header showing the count. Item rendering factored into
+`_entry_list_item.html` to keep the list-building loop readable.
 
 ### T-14 — No way to view raw `expr.yaml` from the UI
 
@@ -143,14 +131,12 @@ portability story) isn't accessible.
 - **Verify:** can see `expr.yaml`, `build_metadata.json`, and the
   `${PYDATA_PROJECT_ROOT}` substitution at work.
 
-### T-15 — Error banner doesn't name the failing tool
+### ~~T-15 — Error banner doesn't name the failing tool~~ ✅ 2026-05-11
 
-`record_error` stores code and message but not which tool was called.
-
-- **Fix:** thread a `tool_name` field through `record_error` and
-  surface it in `templates/catalog.html`'s banner and `error_detail.html`.
-- **Verify:** a failed `catalog_revise` shows "tool: catalog_revise" in
-  the banner.
+`record_error` now takes a `tool` field. `_run_and_record` plumbs each
+tool's name through. Catalog banner shows it as a pill; error-detail
+page shows "tool: …". Tests assert both `catalog_run` and
+`catalog_create` failure paths.
 
 ---
 

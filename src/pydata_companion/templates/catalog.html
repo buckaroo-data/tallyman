@@ -7,6 +7,7 @@
     {% for err in errors %}
       <li>
         <a href="/errors/{{ err.id }}">{{ err.id }}</a>
+        {% if err.tool %}<code class="pill">{{ err.tool }}</code>{% endif %}
         <span class="meta"> · {{ err.created_at }}</span>
         {% if err.prompt %} · <em>{{ err.prompt }}</em>{% endif %}
         — <code>{{ err.message.splitlines()[0][:120] }}</code>
@@ -17,26 +18,33 @@
 {% endif %}
 <div class="layout">
   <aside class="panel">
-    <ul class="entry-list">
-      {% for e in entries %}
-        <li class="{% if e.alias %}named{% if not e.is_current %} forensic{% endif %}{% else %}scratch{% endif %}">
-          <a href="/catalog/{{ e.content_hash }}">
-            {% if e.alias %}
-              <span class="alias">
-                {{ e.alias }}{% if e.version %} <span class="vchip">V{{ e.version }}</span>{% endif %}
-                {% if not e.is_current %}<span class="forensic-tag">forensic</span>{% endif %}
-              </span>
-            {% else %}
-              <span class="hash">{{ e.content_hash }}</span>
-            {% endif %}
-            <span class="prompt">{{ e.prompt or "(no prompt)" }}</span>
-            <span class="meta">{{ e.row_count }} rows · {{ e.execute_seconds }}s</span>
-          </a>
-        </li>
-      {% else %}
+    {%- set named_current = entries | selectattr('alias') | selectattr('is_current') | list %}
+    {%- set named_forensic = entries | selectattr('alias') | rejectattr('is_current') | list %}
+    {%- set scratch = entries | rejectattr('alias') | list %}
+    {%- if not entries %}
+      <ul class="entry-list">
         <li><a href="#"><em>no entries yet — drive Claude with a tool call</em></a></li>
-      {% endfor %}
-    </ul>
+      </ul>
+    {%- else %}
+      {%- if named_current %}
+        <div class="section-header">named ({{ named_current|length }})</div>
+        <ul class="entry-list">
+          {% for e in named_current %}{% include "_entry_list_item.html" %}{% endfor %}
+        </ul>
+      {%- endif %}
+      {%- if named_forensic %}
+        <div class="section-header">forensic ({{ named_forensic|length }})</div>
+        <ul class="entry-list">
+          {% for e in named_forensic %}{% include "_entry_list_item.html" %}{% endfor %}
+        </ul>
+      {%- endif %}
+      {%- if scratch %}
+        <div class="section-header">scratch ({{ scratch|length }})</div>
+        <ul class="entry-list">
+          {% for e in scratch %}{% include "_entry_list_item.html" %}{% endfor %}
+        </ul>
+      {%- endif %}
+    {%- endif %}
   </aside>
   <section class="panel detail">
     <h2>catalog</h2>

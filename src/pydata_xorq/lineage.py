@@ -64,6 +64,42 @@ def catalog_parents(project: str, content_hash: str) -> list[str]:
     return parents
 
 
+def column_lineage(project: str, content_hash: str, *, max_depth: int = 6) -> dict[str, str]:
+    """Return per-output-column lineage trees as ASCII strings.
+
+    Loads the entry's xorq expression via the portable load path, calls
+    `xorq.common.utils.lineage_utils.build_column_trees`, and renders each
+    via `build_tree(...).__str__`. Returns `{column_name: ascii_tree}`.
+
+    Returns an empty dict when the entry has no build artifacts or the
+    expression can't be column-traced (e.g. some opaque UDFs).
+    """
+    from pydata_xorq.build import load_entry
+
+    try:
+        expr = load_entry(project, content_hash)
+    except Exception:
+        return {}
+
+    try:
+        from xorq.common.utils.lineage_utils import build_column_trees, build_tree
+    except ImportError:
+        return {}
+
+    try:
+        trees = build_column_trees(expr)
+    except Exception:
+        return {}
+
+    out: dict[str, str] = {}
+    for col, node in trees.items():
+        try:
+            out[col] = str(build_tree(node, max_depth=max_depth))
+        except Exception:
+            continue
+    return out
+
+
 def catalog_dag(project: str) -> dict:
     """Return the full inter-entry DAG for a project.
 

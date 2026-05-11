@@ -104,3 +104,17 @@ def test_api_lineage_returns_internal(fresh_companion_app, project: str, orders_
     body = r.json()
     assert "internal" in body
     assert body["internal"]["nodes"]
+
+
+def test_lineage_entry_page_includes_column_trees(
+    fresh_companion_app, project: str, orders_parquet: Path
+):
+    """T-17: the /lineage/<hash> page now surfaces per-column trees."""
+    res = build_and_persist(project, _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/lineage/{res.content_hash}")
+    assert r.status_code == 200
+    assert "column lineage" in r.text
+    # All three output columns from the agg expression should be present.
+    for col in ("region", "total", "n"):
+        assert f"<code>{col}</code>" in r.text

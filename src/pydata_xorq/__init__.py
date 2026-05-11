@@ -11,6 +11,7 @@ from pydata_xorq.io import ProjectDataNotFound, from_catalog, from_project, proj
 from pydata_xorq.lineage import (
     catalog_dag,
     catalog_parents,
+    column_lineage,
     read_data_sources,
     read_internal_lineage,
 )
@@ -23,6 +24,7 @@ __all__ = [
     "catalog_dag",
     "catalog_parents",
     "code_diff",
+    "column_lineage",
     "from_catalog",
     "from_project",
     "full_diff",

@@ -150,16 +150,15 @@ fixing a typo in a cell's code requires going back to Claude.
 - **Verify:** edit code in browser, hit save, new V_n appears, table
   updates.
 
-### T-17 — Column-level lineage
+### ~~T-17 — Column-level lineage~~ ✅ 2026-05-11
 
-xorq has `xorq.common.utils.lineage_utils.build_column_trees`. We
-ship op-level only.
-
-- **Fix:** call `build_column_trees` from `pydata_xorq.lineage`,
-  expose as `/lineage/<hash>?column=<name>`. Render as nested HTML
-  (per xorq-mcp's `_text_tree_to_html`).
-- **Verify:** click a column header in the entry detail → column-only
-  lineage tree.
+`pydata_xorq.column_lineage(project, hash)` loads the entry via the
+portable load path, runs `xorq.common.utils.lineage_utils.build_column_trees`,
+renders each column's tree via `build_tree(...).__str__` (the ASCII
+art form). The `/lineage/<hash>` page now surfaces per-column trees
+under a "column lineage" section — one `<details>` per output column,
+first one open. Tests assert all three demo columns appear and that
+the trees trace through Filter and Field nodes.
 
 ### T-18 — ML training pipeline
 

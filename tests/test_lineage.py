@@ -85,3 +85,39 @@ def test_catalog_dag_handles_alias_referenced_child(project: str, orders_parquet
 
     child = build_and_persist(project, _from_catalog_code(project, "by_region"))
     assert catalog_parents(project, child.content_hash) == [parent.content_hash]
+
+
+def test_column_lineage_returns_per_column_trees(project: str, orders_parquet: Path):
+    from pydata_xorq import column_lineage
+
+    res = build_and_persist(project, _agg_code(project))
+    cols = column_lineage(project, res.content_hash)
+    # The agg expression produces region/total/n.
+    assert set(cols.keys()) == {"region", "total", "n"}
+    # Each tree is a non-empty ASCII string that mentions the source op.
+    for col, tree in cols.items():
+        assert tree
+        assert "Read" in tree or "Field" in tree
+
+
+def test_column_lineage_traces_through_filter(project: str, orders_parquet: Path):
+    from pydata_xorq import column_lineage
+
+    code = f"""
+from pydata_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+f = t.filter(t.category == "boots")
+expr = f.group_by("region").aggregate(total=f.price.sum())
+"""
+    res = build_and_persist(project, code)
+    cols = column_lineage(project, res.content_hash)
+    # "total" should trace back through the filter and a Field:price.
+    total = cols["total"]
+    assert "Filter" in total
+    assert "Field:price" in total
+
+
+def test_column_lineage_missing_hash_returns_empty(project: str):
+    from pydata_xorq import column_lineage
+
+    assert column_lineage(project, "deadbeef") == {}

@@ -46,5 +46,19 @@
       </svg>
     </div>
   {% endif %}
+
+  {% if column_trees %}
+    <h3 style="margin-top: 20px;">column lineage</h3>
+    <p class="meta">
+      For each output column, the operations that produced its value, all the
+      way back to source reads. From xorq's <code>build_column_trees</code>.
+    </p>
+    {% for col, tree in column_trees.items() %}
+      <details {% if loop.first %}open{% endif %}>
+        <summary><code>{{ col }}</code></summary>
+        <pre class="code" style="font-size: 11px; line-height: 1.4;">{{ tree }}</pre>
+      </details>
+    {% endfor %}
+  {% endif %}
 </section>
 {% endblock %}

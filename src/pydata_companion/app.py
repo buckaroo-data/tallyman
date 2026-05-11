@@ -30,6 +30,7 @@ from pydata_core.notebook import CellNotFound
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_xorq import (
     catalog_dag,
+    column_lineage,
     full_diff,
     list_entries,
     read_internal_lineage,
@@ -329,6 +330,7 @@ def create_app(
         layout = layered_positions(
             lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70
         )
+        cols = column_lineage(project_name, content_hash)
         return templates.TemplateResponse(
             request,
             "lineage_entry.html",
@@ -339,6 +341,7 @@ def create_app(
                 "positions": layout["positions"],
                 "width": layout["width"],
                 "height": layout["height"],
+                "column_trees": cols,
             },
         )
 

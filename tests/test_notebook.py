@@ -268,3 +268,33 @@ def test_api_notebook_unknown_action(fresh_companion_app):
     c = TestClient(fresh_companion_app)
     r = c.patch("/api/notebook", json={"action": "purge", "cell_id": "x"})
     assert r.status_code == 400
+
+
+def test_notebook_renders_markdown_as_html(
+    fresh_companion_app, project: str, orders_parquet, monkeypatch
+):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create as _cc, notebook_edit_markdown as _em
+    _cc("shoe_sales", _agg_code(project))
+    cell = notebook.load(project)["cells"][0]
+    _em(cell["cell_id"], "## Title\n\nSome **bold** text.\n\n- one\n- two\n")
+    c = TestClient(fresh_companion_app)
+    r = c.get("/notebook")
+    assert r.status_code == 200
+    # Rendered html markers, NOT the raw markdown characters.
+    assert "<h2>Title</h2>" in r.text
+    assert "<strong>bold</strong>" in r.text
+    assert "<li>one</li>" in r.text
+    # And the raw value is preserved on the data-attr for the edit toggle.
+    assert "data-raw=\"## Title" in r.text
+
+
+def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
+    fresh_companion_app, project: str, orders_parquet, monkeypatch
+):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create as _cc
+    _cc("shoe_sales", _agg_code(project), prompt="")  # empty markdown
+    c = TestClient(fresh_companion_app)
+    r = c.get("/notebook")
+    assert "(no markdown — click edit to add a note)" in r.text

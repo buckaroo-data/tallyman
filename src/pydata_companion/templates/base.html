@@ -96,16 +96,29 @@
     sse.addEventListener('ping', () => {});
     sse.addEventListener('new_entry', (e) => {
       const data = JSON.parse(e.data);
-      // V0: full reload on any new entry. Cheap and reliable.
-      window.location.assign('/catalog/' + data.hash);
+      const path = window.location.pathname;
+      if (path === '/catalog') {
+        // Refresh the index so the new entry appears.
+        window.location.reload();
+      } else if (path.startsWith('/catalog/')) {
+        // Already viewing a specific entry — focus the new one.
+        window.location.assign('/catalog/' + data.hash);
+      }
+      // Other tabs (/notebook, /lineage, /diff): don't yank the user.
     });
     sse.addEventListener('build_failed', () => {
       // Reload the current page so the failure banner re-renders.
+      // (No-op on tabs that don't show the banner; cheap either way.)
       window.location.reload();
     });
     sse.addEventListener('notebook_changed', () => {
-      // Only reload if we're actually on the notebook view.
       if (window.location.pathname === '/notebook') window.location.reload();
+    });
+    sse.addEventListener('chart_attached', (e) => {
+      const data = JSON.parse(e.data);
+      // Reload only if we're viewing the entry the chart was attached to.
+      const path = window.location.pathname;
+      if (path === '/catalog/' + data.hash) window.location.reload();
     });
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
   </script>

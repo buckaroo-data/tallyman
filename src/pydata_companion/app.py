@@ -4,6 +4,7 @@ import asyncio
 import json
 from pathlib import Path
 
+import markdown as md_lib
 import pandas as pd
 import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
@@ -49,6 +50,13 @@ class NotifyPayload(BaseModel):
 
 def _broadcaster() -> tuple[asyncio.Queue, list]:
     return asyncio.Queue(), []
+
+
+def _render_markdown(text: str) -> str:
+    """Render markdown to HTML. Empty/whitespace input returns ''."""
+    if not text or not text.strip():
+        return ""
+    return md_lib.markdown(text, extensions=["fenced_code", "tables"])
 
 
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
@@ -346,6 +354,7 @@ def create_app(
                     "entry_meta": entry_meta,
                     "schema": schema,
                     "preview_html": preview_html,
+                    "markdown_html": _render_markdown(c.get("markdown", "")),
                 }
             )
         return templates.TemplateResponse(

@@ -74,6 +74,52 @@ def run_mcp(project: str | None) -> None:
     mcp_main()
 
 
+@cli.command("pack")
+@click.argument("project_name", required=False)
+@click.option("--project", default=None, help="Project name (defaults to PYDATA_PROJECT env or the positional arg).")
+@click.option("-o", "--output", default=None, help="Output .tgz path. Defaults to ./<project>-<date>.tgz.")
+@click.option("--exclude-cache/--include-cache", default=True, help="Skip xorq cache deps (smaller bundle, paths still portable).")
+def pack_project(project_name: str | None, project: str | None, output: str | None, exclude_cache: bool) -> None:
+    """Tar a project directory into a portable .tgz artifact.
+
+    The output bundle can be untarred anywhere and served read-only via
+    `pydata serve <extracted_dir>`. Portability is provided by the catalog
+    entries' `${PYDATA_PROJECT_ROOT}` placeholder rewriting (see plan.md).
+    """
+    import datetime
+    import tarfile
+    from pathlib import Path
+
+    name = project or project_name or resolve_project()
+    src = project_dir(name)
+    if not src.exists():
+        raise click.ClickException(f"project {name!r} not found at {src}")
+
+    if output is None:
+        stamp = datetime.date.today().isoformat()
+        output = f"./{name}-{stamp}.tgz"
+    out_path = Path(output).resolve()
+
+    excluded = {"__pycache__", ".DS_Store", "buckaroo_sessions.json"}
+
+    def _filter(tarinfo: tarfile.TarInfo) -> tarfile.TarInfo | None:
+        # Exclude in-process state that doesn't survive a hand-off.
+        bare = Path(tarinfo.name).name
+        if bare in excluded:
+            return None
+        if exclude_cache and "/cache/" in tarinfo.name:
+            return None
+        return tarinfo
+
+    click.echo(f"packing {src} → {out_path}")
+    with tarfile.open(out_path, "w:gz") as tar:
+        tar.add(src, arcname=name, filter=_filter)
+
+    size = out_path.stat().st_size
+    click.echo(f"wrote {out_path} ({size/1024:.1f} KB)")
+    click.echo(f"recipient: tar xzf {out_path.name} && pydata serve ./{name}")
+
+
 @cli.command("serve")
 @click.argument("project_dir", type=click.Path(exists=True, file_okay=False))
 @click.option("--port", default=7860, type=int)

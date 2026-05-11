@@ -23,6 +23,7 @@ dependencies = [
     "tornado>=6.0",
     "polars",
     "buckaroo",
+    "markdown>=3.10.2",
 ]
 
 [project.scripts]

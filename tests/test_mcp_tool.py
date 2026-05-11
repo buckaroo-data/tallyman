@@ -51,3 +51,43 @@ def test_catalog_load_parquet_missing(project: str, monkeypatch):
     out = catalog_load_parquet("nope.parquet")
     assert "error" in out
     assert "nope.parquet" in out["error"]
+
+
+def test_catalog_load_parquet_with_name_creates_alias(
+    project: str, orders_parquet, monkeypatch
+):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    out = catalog_load_parquet("orders.parquet", prompt="raw", name="orders")
+    assert "error" not in out
+    assert out["alias"] == "orders"
+    assert out["version"] == 1
+    # Notebook auto-appended.
+    from pydata_core import notebook
+
+    cells = notebook.load(project)["cells"]
+    assert len(cells) == 1
+    assert cells[0]["alias"] == "orders"
+
+
+def test_catalog_load_parquet_name_collision_rejected(
+    project: str, orders_parquet, monkeypatch
+):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    catalog_load_parquet("orders.parquet", name="orders")
+    out = catalog_load_parquet("orders.parquet", name="orders")
+    assert "error" in out
+    assert "already exists" in out["error"]
+
+
+def test_catalog_load_parquet_records_relative_path_only(
+    project: str, orders_parquet, monkeypatch
+):
+    """The synthesized code uses `from_project(rel_path)` without an explicit
+    project= arg, so a project rename wouldn't invalidate the build. (T-24.)"""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    out = catalog_load_parquet("orders.parquet")
+    from pydata_core import entry_dir
+
+    code = (entry_dir(project, out["hash"]) / "expr.py").read_text()
+    assert "project=" not in code
+    assert "from_project('orders.parquet')" in code

@@ -28,7 +28,13 @@
         {% endif %}
       </div>
 
-      <pre class="nb-markdown" id="md-{{ c.cell_id }}">{{ c.markdown or "(no markdown — click edit to add a note)" }}</pre>
+      <div class="nb-markdown" id="md-{{ c.cell_id }}" data-raw="{{ c.markdown|e }}">
+        {% if c.markdown_html %}
+          {{ c.markdown_html|safe }}
+        {% elif not read_only %}
+          <em class="meta">(no markdown — click edit to add a note)</em>
+        {% endif %}
+      </div>
 
       {% if c.preview_html %}
         <div class="nb-preview">{{ c.preview_html|safe }}</div>
@@ -69,13 +75,12 @@ async function nbRemove(cellId) {
   if (resp.ok) window.location.reload();
 }
 function nbEdit(cellId) {
-  const pre = document.getElementById('md-' + cellId);
-  const original = pre.textContent;
-  const placeholder = "(no markdown — click edit to add a note)";
+  const block = document.getElementById('md-' + cellId);
+  const raw = block.dataset.raw || '';
   const ta = document.createElement('textarea');
   ta.className = 'nb-markdown-edit';
-  ta.value = original === placeholder ? '' : original;
-  pre.replaceWith(ta);
+  ta.value = raw;
+  block.replaceWith(ta);
   ta.focus();
   const save = async () => {
     const resp = await fetch('/api/markdown/' + cellId, {

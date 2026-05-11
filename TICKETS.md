@@ -15,75 +15,40 @@ Severity legend:
 
 ## P0 — demo-blocking
 
-### T-01 — SSE `new_entry` redirects from any tab
+### ~~T-01 — SSE `new_entry` redirects from any tab~~ ✅ 2026-05-11
 
-`src/pydata_companion/templates/base.html`'s `new_entry` listener calls
-`window.location.assign('/catalog/' + data.hash)` unconditionally. If
-the agent fires a tool while you're on `/notebook` or `/lineage`, you
-get yanked to the catalog mid-narrative.
+Fixed: the SSE handler now branches on `window.location.pathname`. On
+`/catalog` (no hash) it reloads to refresh the entry list; on
+`/catalog/<hash>` it focuses the new entry; on other tabs it does
+nothing. See `src/pydata_companion/templates/base.html`.
 
-- **Fix:** mirror the `notebook_changed` pattern — only redirect when
-  `window.location.pathname.startsWith('/catalog')`. Otherwise, refresh
-  in place (or do nothing if on a fully-unrelated tab).
-- **Verify:** open `/notebook`, run `catalog_create` from another shell,
-  notebook reloads in place; switch to `/catalog`, run again, you do
-  end up on `/catalog/<new_hash>`.
+### ~~T-02 — Catalog index page doesn't auto-refresh~~ ✅ 2026-05-11
 
-### T-02 — Catalog index page doesn't auto-refresh on new entries
+Fixed alongside T-01. `/catalog` now reloads on `new_entry`.
 
-When viewing `/catalog` (no hash), the SSE handler redirects to a
-specific entry instead of updating the entry list. The "stay on the
-catalog and watch entries appear" flow needs the list to refresh.
+### ~~T-03 — `catalog_load_parquet` only produces scratch~~ ✅ 2026-05-11
 
-- **Fix:** if pathname is exactly `/catalog`, reload to re-render the
-  list. (Cheap; HTMX-style fragment update is a later optimization.)
-- **Verify:** open `/catalog`, then drive `catalog_run` from another
-  terminal — entry appears in the left column within a second.
+Added optional `name` parameter; behaves like `catalog_create` when
+provided. T-24 (hard-coded project name in synthesized code) fixed at
+the same time — the synthesized code now relies on `resolve_project()`.
 
-### T-03 — `catalog_load_parquet` only produces scratch entries
+### ~~T-04 — Markdown renders as `<pre>`~~ ✅ 2026-05-11
 
-Beat 1 of the storyboard says *"Load orders.parquet, name it `orders`"*.
-Today that's two tool calls: `catalog_load_parquet` then `catalog_alias`.
+Server-side rendering via the `markdown` package (`fenced_code` +
+`tables` extensions). Raw markdown preserved in a `data-raw` attribute
+so the edit-toggle textarea gets the unrendered source.
 
-- **Fix:** add an optional `name` parameter to `catalog_load_parquet`
-  in `src/pydata_mcp/server.py`. When provided, behave like
-  `catalog_create` (alias + notebook append).
-- **Verify:** `catalog_load_parquet("orders.parquet", name="orders")`
-  produces a named entry with `version=1` and a notebook cell.
+### ~~T-05 — `chart_attached` SSE has no client handler~~ ✅ 2026-05-11
 
-### T-04 — Markdown renders as `<pre>`, not markdown
+Listener added in `base.html`; reloads only when on the affected entry.
 
-`src/pydata_companion/templates/notebook.html` puts the raw markdown in
-a `<pre>` block. Beat 10 ("rewrite markdown live") is a let-down when
-`## header` shows as literal characters.
+### ~~T-06 — No `pydata pack` command~~ ✅ 2026-05-11
 
-- **Fix:** add `markdown` to deps (`uv add markdown`), render
-  server-side in `notebook_view` for the displayed form, keep the raw
-  text in the textarea on edit.
-- **Verify:** load notebook, type `## Title\n\ntext`, save, see an H2
-  rendered.
-
-### T-05 — `chart_attached` SSE event has no client handler
-
-The MCP tool fires the event, but `base.html` doesn't listen. If you're
-on `/catalog/<hash>` and the agent attaches a chart, the page doesn't
-update.
-
-- **Fix:** add a listener in `base.html`. Reload only when the current
-  pathname matches `/catalog/<event.content_hash>`.
-- **Verify:** open an entry, attach a chart from another shell, chart
-  appears within a second.
-
-### T-06 — No `pydata pack` command
-
-Closing beat 12 currently requires a manual `tar czf ...` on stage.
-
-- **Fix:** add `pydata pack <project> [-o output.tgz]` to
-  `src/pydata_cli/main.py`. Tar up the project directory; optionally
-  run a `pydata serve` smoke check against the bundle and confirm the
-  catalog API returns the expected entries.
-- **Verify:** `pydata pack spike` produces `spike-2026-05-11.tgz` (or
-  similar), and a round-trip `pydata serve <extracted>` works.
+`pydata pack <project>` produces `./<project>-<YYYY-MM-DD>.tgz`,
+skipping `__pycache__`, `.DS_Store`, and the stale
+`buckaroo_sessions.json`. Round-trip serve verified by
+`tests/test_pack.py::test_pack_round_trip_serves`. See also T-24
+(also fixed) which would have invalidated builds on a rename.
 
 ### ~~T-07 — Buckaroo server is not integrated~~ ✅ done 2026-05-11
 
@@ -264,13 +229,11 @@ the full run.
 
 Re-creates dirs, overwrites fixture. Should error or accept `--force`.
 
-### T-24 — `catalog_load_parquet` hard-codes the project name
+### ~~T-24 — `catalog_load_parquet` hard-codes the project name~~ ✅ 2026-05-11
 
-The synthesized code embeds `project="spike"` instead of relying on
-the default. A project rename invalidates the build.
-
-- **Fix:** drop the explicit project arg from the synthesized code;
-  rely on `resolve_project()` at build time.
+Fixed alongside T-03. The synthesized code now reads `from_project(rel_path)`
+without an explicit `project=` argument, so a project rename or rehome
+no longer breaks the build.
 
 ### T-25 — Dead dep: `sse-starlette`
 

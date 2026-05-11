@@ -76,7 +76,9 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
 
 @mcp.tool()
-def catalog_load_parquet(rel_path: str, prompt: str = "") -> dict:
+def catalog_load_parquet(
+    rel_path: str, prompt: str = "", name: str = ""
+) -> dict:
     """Register a parquet file from the project's data/ directory as a catalog entry.
 
     Use this for simple "load this file" steps. The agent does not need to write
@@ -85,20 +87,33 @@ def catalog_load_parquet(rel_path: str, prompt: str = "") -> dict:
     Args:
         rel_path: Path relative to `<project>/data/`. Example: "orders.parquet".
         prompt: Optional human-readable description (the user's intent).
+        name: Optional alias to register the entry under. If provided, the
+            entry behaves like one created by `catalog_create` (named, appended
+            to the notebook). Errors if the alias already exists.
 
     Returns:
-        Same shape as catalog_run.
+        Same shape as catalog_run, plus `alias`/`version` when `name` is set.
     """
     project = resolve_project()
+    if name and get_alias(project, name) is not None:
+        return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
     code = (
         "from pydata_xorq.io import from_project\n"
-        f"expr = from_project({rel_path!r}, project={project!r})\n"
+        f"expr = from_project({rel_path!r})\n"
     )
     out = _run_and_record(project, code, prompt)
     if "error" in out:
         return out
     out.pop("_build", None)
-    _notify("new_entry", content_hash=out["hash"])
+    if name:
+        info = set_alias(project, name, out["hash"], expect_exists=False)
+        notebook.append(project, name, markdown=prompt or "")
+        out["alias"] = info["name"]
+        out["version"] = info["version"]
+        _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
+        _notify("notebook_changed")
+    else:
+        _notify("new_entry", content_hash=out["hash"])
     return out
 
 

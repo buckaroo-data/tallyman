@@ -6,22 +6,23 @@
     {{ cells|length }} cell{{ '' if cells|length == 1 else 's' }}.
     Cells are anchored on aliases; revising an alias updates the cell in place
     and keeps prior versions in forensic history (visible from the catalog tab).
+    {% if not read_only %}Drag a cell by its handle to reorder.{% endif %}
   </p>
 
   {% if not cells %}
     <div class="nb-empty">no named entries yet. Use <code>catalog_create</code> to add a cell.</div>
   {% endif %}
 
+  <div id="nb-cells">
   {% for c in cells %}
     <article class="nb-cell" id="cell-{{ c.cell_id }}" data-cell-id="{{ c.cell_id }}">
       <div class="nb-head">
+        {% if not read_only %}<span class="nb-drag" title="drag to reorder">⋮⋮</span>{% endif %}
         <span class="alias">{{ c.alias }}</span>
         {% if c.version %}<span class="vchip">V{{ c.version }}</span>{% endif %}
         {% if c.latest_hash %}<a class="pill" href="/catalog/{{ c.latest_hash }}">{{ c.latest_hash }}</a>{% endif %}
         {% if not read_only %}
         <span class="nb-actions">
-          <button type="button" onclick="nbMove('{{ c.cell_id }}', {{ loop.index0 - 1 }})" {% if loop.first %}disabled{% endif %}>↑</button>
-          <button type="button" onclick="nbMove('{{ c.cell_id }}', {{ loop.index0 + 1 }})" {% if loop.last %}disabled{% endif %}>↓</button>
           <button type="button" onclick="nbEdit('{{ c.cell_id }}')">edit</button>
           <button type="button" onclick="nbRemove('{{ c.cell_id }}')">×</button>
         </span>
@@ -52,19 +53,31 @@
       {% endif %}
     </article>
   {% endfor %}
+  </div>
 </section>
 
 {% if not read_only %}
+<script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>
 <script>
-async function nbMove(cellId, newIndex) {
-  if (newIndex < 0) return;
-  const resp = await fetch('/api/notebook', {
-    method: 'PATCH',
-    headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({action: 'reorder', cell_id: cellId, new_index: newIndex})
+// Drag-reorder via SortableJS. On drag-end we PATCH the new index;
+// the DOM is already in the right order so we don't reload.
+const nbList = document.getElementById('nb-cells');
+if (nbList && window.Sortable) {
+  Sortable.create(nbList, {
+    handle: '.nb-drag',
+    animation: 120,
+    onEnd: async (evt) => {
+      if (evt.oldIndex === evt.newIndex) return;
+      const cellId = evt.item.dataset.cellId;
+      await fetch('/api/notebook', {
+        method: 'PATCH',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({action: 'reorder', cell_id: cellId, new_index: evt.newIndex})
+      });
+    }
   });
-  if (resp.ok) window.location.reload();
 }
+
 async function nbRemove(cellId) {
   if (!confirm('remove this cell from the notebook? (the catalog entry stays.)')) return;
   const resp = await fetch('/api/notebook', {
@@ -72,28 +85,47 @@ async function nbRemove(cellId) {
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify({action: 'remove', cell_id: cellId})
   });
-  if (resp.ok) window.location.reload();
+  if (resp.ok) {
+    document.getElementById('cell-' + cellId)?.remove();
+  }
 }
+
 function nbEdit(cellId) {
   const block = document.getElementById('md-' + cellId);
   const raw = block.dataset.raw || '';
   const ta = document.createElement('textarea');
   ta.className = 'nb-markdown-edit';
+  ta.id = 'md-edit-' + cellId;
   ta.value = raw;
-  block.replaceWith(ta);
+  block.style.display = 'none';
+  block.insertAdjacentElement('afterend', ta);
   ta.focus();
   const save = async () => {
+    if (ta.dataset.saved === '1') return;
+    ta.dataset.saved = '1';
     const resp = await fetch('/api/markdown/' + cellId, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({markdown: ta.value})
     });
-    if (resp.ok) window.location.reload();
+    if (resp.ok) {
+      const body = await resp.json();
+      block.innerHTML = body.html || '<em class="meta">(no markdown — click edit to add a note)</em>';
+      block.dataset.raw = body.markdown || '';
+    }
+    block.style.display = '';
+    ta.remove();
+  };
+  const cancel = () => {
+    if (ta.dataset.saved === '1') return;
+    ta.dataset.saved = '1';
+    block.style.display = '';
+    ta.remove();
   };
   ta.addEventListener('blur', save, {once: true});
   ta.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) save();
-    if (e.key === 'Escape') window.location.reload();
+    if (e.key === 'Escape') cancel();
   });
 }
 </script>

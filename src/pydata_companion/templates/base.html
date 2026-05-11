@@ -62,6 +62,10 @@
     .dag-empty { color: var(--muted); padding: 12px; }
     .nb-cell { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 14px 16px; }
     .nb-cell .nb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .nb-cell .nb-drag { cursor: grab; color: var(--muted); user-select: none; font-size: 14px; padding: 0 4px; }
+    .nb-cell .nb-drag:active { cursor: grabbing; }
+    .sortable-ghost { opacity: 0.4; }
+    .sortable-chosen { box-shadow: 0 0 0 2px var(--accent); }
     .nb-cell .nb-head .alias { font-weight: 600; }
     .nb-cell .nb-head .nb-actions { margin-left: auto; display: flex; gap: 6px; }
     .nb-cell .nb-head button { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: inherit; }

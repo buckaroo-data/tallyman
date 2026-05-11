@@ -403,7 +403,7 @@ def create_app(
         except CellNotFound:
             raise HTTPException(404, f"cell {cell_id!r} not found")
         await publish({"kind": "notebook_changed"})
-        return cell
+        return {**cell, "html": _render_markdown(cell["markdown"])}
 
     @app.get("/api/notebook")
     def api_notebook():

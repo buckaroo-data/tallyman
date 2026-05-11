@@ -298,3 +298,45 @@ def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
     c = TestClient(fresh_companion_app)
     r = c.get("/notebook")
     assert "(no markdown — click edit to add a note)" in r.text
+
+
+def test_put_markdown_returns_rendered_html(
+    fresh_companion_app, project: str, orders_parquet, monkeypatch
+):
+    """T-10: in-place updates need the server to send back rendered HTML
+    so the client can swap it in without a reload."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create as _cc
+    _cc("shoe_sales", _agg_code(project), prompt="seed")
+    cell = notebook.load(project)["cells"][0]
+    c = TestClient(fresh_companion_app)
+    r = c.put(f"/api/markdown/{cell['cell_id']}", json={"markdown": "## Hello\n\nworld"})
+    assert r.status_code == 200
+    body = r.json()
+    assert "<h2>Hello</h2>" in body["html"]
+    assert body["markdown"] == "## Hello\n\nworld"
+
+
+def test_notebook_page_includes_sortable_js(
+    fresh_companion_app, project: str, orders_parquet, monkeypatch
+):
+    """T-09: drag-reorder requires SortableJS available."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create as _cc
+    _cc("shoe_sales", _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get("/notebook")
+    assert "Sortable.min.js" in r.text
+    assert 'class="nb-drag"' in r.text
+
+
+def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_companion import create_app
+    from pydata_mcp.server import catalog_create as _cc
+    _cc("shoe_sales", _agg_code(project))
+    app = create_app(project, read_only=True)
+    c = TestClient(app)
+    r = c.get("/notebook")
+    assert "Sortable.min.js" not in r.text
+    assert 'class="nb-drag"' not in r.text

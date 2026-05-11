@@ -81,24 +81,27 @@ Swapped to `difflib.unified_diff` → Pygments DiffLexer + HtmlFormatter
 (monokai style, inline `noclasses=True` so it doesn't require a global
 CSS file). Identical inputs short-circuit to "(identical)" sentinel.
 
-### T-09 — No SortableJS drag-reorder for the notebook
+### ~~T-09 — SortableJS drag-reorder~~ ✅ 2026-05-11
 
-Plan calls for SortableJS; current ↑/↓ buttons are the accessibility
-fallback only.
+SortableJS via jsdelivr CDN. The `⋮⋮` grab handle on each cell's
+header invokes drag; on drop we PATCH the new index. No reload — the
+DOM is already in the dropped position. The ↑/↓ buttons were removed
+since the drag handle covers their case (a11y note: keyboard users can
+still call notebook_reorder via the MCP tool). Drag is suppressed in
+serve mode.
 
-- **Fix:** drop SortableJS into `static/` (or CDN with local fallback)
-  and wire to `PATCH /api/notebook` action=reorder.
-- **Verify:** drag a cell, drop, position persists across page reload.
+### ~~T-10 — Full-reload on PATCH/PUT~~ ✅ 2026-05-11
 
-### T-10 — Notebook full-reloads on every PATCH/PUT
+- Reorder: drag-end PATCHes the new index; DOM already in correct
+  position, no reload.
+- Remove: PATCH succeeds, `.remove()` on the cell node.
+- Markdown edit: PUT returns `{cell, html}`, client swaps the rendered
+  HTML in place and removes the textarea. Escape cancels without
+  saving.
 
-`PATCH /api/notebook` (reorder/remove) and `PUT /api/markdown/<id>`
-return JSON, but the client does `window.location.reload()` after.
-
-- **Fix:** swap reloads for in-place DOM updates. Cell-replace fragment
-  for reorder (or just transposing two cells); textarea-toggle on save
-  without reload for markdown.
-- **Verify:** drag-reorder feels smooth; markdown save doesn't flash.
+Side note: I had to revisit the a11y story since the ↑/↓ buttons were
+removed. For now, keyboard users can call notebook_reorder via the MCP
+tool. A keyboard-driven move-cell affordance is a follow-up.
 
 ### ~~T-11 — Diff page's compare-pairs link list~~ ✅ 2026-05-11
 

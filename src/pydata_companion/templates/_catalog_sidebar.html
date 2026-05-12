@@ -1,0 +1,31 @@
+{# Catalog sidebar shared by /catalog, /catalog/<hash>, /errors/<id>.
+   Caller must pass `entries` (annotated by _annotate_entries) and may
+   pass `current_hash` to highlight the currently-displayed entry. #}
+{%- set named_current = entries | selectattr('alias') | selectattr('is_current') | list %}
+{%- set named_forensic = entries | selectattr('alias') | rejectattr('is_current') | list %}
+{%- set scratch = entries | rejectattr('alias') | list %}
+{%- set current_hash = current_hash | default(None) %}
+{%- if not entries %}
+  <ul class="entry-list">
+    <li><a href="#"><em>no entries yet — drive Claude with a tool call</em></a></li>
+  </ul>
+{%- else %}
+  {%- if named_current %}
+    <div class="section-header">named ({{ named_current|length }})</div>
+    <ul class="entry-list">
+      {% for e in named_current %}{% include "_entry_list_item.html" %}{% endfor %}
+    </ul>
+  {%- endif %}
+  {%- if named_forensic %}
+    <div class="section-header">forensic ({{ named_forensic|length }})</div>
+    <ul class="entry-list">
+      {% for e in named_forensic %}{% include "_entry_list_item.html" %}{% endfor %}
+    </ul>
+  {%- endif %}
+  {%- if scratch %}
+    <div class="section-header">scratch ({{ scratch|length }})</div>
+    <ul class="entry-list">
+      {% for e in scratch %}{% include "_entry_list_item.html" %}{% endfor %}
+    </ul>
+  {%- endif %}
+{%- endif %}

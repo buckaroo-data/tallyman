@@ -167,6 +167,7 @@ def create_app(
 
         prompt_history = read_prompts(entry)
         chart_spec = get_chart(project_name, content_hash)
+        sidebar_entries = _annotate_entries(project_name, list_entries(project_name))
         build_artifacts = []
         build_dir = entry / "xorq_build"
         if build_dir.is_dir():
@@ -201,6 +202,8 @@ def create_app(
                 "buckaroo_session": buckaroo_session,
                 "buckaroo_base": buckaroo_base,
                 "build_artifacts": build_artifacts,
+                "entries": sidebar_entries,
+                "current_hash": content_hash,
             },
         )
 
@@ -545,10 +548,16 @@ def create_app(
         rec = get_error(project_name, error_id)
         if rec is None:
             raise HTTPException(404, f"error {error_id} not found")
+        sidebar_entries = _annotate_entries(project_name, list_entries(project_name))
         return templates.TemplateResponse(
             request,
             "error_detail.html",
-            {"project": project_name, "error": rec},
+            {
+                "project": project_name,
+                "error": rec,
+                "entries": sidebar_entries,
+                "current_hash": None,
+            },
         )
 
     return app

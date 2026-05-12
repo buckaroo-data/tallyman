@@ -18,33 +18,7 @@
 {% endif %}
 <div class="layout">
   <aside class="panel">
-    {%- set named_current = entries | selectattr('alias') | selectattr('is_current') | list %}
-    {%- set named_forensic = entries | selectattr('alias') | rejectattr('is_current') | list %}
-    {%- set scratch = entries | rejectattr('alias') | list %}
-    {%- if not entries %}
-      <ul class="entry-list">
-        <li><a href="#"><em>no entries yet — drive Claude with a tool call</em></a></li>
-      </ul>
-    {%- else %}
-      {%- if named_current %}
-        <div class="section-header">named ({{ named_current|length }})</div>
-        <ul class="entry-list">
-          {% for e in named_current %}{% include "_entry_list_item.html" %}{% endfor %}
-        </ul>
-      {%- endif %}
-      {%- if named_forensic %}
-        <div class="section-header">forensic ({{ named_forensic|length }})</div>
-        <ul class="entry-list">
-          {% for e in named_forensic %}{% include "_entry_list_item.html" %}{% endfor %}
-        </ul>
-      {%- endif %}
-      {%- if scratch %}
-        <div class="section-header">scratch ({{ scratch|length }})</div>
-        <ul class="entry-list">
-          {% for e in scratch %}{% include "_entry_list_item.html" %}{% endfor %}
-        </ul>
-      {%- endif %}
-    {%- endif %}
+    {% include "_catalog_sidebar.html" %}
   </aside>
   <section class="panel detail">
     <h2>catalog</h2>

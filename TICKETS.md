@@ -50,6 +50,41 @@ skipping `__pycache__`, `.DS_Store`, and the stale
 `tests/test_pack.py::test_pack_round_trip_serves`. See also T-24
 (also fixed) which would have invalidated builds on a rename.
 
+### T-31 — Buckaroo session pre-hydration (PR against buckaroo)
+
+The biggest remaining FOUC inside the iframe is the bootstrap window:
+the JS bundle parses, connects to `/ws/<session>`, fetches the data
+dictionary + first page of rows, then renders. ~200–500ms even on a
+warm cache.
+
+**Buckaroo-side PR idea:** have `GET /s/<session>` inline the initial
+state into the page as `<script type="application/json"
+id="bk-initial-state">…</script>`. The JS bundle's bootstrap path
+checks for that element first; if present it hydrates synchronously
+and never opens the WS for the first render (it still opens the WS
+for live updates / subsequent pages).
+
+This would collapse the iframe bootstrap from "load JS → connect WS →
+fetch data → render" to "load JS → render". Especially impactful for
+the demo, where each beat creates a new entry and the iframe pops in
+several times.
+
+### T-32 — Iframe pool / multi-session caching (pydata-app side)
+
+Even with pre-hydration, navigating between entries reloads the iframe
+content because the `src` changes. To eliminate that entirely we'd
+keep one iframe per visited entry, hidden, and toggle visibility on
+nav. Memory cost is ~1.5 MB JS state + the grid's data per iframe;
+fine for a 5–10 entry demo.
+
+- **Where:** SPA-lite controller in `base.html`. On navigation, look up
+  the target entry's iframe in a persistent `#iframe-pool` div; if
+  found, move it into the detail pane's iframe slot. If not, create
+  it lazily and move on next nav.
+- **Trade-off:** iframes outside the viewport still keep their WS
+  connections open; that's OK at the demo's scale but worth bounding
+  to ~5 LRU on a longer-lived session.
+
 ### T-30 — XorqBuckarooInfiniteWidget over the standalone server
 
 We're using `mode="buckaroo"` (BuckarooInfiniteWidget) which materialises

@@ -1,10 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
 <div class="layout">
-  <aside class="panel">
+  <aside class="panel" id="catalog-sidebar">
     {% include "_catalog_sidebar.html" %}
   </aside>
-  <section class="panel detail">
+  <section class="panel detail" id="catalog-detail">
     <h2>build failure · {{ error.id }}</h2>
     <div class="meta">
       {% if error.tool %}<span class="pill">tool: {{ error.tool }}</span>{% endif %}

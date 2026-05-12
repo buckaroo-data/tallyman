@@ -17,10 +17,10 @@
 </div>
 {% endif %}
 <div class="layout">
-  <aside class="panel">
+  <aside class="panel" id="catalog-sidebar">
     {% include "_catalog_sidebar.html" %}
   </aside>
-  <section class="panel detail">
+  <section class="panel detail" id="catalog-detail">
     <h2>catalog</h2>
     <p class="meta">{{ entries|length }} entries in project <code>{{ project }}</code>. Pick one on the left.</p>
   </section>

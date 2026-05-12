@@ -361,18 +361,25 @@ def create_app(
     def notebook_view(request: Request):
         data = notebook.load(project_name)
         aliases = load_aliases(project_name)
+        buckaroo_base = buckaroo.base_url if buckaroo and buckaroo.is_running else None
         rendered_cells = []
         for c in data["cells"]:
             latest = aliases.get(c["alias"])
             entry_meta = None
             preview_html = ""
             schema = None
+            bk_session = None
             if latest is not None:
                 entry = entry_dir(project_name, latest)
                 if (entry / "manifest.json").exists():
                     entry_meta = json.loads((entry / "manifest.json").read_text())
                     schema = json.loads((entry / "schema.json").read_text())
-                if (entry / "result.parquet").exists():
+                # When Buckaroo is up, ensure a per-cell session so the
+                # iframe loads instantly. Otherwise fall back to a
+                # pandas.to_html preview.
+                if buckaroo is not None:
+                    bk_session = buckaroo.ensure_session(latest)
+                if bk_session is None and (entry / "result.parquet").exists():
                     table = pq.read_table(entry / "result.parquet")
                     df = table.to_pandas()
                     n = min(20, len(df))
@@ -389,12 +396,17 @@ def create_app(
                     "schema": schema,
                     "preview_html": preview_html,
                     "markdown_html": _render_markdown(c.get("markdown", "")),
+                    "buckaroo_session": bk_session,
                 }
             )
         return templates.TemplateResponse(
             request,
             "notebook.html",
-            {"project": project_name, "cells": rendered_cells},
+            {
+                "project": project_name,
+                "cells": rendered_cells,
+                "buckaroo_base": buckaroo_base,
+            },
         )
 
     @app.patch("/api/notebook")

@@ -340,3 +340,47 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
     r = c.get("/notebook")
     assert "Sortable.min.js" not in r.text
     assert 'class="nb-drag"' not in r.text
+
+
+def test_notebook_uses_buckaroo_iframe_when_session_available(
+    project: str, orders_parquet, monkeypatch
+):
+    """Notebook cells render Buckaroo iframes (BuckarooInfiniteWidget) when
+    the manager is plumbed in. Falls back to pandas.to_html otherwise."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_companion import create_app
+    from pydata_mcp.server import catalog_create as _cc
+
+    _cc("shoe_sales", _agg_code(project))
+
+    class _StubBuckaroo:
+        is_running = True
+        bound_port = 8700
+
+        @property
+        def base_url(self):
+            return "http://127.0.0.1:8700"
+
+        def ensure_session(self, content_hash):
+            return f"sess-{content_hash[:6]}"
+
+    app = create_app(project, buckaroo=_StubBuckaroo())  # type: ignore[arg-type]
+    c = TestClient(app)
+    r = c.get("/notebook")
+    assert 'class="buckaroo-frame nb-buckaroo"' in r.text
+    assert "http://127.0.0.1:8700/s/sess-" in r.text
+    # The HTML preview fallback should NOT render when an iframe is present.
+    assert '<div class="nb-preview">' not in r.text
+
+
+def test_notebook_falls_back_to_html_when_no_buckaroo(
+    fresh_companion_app, project: str, orders_parquet, monkeypatch
+):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create as _cc
+    _cc("shoe_sales", _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get("/notebook")
+    # No Buckaroo manager → HTML preview, no iframe.
+    assert 'class="buckaroo-frame nb-buckaroo"' not in r.text
+    assert '<div class="nb-preview">' in r.text

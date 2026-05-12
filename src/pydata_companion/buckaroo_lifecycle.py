@@ -74,12 +74,28 @@ class BuckarooManager:
         port: int = 8700,
         startup_timeout: float = 8.0,
         log_file: Path | None = None,
+        mode: str = "buckaroo",
     ):
+        """
+        Args:
+            mode: which Buckaroo headless pipeline the server should build for
+                each session. `"buckaroo"` (default here) drives the full
+                ``BuckarooInfiniteWidget`` pipeline — infinite scroll, dataflow,
+                command toolbar, column statistics. `"viewer"` is the lighter
+                ``DfViewer`` (sort/filter only). `"lazy"` uses the
+                ``LazyInfinitePolars`` pipeline for streaming polars frames.
+                The ``XorqBuckarooInfiniteWidget`` flavor is not yet reachable
+                via Buckaroo's standalone server — it operates on a xorq
+                expression rather than a parquet path and would need a
+                hypothetical ``/load_expr`` endpoint we don't have. See
+                buckaroo/xorq_buckaroo.py and TICKETS.md for the gap.
+        """
         self.project = project
         self.requested_port = port
         self.bound_port: int | None = None
         self.startup_timeout = startup_timeout
         self.log_file = log_file
+        self.mode = mode
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
         self._sessions: dict[str, str] = {}
@@ -282,7 +298,11 @@ class BuckarooManager:
             try:
                 resp = self._client.post(
                     f"{self.base_url}/load",
-                    json={"path": str(parquet), "no_browser": True},
+                    json={
+                        "path": str(parquet),
+                        "no_browser": True,
+                        "mode": self.mode,
+                    },
                     timeout=10.0,
                 )
                 resp.raise_for_status()

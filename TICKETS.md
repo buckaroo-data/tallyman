@@ -50,6 +50,36 @@ skipping `__pycache__`, `.DS_Store`, and the stale
 `tests/test_pack.py::test_pack_round_trip_serves`. See also T-24
 (also fixed) which would have invalidated builds on a rename.
 
+### T-30 — XorqBuckarooInfiniteWidget over the standalone server
+
+We're using `mode="buckaroo"` (BuckarooInfiniteWidget) which materialises
+each catalog entry's parquet and pages over the materialised frame.
+`XorqBuckarooInfiniteWidget` (`buckaroo/xorq_buckaroo.py`) is strictly
+better for the demo: it operates on the xorq expression directly,
+pages via `expr.limit(end - start, offset=start).execute()`, and pushes
+sort/aggregation down to the backend. We can't reach it through the
+standalone server today because the server only has `POST /load` /
+`/load_compare` (file-path based) — there's no `/load_expr` endpoint
+that takes a xorq build dir.
+
+- **Where:** would require adding a handler to `buckaroo/server/handlers.py`
+  (call it `LoadExprHandler`) that takes `{path_to_build_dir, no_browser}`,
+  loads the expression via `pydata_xorq.load_entry` (or xorq's
+  `load_expr_from_tgz`), instantiates `XorqBuckarooInfiniteWidget`, and
+  pushes the buckaroo-state to subscribers. Could pair with a new
+  `mode="xorq"` in the existing `LoadHandler` so both endpoints share
+  validation.
+- **In pydata-app:** swap `BuckarooManager.ensure_session` to call the
+  new endpoint with the entry's `xorq_build/` dir; everything else
+  (sessions cache, iframe URL, etc.) stays the same.
+- **Verify:** sorting/filtering a large entry's column doesn't
+  re-materialise the whole parquet, and a backend that supports
+  push-down (datafusion) executes the predicate.
+
+This is a buckaroo-side change, not a pydata-app change. Defer until
+either we add the endpoint to the local buckaroo checkout or the
+buckaroo project ships it.
+
 ### ~~T-07 — Buckaroo server is not integrated~~ ✅ done 2026-05-11
 
 `pydata run` now manages a Buckaroo subprocess (default `:8700`, falls

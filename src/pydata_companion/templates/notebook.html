@@ -37,7 +37,13 @@
         {% endif %}
       </div>
 
-      {% if c.preview_html %}
+      {% if c.buckaroo_session and buckaroo_base %}
+        <iframe
+          class="buckaroo-frame nb-buckaroo"
+          src="{{ buckaroo_base }}/s/{{ c.buckaroo_session }}"
+          style="width: 100%; height: 380px; border: 1px solid var(--line); border-radius: 4px; background: #fff;"
+        ></iframe>
+      {% elif c.preview_html %}
         <div class="nb-preview">{{ c.preview_html|safe }}</div>
       {% elif c.latest_hash %}
         <div class="nb-empty">no result.parquet for {{ c.latest_hash }}</div>

@@ -72,6 +72,54 @@ def test_unit_status_shape(project: str):
     assert s["session_count"] == 0
 
 
+def test_unit_default_mode_is_buckaroo(project: str):
+    """We want the BuckarooInfiniteWidget pipeline, not the lighter DfViewer.
+    The server picks the pipeline based on the `mode` field in POST /load."""
+    mgr = BuckarooManager(project)
+    assert mgr.mode == "buckaroo"
+
+
+def test_unit_mode_override(project: str):
+    mgr = BuckarooManager(project, mode="viewer")
+    assert mgr.mode == "viewer"
+
+
+def test_unit_ensure_session_sends_mode_in_request(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """Pin the wire shape: POST /load body must include mode='buckaroo'
+    so the server builds the BuckarooInfiniteWidget pipeline."""
+    from pydata_xorq import build_and_persist
+
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project)
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        status_code = 200
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"session": "abc123def456"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["url"] = url
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+    session = mgr.ensure_session(res.content_hash)
+    assert session == "abc123def456"
+    assert captured["url"].endswith("/load")
+    assert captured["json"]["mode"] == "buckaroo"
+    assert captured["json"]["no_browser"] is True
+    assert captured["json"]["path"].endswith("/result.parquet")
+
+
 # ---------------------------------------------------------------------------
 # integration: real subprocess + real /load
 # ---------------------------------------------------------------------------
@@ -157,6 +205,9 @@ def test_entry_detail_embeds_iframe_when_buckaroo_present(
     assert "data-table" in r.text
 
 
+_IFRAME_TAG = '<iframe\n        class="buckaroo-frame"'
+
+
 def test_entry_detail_falls_back_when_buckaroo_absent(
     fresh_companion_app, project: str, orders_parquet: Path
 ):
@@ -164,7 +215,9 @@ def test_entry_detail_falls_back_when_buckaroo_absent(
     c = TestClient(fresh_companion_app)
     r = c.get(f"/catalog/{res.content_hash}")
     assert r.status_code == 200
-    assert "buckaroo-frame" not in r.text
+    # The class name may appear inside build_metadata.json's captured git
+    # diff (HTML-escaped); check for the actual <iframe> tag instead.
+    assert _IFRAME_TAG not in r.text
 
 
 def test_entry_detail_falls_back_when_session_unavailable(
@@ -188,5 +241,5 @@ def test_entry_detail_falls_back_when_session_unavailable(
     c = TestClient(app)
     r = c.get(f"/catalog/{res.content_hash}")
     assert r.status_code == 200
-    assert "buckaroo-frame" not in r.text
+    assert _IFRAME_TAG not in r.text
     assert "data-table" in r.text

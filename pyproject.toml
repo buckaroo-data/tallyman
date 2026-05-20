@@ -21,7 +21,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo==0.14.2",
+    "buckaroo>=0.14",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
 ]
@@ -46,6 +46,9 @@ packages = [
     "src/pydata_companion",
     "src/pydata_cli",
 ]
+
+[tool.uv.sources]
+buckaroo = { path = "/Users/paddy/buckaroo", editable = true }
 
 [tool.ruff]
 line-length = 100

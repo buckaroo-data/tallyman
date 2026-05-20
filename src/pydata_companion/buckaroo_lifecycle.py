@@ -16,8 +16,11 @@ Lifecycle:
    port=0).
 3. Poll `/health` until Buckaroo reports ready (~200ms typical).
 4. When the entry-detail route is hit for the first time on a content
-   hash, POST `/load` with the parquet path and store the returned
-   `session` in `catalog/buckaroo_sessions.json` for later retrieval.
+   hash, POST `/load_expr` with the entry's `xorq_build/` dir and store
+   the returned `session` in `catalog/buckaroo_sessions.json` for later
+   retrieval. Buckaroo serves the entry via the xorq backend with
+   push-down sort/search (paging over a materialised parquet is the
+   `/load` flow, which we no longer use).
 5. On shutdown (uvicorn lifespan or `atexit`), close the subprocess's
    stdin and wait briefly; if it doesn't go, SIGTERM.
 
@@ -45,6 +48,8 @@ from pathlib import Path
 import httpx
 
 from pydata_core import catalog_dir, entry_dir
+from pydata_core.paths import project_dir
+from pydata_xorq.portable import expand_to_tmp
 
 log = logging.getLogger("pydata.buckaroo")
 
@@ -74,33 +79,22 @@ class BuckarooManager:
         port: int = 8700,
         startup_timeout: float = 8.0,
         log_file: Path | None = None,
-        mode: str = "buckaroo",
     ):
-        """
-        Args:
-            mode: which Buckaroo headless pipeline the server should build for
-                each session. `"buckaroo"` (default here) drives the full
-                ``BuckarooInfiniteWidget`` pipeline — infinite scroll, dataflow,
-                command toolbar, column statistics. `"viewer"` is the lighter
-                ``DfViewer`` (sort/filter only). `"lazy"` uses the
-                ``LazyInfinitePolars`` pipeline for streaming polars frames.
-                The ``XorqBuckarooInfiniteWidget`` flavor is not yet reachable
-                via Buckaroo's standalone server — it operates on a xorq
-                expression rather than a parquet path and would need a
-                hypothetical ``/load_expr`` endpoint we don't have. See
-                buckaroo/xorq_buckaroo.py and TICKETS.md for the gap.
-        """
         self.project = project
         self.requested_port = port
         self.bound_port: int | None = None
         self.startup_timeout = startup_timeout
         self.log_file = log_file
-        self.mode = mode
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
         self._sessions: dict[str, str] = {}
         self._session_lock = threading.Lock()
         self._buckaroo_started_at: float | None = None
+        # Tmp dirs we created by expanding ${PYDATA_PROJECT_ROOT} placeholders
+        # before POSTing /load_expr. Buckaroo holds the loaded xorq expression
+        # open against these paths for the session lifetime, so we keep them
+        # alive until stop() runs.
+        self._expanded_dirs: dict[str, Path] = {}
         # Auto-restart bookkeeping. If buckaroo dies mid-session and we
         # try to restart on every page hit, a persistent failure (port
         # taken, deps missing) would thrash. Throttle to one attempt per
@@ -230,6 +224,7 @@ class BuckarooManager:
 
     def stop(self) -> None:
         if not self.is_running or self.proc is None:
+            self._cleanup_expanded_dirs()
             return
         log.info("stopping buckaroo")
         try:
@@ -248,6 +243,12 @@ class BuckarooManager:
                 self.proc.kill()
         self.proc = None
         self.bound_port = None
+        self._cleanup_expanded_dirs()
+
+    def _cleanup_expanded_dirs(self) -> None:
+        for p in self._expanded_dirs.values():
+            shutil.rmtree(p, ignore_errors=True)
+        self._expanded_dirs.clear()
 
     # ------------------------------------------------------------------
     # session map (persisted to disk)
@@ -314,6 +315,11 @@ class BuckarooManager:
     def ensure_session(self, content_hash: str) -> str | None:
         """Return a Buckaroo session_id for `content_hash`, creating it if needed.
 
+        Posts the entry's ``xorq_build/`` dir to Buckaroo's ``/load_expr``
+        endpoint so the session is backed by the xorq expression (push-down
+        sort/search against the underlying backend), not by paging over the
+        materialised parquet.
+
         Returns None (instead of raising) if Buckaroo isn't running or the load
         fails — the companion falls back to the pandas.to_html preview in that
         case. We don't want a Buckaroo hiccup to take down the whole detail page.
@@ -325,8 +331,8 @@ class BuckarooManager:
         self._maybe_restart()
         if not self.is_running or self.bound_port is None:
             return None
-        parquet = entry_dir(self.project, content_hash) / "result.parquet"
-        if not parquet.exists():
+        build_dir = entry_dir(self.project, content_hash) / "xorq_build"
+        if not build_dir.is_dir():
             return None
         with self._session_lock:
             cached = self._sessions.get(content_hash)
@@ -334,20 +340,27 @@ class BuckarooManager:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
                 return cached
+            # Expand ${PYDATA_PROJECT_ROOT} to absolute paths in a tmp copy —
+            # buckaroo's xorq_loading.load_expr_build_dir calls xorq.api.load_expr
+            # directly and does no placeholder handling, so an unexpanded
+            # build_dir produces a session whose paged reads return zero rows.
+            expanded = self._expanded_dirs.get(content_hash)
+            if expanded is None:
+                expanded = expand_to_tmp(build_dir, project_dir(self.project))
+                self._expanded_dirs[content_hash] = expanded
             try:
                 resp = self._client.post(
-                    f"{self.base_url}/load",
+                    f"{self.base_url}/load_expr",
                     json={
-                        "path": str(parquet),
+                        "build_dir": str(expanded),
                         "no_browser": True,
-                        "mode": self.mode,
                     },
                     timeout=10.0,
                 )
                 resp.raise_for_status()
                 session_id = resp.json()["session"]
             except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
-                log.warning("buckaroo /load failed for %s: %s", content_hash, exc)
+                log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)
                 return None
             self._sessions[content_hash] = session_id
             self._persist_sessions()

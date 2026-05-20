@@ -11,9 +11,13 @@ Three layers:
 from __future__ import annotations
 
 import json
+import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -192,6 +196,157 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
 
 
 # ---------------------------------------------------------------------------
+# stress: tmp-dir lifecycle, concurrency
+# ---------------------------------------------------------------------------
+
+def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monkeypatch):
+    """The tmp dir created by ensure_session must be deleted by stop().
+
+    Without this, a long-lived companion accumulates per-content-hash
+    tmp dirs in /var/folders/.../pydata_load_*.
+    """
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project)
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"session": "s"}
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
+
+    mgr.ensure_session(res.content_hash)
+    tmp = mgr._expanded_dirs[res.content_hash]
+    assert tmp.is_dir()
+
+    # Simulate already-exited subprocess so stop()'s early-return path runs;
+    # _cleanup_expanded_dirs must fire on that path too.
+    mgr.proc = None
+    mgr.stop()
+    assert not tmp.exists()
+    assert mgr._expanded_dirs == {}
+
+
+def test_unit_stop_cleans_many_expanded_dirs(project: str):
+    """Leak guard: stop() must clean every tracked tmp dir, not just one.
+
+    Constructs N synthetic tmp dirs directly (bypassing ensure_session
+    for speed — we only care about the cleanup contract here).
+    """
+    N = 25
+    mgr = BuckarooManager(project)
+    tmp_paths = []
+    for i in range(N):
+        d = Path(tempfile.mkdtemp(prefix="pydata_load_test_"))
+        mgr._expanded_dirs[f"hash_{i:02d}"] = d
+        tmp_paths.append(d)
+
+    assert all(p.exists() for p in tmp_paths)
+    mgr.stop()  # subprocess never started; only tmp-dir cleanup runs
+
+    assert mgr._expanded_dirs == {}
+    for p in tmp_paths:
+        assert not p.exists(), p
+
+
+def test_unit_concurrent_same_hash_loads_once(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """N threads racing on the same content_hash must produce exactly one
+    /load_expr POST and one tmp dir — the session_lock serialises."""
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project)
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    post_urls: list[str] = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"session": "shared"}
+
+    def fake_post(url, json=None, timeout=None):
+        post_urls.append(url)
+        # Small sleep so threads have a chance to contend on the lock.
+        time.sleep(0.02)
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+
+    results: list[str | None] = []
+    barrier = threading.Barrier(8)
+
+    def worker():
+        barrier.wait()
+        results.append(mgr.ensure_session(res.content_hash))
+
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert results == ["shared"] * 8
+    assert len(post_urls) == 1, post_urls
+    assert len(mgr._expanded_dirs) == 1
+
+
+def test_unit_concurrent_different_hashes_each_load_once(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """Threads racing on N distinct content_hashes each get their own
+    /load_expr POST + tmp dir; no cross-talk through the session_lock."""
+    hashes = [build_and_persist(
+        project, _code(project) + f"\nexpr = expr.mutate(_v={i})"
+    ).content_hash for i in range(5)]
+
+    mgr = BuckarooManager(project)
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    post_count = {"n": 0}
+    posted_build_dirs: list[str] = []
+    posted_lock = threading.Lock()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+        def json(self):
+            return {"session": "any"}
+
+    def fake_post(url, json=None, timeout=None):
+        with posted_lock:
+            post_count["n"] += 1
+            posted_build_dirs.append(json["build_dir"])
+        time.sleep(0.01)
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+
+    barrier = threading.Barrier(len(hashes))
+
+    def worker(h):
+        barrier.wait()
+        mgr.ensure_session(h)
+
+    threads = [threading.Thread(target=worker, args=(h,)) for h in hashes]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert post_count["n"] == len(hashes)
+    assert len(set(posted_build_dirs)) == len(hashes)  # one tmp dir per hash
+    assert len(mgr._expanded_dirs) == len(hashes)
+
+
+# ---------------------------------------------------------------------------
 # integration: real subprocess + real /load
 # ---------------------------------------------------------------------------
 
@@ -219,6 +374,50 @@ def test_integration_spawn_and_load(project: str, orders_parquet: Path):
     finally:
         mgr.stop()
     assert not mgr.is_running
+
+
+@pytest.mark.integration
+def test_integration_load_expr_returns_nonzero_rows(
+    project: str, orders_parquet: Path
+):
+    """Smoking-gun integration test for the placeholder-expansion fix.
+
+    Without expansion, /load_expr loads the schema fine (it reads YAML
+    metadata) but its `rows` field is 0 — buckaroo's xorq.api.load_expr
+    call can't resolve ``${PYDATA_PROJECT_ROOT}`` paths so the underlying
+    parquet read returns empty. The original
+    ``test_integration_spawn_and_load`` test passed even with that bug
+    in place because it only asserted a session id came back. This
+    test asserts the actual contract callers care about: data flows.
+    """
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project, port=0, startup_timeout=15.0)
+    try:
+        mgr.start()
+        session_id = mgr.ensure_session(res.content_hash)
+        assert session_id is not None
+
+        # The tmp dir lives for the manager's lifetime; expr.yaml must be
+        # placeholder-free so xorq can read the upstream parquet.
+        tmp = mgr._expanded_dirs[res.content_hash]
+        expr_yaml = (tmp / "expr.yaml").read_text()
+        assert "${PYDATA_PROJECT_ROOT}" not in expr_yaml
+
+        # /load_expr's response surfaces rows — POST a probe directly to
+        # inspect it. With unexpanded paths this comes back rows=0.
+        resp = httpx.post(
+            f"{mgr.base_url}/load_expr",
+            json={"build_dir": str(tmp), "no_browser": True},
+            timeout=10.0,
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        assert body["rows"] > 0, body
+        # Same schema buckaroo will report over WS to the embed.
+        assert [c["name"] for c in body["columns"]] == ["region", "n"]
+    finally:
+        mgr.stop()
 
 
 @pytest.mark.integration

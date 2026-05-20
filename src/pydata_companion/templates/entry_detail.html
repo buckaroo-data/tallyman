@@ -51,13 +51,13 @@
       </script>
     {% endif %}
 
-    {% if buckaroo_session and buckaroo_base %}
+    {% if buckaroo_session and buckaroo_ws_base %}
       <h3>result <span class="meta">· buckaroo · {{ manifest.row_count }} rows</span></h3>
-      <iframe
-        class="buckaroo-frame"
-        src="{{ buckaroo_base }}/s/{{ buckaroo_session }}"
-        style="width: 100%; height: 60vh; border: 1px solid var(--line); border-radius: 4px; background: #fff;"
-      ></iframe>
+      <div
+        class="buckaroo-embed"
+        data-ws-url="{{ buckaroo_ws_base }}/ws/{{ buckaroo_session }}"
+        style="width: 100%; height: 60vh; border: 1px solid var(--line); border-radius: 4px; background: #181d1f;"
+      ></div>
       <details class="meta" style="margin-top: 6px;">
         <summary>plain pandas preview (fallback)</summary>
         <div style="overflow:auto; max-height: 40vh; margin-top: 6px;">

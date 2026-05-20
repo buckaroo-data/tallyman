@@ -57,6 +57,15 @@ uv run pydata init spike            # creates ~/.pydata-app/projects/spike/ + fi
 uv run pydata run --project spike   # edit-mode companion on http://127.0.0.1:7860
 ```
 
+The companion's dataframe embed is a small React bundle built from
+`packages/embed/`. The built `buckaroo-embed.{js,css}` is committed under
+`src/pydata_companion/static/`, so a fresh clone runs without Node. Rebuild
+after a `buckaroo-js-core` bump with:
+
+```sh
+cd packages/embed && pnpm install && pnpm run build
+```
+
 In another terminal, launch Claude Code from this directory; it picks up
 `.mcp.json` and exposes the `pydata` MCP server.
 

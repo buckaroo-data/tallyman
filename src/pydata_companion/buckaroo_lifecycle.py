@@ -117,6 +117,12 @@ class BuckarooManager:
             raise BuckarooUnavailable("Buckaroo has not finished starting up")
         return f"http://127.0.0.1:{self.bound_port}"
 
+    @property
+    def ws_base_url(self) -> str:
+        if self.bound_port is None:
+            raise BuckarooUnavailable("Buckaroo has not finished starting up")
+        return f"ws://127.0.0.1:{self.bound_port}"
+
     def start(self) -> None:
         """Spawn the Buckaroo subprocess and wait for the handshake."""
         if self.is_running:

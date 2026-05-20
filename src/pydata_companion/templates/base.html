@@ -80,18 +80,16 @@
     .nb-cell .nb-meta { color: var(--muted); font-size: 11px; margin-top: 8px; }
     .nb-empty { color: var(--muted); padding: 16px; }
     .vega-embed { background: #fff; border-radius: 4px; padding: 8px; min-height: 200px; }
-    /* Mask the FOUC inside the iframe: buckaroo's session HTML defaults
-       to a dark background in prefers-color-scheme: dark, but the iframe
-       element itself paints white during the brief window between
-       `src` set and content first-paint. Stage a dark background and
-       fade the content in once `load` fires. */
-    iframe.buckaroo-frame { background: #181d1f; opacity: 0; transition: opacity 180ms ease-out; }
-    iframe.buckaroo-frame.ready { opacity: 1; }
+    /* Buckaroo React embed: background matches the widget's dark theme so
+       there's no white flash between mount and first WebSocket payload. */
+    .buckaroo-embed { background: #181d1f; }
     .edit-code-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; margin-left: 8px; }
     .edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
     .section-header { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; padding: 10px 12px 4px; border-top: 1px solid var(--line); }
     .section-header:first-child { border-top: 0; }
   </style>
+  <link rel="stylesheet" href="/static/buckaroo-embed.css">
+  <script type="module" src="/static/buckaroo-embed.js"></script>
 </head>
 <body>
   <header>
@@ -140,32 +138,6 @@
       if (path === '/catalog/' + data.hash) window.location.reload();
     });
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
-
-    // Mark iframes ready when their content loads. Applies to all
-    // existing iframes (entry-detail single iframe; notebook cell
-    // iframes) and to any iframes added later via SPA-lite swap.
-    function markIframeReady(el) {
-      if (!el.classList.contains('buckaroo-frame')) return;
-      const ready = () => el.classList.add('ready');
-      if (el.dataset.bound === '1') return;
-      el.dataset.bound = '1';
-      el.addEventListener('load', ready);
-      // If load already fired before this script ran (cached), check
-      // contentDocument readiness.
-      try {
-        if (el.contentDocument && el.contentDocument.readyState === 'complete') ready();
-      } catch (_) { /* cross-origin: rely on load event */ }
-    }
-    document.querySelectorAll('iframe.buckaroo-frame').forEach(markIframeReady);
-    new MutationObserver((mutations) => {
-      for (const m of mutations) {
-        m.addedNodes.forEach((n) => {
-          if (n.nodeType !== 1) return;
-          if (n.matches && n.matches('iframe.buckaroo-frame')) markIframeReady(n);
-          if (n.querySelectorAll) n.querySelectorAll('iframe.buckaroo-frame').forEach(markIframeReady);
-        });
-      }
-    }).observe(document.body, {childList: true, subtree: true});
 
     // SPA-lite navigation: intercept clicks on /catalog/<hash> links and
     // swap only the sidebar + detail regions, avoiding the full-page

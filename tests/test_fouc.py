@@ -1,9 +1,9 @@
-"""Visible-load behavior: SPA-lite swap regions and iframe fade-in plumbing.
+"""Visible-load behavior: SPA-lite swap regions and embed plumbing.
 
 These tests don't run a browser, so we can't observe the actual flash
 duration. They DO assert that the HTML/CSS/JS contract the SPA-lite
-controller depends on is in place: swap regions present, iframe
-opacity classes wired up, navigation handlers attached.
+controller depends on is in place: swap regions present, embed bundle
+referenced, navigation handlers attached.
 """
 from __future__ import annotations
 
@@ -53,16 +53,15 @@ def test_error_detail_has_swap_regions(fresh_companion_app, project: str):
     assert 'id="catalog-detail"' in r.text
 
 
-def test_iframe_fouc_css_present(fresh_companion_app):
-    """Dark background + opacity transition CSS lives in the base
-    template so the iframe element doesn't flash white before content
-    paints."""
+def test_embed_bundle_referenced(fresh_companion_app):
+    """The compiled buckaroo-embed bundle + its dark-background placeholder
+    CSS live in base.html so embed divs render on top of the right colour
+    before the WebSocket payload lands."""
     c = TestClient(fresh_companion_app)
     r = c.get("/catalog")
-    assert "iframe.buckaroo-frame" in r.text
-    assert "opacity: 0" in r.text
-    assert "transition: opacity" in r.text
-    assert ".ready" in r.text  # the class added by JS on iframe load
+    assert '/static/buckaroo-embed.js' in r.text
+    assert '/static/buckaroo-embed.css' in r.text
+    assert '.buckaroo-embed { background: #181d1f; }' in r.text
 
 
 def test_spa_lite_js_wired_up(fresh_companion_app):
@@ -73,9 +72,6 @@ def test_spa_lite_js_wired_up(fresh_companion_app):
     assert "history.pushState" in r.text
     # Routes the click handler activates on — the JS regex escapes / as \/.
     assert r"^\/catalog" in r.text
-    # Iframe ready-marker plumbing.
-    assert "markIframeReady" in r.text
-    assert "MutationObserver" in r.text
 
 
 def test_lineage_pages_fall_through_to_real_nav(

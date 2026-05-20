@@ -37,12 +37,12 @@
         {% endif %}
       </div>
 
-      {% if c.buckaroo_session and buckaroo_base %}
-        <iframe
-          class="buckaroo-frame nb-buckaroo"
-          src="{{ buckaroo_base }}/s/{{ c.buckaroo_session }}"
-          style="width: 100%; height: 380px; border: 1px solid var(--line); border-radius: 4px; background: #fff;"
-        ></iframe>
+      {% if c.buckaroo_session and buckaroo_ws_base %}
+        <div
+          class="buckaroo-embed nb-buckaroo"
+          data-ws-url="{{ buckaroo_ws_base }}/ws/{{ c.buckaroo_session }}"
+          style="width: 100%; height: 380px; border: 1px solid var(--line); border-radius: 4px; background: #181d1f;"
+        ></div>
       {% elif c.preview_html %}
         <div class="nb-preview">{{ c.preview_html|safe }}</div>
       {% elif c.latest_hash %}

@@ -7,3 +7,5 @@ build/
 .ruff_cache/
 .pytest_cache/
 .DS_Store
+node_modules/
+src/pydata_companion/static/*.map

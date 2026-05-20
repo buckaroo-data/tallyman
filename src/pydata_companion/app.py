@@ -182,7 +182,9 @@ def create_app(
         buckaroo_session = (
             buckaroo.ensure_session(content_hash) if buckaroo is not None else None
         )
-        buckaroo_base = buckaroo.base_url if buckaroo and buckaroo.is_running else None
+        buckaroo_ws_base = (
+            buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
+        )
         return templates.TemplateResponse(
             request,
             "entry_detail.html",
@@ -200,7 +202,7 @@ def create_app(
                 "forensic_history": forensic_history,
                 "chart_spec": chart_spec,
                 "buckaroo_session": buckaroo_session,
-                "buckaroo_base": buckaroo_base,
+                "buckaroo_ws_base": buckaroo_ws_base,
                 "build_artifacts": build_artifacts,
                 "entries": sidebar_entries,
                 "current_hash": content_hash,
@@ -364,7 +366,9 @@ def create_app(
     def notebook_view(request: Request):
         data = notebook.load(project_name)
         aliases = load_aliases(project_name)
-        buckaroo_base = buckaroo.base_url if buckaroo and buckaroo.is_running else None
+        buckaroo_ws_base = (
+            buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
+        )
         rendered_cells = []
         for c in data["cells"]:
             latest = aliases.get(c["alias"])
@@ -378,7 +382,7 @@ def create_app(
                     entry_meta = json.loads((entry / "manifest.json").read_text())
                     schema = json.loads((entry / "schema.json").read_text())
                 # When Buckaroo is up, ensure a per-cell session so the
-                # iframe loads instantly. Otherwise fall back to a
+                # React embed connects directly. Otherwise fall back to a
                 # pandas.to_html preview.
                 if buckaroo is not None:
                     bk_session = buckaroo.ensure_session(latest)
@@ -408,7 +412,7 @@ def create_app(
             {
                 "project": project_name,
                 "cells": rendered_cells,
-                "buckaroo_base": buckaroo_base,
+                "buckaroo_ws_base": buckaroo_ws_base,
             },
         )
 

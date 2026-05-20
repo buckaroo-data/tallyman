@@ -183,11 +183,15 @@ class _StubBuckaroo:
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self.bound_port}"
 
+    @property
+    def ws_base_url(self) -> str:
+        return f"ws://127.0.0.1:{self.bound_port}"
+
     def ensure_session(self, content_hash: str) -> str | None:
         return self.session
 
 
-def test_entry_detail_embeds_iframe_when_buckaroo_present(
+def test_entry_detail_embeds_react_widget_when_buckaroo_present(
     project: str, orders_parquet: Path
 ):
     from pydata_companion import create_app
@@ -198,14 +202,14 @@ def test_entry_detail_embeds_iframe_when_buckaroo_present(
     c = TestClient(app)
     r = c.get(f"/catalog/{res.content_hash}")
     assert r.status_code == 200
-    assert 'class="buckaroo-frame"' in r.text
-    assert "http://127.0.0.1:8700/s/abc123" in r.text
+    assert 'class="buckaroo-embed"' in r.text
+    assert 'data-ws-url="ws://127.0.0.1:8700/ws/abc123"' in r.text
     # Pandas preview is still in the page but tucked behind a <details>.
     assert "<details" in r.text
     assert "data-table" in r.text
 
 
-_IFRAME_TAG = '<iframe\n        class="buckaroo-frame"'
+_EMBED_TAG = '<div\n        class="buckaroo-embed"'
 
 
 def test_entry_detail_falls_back_when_buckaroo_absent(
@@ -216,8 +220,8 @@ def test_entry_detail_falls_back_when_buckaroo_absent(
     r = c.get(f"/catalog/{res.content_hash}")
     assert r.status_code == 200
     # The class name may appear inside build_metadata.json's captured git
-    # diff (HTML-escaped); check for the actual <iframe> tag instead.
-    assert _IFRAME_TAG not in r.text
+    # diff (HTML-escaped); check for the actual mount-div tag instead.
+    assert _EMBED_TAG not in r.text
 
 
 def test_entry_detail_falls_back_when_session_unavailable(
@@ -241,5 +245,5 @@ def test_entry_detail_falls_back_when_session_unavailable(
     c = TestClient(app)
     r = c.get(f"/catalog/{res.content_hash}")
     assert r.status_code == 200
-    assert _IFRAME_TAG not in r.text
+    assert _EMBED_TAG not in r.text
     assert "data-table" in r.text

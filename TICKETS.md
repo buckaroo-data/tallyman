@@ -331,6 +331,44 @@ N-cell notebook = N WS connections + N AG-Grid instances.
 Defer until Option B is merged. Should be the first test against the
 new embed surface.
 
+### T-34 — `/internal/notify` should log the event `kind`
+
+Found during the 2026-05-20 buckaroo-death investigation. Companion
+log showed 145 `POST /internal/notify HTTP/1.1 200 OK` lines in a
+session with no observable state mutation. Couldn't tell what the
+events *were* because the handler (`src/pydata_companion/app.py`,
+`@app.post("/internal/notify")` ~line 269) just calls
+`await publish(payload.model_dump())` and returns — no log line, no
+visibility into the burst.
+
+**Fix:** add one `log.info("notify kind=%s hash=%s", payload.kind,
+payload.hash)` (or equivalent) inside the handler so future
+"where did all these events come from" investigations are
+single-grep instead of guesswork. Possibly also include the
+remote address (useful when multiple MCP-server processes are
+talking to one companion).
+
+Cheap; high observability payoff; touches one file.
+
+### T-35 — Companion startup banner should print buckaroo PID
+
+Found during the same investigation. `pydata run` echoes
+"buckaroo · http://127.0.0.1:8700 (log: ...)" but not the PID. When
+stale buckaroos linger from earlier debugging (port 8701, port 0
+fallback after a port collision, etc.), `ps`/`lsof` are needed to
+disambiguate which buckaroo belongs to which companion. After
+auto-restart the bound port can also change without the user
+noticing — printing the new PID/port on restart would surface that.
+
+**Fix:** echo `self.proc.pid` (and the final `bound_port`) after
+`start()` succeeds in `pydata_cli/main.py` and again in
+`BuckarooManager._maybe_restart` after a restart. Both currently
+`log.info` the URL but the PID isn't there.
+
+Trivial; useful for development hygiene; should also save the
+PID into `buckaroo_sessions.json`'s envelope for the auto-restart
+detection case.
+
 ### ~~T-23 — `pydata init` silently re-runs~~ ✅ 2026-05-11
 
 `pydata init` now errors if the project already exists. `--force`

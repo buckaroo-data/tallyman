@@ -269,6 +269,64 @@ has to happen before any test or helper imports xorq).
 default in `pyproject.toml` with explicit `pytest -m integration` for
 the full run.
 
+### T-33 — Memory-scaling integration test for the React embed
+
+Once the iframe-to-React-embed switch lands (Option B in the chat:
+local esbuild bundle that mounts `BuckarooServerView` from
+`buckaroo-js-core` into a `[data-ws-url]` div), we need a test that
+catches per-cell leaks before they hit the demo. Each notebook cell
+becomes its own `BuckarooServerView` mount with its own WebSocket; an
+N-cell notebook = N WS connections + N AG-Grid instances.
+
+**What to measure, on the same machine, with the same fixture:**
+
+- Server side: RSS of the Buckaroo subprocess (`buckaroo_lifecycle.py`'s
+  `BuckarooManager.proc`) sampled before any cells load and after each
+  cell loads. `psutil.Process(self.proc.pid).memory_info().rss` is the
+  obvious hook.
+- Browser side: `performance.memory.usedJSHeapSize` (Chromium only —
+  the test driver will need to be Chromium) sampled at the same
+  checkpoints from the rendered notebook page.
+
+**Test shape:**
+
+- Playwright spec under `tests/integration/` (new dir; we don't have
+  one yet — slot next to `tests/test_mcp_stdio.py`-style integration
+  files and gate with `@pytest.mark.integration`).
+- Fixture: a project with N synthetic catalog entries, one notebook
+  cell per entry. Parametrise N over `[1, 5, 10, 25]`.
+- For each N: launch `pydata run`, load `/notebook`, wait for all
+  embeds to reach `initial_state`, sample both metrics, then close the
+  page and re-sample server RSS to catch sessions that don't release.
+- Assert: server RSS growth per cell is sub-linear (i.e. shared
+  per-server overhead dominates) or at least bounded by a soft cap
+  (~20 MB/cell?); browser heap growth per cell stays under a soft cap
+  (~10 MB/cell?). Numbers are placeholders — first run sets the
+  baseline, future runs guard against regressions.
+
+**Why this is worth a ticket and not just a follow-up:**
+
+- The current iframe model isolates each cell in its own browser
+  context; React-embed collapses them into one. Leaks that were
+  invisible behind iframe boundaries become visible.
+- The talk demo will load a multi-cell notebook live. If the embed
+  approach leaks per cell, we will only find out when the audience
+  sees it.
+- Bounds the conversation about T-32 ("iframe pool") — once we have
+  numbers, "should we lazy-mount on scroll?" stops being a guess.
+
+**Files likely to touch:**
+
+- `tests/integration/test_embed_memory.py` (new).
+- `tests/integration/conftest.py` (new; project + entries fixture).
+- `pyproject.toml` — add `playwright` to a `dev` or `integration`
+  dependency group.
+- `.github/workflows/tests.yml` — extend the integration job once the
+  buckaroo path-source issue (T-26) is resolved.
+
+Defer until Option B is merged. Should be the first test against the
+new embed surface.
+
 ### ~~T-23 — `pydata init` silently re-runs~~ ✅ 2026-05-11
 
 `pydata init` now errors if the project already exists. `--force`

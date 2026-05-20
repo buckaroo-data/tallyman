@@ -146,23 +146,13 @@ def test_unit_status_shape(project: str):
     assert s["session_count"] == 0
 
 
-def test_unit_default_mode_is_buckaroo(project: str):
-    """We want the BuckarooInfiniteWidget pipeline, not the lighter DfViewer.
-    The server picks the pipeline based on the `mode` field in POST /load."""
-    mgr = BuckarooManager(project)
-    assert mgr.mode == "buckaroo"
-
-
-def test_unit_mode_override(project: str):
-    mgr = BuckarooManager(project, mode="viewer")
-    assert mgr.mode == "viewer"
-
-
-def test_unit_ensure_session_sends_mode_in_request(
+def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
     project: str, orders_parquet: Path, monkeypatch
 ):
-    """Pin the wire shape: POST /load body must include mode='buckaroo'
-    so the server builds the BuckarooInfiniteWidget pipeline."""
+    """When an entry has an xorq_build/ dir (every catalog entry does),
+    ensure_session posts to /load_expr so Buckaroo serves it via the
+    xorq backend with push-down sort/search rather than paging over a
+    materialised parquet."""
     from pydata_xorq import build_and_persist
 
     res = build_and_persist(project, _code(project))
@@ -188,10 +178,17 @@ def test_unit_ensure_session_sends_mode_in_request(
     monkeypatch.setattr(mgr._client, "post", fake_post)
     session = mgr.ensure_session(res.content_hash)
     assert session == "abc123def456"
-    assert captured["url"].endswith("/load")
-    assert captured["json"]["mode"] == "buckaroo"
+    assert captured["url"].endswith("/load_expr"), captured["url"]
     assert captured["json"]["no_browser"] is True
-    assert captured["json"]["path"].endswith("/result.parquet")
+    # The build_dir we POST must already have ${PYDATA_PROJECT_ROOT}
+    # expanded — buckaroo's xorq_loading.load_expr_build_dir calls
+    # xorq.api.load_expr directly and does no placeholder handling, so
+    # an unexpanded build_dir produces a session whose paged reads return
+    # zero rows (the bug we hit on 2026-05-20).
+    posted_dir = Path(captured["json"]["build_dir"])
+    assert posted_dir.is_dir(), posted_dir
+    expr_yaml = (posted_dir / "expr.yaml").read_text()
+    assert "${PYDATA_PROJECT_ROOT}" not in expr_yaml
 
 
 # ---------------------------------------------------------------------------

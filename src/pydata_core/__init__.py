@@ -27,6 +27,12 @@ from pydata_core.paths import (
     pydata_home,
     resolve_project,
 )
+from pydata_core.summary_stats import (
+    StatSourceError,
+    list_stats,
+    remove_stat,
+    write_stat,
+)
 
 __all__ = [
     "AliasExists",
@@ -34,6 +40,10 @@ __all__ = [
     "CellNotFound",
     "ChartSpecError",
     "Manifest",
+    "StatSourceError",
+    "list_stats",
+    "remove_stat",
+    "write_stat",
     "alias_for_hash",
     "catalog_dir",
     "data_dir",

@@ -373,6 +373,11 @@ class BuckarooManager:
                     json={
                         "build_dir": str(expanded),
                         "no_browser": True,
+                        # Buckaroo PR #784 scans <project_root>/stats/*.py
+                        # for project-authored summary stats and folds them
+                        # into the session's analysis_klasses. Older buckaroo
+                        # builds ignore this field, so it's safe to always send.
+                        "project_root": str(project_dir(self.project)),
                     },
                     timeout=10.0,
                 )

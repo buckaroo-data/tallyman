@@ -12,16 +12,20 @@ from pydata_core import (
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
+    StatSourceError,
     alias_for_hash,
     entry_dir,
     get_alias,
+    list_stats,
     notebook,
     record_error,
     remove_alias,
+    remove_stat,
     rename_alias,
     resolve_project,
     set_alias,
     set_chart,
+    write_stat,
 )
 from pydata_core import history_for
 from pydata_xorq import BuildError, build_and_persist, full_diff, list_entries
@@ -367,6 +371,72 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
             else None
         ),
     }
+
+
+@mcp.tool()
+def catalog_add_summary_stat(name: str, source: str) -> dict:
+    """Register a project-authored column summary stat.
+
+    ``source`` must define a callable ``compute(col)`` that takes an ibis
+    column expression and returns an ibis expression (scalar). The
+    function is validated by dry-running it against a 1-row in-memory
+    table before the file lands on disk — syntax / type / shape errors
+    surface in the tool response, not later in the buckaroo log.
+
+    The stat shows up alongside the built-in xorq column stats the next
+    time a catalog entry's buckaroo session is loaded (clicking a
+    different entry, or after a buckaroo restart). V1 does NOT hot-swap
+    already-loaded sessions.
+
+    ``source`` example::
+
+        def compute(col):
+            return (col.cast("string").contains("@").sum() / col.count())
+
+    The function name MUST be ``compute``; the *filename* is ``<name>.py``
+    under ``<project>/stats/``, and the file's stem is the stat's key in
+    every column's stats panel.
+
+    Args:
+        name: filename stem (no ``.py``). Must be a valid python identifier.
+        source: the file body. Must define ``compute(col) -> ibis_expr``.
+    """
+    project = resolve_project()
+    try:
+        path = write_stat(project, name, source)
+    except StatSourceError as exc:
+        return {"error": str(exc)}
+    _notify("stats_changed", extra={"action": "add", "name": name})
+    return {"name": name, "path": str(path)}
+
+
+@mcp.tool()
+def catalog_remove_summary_stat(name: str) -> dict:
+    """Soft-delete a project-authored stat.
+
+    Moves ``stats/<name>.py`` to ``stats/_disabled/<name>.py``. The
+    ``_disabled/`` subdirectory is ignored by buckaroo's scanner (the
+    ``_`` prefix is the convention) so the stat disappears from new
+    sessions on the next load. To hard-delete, ``rm`` the file under
+    ``stats/_disabled/`` manually.
+    """
+    project = resolve_project()
+    new_path = remove_stat(project, name)
+    if new_path is None:
+        return {"error": f"no stat named {name!r}"}
+    _notify("stats_changed", extra={"action": "remove", "name": name})
+    return {"name": name, "moved_to": str(new_path)}
+
+
+@mcp.tool()
+def catalog_list_summary_stats() -> list[dict]:
+    """List every project-authored summary stat (active + disabled).
+
+    Returns ``[{name, path, source, disabled}]`` sorted with active stats
+    first, then disabled (parked) ones.
+    """
+    project = resolve_project()
+    return list_stats(project)
 
 
 @mcp.tool()

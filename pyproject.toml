@@ -17,12 +17,11 @@ dependencies = [
     "pyarrow>=16",
     "sse-starlette>=2.1",
     "tomli-w>=1.0",
-    # Buckaroo's server. Path source declared in [tool.uv.sources].
     # We pin requires-python to <3.14 because buckaroo's pyarrow constraint on
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo",
+    "buckaroo==0.14.2",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
 ]
@@ -64,6 +63,3 @@ markers = [
 filterwarnings = [
     "ignore::UserWarning:xorq.ibis_yaml.translate",
 ]
-
-[tool.uv.sources]
-buckaroo = { path = "../../buckaroo" }

@@ -64,6 +64,80 @@ def test_unit_ensure_session_short_circuits_when_not_running(project: str):
     assert mgr.ensure_session("anyhash") is None
 
 
+def test_unit_ensure_session_restarts_dead_subprocess(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """If buckaroo's subprocess died since the last call (mid-session crash,
+    OOM, signal), ensure_session attempts one restart instead of silently
+    falling back forever. Without this, a one-time death turns the rest of
+    the session into pandas-only with no log line the user would notice."""
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project)
+    # Simulate a previously-running buckaroo that has now exited.
+    class _DeadProc:
+        returncode = 1
+        def poll(self):
+            return 1
+    mgr.proc = _DeadProc()  # type: ignore[assignment]
+    mgr.bound_port = None
+
+    # Stub start() so the test doesn't actually spawn a subprocess —
+    # it just flips state to "running" as a real start would.
+    restart_calls = {"n": 0}
+    class _LiveProc:
+        returncode = None
+        def poll(self):
+            return None
+    def fake_start(self):
+        restart_calls["n"] += 1
+        self.proc = _LiveProc()
+        self.bound_port = 8700
+    monkeypatch.setattr(BuckarooManager, "start", fake_start)
+
+    # Stub the /load POST so we don't need a real server.
+    class _Resp:
+        def raise_for_status(self): pass
+        def json(self): return {"session": "restored-session"}
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
+
+    sid = mgr.ensure_session(res.content_hash)
+    assert sid == "restored-session"
+    assert restart_calls["n"] == 1
+
+
+def test_unit_ensure_session_restart_throttled(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """If buckaroo restart fails, don't retry on every page hit — that
+    would hammer the system with subprocess spawns. Throttle to one
+    attempt per cooldown."""
+    build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager(project)
+    class _DeadProc:
+        returncode = 1
+        def poll(self):
+            return 1
+    mgr.proc = _DeadProc()  # type: ignore[assignment]
+    mgr.bound_port = None
+
+    from pydata_companion.buckaroo_lifecycle import BuckarooUnavailable
+    restart_calls = {"n": 0}
+    def failing_start(self):
+        restart_calls["n"] += 1
+        raise BuckarooUnavailable("simulated startup failure")
+    monkeypatch.setattr(BuckarooManager, "start", failing_start)
+
+    # First call attempts a restart.
+    assert mgr.ensure_session("anyhash") is None
+    assert restart_calls["n"] == 1
+
+    # Second call within the cooldown window does NOT attempt another.
+    assert mgr.ensure_session("anyhash") is None
+    assert restart_calls["n"] == 1
+
+
 def test_unit_status_shape(project: str):
     mgr = BuckarooManager(project)
     s = mgr.status()

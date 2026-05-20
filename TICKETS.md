@@ -50,74 +50,52 @@ skipping `__pycache__`, `.DS_Store`, and the stale
 `tests/test_pack.py::test_pack_round_trip_serves`. See also T-24
 (also fixed) which would have invalidated builds on a rename.
 
-### T-31 — Buckaroo session pre-hydration (PR against buckaroo)
+### ~~T-31 — Buckaroo session pre-hydration~~ ✗ moot under React embed 2026-05-20
 
-The biggest remaining FOUC inside the iframe is the bootstrap window:
-the JS bundle parses, connects to `/ws/<session>`, fetches the data
-dictionary + first page of rows, then renders. ~200–500ms even on a
-warm cache.
+Premised on the iframe model where `GET /s/<session>` returned an HTML
+shell that booted a JS bundle. After the iframe → React-embed swap
+(5ee5cc7) the embed mounts directly into the companion's page and
+hydrates over WS — there is no separate `/s/<session>` HTML to
+pre-hydrate. The FOUC story is now "load WS → first frame," not
+"load JS → connect WS → fetch → render"; the right next move there
+is WS-side first-frame size reduction (see T-33's memory baseline)
+rather than HTML pre-hydration.
 
-**Buckaroo-side PR idea:** have `GET /s/<session>` inline the initial
-state into the page as `<script type="application/json"
-id="bk-initial-state">…</script>`. The JS bundle's bootstrap path
-checks for that element first; if present it hydrates synchronously
-and never opens the WS for the first render (it still opens the WS
-for live updates / subsequent pages).
+### ~~T-32 — Iframe pool / multi-session caching~~ ✗ moot 2026-05-20
 
-This would collapse the iframe bootstrap from "load JS → connect WS →
-fetch data → render" to "load JS → render". Especially impactful for
-the demo, where each beat creates a new entry and the iframe pops in
-several times.
+Same iframe → React-embed swap; there are no iframes left to pool.
+Each `[data-ws-url]` div now mounts a `BuckarooServerView` in place,
+and SPA-lite navigation swaps the host element via the
+`MutationObserver` in `static/buckaroo-embed.js`. T-33 is the live
+guard for the memory shape this changes to.
 
-### T-32 — Iframe pool / multi-session caching (pydata-app side)
+### ~~T-30 — XorqBuckarooInfiniteWidget over the standalone server~~ ✅ 2026-05-20
 
-Even with pre-hydration, navigating between entries reloads the iframe
-content because the `src` changes. To eliminate that entirely we'd
-keep one iframe per visited entry, hidden, and toggle visibility on
-nav. Memory cost is ~1.5 MB JS state + the grid's data per iframe;
-fine for a 5–10 entry demo.
+**Buckaroo side:** Filed as
+[buckaroo-data/buckaroo#773](https://github.com/buckaroo-data/buckaroo/issues/773);
+implemented as
+[buckaroo-data/buckaroo#776](https://github.com/buckaroo-data/buckaroo/pull/776)
+(`feat/load-expr-server`). Adds `POST /load_expr` + a `backend="xorq"`
+discriminator on the existing `mode="buckaroo"` dispatch arm.
 
-- **Where:** SPA-lite controller in `base.html`. On navigation, look up
-  the target entry's iframe in a persistent `#iframe-pool` div; if
-  found, move it into the detail pane's iframe slot. If not, create
-  it lazily and move on next nav.
-- **Trade-off:** iframes outside the viewport still keep their WS
-  connections open; that's OK at the demo's scale but worth bounding
-  to ~5 LRU on a longer-lived session.
+**pydata-app side:** `BuckarooManager.ensure_session` POSTs to
+`/load_expr` with the entry's `xorq_build/` directory; the dead
+`mode` parameter is gone. One subtlety surfaced during integration:
+buckaroo's `xorq_loading.load_expr_build_dir` calls
+`xorq.api.load_expr` directly, so it does **not** resolve pydata's
+`${PYDATA_PROJECT_ROOT}` placeholders. Without expansion the session
+loads fine (schema flows from YAML) but every paged read returns
+zero rows. ensure_session now `expand_to_tmp`s the build dir before
+POSTing and rmtree's the tmp on `stop()`. Tracked per content_hash
+so concurrent hits don't double-expand.
 
-### T-30 — XorqBuckarooInfiniteWidget over the standalone server
+Verified end-to-end: `GET /catalog/shoe_sales` →
+`buckaroo.server.handlers: load_expr ... rows=4 backend=xorq`.
 
-We're using `mode="buckaroo"` (BuckarooInfiniteWidget) which materialises
-each catalog entry's parquet and pages over the materialised frame.
-`XorqBuckarooInfiniteWidget` (`buckaroo/xorq_buckaroo.py`) is strictly
-better for the demo: it operates on the xorq expression directly,
-pages via `expr.limit(end - start, offset=start).execute()`, and pushes
-sort/aggregation down to the backend. We can't reach it through the
-standalone server today because the server only has `POST /load` /
-`/load_compare` (file-path based) — there's no `/load_expr` endpoint
-that takes a xorq build dir.
-
-- **Where:** would require adding a handler to `buckaroo/server/handlers.py`
-  (call it `LoadExprHandler`) that takes `{path_to_build_dir, no_browser}`,
-  loads the expression via `pydata_xorq.load_entry` (or xorq's
-  `load_expr_from_tgz`), instantiates `XorqBuckarooInfiniteWidget`, and
-  pushes the buckaroo-state to subscribers. Could pair with a new
-  `mode="xorq"` in the existing `LoadHandler` so both endpoints share
-  validation.
-- **In pydata-app:** swap `BuckarooManager.ensure_session` to call the
-  new endpoint with the entry's `xorq_build/` dir; everything else
-  (sessions cache, iframe URL, etc.) stays the same.
-- **Verify:** sorting/filtering a large entry's column doesn't
-  re-materialise the whole parquet, and a backend that supports
-  push-down (datafusion) executes the predicate.
-
-This is a buckaroo-side change, not a pydata-app change. Defer until
-either we add the endpoint to the local buckaroo checkout or the
-buckaroo project ships it.
-
-Filed upstream as
-[buckaroo-data/buckaroo#773](https://github.com/buckaroo-data/buckaroo/issues/773)
-(2026-05-20).
+Files touched: `src/pydata_companion/buckaroo_lifecycle.py`,
+`tests/test_buckaroo.py` (+5 tests: 4 stress, 1 row-count smoke
+integration). pyproject + uv.lock pin buckaroo to the local PR 776
+editable; switch to a git ref or published version once PR 776 lands.
 
 ### ~~T-07 — Buckaroo server is not integrated~~ ✅ done 2026-05-11
 

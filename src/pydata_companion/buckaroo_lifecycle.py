@@ -55,7 +55,18 @@ log = logging.getLogger("pydata.buckaroo")
 
 
 def _port_in_use(port: int) -> bool:
+    """Probe whether `port` is currently bound to a listener on localhost.
+
+    SO_REUSEADDR matches Tornado's own bind options — without it, the probe
+    false-positives for ~60s after a restart whenever the previous buckaroo
+    had any client connections (a browser WS, the embed) open at shutdown:
+    the closed connections' TIME_WAIT artifacts make a bare bind() fail with
+    EADDRINUSE even though no listener exists. The real Tornado server can
+    still bind such a port; the probe just disagreed and forced a port=0
+    fallback the user noticed as a fresh random port on each restart.
+    """
     s = socket.socket()
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     try:
         s.bind(("127.0.0.1", port))
     except OSError:

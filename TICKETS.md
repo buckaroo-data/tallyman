@@ -115,6 +115,10 @@ This is a buckaroo-side change, not a pydata-app change. Defer until
 either we add the endpoint to the local buckaroo checkout or the
 buckaroo project ships it.
 
+Filed upstream as
+[buckaroo-data/buckaroo#773](https://github.com/buckaroo-data/buckaroo/issues/773)
+(2026-05-20).
+
 ### ~~T-07 — Buckaroo server is not integrated~~ ✅ done 2026-05-11
 
 `pydata run` now manages a Buckaroo subprocess (default `:8700`, falls

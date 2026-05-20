@@ -209,20 +209,21 @@ The companion has two modes. **Edit mode** (`pydata run`) is the authoring surfa
 Buckaroo runs as a **live Tornado server** managed by the companion subprocess group. This enables search, sort, filter, and column-level recon (null counts, distributions) directly in the table widget — the in-line recon tier of the three-tier model.
 
 **Lifecycle:**
-1. `pydata run` starts: companion spawns `python -m buckaroo.server --port 8700` as a subprocess. Companion holds the subprocess handle; cleans up on shutdown.
-2. Companion proxies/passes file paths only — no data is copied; both processes read the same parquet file.
-3. When a new catalog entry lands (companion is notified via `/internal/notify`), the companion POSTs `result.parquet`'s file path to buckaroo's `/load` endpoint and gets back a `session_id`. Stored in `buckaroo_sessions.json` keyed by content hash.
-4. Catalog tab's entry-detail panel includes `<iframe src="http://localhost:8700/s/<session_id>" />`. Buckaroo handles its own UI for that table.
-5. On startup, companion repopulates `buckaroo_sessions.json` by calling `/load` for every parquet in the catalog (lazy: only when the entry is first viewed).
+1. `pydata run` starts: companion spawns `python -m buckaroo.server --port 8700 --no-browser --stdio-control` as a subprocess. Companion holds the subprocess handle; cleans up on shutdown.
+2. When a new catalog entry lands (companion is notified via `/internal/notify`), the companion expands the entry's `xorq_build/` dir into a tmp copy with `${PYDATA_PROJECT_ROOT}` placeholders resolved, then POSTs that path to buckaroo's `/load_expr` endpoint (added in upstream PR 776). Buckaroo loads the xorq expression and returns a `session_id`. Stored in `buckaroo_sessions.json` keyed by content hash.
+3. The entry-detail page renders a `<div data-ws-url="ws://localhost:8700/ws/<session_id>">` placeholder; the React embed (`static/buckaroo-embed.js`, built from `packages/embed/`) mounts `BuckarooServerView` into it and pages rows over the WS. Sort/search push-down lands on the underlying backend rather than re-materialising the parquet.
+4. On companion startup, `buckaroo_sessions.json` is loaded but treated as a *naming hint* — buckaroo itself is fresh, so sessions are lazily re-created on first view (and the cache is invalidated when buckaroo's reported `started` timestamp doesn't match what was last persisted).
 
 **What goes through Buckaroo vs not:**
-- Tabular results → Buckaroo iframe.
-- Chart (Vega-Lite spec attached) → renders above the iframe in the entry detail panel.
+- Tabular results → React embed (`BuckarooServerView`) mounted into the entry-detail page, talking to Buckaroo's WS.
+- Chart (Vega-Lite spec attached) → renders above the embed in the entry detail panel.
 - Schema, code, prompt, lineage, forensic history → Jinja2-rendered HTML in the entry detail tabs (NOT in Buckaroo).
 
 **Why not the Buckaroo MCP server?** Different pattern: that one opens a sibling browser tab. We want Buckaroo embedded inside our companion's catalog tab, not as a sibling. We use the standalone Tornado server directly.
 
-**Build prerequisites:** `~/buckaroo/scripts/full_build.sh` produces the JS bundles in `~/buckaroo/buckaroo/static/`. We either depend on `buckaroo` from PyPI (if those static assets are shipped) or copy the static dir into our package as a build step.
+**Why React embed and not iframe?** The original design used `<iframe src="/s/<session>">`. The iframe model carried a FOUC (full bundle re-bootstrap per nav) and a per-cell isolation tax (separate browser contexts). The React embed mounts directly into the host page, sharing the document, and connects over WS. T-31/T-32 documented the iframe-era follow-ups; both are now moot. T-33 is the new memory baseline ticket for the embed model.
+
+**Build prerequisites:** `packages/embed/` builds a tiny ~1.4MB ESM bundle that mounts `BuckarooServerView` from `buckaroo-js-core`. Bundle is committed at `src/pydata_companion/static/buckaroo-embed.js` so fresh clones run without Node. The Python `buckaroo` server is a normal PyPI dep (path-sourced during PR 776 testing; switch to a published version or git ref once PR 776 lands).
 
 ---
 
@@ -279,7 +280,7 @@ Closing line on stage: *"The notebook is the story. The catalog is what did the 
 | 8 | Auto-focus catalog tab on new entries | "The browser updates live as the agent works" — the talk's thesis |
 | 9 | Catalog itself is curated (prune wrong explanations); not append-only-forever | Honesty over completeness |
 | 10 | Identity by content hash; aliases are mutable handles | Standard xorq model |
-| 11 | Live Buckaroo Tornado server (port 8700), iframed into entry detail | Search requires live server; static-embed insufficient |
+| 11 | Live Buckaroo Tornado server (port 8700), React-embedded into entry detail; sessions backed by `XorqBuckarooInfiniteWidget` via `/load_expr` | Search/sort push-down lands on the xorq backend; no parquet re-materialisation |
 | 12 | Build pydata-app fresh; vendor/copy from xorq-mcp; don't extend it | Different data model; talk hardening easier in a fresh repo |
 
 ---

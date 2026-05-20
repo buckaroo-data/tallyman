@@ -33,9 +33,15 @@ What's working:
 - **Buckaroo subprocess** — `pydata run` spawns `python -m buckaroo.server`
   on `:8700` (falls back to a random port if busy), watches for the
   `BUCKAROO_PORT=...` handshake, and lazily creates per-entry sessions on
-  first view. Sessions are persisted under `catalog/buckaroo_sessions.json`
-  and invalidated by start-time when Buckaroo restarts. Tear-down rides
-  along with the companion. Disable with `--no-buckaroo`.
+  first view by POSTing the entry's `xorq_build/` dir to Buckaroo's
+  `/load_expr` endpoint (PR 776) — sort/search push down to the xorq
+  backend rather than paging over a materialised parquet. The build dir
+  is expanded into a tmp copy first so `${PYDATA_PROJECT_ROOT}`
+  placeholders are resolved before xorq's loader sees them. Sessions are
+  persisted under `catalog/buckaroo_sessions.json` and invalidated by
+  start-time when Buckaroo restarts; tmp dirs are cleaned on
+  `BuckarooManager.stop()`. Tear-down rides along with the companion.
+  Disable with `--no-buckaroo`.
 - **Build artifacts are portable.** xorq's absolute filesystem paths are
   rewritten to `${PYDATA_PROJECT_ROOT}` on write and expanded back on load.
 - **`pydata serve <project_dir>`** — read-only companion against a project

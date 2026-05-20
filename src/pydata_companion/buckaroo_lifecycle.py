@@ -101,6 +101,12 @@ class BuckarooManager:
         self._sessions: dict[str, str] = {}
         self._session_lock = threading.Lock()
         self._buckaroo_started_at: float | None = None
+        # Auto-restart bookkeeping. If buckaroo dies mid-session and we
+        # try to restart on every page hit, a persistent failure (port
+        # taken, deps missing) would thrash. Throttle to one attempt per
+        # ``_restart_cooldown`` seconds.
+        self._last_restart_attempt: float = 0.0
+        self._restart_cooldown: float = 30.0
         self._load_session_file()
 
     # ------------------------------------------------------------------
@@ -283,13 +289,40 @@ class BuckarooManager:
     # session creation
     # ------------------------------------------------------------------
 
+    def _maybe_restart(self) -> None:
+        """If buckaroo's subprocess has exited since we last looked,
+        attempt to restart it. Throttled so a persistently-failing
+        startup doesn't thrash on every page view."""
+        if self.is_running:
+            return
+        if self.proc is None:
+            return  # never started; not our job to start it here
+        rc = self.proc.poll()
+        now = time.monotonic()
+        if now - self._last_restart_attempt < self._restart_cooldown:
+            return
+        self._last_restart_attempt = now
+        log.warning("buckaroo subprocess exited (rc=%s); attempting restart", rc)
+        self.proc = None
+        self.bound_port = None
+        try:
+            self.start()
+            log.info("buckaroo restarted successfully")
+        except BuckarooUnavailable as exc:
+            log.warning("buckaroo restart failed: %s (will retry after cooldown)", exc)
+
     def ensure_session(self, content_hash: str) -> str | None:
         """Return a Buckaroo session_id for `content_hash`, creating it if needed.
 
         Returns None (instead of raising) if Buckaroo isn't running or the load
         fails — the companion falls back to the pandas.to_html preview in that
         case. We don't want a Buckaroo hiccup to take down the whole detail page.
+
+        If the subprocess died since the last call (mid-session crash, OOM,
+        or signal), one restart attempt is made — throttled by
+        ``_restart_cooldown`` to avoid thrashing on a persistent failure.
         """
+        self._maybe_restart()
         if not self.is_running or self.bound_port is None:
             return None
         parquet = entry_dir(self.project, content_hash) / "result.parquet"

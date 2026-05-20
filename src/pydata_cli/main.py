@@ -58,10 +58,11 @@ def run_companion(
 
     bk: BuckarooManager | None = None
     if buckaroo:
-        bk = BuckarooManager(project_name, port=buckaroo_port)
+        buckaroo_log = project_dir(project_name) / "buckaroo.log"
+        bk = BuckarooManager(project_name, port=buckaroo_port, log_file=buckaroo_log)
         try:
             bk.start()
-            click.echo(f"  buckaroo · {bk.base_url}")
+            click.echo(f"  buckaroo · {bk.base_url} (log: {buckaroo_log})")
         except BuckarooUnavailable as exc:
             click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
             bk = None

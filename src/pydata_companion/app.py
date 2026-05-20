@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from pathlib import Path
 
 import markdown as md_lib
@@ -37,6 +38,8 @@ from pydata_xorq import (
     read_prompts,
 )
 from pydata_xorq.layout import layered_positions
+
+log = logging.getLogger("pydata.companion")
 
 PKG_DIR = Path(__file__).resolve().parent
 TEMPLATES_DIR = PKG_DIR / "templates"
@@ -270,6 +273,13 @@ def create_app(
     async def notify(payload: NotifyPayload):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
+        # T-34: log the kind so "where did all these /internal/notify hits come
+        # from" investigations are a single grep rather than guesswork.
+        log.info(
+            "notify kind=%s hash=%s",
+            payload.kind,
+            getattr(payload, "hash", None),
+        )
         await publish(payload.model_dump())
         return {"ok": True, "subscribers": len(subscribers)}
 

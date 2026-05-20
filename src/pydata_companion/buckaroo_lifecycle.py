@@ -319,7 +319,15 @@ class BuckarooManager:
         self.bound_port = None
         try:
             self.start()
-            log.info("buckaroo restarted successfully")
+            # T-35: after restart the bound port may have changed (random
+            # port fallback if the original was in use); print both so the
+            # user can correlate against ps/lsof.
+            new_pid = self.proc.pid if self.proc is not None else "?"
+            log.info(
+                "buckaroo restarted successfully (pid=%s port=%s)",
+                new_pid,
+                self.bound_port,
+            )
         except BuckarooUnavailable as exc:
             log.warning("buckaroo restart failed: %s (will retry after cooldown)", exc)
 

@@ -91,6 +91,7 @@ def test_unit_ensure_session_restarts_dead_subprocess(
     restart_calls = {"n": 0}
     class _LiveProc:
         returncode = None
+        pid = 99999
         def poll(self):
             return None
     def fake_start(self):

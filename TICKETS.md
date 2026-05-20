@@ -244,12 +244,11 @@ Conftest now sets `XORQ_CACHE_DIR` to a session-scoped `mkdtemp` at
 module load (xorq freezes the env var at first import, so the env tweak
 has to happen before any test or helper imports xorq).
 
-### T-22 — Slow stdio tests aren't marked
+### ~~T-22 — Slow stdio tests aren't marked~~ ✅ already done
 
-`tests/test_mcp_stdio.py` is ~3.5s for 3 tests. Mark as
-`@pytest.mark.integration` and add `addopts = "-m 'not integration'"`
-default in `pyproject.toml` with explicit `pytest -m integration` for
-the full run.
+`tests/test_mcp_stdio.py` tests are all decorated with
+`@pytest.mark.integration`; `pyproject.toml` has
+`addopts = "-m 'not integration'"`. Closed on review 2026-05-20.
 
 ### T-33 — Memory-scaling integration test for the React embed
 
@@ -309,43 +308,18 @@ N-cell notebook = N WS connections + N AG-Grid instances.
 Defer until Option B is merged. Should be the first test against the
 new embed surface.
 
-### T-34 — `/internal/notify` should log the event `kind`
+### ~~T-34 — `/internal/notify` should log the event `kind`~~ ✅ 2026-05-20
 
-Found during the 2026-05-20 buckaroo-death investigation. Companion
-log showed 145 `POST /internal/notify HTTP/1.1 200 OK` lines in a
-session with no observable state mutation. Couldn't tell what the
-events *were* because the handler (`src/pydata_companion/app.py`,
-`@app.post("/internal/notify")` ~line 269) just calls
-`await publish(payload.model_dump())` and returns — no log line, no
-visibility into the burst.
+`@app.post("/internal/notify")` now `log.info`s `kind` and `hash`
+before publishing to subscribers. Logger is `pydata.companion`; INFO
+level is on by default under uvicorn's `log_level="info"`.
 
-**Fix:** add one `log.info("notify kind=%s hash=%s", payload.kind,
-payload.hash)` (or equivalent) inside the handler so future
-"where did all these events come from" investigations are
-single-grep instead of guesswork. Possibly also include the
-remote address (useful when multiple MCP-server processes are
-talking to one companion).
+### ~~T-35 — Companion startup banner should print buckaroo PID~~ ✅ 2026-05-20
 
-Cheap; high observability payoff; touches one file.
-
-### T-35 — Companion startup banner should print buckaroo PID
-
-Found during the same investigation. `pydata run` echoes
-"buckaroo · http://127.0.0.1:8700 (log: ...)" but not the PID. When
-stale buckaroos linger from earlier debugging (port 8701, port 0
-fallback after a port collision, etc.), `ps`/`lsof` are needed to
-disambiguate which buckaroo belongs to which companion. After
-auto-restart the bound port can also change without the user
-noticing — printing the new PID/port on restart would surface that.
-
-**Fix:** echo `self.proc.pid` (and the final `bound_port`) after
-`start()` succeeds in `pydata_cli/main.py` and again in
-`BuckarooManager._maybe_restart` after a restart. Both currently
-`log.info` the URL but the PID isn't there.
-
-Trivial; useful for development hygiene; should also save the
-PID into `buckaroo_sessions.json`'s envelope for the auto-restart
-detection case.
+`pydata run` banner now includes `pid=<n>` next to the URL. After an
+auto-restart in `BuckarooManager._maybe_restart`, the success log
+includes both the new pid and the bound port (which can change if the
+original port was reclaimed by something else).
 
 ### ~~T-23 — `pydata init` silently re-runs~~ ✅ 2026-05-11
 

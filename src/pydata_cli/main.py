@@ -62,7 +62,12 @@ def run_companion(
         bk = BuckarooManager(project_name, port=buckaroo_port, log_file=buckaroo_log)
         try:
             bk.start()
-            click.echo(f"  buckaroo · {bk.base_url} (log: {buckaroo_log})")
+            # T-35: include PID + bound port so `ps`/`lsof` disambiguation is
+            # trivial when stale buckaroos linger from earlier debugging.
+            click.echo(
+                f"  buckaroo · {bk.base_url} pid={bk.proc.pid if bk.proc else '?'} "
+                f"(log: {buckaroo_log})"
+            )
         except BuckarooUnavailable as exc:
             click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
             bk = None

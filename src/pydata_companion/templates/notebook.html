@@ -1,8 +1,8 @@
 {% extends "base.html" %}
 {% block content %}
-<section style="padding: 12px 16px;">
-  <h2 style="margin: 8px 16px;">notebook · {{ project }}</h2>
-  <p class="meta" style="margin: 0 16px 8px;">
+<section style="padding: 4px 0;">
+  <h2 style="margin: 0 16px 2px;">notebook · {{ project }}</h2>
+  <p class="meta" style="margin: 0 16px 4px;">
     {{ cells|length }} cell{{ '' if cells|length == 1 else 's' }}.
     Cells are anchored on aliases; revising an alias updates the cell in place
     and keeps prior versions in forensic history (visible from the catalog tab).
@@ -21,12 +21,15 @@
         <span class="alias">{{ c.alias }}</span>
         {% if c.version %}<span class="vchip">V{{ c.version }}</span>{% endif %}
         {% if c.latest_hash %}<a class="pill" href="/catalog/{{ c.latest_hash }}">{{ c.latest_hash }}</a>{% endif %}
-        {% if not read_only %}
         <span class="nb-actions">
+          {% if c.buckaroo_session and buckaroo_ws_base %}
+          <button type="button" class="nb-size-btn" onclick="nbCycleSize('{{ c.cell_id }}', this)" title="cycle embed size: 260px → 75vh → 90vh">260px</button>
+          {% endif %}
+          {% if not read_only %}
           <button type="button" onclick="nbEdit('{{ c.cell_id }}')">edit</button>
           <button type="button" onclick="nbRemove('{{ c.cell_id }}')">×</button>
+          {% endif %}
         </span>
-        {% endif %}
       </div>
 
       <div class="nb-markdown" id="md-{{ c.cell_id }}" data-raw="{{ c.markdown|e }}">
@@ -41,7 +44,6 @@
         <div
           class="buckaroo-embed nb-buckaroo"
           data-ws-url="{{ buckaroo_ws_base }}/ws/{{ c.buckaroo_session }}"
-          style="width: 100%; height: 380px; border: 1px solid var(--line); border-radius: 4px; background: #181d1f;"
         ></div>
       {% elif c.preview_html %}
         <div class="nb-preview">{{ c.preview_html|safe }}</div>
@@ -61,6 +63,26 @@
   {% endfor %}
   </div>
 </section>
+
+<script>
+// Cycle the embed size on a notebook cell: 260px → 75vh → 90vh → 260px.
+// Lives outside the read-only guard so the toggle works in `pydata serve`
+// (no mutations — purely client-side viewport choice).
+function nbCycleSize(cellId, btn) {
+  const cycle = [
+    {key: "", label: "260px"},
+    {key: "3q", label: "75vh"},
+    {key: "max", label: "90vh"},
+  ];
+  const embed = document.querySelector('#cell-' + cellId + ' .nb-buckaroo');
+  if (!embed) return;
+  const cur = embed.dataset.size || "";
+  const idx = cycle.findIndex((s) => s.key === cur);
+  const next = cycle[(idx + 1) % cycle.length];
+  if (next.key) embed.dataset.size = next.key; else delete embed.dataset.size;
+  if (btn) btn.textContent = next.label;
+}
+</script>
 
 {% if not read_only %}
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>

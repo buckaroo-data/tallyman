@@ -64,8 +64,8 @@
     .dag .edge { stroke: var(--muted); stroke-width: 1.5; fill: none; opacity: 0.7; }
     .dag a:hover .node-box { stroke: var(--accent); }
     .dag-empty { color: var(--muted); padding: 12px; }
-    .nb-cell { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 12px 14px; margin: 14px 16px; }
-    .nb-cell .nb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; }
+    .nb-cell { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; padding: 8px 12px; margin: 8px 16px; overflow: hidden; }
+    .nb-cell .nb-head { display: flex; align-items: center; gap: 8px; margin-bottom: 4px; }
     .nb-cell .nb-drag { cursor: grab; color: var(--muted); user-select: none; font-size: 14px; padding: 0 4px; }
     .nb-cell .nb-drag:active { cursor: grabbing; }
     .sortable-ghost { opacity: 0.4; }
@@ -74,15 +74,36 @@
     .nb-cell .nb-head .nb-actions { margin-left: auto; display: flex; gap: 6px; }
     .nb-cell .nb-head button { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: inherit; }
     .nb-cell .nb-head button:hover { color: var(--fg); border-color: var(--accent); }
-    .nb-cell .nb-markdown { color: var(--muted); margin: 4px 0 10px; white-space: pre-wrap; }
+    .nb-cell .nb-markdown { color: var(--muted); margin: 2px 0 6px; }
+    /* Kill default browser margins on rendered markdown — h1/p/etc. blow
+       cells up vertically and bury the next cell below the fold. */
+    .nb-cell .nb-markdown > :first-child { margin-top: 0; }
+    .nb-cell .nb-markdown > :last-child { margin-bottom: 0; }
+    .nb-cell .nb-markdown h1, .nb-cell .nb-markdown h2, .nb-cell .nb-markdown h3,
+    .nb-cell .nb-markdown h4, .nb-cell .nb-markdown h5, .nb-cell .nb-markdown h6 {
+      margin: 4px 0 2px; font-size: 13px; color: var(--fg); font-weight: 600;
+    }
+    .nb-cell .nb-markdown p { margin: 2px 0; }
+    .nb-cell .nb-markdown ul, .nb-cell .nb-markdown ol { margin: 2px 0; padding-left: 20px; }
     .nb-cell .nb-markdown-edit { width: 100%; min-height: 60px; background: #0a0c12; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 6px 8px; font-family: ui-monospace, monospace; font-size: 12px; }
     .nb-cell .nb-preview { overflow: auto; max-height: 240px; }
-    .nb-cell .nb-meta { color: var(--muted); font-size: 11px; margin-top: 8px; }
+    .nb-cell .nb-meta { color: var(--muted); font-size: 11px; margin-top: 6px; }
     .nb-empty { color: var(--muted); padding: 16px; }
     .vega-embed { background: #fff; border-radius: 4px; padding: 8px; min-height: 200px; }
     /* Buckaroo React embed: background matches the widget's dark theme so
-       there's no white flash between mount and first WebSocket payload. */
-    .buckaroo-embed { background: #181d1f; }
+       there's no white flash between mount and first WebSocket payload.
+       Default height suits the entry-detail page; notebook cells override
+       to a smaller fixed height so the next cell is visible on first load. */
+    /* overflow: hidden is load-bearing — AG Grid sizes by row count inside
+       (autoHeight not exposed; see buckaroo-data/buckaroo#846), so without
+       clipping the grid renders past the box and visually invades the next
+       notebook cell. */
+    .buckaroo-embed { background: #181d1f; border: 1px solid var(--line); border-radius: 4px; width: 100%; height: 55vh; overflow: hidden; }
+    .buckaroo-embed.nb-buckaroo { height: 260px; }
+    /* notebook-cell embed size cycle: default → 3q-viewport → max */
+    .buckaroo-embed.nb-buckaroo[data-size="3q"] { height: 75vh; }
+    .buckaroo-embed.nb-buckaroo[data-size="max"] { height: 90vh; }
+    .nb-size-btn { font-family: ui-monospace, monospace; min-width: 44px; text-align: center; }
     .edit-code-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; margin-left: 8px; }
     .edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
     .section-header { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; padding: 10px 12px 4px; border-top: 1px solid var(--line); }

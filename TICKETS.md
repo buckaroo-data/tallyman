@@ -339,14 +339,15 @@ The companion's `/api/sse` route returns `EventSourceResponse` from
 `sse_starlette.sse`. My V0.5 description was wrong — I don't roll my
 own SSE, the dep is in use. Closed without action.
 
-### ~~T-26 — No CI~~ ⚠ partial 2026-05-11
+### ~~T-26 — No CI~~ ✅ 2026-05-24
 
-`.github/workflows/tests.yml` shipped as a starting point. Two jobs:
-fast suite (default `-m 'not integration'`) and integration. Will not
-work as-is until the buckaroo path source is replaced with a git ref
-or a published PyPI version — `[tool.uv.sources] buckaroo = { path =
-"../../buckaroo" }` can't resolve under `$GITHUB_WORKSPACE`. Workflow
-text documents the constraint.
+`.github/workflows/tests.yml` runs three sequential jobs on push to
+``main``/``spike/**`` and on PRs targeting ``main``: ruff lint, fast
+test suite (`-m "not integration"`), and integration tests. Was
+provisional until the buckaroo path source was resolved — pinning
+``buckaroo==0.14.6`` from PyPI (commit a89c7b4) cleared the blocker.
+The embed bundle is not built in CI; Python tests only reference its
+URL, never load it.
 
 ### T-36 — `/api/data/<hash>` leaf goes Arrow → pandas → records
 

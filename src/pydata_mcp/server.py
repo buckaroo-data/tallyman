@@ -12,19 +12,23 @@ from pydata_core import (
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
+    PostProcessingSourceError,
     StatSourceError,
     alias_for_hash,
     entry_dir,
     get_alias,
+    list_post_processings,
     list_stats,
     notebook,
     record_error,
     remove_alias,
+    remove_post_processing,
     remove_stat,
     rename_alias,
     resolve_project,
     set_alias,
     set_chart,
+    write_post_processing,
     write_stat,
 )
 from pydata_core import history_for
@@ -437,6 +441,73 @@ def catalog_list_summary_stats() -> list[dict]:
     """
     project = resolve_project()
     return list_stats(project)
+
+
+@mcp.tool()
+def catalog_add_post_processing(name: str, source: str) -> dict:
+    """Register a project-authored post-processing function.
+
+    ``source`` must define a callable ``process(expr)`` that takes the
+    table expression and returns either a transformed ibis expression or
+    a pandas DataFrame. The function is validated by dry-running it
+    against a small in-memory table before the file lands on disk —
+    syntax / type / shape errors surface in the tool response, not later
+    in the buckaroo log.
+
+    The function shows up as a new option in the embed's "post
+    processing" dropdown the next time a catalog entry's buckaroo
+    session is loaded (clicking a different entry, revising an alias,
+    or after a buckaroo restart). V1 does NOT hot-swap already-loaded
+    sessions.
+
+    ``source`` example — flag low-volume regions::
+
+        def process(expr):
+            return expr.filter(expr.n < 100)
+
+    The function name MUST be ``process``; the *filename* is
+    ``<name>.py`` under ``<project>/post_processing/``, and the file's
+    stem is the option label in the dropdown.
+
+    Args:
+        name: filename stem (no ``.py``). Must be a valid python identifier.
+        source: file body. Must define ``process(expr) -> ibis_expr | DataFrame``.
+    """
+    project = resolve_project()
+    try:
+        path = write_post_processing(project, name, source)
+    except PostProcessingSourceError as exc:
+        return {"error": str(exc)}
+    _notify("post_processing_changed", extra={"action": "add", "name": name})
+    return {"name": name, "path": str(path)}
+
+
+@mcp.tool()
+def catalog_remove_post_processing(name: str) -> dict:
+    """Soft-delete a project-authored post-processing function.
+
+    Moves ``post_processing/<name>.py`` to
+    ``post_processing/_disabled/<name>.py``. The ``_disabled/``
+    subdirectory is ignored by buckaroo's scanner so the option
+    disappears from the dropdown on the next session load.
+    """
+    project = resolve_project()
+    new_path = remove_post_processing(project, name)
+    if new_path is None:
+        return {"error": f"no post-processing named {name!r}"}
+    _notify("post_processing_changed", extra={"action": "remove", "name": name})
+    return {"name": name, "moved_to": str(new_path)}
+
+
+@mcp.tool()
+def catalog_list_post_processings() -> list[dict]:
+    """List every project-authored post-processing function (active + disabled).
+
+    Returns ``[{name, path, source, disabled}]`` sorted with active
+    entries first, then disabled (parked) ones.
+    """
+    project = resolve_project()
+    return list_post_processings(project)
 
 
 @mcp.tool()

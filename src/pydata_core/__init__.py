@@ -27,6 +27,12 @@ from pydata_core.paths import (
     pydata_home,
     resolve_project,
 )
+from pydata_core.post_processing import (
+    PostProcessingSourceError,
+    list_post_processings,
+    remove_post_processing,
+    write_post_processing,
+)
 from pydata_core.summary_stats import (
     StatSourceError,
     list_stats,
@@ -40,9 +46,13 @@ __all__ = [
     "CellNotFound",
     "ChartSpecError",
     "Manifest",
+    "PostProcessingSourceError",
     "StatSourceError",
+    "list_post_processings",
     "list_stats",
+    "remove_post_processing",
     "remove_stat",
+    "write_post_processing",
     "write_stat",
     "alias_for_hash",
     "catalog_dir",

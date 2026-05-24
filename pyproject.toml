@@ -5,7 +5,7 @@ description = "Deconstructed notebook for the PyData London 2026 talk"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
 dependencies = [
-    "xorq>=0.3.8",
+    "xorq==0.3.26",
     "fastmcp>=2.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
@@ -21,7 +21,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo>=0.14",
+    "buckaroo==0.14.6",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
 ]
@@ -46,9 +46,6 @@ packages = [
     "src/pydata_companion",
     "src/pydata_cli",
 ]
-
-[tool.uv.sources]
-buckaroo = { path = "/Users/paddy/buckaroo", editable = true }
 
 [tool.ruff]
 line-length = 100

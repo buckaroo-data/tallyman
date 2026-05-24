@@ -7,6 +7,7 @@ from pathlib import Path
 
 import markdown as md_lib
 import pandas as pd
+import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -61,6 +62,29 @@ def _render_markdown(text: str) -> str:
     if not text or not text.strip():
         return ""
     return md_lib.markdown(text, extensions=["fenced_code", "tables"])
+
+
+def _read_head_rows(path: Path, n: int, pf: pq.ParquetFile | None = None) -> pa.Table:
+    """Read at most the first ``n`` rows of a parquet file as an arrow Table.
+
+    Uses ``iter_batches`` to stop as soon as enough rows have been collected,
+    so a 200-row read against a multi-million-row parquet doesn't materialise
+    the whole file. Returns the concatenated batches sliced to exactly ``n``.
+    """
+    if pf is None:
+        pf = pq.ParquetFile(path)
+    if n <= 0:
+        return pf.schema_arrow.empty_table()
+    collected: list = []
+    rows_so_far = 0
+    for batch in pf.iter_batches(batch_size=min(n, 10_000)):
+        collected.append(batch)
+        rows_so_far += batch.num_rows
+        if rows_so_far >= n:
+            break
+    if not collected:
+        return pf.schema_arrow.empty_table()
+    return pa.Table.from_batches(collected).slice(0, n)
 
 
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
@@ -160,14 +184,6 @@ def create_app(
             for i, h in enumerate(hist_hashes, start=1):
                 forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
 
-        # V0: render the parquet as HTML directly. Cap rows to keep payload small.
-        table = pq.read_table(entry / "result.parquet")
-        df = table.to_pandas()
-        preview_rows = min(200, len(df))
-        table_html = df.head(preview_rows).to_html(
-            classes="data-table", index=False, border=0
-        )
-
         prompt_history = read_prompts(entry)
         chart_spec = get_chart(project_name, content_hash)
         sidebar_entries = _annotate_entries(project_name, list_entries(project_name))
@@ -188,6 +204,26 @@ def create_app(
         buckaroo_ws_base = (
             buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
         )
+
+        # Only read parquet when Buckaroo isn't there to render — its WS path
+        # streams rows on demand from the xorq expression, so for buckaroo-up
+        # sessions we want zero parquet materialisation in the companion.
+        # Citibike-scale entries (millions of rows) blow up to many GB if we
+        # to_pandas() them unconditionally.
+        table_html = ""
+        preview_rows = 0
+        result_path = entry / "result.parquet"
+        if result_path.exists():
+            total_rows = pq.ParquetFile(result_path).metadata.num_rows
+            if buckaroo_session is None:
+                # Stream just enough row groups to fill the fallback preview.
+                preview_rows = min(200, total_rows)
+                head_table = _read_head_rows(result_path, preview_rows)
+                table_html = head_table.to_pandas().to_html(
+                    classes="data-table", index=False, border=0
+                )
+        else:
+            total_rows = 0
         return templates.TemplateResponse(
             request,
             "entry_detail.html",
@@ -198,7 +234,7 @@ def create_app(
                 "code": code,
                 "table_html": table_html,
                 "preview_rows": preview_rows,
-                "total_rows": len(df),
+                "total_rows": total_rows,
                 "prompt_history": prompt_history,
                 "alias": alias,
                 "version": version,
@@ -220,6 +256,10 @@ def create_app(
         on typical aggregate results. Set `limit` higher when feeding a
         chart that needs more rows; the response always reports `total` and
         `offset` so the caller can decide whether to fetch more.
+
+        Streams row groups via ``iter_batches`` rather than reading the whole
+        file — vega-embed on a citibike-scale result asking for 200 rows
+        shouldn't pull millions of rows into Python.
         """
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
@@ -229,14 +269,14 @@ def create_app(
             raise HTTPException(404, "no result.parquet")
         pf = pq.ParquetFile(result_path)
         total = pf.metadata.num_rows
-        # Cheap path for small results: read whole table, slice in memory.
-        # We don't bother with row-group seek for V0 since aggregates are
-        # tiny; this becomes worth optimising once Buckaroo handles the
-        # bulk-data case (T-07, now done).
-        df = pf.read().to_pandas()
-        slice_ = df.iloc[offset : offset + limit] if limit > 0 else df.iloc[:0]
+        needed = offset + limit if limit > 0 else 0
+        if needed > 0 and total > 0:
+            table = _read_head_rows(result_path, min(needed, total), pf=pf)
+            df = table.slice(offset, limit).to_pandas()
+        else:
+            df = pf.schema_arrow.empty_table().to_pandas()
         return {
-            "data": slice_.to_dict(orient="records"),
+            "data": df.to_dict(orient="records"),
             "offset": offset,
             "limit": limit,
             "total": total,

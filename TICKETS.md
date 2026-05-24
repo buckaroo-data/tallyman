@@ -348,6 +348,25 @@ or a published PyPI version — `[tool.uv.sources] buckaroo = { path =
 "../../buckaroo" }` can't resolve under `$GITHUB_WORKSPACE`. Workflow
 text documents the constraint.
 
+### T-36 — `/api/data/<hash>` leaf goes Arrow → pandas → records
+
+`api_data` in `src/pydata_companion/app.py` currently ends with
+`df.to_dict(orient="records")` after the parquet `iter_batches` →
+arrow `slice()` → `to_pandas()` chain. The pandas step exists only to
+re-emit records that FastAPI then re-serialises to JSON.
+
+At the actual call volume (vega-embed asks for ≤200 rows of a
+pre-aggregated result), this is fine — ~5ms per request. Tracked as
+hygiene rather than a real problem: drop pandas from the leaf with
+`table.slice(offset, limit).to_pylist()` (arrow → list[dict]
+directly), saving one copy and the pandas import on this path.
+
+Decision deferred — the architecturally pure answer ("send parquet
+bytes, decode in browser with hyparquet, vega-embed gets
+`{values: rows}` from the decoded objects") is over-engineered for
+the chart-data scale we care about. Revisit only if a future caller
+needs `/api/data` for larger payloads.
+
 ---
 
 ## P4 — design questions punted in V0.5

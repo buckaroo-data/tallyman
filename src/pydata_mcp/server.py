@@ -17,6 +17,7 @@ from pydata_core import (
     alias_for_hash,
     entry_dir,
     get_alias,
+    history_for,
     list_post_processings,
     list_stats,
     notebook,
@@ -31,7 +32,6 @@ from pydata_core import (
     write_post_processing,
     write_stat,
 )
-from pydata_core import history_for
 from pydata_xorq import BuildError, build_and_persist, full_diff, list_entries
 
 log = logging.getLogger("pydata_mcp")

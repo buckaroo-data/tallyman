@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import json
 import re
-from pathlib import Path
 
 from pydata_core import entries_dir, entry_dir
 from pydata_xorq.portable import PLACEHOLDER

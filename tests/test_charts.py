@@ -10,7 +10,6 @@ from pydata_core import ChartSpecError, get_chart, list_charts, remove_chart, se
 from pydata_mcp.server import catalog_chart, catalog_create
 from pydata_xorq import build_and_persist
 
-
 SAMPLE_SPEC = {
     "mark": "bar",
     "encoding": {

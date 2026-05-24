@@ -180,8 +180,14 @@ def full_diff(
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
     a_schema = json.loads((a_entry / "schema.json").read_text()) if (a_entry / "schema.json").exists() else {}
     b_schema = json.loads((b_entry / "schema.json").read_text()) if (b_entry / "schema.json").exists() else {}
-    a_df = pq.read_table(a_entry / "result.parquet").to_pandas() if (a_entry / "result.parquet").exists() else pd.DataFrame()
-    b_df = pq.read_table(b_entry / "result.parquet").to_pandas() if (b_entry / "result.parquet").exists() else pd.DataFrame()
+    a_df = (
+        pq.read_table(a_entry / "result.parquet").to_pandas()
+        if (a_entry / "result.parquet").exists() else pd.DataFrame()
+    )
+    b_df = (
+        pq.read_table(b_entry / "result.parquet").to_pandas()
+        if (b_entry / "result.parquet").exists() else pd.DataFrame()
+    )
     return {
         "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),
         "schema": schema_diff(a_schema, b_schema),

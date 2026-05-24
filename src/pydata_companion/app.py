@@ -6,7 +6,6 @@ import logging
 from pathlib import Path
 
 import markdown as md_lib
-import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
@@ -16,6 +15,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
+from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_core import (
     alias_for_hash,
     entry_dir,
@@ -29,7 +29,6 @@ from pydata_core import (
     version_of_hash,
 )
 from pydata_core.notebook import CellNotFound
-from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_xorq import (
     catalog_dag,
     column_lineage,
@@ -495,7 +494,8 @@ def create_app(
         """
         if read_only:
             raise HTTPException(403, "serve mode")
-        from pydata_core import get_alias as _get_alias, set_alias as _set_alias
+        from pydata_core import get_alias as _get_alias
+        from pydata_core import set_alias as _set_alias
         from pydata_xorq import build_and_persist as _build_and_persist
         from pydata_xorq.build import BuildError
 

@@ -3,8 +3,7 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from pydata_cli.fixtures import write_shoe_orders
-from pydata_core import data_dir, ensure_project, entry_dir, project_dir
+from pydata_core import entry_dir, project_dir
 from pydata_xorq import build_and_persist, load_entry
 from pydata_xorq.portable import PLACEHOLDER
 

@@ -23,7 +23,7 @@ def _storyboard(project: str, parquet: Path) -> dict:
                 "tool": "catalog_create",
                 "args": {
                     "name": "by_region",
-                    "code": f"from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nexpr = t.group_by('region').aggregate(n=t.count())\n",
+                    "code": "from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nexpr = t.group_by('region').aggregate(n=t.count())\n",  # noqa: E501
                     "prompt": "by region",
                 },
             },
@@ -31,7 +31,7 @@ def _storyboard(project: str, parquet: Path) -> dict:
                 "tool": "catalog_revise",
                 "args": {
                     "name": "by_region",
-                    "code": f"from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nf = t.filter(t.category == 'boots')\nexpr = f.group_by('region').aggregate(n=f.count())\n",
+                    "code": "from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nf = t.filter(t.category == 'boots')\nexpr = f.group_by('region').aggregate(n=f.count())\n",  # noqa: E501
                     "prompt": "boots only",
                 },
             },

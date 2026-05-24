@@ -61,8 +61,8 @@ def test_append_idempotent_on_alias(project: str):
 
 def test_reorder(project: str):
     a = notebook.append(project, "a")
-    b = notebook.append(project, "b")
-    c = notebook.append(project, "c")
+    notebook.append(project, "b")
+    notebook.append(project, "c")
     notebook.reorder(project, a["cell_id"], 2)
     assert [x["alias"] for x in notebook.load(project)["cells"]] == ["b", "c", "a"]
 
@@ -274,7 +274,8 @@ def test_notebook_renders_markdown_as_html(
     fresh_companion_app, project: str, orders_parquet, monkeypatch
 ):
     monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc, notebook_edit_markdown as _em
+    from pydata_mcp.server import catalog_create as _cc
+    from pydata_mcp.server import notebook_edit_markdown as _em
     _cc("shoe_sales", _agg_code(project))
     cell = notebook.load(project)["cells"][0]
     _em(cell["cell_id"], "## Title\n\nSome **bold** text.\n\n- one\n- two\n")

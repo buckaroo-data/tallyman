@@ -83,7 +83,7 @@ expr = t.order_by("region")
     assert "named (" in r.text
     assert "scratch (" in r.text
     # The currently-viewed entry is the scratch one — it gets .current.
-    assert f'class="scratch current"' in r.text
+    assert 'class="scratch current"' in r.text
     assert 'aria-current="page"' in r.text
     # And the named entry is NOT marked current.
     assert 'class="named current"' not in r.text

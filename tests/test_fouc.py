@@ -61,7 +61,10 @@ def test_embed_bundle_referenced(fresh_companion_app):
     r = c.get("/catalog")
     assert '/static/buckaroo-embed.js' in r.text
     assert '/static/buckaroo-embed.css' in r.text
-    assert '.buckaroo-embed { background: #181d1f; }' in r.text
+    # CSS for .buckaroo-embed sets the dark background before the WS payload
+    # arrives. Exact rule shape grew (sizing/border/overflow added alongside
+    # the size-toggle work) — assert on the substring that names the colour.
+    assert ".buckaroo-embed" in r.text and "#181d1f" in r.text
 
 
 def test_spa_lite_js_wired_up(fresh_companion_app):

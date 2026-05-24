@@ -1,14 +1,13 @@
 from __future__ import annotations
 
 import os
-
 from pathlib import Path
 
 import click
 import uvicorn
 
-from pydata_core import data_dir, ensure_project, project_dir, resolve_project
 from pydata_cli.fixtures import write_shoe_orders
+from pydata_core import data_dir, ensure_project, project_dir, resolve_project
 
 
 @click.group()
@@ -18,8 +17,19 @@ def cli() -> None:
 
 @cli.command("init")
 @click.argument("name")
-@click.option("--with-fixture/--no-fixture", default=True, help="Generate a synthetic shoe-orders parquet under data/.")
-@click.option("--force", is_flag=True, help="Re-run init even if the project already exists. Overwrites the fixture if --with-fixture; never touches catalog entries or aliases.")
+@click.option(
+    "--with-fixture/--no-fixture",
+    default=True,
+    help="Generate a synthetic shoe-orders parquet under data/.",
+)
+@click.option(
+    "--force",
+    is_flag=True,
+    help=(
+        "Re-run init even if the project already exists. Overwrites the fixture if "
+        "--with-fixture; never touches catalog entries or aliases."
+    ),
+)
 def init_project(name: str, with_fixture: bool, force: bool) -> None:
     """Initialize a new project under ~/.pydata-app/projects/<name>/."""
     from pydata_core import project_dir
@@ -38,10 +48,18 @@ def init_project(name: str, with_fixture: bool, force: bool) -> None:
 
 
 @cli.command("run")
-@click.option("--project", default=None, help="Project name (defaults to PYDATA_PROJECT env or 'spike').")
+@click.option(
+    "--project",
+    default=None,
+    help="Project name (defaults to PYDATA_PROJECT env or 'spike').",
+)
 @click.option("--port", default=7860, type=int)
 @click.option("--host", default="127.0.0.1")
-@click.option("--buckaroo/--no-buckaroo", default=True, help="Manage a Buckaroo subprocess on :8700 for in-table recon.")
+@click.option(
+    "--buckaroo/--no-buckaroo",
+    default=True,
+    help="Manage a Buckaroo subprocess on :8700 for in-table recon.",
+)
 @click.option("--buckaroo-port", default=8700, type=int)
 def run_companion(
     project: str | None, port: int, host: str, buckaroo: bool, buckaroo_port: int
@@ -49,7 +67,9 @@ def run_companion(
     """Start the companion FastAPI app."""
     project_name = resolve_project(project)
     if not project_dir(project_name).exists():
-        raise click.ClickException(f"project '{project_name}' not found. Run `pydata init {project_name}` first.")
+        raise click.ClickException(
+            f"project '{project_name}' not found. Run `pydata init {project_name}` first."
+        )
     os.environ.setdefault("PYDATA_PROJECT", project_name)
     click.echo(f"pydata run · project={project_name} · http://{host}:{port}")
 
@@ -81,7 +101,11 @@ def run_companion(
 
 
 @cli.command("mcp")
-@click.option("--project", default=None, help="Project name (defaults to PYDATA_PROJECT env or 'spike').")
+@click.option(
+    "--project",
+    default=None,
+    help="Project name (defaults to PYDATA_PROJECT env or 'spike').",
+)
 def run_mcp(project: str | None) -> None:
     """Start the MCP server (this is what Claude Code spawns)."""
     if project:
@@ -94,9 +118,16 @@ def run_mcp(project: str | None) -> None:
 @cli.command("replay")
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False))
 @click.option("--project", default=None, help="Project name override.")
-@click.option("--delay", default=0.0, type=float, help="Seconds to sleep between steps (for stage pacing).")
+@click.option(
+    "--delay",
+    default=0.0,
+    type=float,
+    help="Seconds to sleep between steps (for stage pacing).",
+)
 @click.option("--stop-on-error/--continue-on-error", default=True)
-def replay_storyboard(storyboard: str, project: str | None, delay: float, stop_on_error: bool) -> None:
+def replay_storyboard(
+    storyboard: str, project: str | None, delay: float, stop_on_error: bool
+) -> None:
     """Replay a storyboard JSON file by calling MCP tools in order.
 
     The storyboard is a JSON object of shape:
@@ -180,10 +211,24 @@ def _summarise(result):
 
 @cli.command("pack")
 @click.argument("project_name", required=False)
-@click.option("--project", default=None, help="Project name (defaults to PYDATA_PROJECT env or the positional arg).")
-@click.option("-o", "--output", default=None, help="Output .tgz path. Defaults to ./<project>-<date>.tgz.")
-@click.option("--exclude-cache/--include-cache", default=True, help="Skip xorq cache deps (smaller bundle, paths still portable).")
-def pack_project(project_name: str | None, project: str | None, output: str | None, exclude_cache: bool) -> None:
+@click.option(
+    "--project",
+    default=None,
+    help="Project name (defaults to PYDATA_PROJECT env or the positional arg).",
+)
+@click.option(
+    "-o", "--output",
+    default=None,
+    help="Output .tgz path. Defaults to ./<project>-<date>.tgz.",
+)
+@click.option(
+    "--exclude-cache/--include-cache",
+    default=True,
+    help="Skip xorq cache deps (smaller bundle, paths still portable).",
+)
+def pack_project(
+    project_name: str | None, project: str | None, output: str | None, exclude_cache: bool
+) -> None:
     """Tar a project directory into a portable .tgz artifact.
 
     The output bundle can be untarred anywhere and served read-only via

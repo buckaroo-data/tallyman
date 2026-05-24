@@ -3,7 +3,8 @@
 Buckaroo is the in-table recon surface (column distributions, null counts,
 sort/filter/search) and is what beat 2 of the talk's storyboard relies on.
 Buckaroo runs as its own Tornado server on a separate port; the companion
-embeds it via iframe and pre-warms a session per catalog entry.
+mounts the React embed (``static/buckaroo-embed.js``) into the entry-detail
+page and pre-warms a WS session per catalog entry.
 
 Lifecycle:
 

@@ -2,15 +2,19 @@
 
 The xorq MCP app that backs the PyData London 2026 talk *"The Future of Notebooks in a Claude Code World"* (see `proposal.md`). This document is the result of a grilling pass; it supersedes earlier drafts. Decisions baked in from the grilling are stated; remaining open questions are listed at the end.
 
-> **V0.5 implementation status (2026-05-10).** Working end-to-end on branch
-> `spike/catalog-run-loop` with 151 passing tests:
+> **V0.6 implementation status (2026-05-24).** Working end-to-end on branch
+> `spike/catalog-run-loop`:
 >
-> - All 13 MCP tools listed below — including `catalog_chart`, `catalog_diff`,
->   `catalog_unalias`, and the three `notebook_*` tools.
+> - 16 MCP tools — the original 13 (`catalog_*`, three `notebook_*`) plus
+>   the LLM-summary-stats trio (`catalog_add_summary_stat`,
+>   `catalog_remove_summary_stat`, `catalog_list_summary_stats`) backed by
+>   `<project>/stats/<name>.py` files and the `project_root` field on
+>   `/load_expr`. Design lives in `plans/llm-summary-stats.md`.
 > - Catalog tab (named/forensic/scratch ordering, V_n chips, forensic history,
 >   build-failure banner with detail page).
-> - Notebook tab (cells anchored on aliases, ↑/↓ reorder, click-to-edit
->   markdown, × remove; auto-append on `catalog_create`/`catalog_alias`).
+> - Notebook tab (cells anchored on aliases, drag-reorder via SortableJS
+>   with ↑/↓ button fallback for accessibility, click-to-edit markdown,
+>   × remove; auto-append on `catalog_create`/`catalog_alias`).
 > - Lineage tab (catalog DAG via `from_catalog` parent edges, plus per-entry
 >   internal expression DAG; pure SVG, no Cytoscape dep yet).
 > - Diff tab (`/diff/<alias>[/<va>/<vb>]`): code diff (difflib unified),
@@ -18,17 +22,24 @@ The xorq MCP app that backs the PyData London 2026 talk *"The Future of Notebook
 >   side-by-side, head() side-by-side. All five flavors shown together.
 > - Vega-Lite charts attached to entries via `catalog_chart`; entry-detail
 >   embeds vega-embed and pulls data via `/api/data/<hash>`.
-> - **`pydata serve <project_dir>`** read-only artifact mode. Project
->   directories are portable across machines/users via build-time
->   `${PYDATA_PROJECT_ROOT}` placeholder rewriting.
+> - Buckaroo lifecycle: companion-managed Tornado subprocess on :8700,
+>   `/load_expr` POST per entry (buckaroo PR 776 has landed), React embed
+>   (`static/buckaroo-embed.js`) mounted into entry-detail and talking
+>   to the buckaroo WS for paged rows + sort/search push-down.
+>   `buckaroo==0.14.6` and `xorq==0.3.26` pinned from PyPI (no editable
+>   sources). Search regression in 0.14.4/0.14.5 reported as
+>   buckaroo-data/buckaroo#838, fixed in 0.14.6.
+> - **`pydata serve <project_dir>`** read-only artifact mode and
+>   **`pydata pack [<project>]`** tar-up command (portable `.tgz`,
+>   `${PYDATA_PROJECT_ROOT}` placeholders preserved, optional
+>   `--exclude-cache`).
+> - **`pydata replay <storyboard.json>`** rehearsal mode that drives the
+>   MCP tool surface deterministically (the open question #10 fallback).
 > - MCP-over-stdio proven by `tests/test_mcp_stdio.py` (spawns the CLI as a
 >   subprocess and round-trips real tool calls).
 >
-> **Not yet built (V1):** Buckaroo iframe + Tornado lifecycle (beat 2 of
-> the storyboard — replaces the `pandas.to_html` table previews);
-> SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
-> accessibility fallback); column-level lineage; ML training pipeline
-> (beats 7-8); `pydata pack` (today's hand-off is `cp -r` or `tar`).
+> **Not yet built (V1):** column-level lineage; ML training pipeline
+> (beats 7-8); `catalog_prune` MCP tool.
 
 ---
 
@@ -81,12 +92,12 @@ Identity is by **content hash**, never by timestamp. Aliases are mutable handles
 │  (right half of        │              │  (FastAPI + Jinja2)     │
 │   screen, full-height) │ ── click ──► │  port 7860              │
 │                        │              └────────┬────────────────┘
-│  ┌──────────────────┐  │                       │ subprocess + iframe
-│  │ buckaroo iframe  │  │ ◄── iframe to ──┐     ▼
-│  │ /s/<session_id>  │◄─┼────8700─────────┐  ┌─────────────────────┐
-│  └──────────────────┘  │                 └──┤  buckaroo server    │
-└────────────────────────┘                    │  (subprocess, 8700) │
-                                              └─────────────────────┘
+│  ┌──────────────────┐  │                       │ spawns + supervises
+│  │ React embed      │  │  WebSocket (paged     ▼
+│  │ (buckaroo-embed) │◄─┼──rows, sort, search)─►┌─────────────────────┐
+│  │  in entry detail │  │            :8700      │  buckaroo server    │
+│  └──────────────────┘  │                       │  (subprocess, 8700) │
+└────────────────────────┘                       └─────────────────────┘
 ```
 
 Three processes on one machine — `pydata_mcp` (spawned by Claude Code), `pydata_companion` (the FastAPI app you start manually with `pydata run`), and a `buckaroo` server subprocess managed by the companion.
@@ -135,7 +146,7 @@ Seven Python packages in one monorepo. Boundary discipline matters because the t
 | `pydata_companion` | FastAPI app. Reads catalog from disk. Manages buckaroo subprocess. Serves Jinja2 templates + SSE. Accepts notebook edits from browser. | `fastapi`, `pydata_core`, `buckaroo` |
 | `pydata_companion/static/` | Static assets: Buckaroo bundles (copied from `~/buckaroo` build output), Vega-Lite, Cytoscape, custom JS for notebook drag/edit. | (build artifact) |
 | `pydata_companion/templates/` | Jinja2 templates: `base.html`, `catalog.html`, `notebook.html`, `lineage.html`, `diff.html`, fragments for SSE updates. | (templates) |
-| `pydata_cli` | The `pydata` console script. `pydata init <name>` / `pydata run` / `pydata mcp` (the latter is what Claude Code spawns) / `pydata serve <project_dir>` (read-only companion against a handed-off project). | `click`, `pydata_companion`, `pydata_mcp` |
+| `pydata_cli` | The `pydata` console script. `pydata init <name>` / `pydata run` / `pydata mcp` (the latter is what Claude Code spawns) / `pydata serve <project_dir>` (read-only companion against a handed-off project) / `pydata pack [<project>]` (portable `.tgz`) / `pydata replay <storyboard.json>` (deterministic rehearsal). | `click`, `pydata_companion`, `pydata_mcp` |
 
 Single `pyproject.toml` at the repo root, src-layout, uv-managed. Python 3.13.
 
@@ -143,7 +154,7 @@ Single `pyproject.toml` at the repo root, src-layout, uv-managed. Python 3.13.
 
 ## MCP tool surface
 
-13 tools implemented as of V0.5; names use `catalog_*`, `notebook_*`, `viewer_*` prefixes for legibility. The plan-original `viewer_*` row is still V1 because the demo so far does not need it (the agent's tool choice + SSE auto-focus covers the cases).
+16 tools implemented as of V0.6 (13 catalog/notebook + 3 summary-stats); names use `catalog_*`, `notebook_*`, `viewer_*` prefixes for legibility. The plan-original `viewer_*` row is still V1 because the demo so far does not need it (the agent's tool choice + SSE auto-focus covers the cases).
 
 **Catalog mutation:**
 | Tool | Behavior |
@@ -156,6 +167,9 @@ Single `pyproject.toml` at the repo root, src-layout, uv-managed. Python 3.13.
 | `catalog_rename(old_name, new_name)` | Change an alias name. Notebook follows. ✅ |
 | `catalog_unalias(name)` | Drop an alias; entries remain, notebook cell is removed. ✅ |
 | `catalog_chart(hash_or_alias, vega_spec)` | Attach a Vega-Lite chart spec to an entry. Companion renders it above the table. ✅ |
+| `catalog_add_summary_stat(name, source)` | Write `<project>/stats/<name>.py` (`def compute(col): ...`); validated against a 1-row ibis memtable in a restricted-globals namespace before persisting. Picked up by buckaroo on next session-load via `project_root`. ✅ |
+| `catalog_remove_summary_stat(name)` | Soft-disable by moving the file to `stats/_disabled/` (buckaroo skips the `_` prefix). ✅ |
+| `catalog_list_summary_stats()` | List enabled summary-stat files in the project. ✅ |
 | `catalog_prune(hash_or_alias)` | Remove an entry from the catalog. Removes from notebook if present. *(V1 — not yet implemented)* |
 
 **Notebook mutation:**
@@ -188,7 +202,7 @@ The companion has two modes. **Edit mode** (`pydata run`) is the authoring surfa
 | Route | Purpose |
 |---|---|
 | `/` | Redirect to `/catalog` |
-| `/catalog` | Default tab. Two-column layout *inside the tab*: left = entry list (named first, sortable, searchable input filtering by name+prompt), right = entry detail (Buckaroo iframe + tabs: Data \| Schema \| Code \| Prompt \| Lineage \| Forensic-history). |
+| `/catalog` | Default tab. Two-column layout *inside the tab*: left = entry list (named first, sortable, searchable input filtering by name+prompt), right = entry detail (Buckaroo React embed + tabs: Data \| Schema \| Code \| Prompt \| Lineage \| Forensic-history). |
 | `/catalog/<hash_or_alias>` | Deep link to an entry's detail view. |
 | `/notebook` | Notebook tab. Vertical scroll of cells; markdown editor above each code cell (contenteditable + serialized to markdown on save); drag-handle for reorder; × for remove; chart panel above table when present. Reorder uses [SortableJS](https://sortablejs.github.io/Sortable/). |
 | `/lineage` | Cytoscape DAG view of the catalog. Click a node = focus that entry in the catalog tab. |
@@ -223,7 +237,7 @@ Buckaroo runs as a **live Tornado server** managed by the companion subprocess g
 
 **Why React embed and not iframe?** The original design used `<iframe src="/s/<session>">`. The iframe model carried a FOUC (full bundle re-bootstrap per nav) and a per-cell isolation tax (separate browser contexts). The React embed mounts directly into the host page, sharing the document, and connects over WS. T-31/T-32 documented the iframe-era follow-ups; both are now moot. T-33 is the new memory baseline ticket for the embed model.
 
-**Build prerequisites:** `packages/embed/` builds a tiny ~1.4MB ESM bundle that mounts `BuckarooServerView` from `buckaroo-js-core`. Bundle is committed at `src/pydata_companion/static/buckaroo-embed.js` so fresh clones run without Node. The Python `buckaroo` server is a normal PyPI dep (path-sourced during PR 776 testing; switch to a published version or git ref once PR 776 lands).
+**Build prerequisites:** `packages/embed/` builds a tiny ~1.4MB ESM bundle that mounts `BuckarooServerView` from `buckaroo-js-core`. Bundle is committed at `src/pydata_companion/static/buckaroo-embed.js` so fresh clones run without Node. The Python `buckaroo` server is a normal PyPI dep — `buckaroo==0.14.6` pinned in `pyproject.toml` (PR 776 has landed; no editable source override).
 
 ---
 
@@ -249,7 +263,7 @@ Twelve beats. Dataset: TBD (Citibike or NYC orders/sales — see open questions)
 
 | # | Prompt (terminal) | Expected effect (companion) |
 |---|---|---|
-| 1 | "Load `orders.parquet` from disk; name this `orders`." | Named entry `orders` appears in catalog tab. Auto-focus. Buckaroo iframe loads. Cell appears in notebook tab. |
+| 1 | "Load `orders.parquet` from disk; name this `orders`." | Named entry `orders` appears in catalog tab. Auto-focus. Buckaroo React embed mounts and connects to the WS. Cell appears in notebook tab. |
 | 2 | (No prompt — you click a column header in Buckaroo to inspect distribution.) | Buckaroo's inline recon: histogram, null counts, top values. Audience sees the "free recon" tier. |
 | 3 | "Filter `orders` to just shoe sales; name this `shoe_sales`." | Named entry `shoe_sales` appears. Notebook tab shows two cells now. |
 | 4 | "To verify shoe_sales looks right, group it by state." | Scratch entry appears in catalog, nested under `shoe_sales` as a collapsed footnote (lineage-derived). Auto-focus on the scratch. **Notebook unchanged.** |
@@ -297,9 +311,9 @@ Smaller, mostly tactical:
 
 4. **Multi-notebook per project.** V1 = one default notebook per project. V2 = multiple. My lean: **single in V1, design notebook IO so multi is additive later.**
 
-5. **Reordering UX.** SortableJS for drag-and-drop. Confirmed in plan. Click-and-keyboard fallback (↑↓ buttons) on each cell for accessibility.
+5. **Reordering UX.** ✅ Resolved — SortableJS shipped in `notebook.html`, ↑/↓ button fallback retained for accessibility.
 
-6. **Buckaroo build/dependency.** Do we depend on `buckaroo` from PyPI (assumes published static assets), or copy `~/buckaroo/buckaroo/static/` into `pydata_companion/static/buckaroo/` as a build step? Cleaner: **PyPI dep if it ships static**, else copy.
+6. **Buckaroo build/dependency.** ✅ Resolved — `buckaroo==0.14.6` from PyPI. The embed bundle is committed at `src/pydata_companion/static/buckaroo-embed.js`; the Python server is a normal PyPI dep with no editable override.
 
 7. **Project lifecycle.** `pydata init <name>` writes `~/.pydata-app/projects/<name>/`. `pydata run` from that dir, or `pydata run --project <name>` from anywhere. Question: is the project rooted in `~/.pydata-app/...` or in CWD? My lean: **`~/.pydata-app/projects/`** — keeps state separate from code. Conference dataset committed to the repo as a fixture, copied into project on `init`.
 
@@ -307,7 +321,7 @@ Smaller, mostly tactical:
 
 9. **Active-cell context for "refine that".** Agent uses recent context. If unreliable in rehearsal, add `viewer_active_alias()` tool that returns whatever the user last clicked in the catalog tab.
 
-10. **Pre-talk rehearsal mode.** A `pydata replay <storyboard.json>` mode that runs the demo deterministically without an agent. Used for testing and as a fallback recording target.
+10. **Pre-talk rehearsal mode.** ✅ Resolved — `pydata replay <storyboard.json>` ships in `pydata_cli.main:replay_storyboard`; calls MCP tools in order with optional `--delay` for stage pacing.
 
 ---
 

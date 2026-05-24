@@ -40,6 +40,13 @@
         {% endif %}
       </div>
 
+      {% if c.chart_spec %}
+        <div
+          class="chart-panel nb-chart"
+          data-hash="{{ c.latest_hash }}"
+          data-spec='{{ c.chart_spec | tojson }}'
+        ></div>
+      {% endif %}
       {% if c.buckaroo_session and buckaroo_ws_base %}
         <div
           class="buckaroo-embed nb-buckaroo"
@@ -83,6 +90,10 @@ function nbCycleSize(cellId, btn) {
   if (btn) btn.textContent = next.label;
 }
 </script>
+
+{% if cells | selectattr('chart_spec') | first %}
+  {% include "_vega_mount.html" %}
+{% endif %}
 
 {% if not read_only %}
 <script src="https://cdn.jsdelivr.net/npm/sortablejs@1.15.2/Sortable.min.js"></script>

@@ -414,6 +414,7 @@ def create_app(
                     "preview_html": preview_html,
                     "markdown_html": _render_markdown(c.get("markdown", "")),
                     "buckaroo_session": bk_session,
+                    "chart_spec": get_chart(project_name, latest) if latest else None,
                 }
             )
         return templates.TemplateResponse(

@@ -35,20 +35,11 @@
 
     {% if chart_spec %}
       <h3>chart</h3>
-      <div id="vega-chart-{{ manifest.content_hash }}" class="vega-embed"></div>
-      <script src="https://cdn.jsdelivr.net/npm/vega@5"></script>
-      <script src="https://cdn.jsdelivr.net/npm/vega-lite@5"></script>
-      <script src="https://cdn.jsdelivr.net/npm/vega-embed@6"></script>
-      <script>
-        (async () => {
-          const resp = await fetch('/api/data/{{ manifest.content_hash }}');
-          const {data} = await resp.json();
-          const spec = {{ chart_spec | tojson }};
-          spec.data = {values: data};
-          spec.width = spec.width ?? 'container';
-          await vegaEmbed('#vega-chart-{{ manifest.content_hash }}', spec, {actions: false});
-        })();
-      </script>
+      <div
+        class="chart-panel"
+        data-hash="{{ manifest.content_hash }}"
+        data-spec='{{ chart_spec | tojson }}'
+      ></div>
     {% endif %}
 
     {% if buckaroo_session and buckaroo_ws_base %}
@@ -155,4 +146,8 @@
     {% endif %}
   </section>
 </div>
+
+{% if chart_spec %}
+  {% include "_vega_mount.html" %}
+{% endif %}
 {% endblock %}

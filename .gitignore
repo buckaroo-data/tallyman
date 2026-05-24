@@ -9,3 +9,6 @@ build/
 .DS_Store
 node_modules/
 src/pydata_companion/static/*.map
+# vite build output — rebuild via `cd packages/embed && pnpm build`
+src/pydata_companion/static/buckaroo-embed.js
+src/pydata_companion/static/buckaroo-embed.css

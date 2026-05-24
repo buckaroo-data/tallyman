@@ -63,14 +63,20 @@ uv run pydata init spike            # creates ~/.pydata-app/projects/spike/ + fi
 uv run pydata run --project spike   # edit-mode companion on http://127.0.0.1:7860
 ```
 
-The companion's dataframe embed is a small React bundle built from
-`packages/embed/`. The built `buckaroo-embed.{js,css}` is committed under
-`src/pydata_companion/static/`, so a fresh clone runs without Node. Rebuild
-after a `buckaroo-js-core` bump with:
+The companion's dataframe embed is a Vite React library in `packages/embed/`
+that builds into `src/pydata_companion/static/buckaroo-embed.{js,css}`. The
+build artifact is **not** committed — Node + pnpm are install-time
+prerequisites:
 
 ```sh
-cd packages/embed && pnpm install && pnpm run build
+cd packages/embed && pnpm install && pnpm build      # one-time per checkout
+# or, for active embed development:
+cd packages/embed && pnpm dev                        # vite build --watch
 ```
+
+Bump `buckaroo-js-core` in `packages/embed/package.json` to match the
+Python `buckaroo` pin in `pyproject.toml` and rebuild whenever either
+side moves.
 
 In another terminal, launch Claude Code from this directory; it picks up
 `.mcp.json` and exposes the `pydata` MCP server.

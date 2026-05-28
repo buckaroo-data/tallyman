@@ -13,7 +13,7 @@ def test_init_creates_project(isolated_home: Path):
     runner = CliRunner()
     result = runner.invoke(cli, ["init", "alpha", "--no-fixture"])
     assert result.exit_code == 0
-    assert (project_dir("alpha") / "catalog" / "entries").is_dir()
+    assert (project_dir("alpha") / "artifacts" / "catalog" / "entries").is_dir()
 
 
 def test_init_rejects_existing_project(isolated_home: Path):

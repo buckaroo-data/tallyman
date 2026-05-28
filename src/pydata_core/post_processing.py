@@ -26,7 +26,7 @@ import inspect
 import re
 from pathlib import Path
 
-from pydata_core.paths import project_dir
+from pydata_core.paths import post_processing_dir as _post_processing_dir
 
 # Mirrors the allowlist in ``buckaroo/server/xorq_loading.py``. Keeping
 # them in sync by hand for now — these are the names the function body
@@ -48,7 +48,7 @@ class PostProcessingSourceError(ValueError):
 
 
 def post_processing_dir(project: str) -> Path:
-    return project_dir(project) / "post_processing"
+    return _post_processing_dir(project)
 
 
 def disabled_dir(project: str) -> Path:

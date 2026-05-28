@@ -188,9 +188,11 @@ def build_and_persist(
     # Best-effort: register with the xorq catalog git repo.
     try:
         from pydata_core.xorq_catalog import add_entry as _xcat_add
-        _xcat_add(xorq_build_dir, entry_name=content_hash)
+
+        _xcat_add(project, xorq_build_dir, entry_name=content_hash)
     except Exception as exc:
         import logging
+
         logging.getLogger(__name__).warning("xorq catalog add skipped: %s", exc)
 
     return BuildResult(

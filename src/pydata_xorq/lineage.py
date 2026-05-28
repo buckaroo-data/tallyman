@@ -54,8 +54,10 @@ def catalog_parents(project: str, content_hash: str) -> list[str]:
     sources = read_data_sources(project, content_hash)
     parents: list[str] = []
     # The portable form references PLACEHOLDER paths like
-    # ${PYDATA_PROJECT_ROOT}/catalog/entries/<hash>/result.parquet.
-    rel_re = re.compile(rf"^{re.escape(PLACEHOLDER)}/catalog/entries/([0-9a-f]+)/result\.parquet$")
+    # ${PYDATA_PROJECT_ROOT}/artifacts/catalog/entries/<hash>/result.parquet.
+    rel_re = re.compile(
+        rf"^{re.escape(PLACEHOLDER)}/artifacts/catalog/entries/([0-9a-f]+)/result\.parquet$"
+    )
     for src in sources:
         m = rel_re.match(src)
         if m and m.group(1) != content_hash:

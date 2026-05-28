@@ -15,7 +15,7 @@ os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 import pytest  # noqa: E402
 
 from pydata_cli.fixtures import write_shoe_orders  # noqa: E402
-from pydata_core import data_dir, ensure_project  # noqa: E402
+from pydata_core import data_dir, ensure_project, set_active_project  # noqa: E402
 
 
 @pytest.fixture
@@ -31,8 +31,16 @@ def isolated_home(tmp_path: Path, monkeypatch) -> Path:
 
 @pytest.fixture
 def project(isolated_home: Path) -> str:
+    """Create a project and mark it active.
+
+    The active-project file lives under ``isolated_home`` (tmp), so the
+    write is automatically isolated per-test. In-process callers of
+    ``resolve_project()`` pick it up via the production code path —
+    no monkeypatching needed.
+    """
     name = "test"
     ensure_project(name)
+    set_active_project(name)
     return name
 
 

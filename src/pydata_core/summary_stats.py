@@ -25,7 +25,7 @@ import inspect
 import re
 from pathlib import Path
 
-from pydata_core.paths import project_dir
+from pydata_core.paths import stats_dir as _stats_dir
 
 # Mirrors the allowlist in ``buckaroo/server/xorq_loading.py``. Keeping
 # them in sync by hand for now — these are the names the function body
@@ -48,7 +48,7 @@ class StatSourceError(ValueError):
 
 
 def stats_dir(project: str) -> Path:
-    return project_dir(project) / "stats"
+    return _stats_dir(project)
 
 
 def disabled_dir(project: str) -> Path:

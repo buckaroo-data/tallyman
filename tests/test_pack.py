@@ -37,9 +37,9 @@ def test_pack_creates_tgz(
 
     with tarfile.open(out_path) as tar:
         names = tar.getnames()
-    assert f"{project}/catalog/aliases.json" in names
+    assert f"{project}/artifacts/catalog/aliases.json" in names
     assert f"{project}/data/orders.parquet" in names
-    assert any(f"{project}/catalog/entries/{h}/" in n for n in names)
+    assert any(f"{project}/artifacts/catalog/entries/{h}/" in n for n in names)
 
 
 def test_pack_skips_buckaroo_sessions(

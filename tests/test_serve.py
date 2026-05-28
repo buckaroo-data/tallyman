@@ -73,7 +73,10 @@ def test_project_path_override_relocates_project(
 
     # Sanity: project_dir() now returns the handoff path.
     assert project_dir(project) == handoff
-    assert entry_dir(project, res.content_hash) == handoff / "catalog" / "entries" / res.content_hash
+    assert (
+        entry_dir(project, res.content_hash)
+        == handoff / "artifacts" / "catalog" / "entries" / res.content_hash
+    )
 
     # Serve mode should render correctly against the relocated project.
     app = create_app(project, read_only=True)

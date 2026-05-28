@@ -5,11 +5,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pydata_core.paths import ensure_project, project_dir
+from pydata_core.paths import ensure_project, errors_path
 
 
 def _errors_path(project: str) -> Path:
-    return project_dir(project) / "errors.jsonl"
+    return errors_path(project)
 
 
 def record_error(

@@ -2,7 +2,14 @@
 
 All functions are best-effort: failures are logged but never propagate to the
 caller so a missing or misconfigured catalog repo never breaks the main build.
+
+Each function takes an explicit ``project`` argument — the xorq catalog
+repo lives at ``<project>/artifacts/catalog/``, and the calling layer
+(aliases.py, build.py) already knows which project it's mutating. Using
+``resolve_project()`` here would risk writing to the wrong catalog if the
+user switched projects mid-operation.
 """
+
 from __future__ import annotations
 
 import logging
@@ -11,21 +18,31 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from pydata_core.paths import catalog_repo_path
+from pydata_core.paths import catalog_dir
 
 log = logging.getLogger(__name__)
 
 
-def _xorq(*args: str, **kw) -> subprocess.CompletedProcess:
+def _repo_path(project: str) -> Path:
+    return catalog_dir(project)
+
+
+def _xorq(project: str, *args: str, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(
-        ["uv", "run", "xorq", "catalog", "--path", str(catalog_repo_path()), *args],
+        ["uv", "run", "xorq", "catalog", "--path", str(_repo_path(project)), *args],
         capture_output=True,
         text=True,
         **kw,
     )
 
 
-def add_entry(build_dir: Path, aliases: list[str] = (), *, entry_name: str | None = None) -> bool:
+def add_entry(
+    project: str,
+    build_dir: Path,
+    aliases: list[str] = (),
+    *,
+    entry_name: str | None = None,
+) -> bool:
     """Add *build_dir* to the xorq catalog, optionally tagging with *aliases*.
 
     *entry_name* lets the caller control the name xorq uses for the entry
@@ -34,7 +51,7 @@ def add_entry(build_dir: Path, aliases: list[str] = (), *, entry_name: str | Non
 
     Returns True on success.
     """
-    repo = catalog_repo_path()
+    repo = _repo_path(project)
     if not repo.exists():
         log.warning("xorq catalog repo not found at %s — skipping", repo)
         return False
@@ -44,7 +61,7 @@ def add_entry(build_dir: Path, aliases: list[str] = (), *, entry_name: str | Non
         alias_flags += ["-a", a]
 
     def _run(d: Path) -> bool:
-        r = _xorq("add", "--no-sync", str(d), *alias_flags)
+        r = _xorq(project, "add", "--no-sync", str(d), *alias_flags)
         if r.returncode != 0:
             log.warning("xorq catalog add failed for %s: %s", d, r.stderr.strip())
             return False
@@ -58,25 +75,24 @@ def add_entry(build_dir: Path, aliases: list[str] = (), *, entry_name: str | Non
     return _run(build_dir)
 
 
-def add_alias(content_hash: str, alias: str) -> bool:
-    """Point *alias* at *content_hash* in the xorq catalog."""
-    repo = catalog_repo_path()
+def add_alias(project: str, content_hash: str, alias: str) -> bool:
+    """Point *alias* at *content_hash* in the project's xorq catalog."""
+    repo = _repo_path(project)
     if not repo.exists():
         log.warning("xorq catalog repo not found at %s — skipping", repo)
         return False
-    # xorq catalog add-alias NAME ALIAS  (positional: entry name, then alias)
-    r = _xorq("add-alias", content_hash, alias, "--no-sync")
+    r = _xorq(project, "add-alias", content_hash, alias, "--no-sync")
     if r.returncode != 0:
         log.warning("xorq catalog add-alias failed: %s", r.stderr.strip())
         return False
     return True
 
 
-def remove_alias(alias: str) -> bool:
-    repo = catalog_repo_path()
+def remove_alias(project: str, alias: str) -> bool:
+    repo = _repo_path(project)
     if not repo.exists():
         return False
-    r = _xorq("remove-alias", alias, "--no-sync")
+    r = _xorq(project, "remove-alias", alias, "--no-sync")
     if r.returncode != 0:
         log.warning("xorq catalog remove-alias failed: %s", r.stderr.strip())
         return False

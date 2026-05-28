@@ -83,10 +83,10 @@ def test_load_entry_fails_clean_if_data_missing(
     res = build_and_persist(project, _agg_code(project))
     new_home = tmp_path / "alt-home"
     new_project_root = new_home / "projects" / project
-    (new_project_root / "catalog" / "entries").mkdir(parents=True)
+    (new_project_root / "artifacts" / "catalog" / "entries").mkdir(parents=True)
     shutil.copytree(
         entry_dir(project, res.content_hash),
-        new_project_root / "catalog" / "entries" / res.content_hash,
+        new_project_root / "artifacts" / "catalog" / "entries" / res.content_hash,
     )
     # NOTE: we deliberately do NOT copy data/ into the new tree.
     monkeypatch.setenv("PYDATA_HOME", str(new_home))

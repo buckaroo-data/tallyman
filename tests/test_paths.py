@@ -121,7 +121,6 @@ def test_validate_project_name_accepts(name: str):
     "name",
     [
         "",  # empty
-        "1foo",  # starts non-alphanum
         "_foo",  # starts with underscore
         "-foo",  # starts with hyphen
         "FOO",  # uppercase

@@ -107,7 +107,7 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
     _write_json(_aliases_path(project), aliases)
     _write_json(_history_path(project), history)
 
-    _xcat.add_alias(content_hash, alias=name)
+    _xcat.add_alias(project, content_hash, alias=name)
 
     return {
         "name": name,
@@ -137,4 +137,4 @@ def remove_alias(project: str, name: str) -> None:
     history.pop(name, None)
     _write_json(_aliases_path(project), aliases)
     _write_json(_history_path(project), history)
-    _xcat.remove_alias(name)
+    _xcat.remove_alias(project, name)

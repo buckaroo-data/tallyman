@@ -224,3 +224,38 @@ def test_sse_project_switched_event_fires(isolated_home: Path):
     # SSE event firing is observed end-to-end in browser; here we just assert
     # the route returned cleanly and the switch took effect.
     assert resolve_project() == "beta"
+
+
+# ---------------------------------------------------------------------------
+# Chrome (dropdown + new-project button)
+# ---------------------------------------------------------------------------
+
+
+def test_chrome_renders_dropdown_in_writable_mode(isolated_home: Path):
+    ensure_project("alpha")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.get("/catalog")
+    assert r.status_code == 200
+    # The dropdown and + new button are present in normal mode.
+    assert 'id="project-select"' in r.text
+    assert 'id="new-project-btn"' in r.text
+    # Body carries the active-project tag for the SSE filter.
+    assert 'data-active-project="alpha"' in r.text
+
+
+def test_chrome_hides_switcher_in_read_only_mode(isolated_home: Path, orders_parquet: Path):
+    """pydata serve mode: dropdown and + new button are gone, replaced by the
+    static `project: <name>` label."""
+    ensure_project("alpha")
+    set_active_project("alpha")
+    app = create_app(read_only=True)
+    c = TestClient(app)
+    r = c.get("/catalog")
+    assert r.status_code == 200
+    assert 'id="project-select"' not in r.text
+    assert 'id="new-project-btn"' not in r.text
+    # Static label still shows which project we're viewing.
+    assert "project: alpha" in r.text
+    assert "serve mode" in r.text

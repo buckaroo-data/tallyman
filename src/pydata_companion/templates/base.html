@@ -39,6 +39,17 @@
     table.data-table th, table.data-table td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; }
     table.data-table th { background: #0a0c12; position: sticky; top: 0; }
     .pill { display: inline-block; padding: 2px 6px; border: 1px solid var(--line); border-radius: 10px; color: var(--muted); font-size: 11px; margin-right: 6px; }
+    .project-switcher { display: inline-flex; align-items: center; gap: 4px; margin-right: 18px; }
+    .project-switcher select { background: var(--bg, #0a0c12); color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 2px 6px; font-family: inherit; font-size: 12px; }
+    .project-switcher select:focus { outline: 1px solid var(--accent); }
+    #new-project-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 2px 8px; font-size: 11px; cursor: pointer; font-family: inherit; }
+    #new-project-btn:hover { color: var(--fg); border-color: var(--accent); }
+    .empty-state { max-width: 520px; margin: 60px auto; padding: 16px; }
+    .empty-state h2 { margin-top: 0; }
+    .empty-state form { display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+    .empty-state input[type=text] { background: #0a0c12; color: var(--fg); border: 1px solid var(--line); border-radius: 4px; padding: 8px; font-family: inherit; font-size: 14px; }
+    .empty-state button { background: var(--accent); color: white; border: 0; border-radius: 4px; padding: 8px 16px; font-family: inherit; cursor: pointer; }
+    .empty-state button:hover { opacity: 0.9; }
     .live { color: var(--accent); }
     .error-banner { background: #2a1b1b; border: 1px solid #5a3a3a; color: #ffb4b4; padding: 10px 12px; border-radius: 4px; margin: 0 16px 12px; }
     .error-banner ul { margin: 6px 0 0 0; padding-left: 20px; }
@@ -114,10 +125,22 @@
   <link rel="stylesheet" href="/static/buckaroo-embed.css">
   <script type="module" src="/static/buckaroo-embed.js"></script>
 </head>
-<body>
+<body data-active-project="{{ project }}">
   <header>
     <span class="brand">pydata</span>
-    <span class="project">project: {{ project }}</span>
+    {% if read_only %}
+      <span class="project">project: {{ project }}</span>
+    {% else %}
+      <span class="project-switcher">
+        <label class="meta" for="project-select" style="margin-right: 4px;">project:</label>
+        <select id="project-select" aria-label="Active project" onchange="switchProject(this.value)">
+          {# Populated by JS on load — the active project's name is filled in #}
+          {# here so the dropdown renders correctly even before the fetch lands #}
+          <option value="{{ project }}" selected>{{ project }}</option>
+        </select>
+        <button type="button" id="new-project-btn" onclick="createNewProject()" title="Create a new project">+ new</button>
+      </span>
+    {% endif %}
     <nav>
       <a href="/catalog">catalog</a>
       <a href="/notebook">notebook</a>
@@ -130,12 +153,69 @@
     {% block content %}{% endblock %}
   </main>
   <script>
+    // Project switcher: populate the dropdown from /api/projects on load.
+    // The active project is server-rendered in <body data-active-project>;
+    // the JS fills in the other options + handles change / new-project clicks.
+    async function loadProjects() {
+      const sel = document.getElementById('project-select');
+      if (!sel) return;  // serve mode hides the switcher
+      try {
+        const r = await fetch('/api/projects');
+        if (!r.ok) return;
+        const {active, available} = await r.json();
+        sel.innerHTML = '';
+        for (const name of available) {
+          const opt = document.createElement('option');
+          opt.value = name;
+          opt.textContent = name;
+          if (name === active) opt.selected = true;
+          sel.appendChild(opt);
+        }
+      } catch (e) { /* network blip — fall back to the server-rendered option */ }
+    }
+    async function switchProject(name) {
+      const r = await fetch('/api/projects/switch', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name}),
+      });
+      if (r.ok) window.location.reload();
+      else {
+        const data = await r.json().catch(() => ({}));
+        alert('switch failed: ' + (data.detail || r.status));
+      }
+    }
+    async function createNewProject() {
+      const name = prompt('New project name (lowercase letters, digits, hyphens, underscores; up to 32):');
+      if (!name) return;
+      const r = await fetch('/api/projects/new', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({name, with_fixture: false}),
+      });
+      if (r.ok) window.location.reload();
+      else {
+        const data = await r.json().catch(() => ({}));
+        alert('create failed: ' + (data.detail || r.status));
+      }
+    }
+    loadProjects();
+
+    // Cross-project event filter: ignore SSE events whose `project` field
+    // doesn't match this tab's active project. Untagged events (legacy
+    // emitters, plus project_switched which is global) always run.
+    const activeProject = document.body.dataset.activeProject;
+    function eventForThisProject(data) {
+      return !data || !data.project || data.project === activeProject;
+    }
+
     const status = document.getElementById('sse-status');
     const sse = new EventSource('/api/sse');
     sse.addEventListener('hello', () => { status.textContent = 'live'; status.classList.add('live'); });
     sse.addEventListener('ping', () => {});
     sse.addEventListener('new_entry', (e) => {
       const data = JSON.parse(e.data);
+      if (!eventForThisProject(data)) return;
       const path = window.location.pathname;
       if (path === '/catalog') {
         // Refresh the index so the new entry appears.
@@ -146,19 +226,28 @@
       }
       // Other tabs (/notebook, /lineage, /diff): don't yank the user.
     });
-    sse.addEventListener('build_failed', () => {
+    sse.addEventListener('build_failed', (e) => {
+      const data = (() => { try { return JSON.parse(e.data); } catch { return {}; } })();
+      if (!eventForThisProject(data)) return;
       // Reload the current page so the failure banner re-renders.
       // (No-op on tabs that don't show the banner; cheap either way.)
       window.location.reload();
     });
-    sse.addEventListener('notebook_changed', () => {
+    sse.addEventListener('notebook_changed', (e) => {
+      const data = (() => { try { return JSON.parse(e.data); } catch { return {}; } })();
+      if (!eventForThisProject(data)) return;
       if (window.location.pathname === '/notebook') window.location.reload();
     });
     sse.addEventListener('chart_attached', (e) => {
       const data = JSON.parse(e.data);
+      if (!eventForThisProject(data)) return;
       // Reload only if we're viewing the entry the chart was attached to.
       const path = window.location.pathname;
       if (path === '/catalog/' + data.hash) window.location.reload();
+    });
+    sse.addEventListener('project_switched', () => {
+      // Global signal — every tab listens and reloads to pick up the new project.
+      window.location.reload();
     });
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
 

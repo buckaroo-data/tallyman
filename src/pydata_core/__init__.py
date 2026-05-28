@@ -27,10 +27,13 @@ from pydata_core.paths import (
     pydata_home,
     resolve_project,
 )
+from pydata_core.marimo_export import export_notebook_path, notebook_to_marimo
 from pydata_core.post_processing import (
+    PostProcessingRunError,
     PostProcessingSourceError,
     list_post_processings,
     remove_post_processing,
+    run_post_processing,
     write_post_processing,
 )
 from pydata_core.summary_stats import (
@@ -46,7 +49,11 @@ __all__ = [
     "CellNotFound",
     "ChartSpecError",
     "Manifest",
+    "export_notebook_path",
+    "notebook_to_marimo",
+    "PostProcessingRunError",
     "PostProcessingSourceError",
+    "run_post_processing",
     "StatSourceError",
     "list_post_processings",
     "list_stats",

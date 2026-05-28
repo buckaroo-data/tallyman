@@ -157,3 +157,80 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
 
     resp = catalog_remove_post_processing("never_existed")
     assert resp == {"error": "no post-processing named 'never_existed'"}
+
+
+# ---------------------------------------------------------------------------
+# catalog_run_post_processing — test against a real catalog entry
+# ---------------------------------------------------------------------------
+
+def _agg_code(project: str) -> str:
+    return (
+        "from pydata_xorq.io import from_project\n"
+        f"t = from_project('orders.parquet', project={project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n"
+    )
+
+
+def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch):
+    """run_post_processing resolves an alias and returns filtered rows."""
+    from pathlib import Path
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+
+    catalog_create("agg", _agg_code(project))
+    resp = catalog_run_post_processing(
+        code="def process(expr):\n    return expr\n",
+        entry="agg",
+    )
+    assert "error" not in resp
+    assert resp["row_count"] > 0
+    assert "n" in resp["columns"]
+    assert isinstance(resp["preview"], list)
+
+
+def test_run_post_processing_by_hash(project: str, orders_parquet, monkeypatch):
+    """run_post_processing accepts a raw content hash."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+
+    out = catalog_create("agg2", _agg_code(project))
+    resp = catalog_run_post_processing(
+        code="def process(expr):\n    return expr\n",
+        entry=out["hash"],
+    )
+    assert "error" not in resp
+    assert resp["entry"] == out["hash"]
+
+
+def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, monkeypatch):
+    """A filter in process() produces fewer rows than the original."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+
+    catalog_create("agg3", _agg_code(project))
+    all_rows = catalog_run_post_processing("def process(expr):\n    return expr\n", "agg3")
+    filtered = catalog_run_post_processing(
+        "def process(expr):\n    return expr.filter(expr.n > 9999)\n", "agg3"
+    )
+    assert "error" not in all_rows
+    assert "error" not in filtered
+    assert filtered["row_count"] < all_rows["row_count"]
+
+
+def test_run_post_processing_bad_code_returns_error(project: str, orders_parquet, monkeypatch):
+    """Syntax errors in the process function surface as error dict."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+
+    catalog_create("agg4", _agg_code(project))
+    resp = catalog_run_post_processing("def process(expr):\n    return 42\n", "agg4")
+    assert "error" in resp
+
+
+def test_run_post_processing_unknown_entry_returns_error(project: str, monkeypatch):
+    """Unknown alias or hash returns error dict, does not raise."""
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    from pydata_mcp.server import catalog_run_post_processing
+
+    resp = catalog_run_post_processing("def process(expr):\n    return expr\n", "no_such_entry")
+    assert "error" in resp

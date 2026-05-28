@@ -180,6 +180,95 @@ def write_post_processing(project: str, name: str, source: str) -> Path:
     return path
 
 
+class PostProcessingRunError(ValueError):
+    """Raised by ``run_post_processing`` when the function fails against real data."""
+
+
+def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> dict:
+    """Execute a ``process(expr)`` function against a catalog entry's result.
+
+    Resolves *entry_name_or_hash* as an alias first, then as a raw content
+    hash. Loads ``result.parquet`` for that entry, execs *source* in a
+    restricted namespace, calls ``process(table)``, executes the result, and
+    returns a preview dict.
+
+    Returns::
+
+        {
+            "entry": "<hash>",
+            "row_count": <int>,
+            "columns": ["col1", ...],
+            "preview": [{...}, ...],   # first 20 rows
+        }
+
+    Raises ``PostProcessingRunError`` on any failure — caller surfaces this
+    as the tool's ``{"error": ...}`` response.
+    """
+    from pydata_core.aliases import get_alias  # avoid circular at module level
+    from pydata_core.paths import entry_dir
+
+    # Resolve alias → hash, or treat as bare hash.
+    content_hash = get_alias(project, entry_name_or_hash) or entry_name_or_hash
+    parquet_path = entry_dir(project, content_hash) / "result.parquet"
+    if not parquet_path.exists():
+        raise PostProcessingRunError(
+            f"no result.parquet found for entry {entry_name_or_hash!r} "
+            f"(resolved hash: {content_hash})"
+        )
+
+    try:
+        import pyarrow.parquet as pq  # noqa: PLC0415
+        import xorq.api as xo  # noqa: PLC0415
+    except ImportError as exc:
+        raise PostProcessingRunError(f"missing dependency: {exc}") from None
+
+    table = pq.read_table(parquet_path)
+    ibis_table = xo.memtable(table.to_pandas(), name="_post_processing_run")
+
+    # Exec the source and extract process().
+    ns: dict = {}
+    try:
+        exec(compile(source, "<post_processing_run>", "exec"), _restricted_globals(), ns)
+    except SyntaxError as exc:
+        raise PostProcessingRunError(f"syntax error: {exc}") from None
+    except Exception as exc:
+        raise PostProcessingRunError(f"source raised at exec time: {exc!r}") from None
+
+    process = ns.get("process")
+    if not callable(process):
+        raise PostProcessingRunError("source must define a callable named 'process'")
+
+    try:
+        result = process(ibis_table)
+    except Exception as exc:
+        raise PostProcessingRunError(f"process() raised: {exc!r}") from None
+
+    # Execute to get actual rows.
+    try:
+        import pandas as pd  # noqa: PLC0415
+        if hasattr(result, "execute"):
+            df = result.execute()
+        elif isinstance(result, pd.DataFrame):
+            df = result
+        else:
+            raise PostProcessingRunError(
+                f"process() must return an ibis expression or pandas DataFrame "
+                f"(got {type(result).__name__})"
+            )
+    except PostProcessingRunError:
+        raise
+    except Exception as exc:
+        raise PostProcessingRunError(f"execute() raised: {exc!r}") from None
+
+    preview = df.head(20).to_dict(orient="records")
+    return {
+        "entry": content_hash,
+        "row_count": len(df),
+        "columns": list(df.columns),
+        "preview": preview,
+    }
+
+
 def remove_post_processing(project: str, name: str) -> Path | None:
     """Soft-delete by moving ``post_processing/<name>.py`` to
     ``post_processing/_disabled/<name>.py``. Returns the new path, or

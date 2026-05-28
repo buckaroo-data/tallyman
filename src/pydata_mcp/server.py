@@ -12,7 +12,9 @@ from pydata_core import (
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
+    PostProcessingRunError,
     PostProcessingSourceError,
+    export_notebook_path,
     StatSourceError,
     alias_for_hash,
     entry_dir,
@@ -27,6 +29,7 @@ from pydata_core import (
     remove_stat,
     rename_alias,
     resolve_project,
+    run_post_processing,
     set_alias,
     set_chart,
     write_post_processing,
@@ -508,6 +511,71 @@ def catalog_list_post_processings() -> list[dict]:
     """
     project = resolve_project()
     return list_post_processings(project)
+
+
+@mcp.tool()
+def catalog_run_post_processing(code: str, entry: str) -> dict:
+    """Test a post-processing function against a real catalog entry's result.
+
+    Use this to iterate on ``process(expr)`` code before committing it with
+    ``catalog_add_post_processing``. The function is executed against the
+    entry's stored ``result.parquet`` — you see real output rows, not the
+    small dry-run memtable that ``catalog_add_post_processing`` validates
+    against.
+
+    Typical workflow::
+
+        # 1. Draft the function.
+        catalog_run_post_processing(
+            code="def process(expr):\\n    return expr.filter(expr.n > 10)\\n",
+            entry="shoe_sales",
+        )
+        # 2. Iterate until the preview looks right.
+        # 3. Commit it.
+        catalog_add_post_processing("high_volume", code)
+
+    ``entry`` can be an alias name (e.g. ``"shoe_sales"``) or a raw content
+    hash. The current alias revision is used when both exist.
+
+    Args:
+        code: Python source defining ``process(expr) -> ibis_expr | DataFrame``.
+        entry: Alias name or content hash of the catalog entry to test against.
+
+    Returns:
+        dict with keys: ``entry`` (resolved hash), ``row_count``, ``columns``,
+        ``preview`` (first 20 rows as list-of-dicts). On error, ``{"error": ...}``.
+    """
+    project = resolve_project()
+    try:
+        return run_post_processing(project, entry, code)
+    except PostProcessingRunError as exc:
+        return {"error": str(exc)}
+
+
+@mcp.tool()
+def catalog_export_marimo() -> dict:
+    """Export the project's notebook to a Marimo Python notebook file.
+
+    Converts the default notebook to a ``.py`` file that can be opened and
+    run directly with ``marimo edit notebook_marimo.py``. Each notebook cell
+    becomes a pair of Marimo cells: a markdown narrative cell and a code cell
+    that re-runs the xorq expression and displays the result DataFrame.
+
+    The file is written to ``<project_dir>/notebook_marimo.py`` and is also
+    downloadable via the companion's ``/export/marimo`` route.
+
+    Returns:
+        dict with keys: ``path`` (absolute path of the written file),
+        ``cells`` (number of notebook cells exported).
+    """
+    project = resolve_project()
+    try:
+        path = export_notebook_path(project)
+    except Exception as exc:
+        return {"error": str(exc)}
+    from pydata_core.notebook import load as _load  # noqa: PLC0415
+    n = len(_load(project).get("cells", []))
+    return {"path": str(path), "cells": n}
 
 
 @mcp.tool()

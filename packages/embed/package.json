@@ -9,7 +9,7 @@
     "dev": "vite build --watch"
   },
   "dependencies": {
-    "buckaroo-js-core": "0.14.6",
+    "buckaroo-js-core": "0.14.8",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },

@@ -97,18 +97,15 @@
     .nb-chart { margin: 4px 0 8px; min-height: 180px; }
     /* Buckaroo React embed: background matches the widget's dark theme so
        there's no white flash between mount and first WebSocket payload.
-       Default height suits the entry-detail page; notebook cells override
-       to a smaller fixed height so the next cell is visible on first load. */
-    /* overflow: hidden is load-bearing — AG Grid sizes by row count inside
-       (autoHeight not exposed; see buckaroo-data/buckaroo#846), so without
-       clipping the grid renders past the box and visually invades the next
-       notebook cell. */
-    .buckaroo-embed { background: #181d1f; border: 1px solid var(--line); border-radius: 4px; width: 100%; height: 55vh; overflow: hidden; }
-    .buckaroo-embed.nb-buckaroo { height: 260px; }
-    /* notebook-cell embed size cycle: default → 3q-viewport → max */
-    .buckaroo-embed.nb-buckaroo[data-size="3q"] { height: 75vh; }
-    .buckaroo-embed.nb-buckaroo[data-size="max"] { height: 90vh; }
-    .nb-size-btn { font-family: ui-monospace, monospace; min-width: 44px; text-align: center; }
+       autoHeight lets the grid size itself to its row count; max-height caps
+       it so large tables don't push content off the page. min-height keeps
+       the "connecting…" state visible. overflow: hidden clips any internal
+       AG Grid chrome that bleeds past the cap. */
+    /* Entry-detail: autoHeight lets the grid shrink to its row count, capped by max-height.
+       Notebook cells: inline height is computed server-side from row_count so the infinite
+       scroll model knows its viewport and fires the first page request correctly. */
+    .buckaroo-embed { background: #181d1f; border: 1px solid var(--line); border-radius: 4px; width: 100%; min-height: 120px; max-height: 60vh; overflow: hidden; }
+    .buckaroo-embed.nb-buckaroo { max-height: none; }
     .edit-code-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; margin-left: 8px; }
     .edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
     .section-header { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; padding: 10px 12px 4px; border-top: 1px solid var(--line); }

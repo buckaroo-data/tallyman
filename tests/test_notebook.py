@@ -372,10 +372,21 @@ def test_notebook_uses_buckaroo_embed_when_session_available(
     app = create_app(project, buckaroo=_StubBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
     r = c.get("/notebook")
+    # Lazy loading: initial HTML has data-hash placeholder, not data-ws-url.
+    # The IntersectionObserver fires /api/session/<hash> on scroll and sets
+    # data-ws-url dynamically; buckaroo-embed.js then mounts the React embed.
     assert 'class="buckaroo-embed nb-buckaroo"' in r.text
-    assert 'data-ws-url="ws://127.0.0.1:8700/ws/sess-' in r.text
-    # The HTML preview fallback should NOT render when an embed is present.
+    assert 'data-hash=' in r.text
+    assert 'data-ws-url="' not in r.text  # WS URL added dynamically, not in initial HTML
+    # The HTML preview fallback should NOT render when Buckaroo is available.
     assert '<div class="nb-preview">' not in r.text
+
+    # /api/session/<hash> returns the WS URL on demand.
+    from pydata_core import get_alias
+    content_hash = get_alias(project, "shoe_sales")
+    sr = c.get(f"/api/session/{content_hash}")
+    assert sr.status_code == 200
+    assert sr.json()["ws_url"].startswith("ws://127.0.0.1:8700/ws/sess-")
 
 
 def test_notebook_falls_back_to_html_when_no_buckaroo(

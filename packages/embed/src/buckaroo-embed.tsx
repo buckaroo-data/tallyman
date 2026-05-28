@@ -1,11 +1,9 @@
 // Mount `BuckarooServerView` into every [data-ws-url] div on the page.
 //
-// The companion's templates render <div class="buckaroo-embed"
-// data-ws-url="ws://127.0.0.1:8700/ws/<session>"></div> placeholders where
-// it used to render <iframe src=".../s/<session>">. This script scans for
-// those divs (on initial load and on SPA-lite nav swaps) and mounts the
-// React embed into each. Buckaroo's Tornado server stays running — it's
-// the WebSocket data source — but the page chrome is gone.
+// The companion's templates render placeholder divs with data-hash (lazy) or
+// data-ws-url (immediate, e.g. entry-detail). This script mounts React embeds
+// for data-ws-url divs on load, and re-mounts when data-ws-url is set
+// dynamically (e.g. by the notebook's IntersectionObserver lazy-load).
 import * as React from "react";
 import { createRoot, Root } from "react-dom/client";
 import { BuckarooServerView } from "buckaroo-js-core";
@@ -18,16 +16,15 @@ interface MountedEl extends HTMLElement {
 function mount(el: MountedEl): void {
     if (el.__buckarooRoot) return;
     const wsUrl = el.dataset.wsUrl;
-    if (!wsUrl) {
-        console.warn("[buckaroo-embed] mount target has no data-ws-url", el);
-        return;
-    }
+    if (!wsUrl) return;
+    const autoHeight = el.hasAttribute("data-auto-height");
     const root = createRoot(el);
     el.__buckarooRoot = root;
     root.render(
         React.createElement(BuckarooServerView, {
             wsUrl,
-            style: { width: "100%", height: "100%" },
+            autoHeight: autoHeight || undefined,
+            style: { width: "100%", height: autoHeight ? undefined : "100%" },
         }),
     );
 }
@@ -44,10 +41,16 @@ function scanAndMount(root: ParentNode = document): void {
 
 scanAndMount();
 
-// SPA-lite navigation in base.html swaps the main content in place; pick up
-// new mount points and tear down ones that are no longer attached.
+// Watch for:
+//   childList — SPA-lite nav swaps add/remove whole subtrees
+//   attributes — lazy-load sets data-ws-url on an existing placeholder div
 const observer = new MutationObserver((records) => {
     for (const r of records) {
+        if (r.type === "attributes") {
+            const el = r.target;
+            if (el instanceof HTMLElement && el.dataset.wsUrl) mount(el);
+            continue;
+        }
         r.addedNodes.forEach((n) => {
             if (!(n instanceof HTMLElement)) return;
             if (n.matches?.("[data-ws-url]")) mount(n);
@@ -60,4 +63,9 @@ const observer = new MutationObserver((records) => {
         });
     }
 });
-observer.observe(document.body, { childList: true, subtree: true });
+observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["data-ws-url"],
+});

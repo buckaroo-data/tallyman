@@ -275,7 +275,7 @@ def create_app(
         else:
             df = pf.schema_arrow.empty_table().to_pandas()
         return {
-            "data": df.to_dict(orient="records"),
+            "data": json.loads(df.to_json(orient="records")),
             "offset": offset,
             "limit": limit,
             "total": total,
@@ -415,27 +415,23 @@ def create_app(
     def notebook_view(request: Request):
         data = notebook.load(project_name)
         aliases = load_aliases(project_name)
-        buckaroo_ws_base = (
-            buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
-        )
+        buckaroo_available = buckaroo is not None and buckaroo.is_running
+        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo_available else None
         rendered_cells = []
         for c in data["cells"]:
             latest = aliases.get(c["alias"])
             entry_meta = None
             preview_html = ""
             schema = None
-            bk_session = None
             if latest is not None:
                 entry = entry_dir(project_name, latest)
                 if (entry / "manifest.json").exists():
                     entry_meta = json.loads((entry / "manifest.json").read_text())
                     schema = json.loads((entry / "schema.json").read_text())
-                # When Buckaroo is up, ensure a per-cell session so the
-                # React embed connects directly. Otherwise fall back to a
-                # pandas.to_html preview.
-                if buckaroo is not None:
-                    bk_session = buckaroo.ensure_session(latest)
-                if bk_session is None and (entry / "result.parquet").exists():
+                # Sessions are created lazily via /api/session/<hash> when the
+                # cell scrolls into view. Only fall back to pandas preview when
+                # Buckaroo is not available at all.
+                if not buckaroo_available and (entry / "result.parquet").exists():
                     table = pq.read_table(entry / "result.parquet")
                     df = table.to_pandas()
                     n = min(20, len(df))
@@ -452,7 +448,7 @@ def create_app(
                     "schema": schema,
                     "preview_html": preview_html,
                     "markdown_html": _render_markdown(c.get("markdown", "")),
-                    "buckaroo_session": bk_session,
+                    "buckaroo_available": buckaroo_available,
                     "chart_spec": get_chart(project_name, latest) if latest else None,
                 }
             )
@@ -463,8 +459,24 @@ def create_app(
                 "project": project_name,
                 "cells": rendered_cells,
                 "buckaroo_ws_base": buckaroo_ws_base,
+                "buckaroo_available": buckaroo_available,
             },
         )
+
+    @app.get("/api/session/{content_hash}")
+    def get_session(content_hash: str):
+        """Create (or return cached) Buckaroo session for a catalog entry.
+
+        Called by the notebook's IntersectionObserver when a cell scrolls into
+        view. Keeps page-load O(1) regardless of notebook size — sessions are
+        created one at a time as the user scrolls, not all at once.
+        """
+        if buckaroo is None or not buckaroo.is_running:
+            return {"ws_url": None}
+        session_id = buckaroo.ensure_session(content_hash)
+        if session_id is None:
+            return {"ws_url": None}
+        return {"ws_url": f"{buckaroo.ws_base_url}/ws/{session_id}"}
 
     @app.patch("/api/notebook")
     async def patch_notebook(payload: dict):

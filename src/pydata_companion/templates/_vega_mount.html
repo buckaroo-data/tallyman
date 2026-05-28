@@ -32,10 +32,15 @@
   await Promise.all(Array.from(targets).map(async (el) => {
     try {
       const spec = JSON.parse(el.dataset.spec);
-      const resp = await fetch('/api/data/' + el.dataset.hash);
-      if (!resp.ok) throw new Error('GET /api/data failed: ' + resp.status);
-      const {data} = await resp.json();
-      spec.data = {values: data};
+      // Only fetch + merge API data if the spec doesn't already contain
+      // inline GeoJSON features (detected by geometry on the first value).
+      const hasInlineGeo = spec.data?.values?.[0]?.geometry != null;
+      if (!hasInlineGeo) {
+        const resp = await fetch('/api/data/' + el.dataset.hash);
+        if (!resp.ok) throw new Error('GET /api/data failed: ' + resp.status);
+        const {data} = await resp.json();
+        spec.data = {values: data};
+      }
       spec.width = spec.width ?? 'container';
       await vegaEmbed(el, spec, {actions: false});
     } catch (err) {

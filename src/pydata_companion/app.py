@@ -125,26 +125,66 @@ def create_app(
     read_only: bool = False,
     buckaroo: "BuckarooManager | None" = None,
 ) -> FastAPI:
-    project_name = resolve_project(project)
+    # ``project`` (if given) seeds the active-project file on startup but is
+    # never the runtime source of truth — every route re-resolves via
+    # ``_current_project()`` so dropdown switches take effect without
+    # rebuilding the app.
+    seed = resolve_project(project)
+    if seed and project:
+        # CLI passed --project explicitly: make it stick by writing the file.
+        try:
+            from pydata_core.paths import set_active_project as _sap
+
+            _sap(project)
+        except (FileNotFoundError, ValueError):
+            # Project doesn't exist or name is invalid — let the empty-state
+            # landing handle it.
+            pass
+
     app = FastAPI(title="pydata companion")
     templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
     templates.env.globals["read_only"] = read_only
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
+    def _current_project() -> str | None:
+        return resolve_project() or seed
+
+    def _require_project() -> str:
+        p = _current_project()
+        if p is None:
+            # Caller is inside a route that needs a project; signal the
+            # empty-state landing.
+            raise HTTPException(503, "No active project — visit / to create one")
+        return p
+
     # In-process fan-out for SSE clients. Each client gets its own queue.
     subscribers: list[asyncio.Queue] = []
 
     async def publish(event: dict):
+        # Every event is tagged with the project it happened in so the
+        # client (base.html) can ignore cross-project events without
+        # touching the channel routing.
+        event.setdefault("project", _current_project())
         for q in list(subscribers):
             await q.put(event)
 
     @app.get("/", include_in_schema=False)
-    def root():
+    def root(request: Request):
+        # No project on disk yet → show the empty-state landing page.
+        if _current_project() is None:
+            from pydata_core.paths import list_projects
+
+            return templates.TemplateResponse(
+                request,
+                "empty_state.html",
+                {"available_projects": list_projects()},
+            )
         return RedirectResponse("/catalog")
 
     @app.get("/catalog", response_class=HTMLResponse)
     def catalog(request: Request):
+        project_name = _require_project()
         entries = _annotate_entries(project_name, list_entries(project_name))
         errors = list_errors(project_name, limit=5)
         return templates.TemplateResponse(
@@ -155,6 +195,7 @@ def create_app(
 
     @app.get("/catalog/{content_hash}", response_class=HTMLResponse)
     def catalog_entry(request: Request, content_hash: str):
+        project_name = _require_project()
         # Allow alias lookup too: /catalog/<alias> resolves to latest hash.
         alias = None
         version = None
@@ -260,6 +301,7 @@ def create_app(
         file — vega-embed on a citibike-scale result asking for 200 rows
         shouldn't pull millions of rows into Python.
         """
+        project_name = _require_project()
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
         entry = entry_dir(project_name, content_hash)
@@ -283,6 +325,7 @@ def create_app(
 
     @app.get("/api/sse")
     async def sse(request: Request):
+        project_name = _require_project()
         queue: asyncio.Queue = asyncio.Queue()
         subscribers.append(queue)
 
@@ -310,6 +353,7 @@ def create_app(
 
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
+        project_name = _require_project()
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
         # T-34: log the kind so "where did all these /internal/notify hits come
@@ -320,10 +364,72 @@ def create_app(
             getattr(payload, "hash", None),
         )
         await publish(payload.model_dump())
-        return {"ok": True, "subscribers": len(subscribers)}
+        return {"ok": True, "subscribers": len(subscribers), "project": project_name}
+
+    # ------------------------------------------------------------------
+    # Project lifecycle routes (used by the dropdown + MCP write-tools)
+    # ------------------------------------------------------------------
+
+    @app.get("/api/projects")
+    def api_projects():
+        from pydata_core.paths import list_projects as _list_projects
+
+        return {
+            "active": _current_project(),
+            "available": _list_projects(),
+        }
+
+    @app.post("/api/projects/switch")
+    async def api_projects_switch(payload: dict):
+        if read_only:
+            raise HTTPException(403, "companion is in read-only (serve) mode")
+        name = (payload or {}).get("name", "")
+        try:
+            from pydata_core.paths import set_active_project as _sap
+            from pydata_core.paths import validate_project_name as _vpn
+
+            _vpn(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        previous = _current_project()
+        try:
+            _sap(name)
+        except FileNotFoundError:
+            raise HTTPException(404, f"project {name!r} not found")
+        await publish({"kind": "project_switched", "name": name})
+        return {"previous": previous, "active": name}
+
+    @app.post("/api/projects/new")
+    async def api_projects_new(payload: dict):
+        if read_only:
+            raise HTTPException(403, "companion is in read-only (serve) mode")
+        from pydata_core import ensure_project as _ensure_project
+        from pydata_core.paths import projects_root as _projects_root
+        from pydata_core.paths import set_active_project as _sap
+
+        name = (payload or {}).get("name", "")
+        with_fixture = bool((payload or {}).get("with_fixture", False))
+        try:
+            from pydata_core.paths import validate_project_name as _vpn
+
+            _vpn(name)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        if (_projects_root() / name).exists():
+            raise HTTPException(409, f"project {name!r} already exists")
+        _ensure_project(name)
+        if with_fixture:
+            from pydata_cli.fixtures import write_shoe_orders  # noqa: PLC0415
+            from pydata_core import data_dir as _data_dir  # noqa: PLC0415
+
+            write_shoe_orders(_data_dir(name) / "orders.parquet")
+        _sap(name)
+        await publish({"kind": "project_switched", "name": name})
+        return {"name": name, "active": name}
 
     @app.get("/api/entries")
     def api_entries():
+        project_name = _require_project()
         return {
             "project": project_name,
             "entries": _annotate_entries(project_name, list_entries(project_name)),
@@ -331,6 +437,7 @@ def create_app(
 
     @app.get("/lineage", response_class=HTMLResponse)
     def lineage_overview(request: Request):
+        project_name = _require_project()
         dag = catalog_dag(project_name)
         node_id = lambda n: n["hash"]  # noqa: E731
         nodes_for_layout = [{"id": node_id(n), **n} for n in dag["nodes"]]
@@ -371,6 +478,7 @@ def create_app(
 
     @app.get("/lineage/{content_hash}", response_class=HTMLResponse)
     def lineage_entry(request: Request, content_hash: str):
+        project_name = _require_project()
         aliases = load_aliases(project_name)
         if content_hash in aliases:
             content_hash = aliases[content_hash]
@@ -401,6 +509,7 @@ def create_app(
 
     @app.get("/api/lineage/{content_hash}")
     def api_lineage(content_hash: str):
+        project_name = _require_project()
         if not entry_dir(project_name, content_hash).exists():
             raise HTTPException(404)
         return {
@@ -409,10 +518,12 @@ def create_app(
 
     @app.get("/api/catalog_dag")
     def api_catalog_dag():
+        project_name = _require_project()
         return {"project": project_name, **catalog_dag(project_name)}
 
     @app.get("/notebook", response_class=HTMLResponse)
     def notebook_view(request: Request):
+        project_name = _require_project()
         data = notebook.load(project_name)
         aliases = load_aliases(project_name)
         buckaroo_available = buckaroo is not None and buckaroo.is_running
@@ -481,9 +592,11 @@ def create_app(
     @app.get("/export/marimo")
     def export_marimo():
         """Download the default notebook as a Marimo Python file."""
+        project_name = _require_project()
         from fastapi.responses import Response  # noqa: PLC0415
 
         from pydata_core.marimo_export import notebook_to_marimo  # noqa: PLC0415
+
         content = notebook_to_marimo(project_name)
         filename = f"{project_name}_notebook.py"
         return Response(
@@ -494,6 +607,7 @@ def create_app(
 
     @app.patch("/api/notebook")
     async def patch_notebook(payload: dict):
+        project_name = _require_project()
         if read_only:
             raise HTTPException(403, "serve mode")
         action = payload.get("action")
@@ -518,6 +632,7 @@ def create_app(
         browser without having to round-trip through Claude. The new
         revision becomes V_{n+1}; V_n stays in forensic history.
         """
+        project_name = _require_project()
         if read_only:
             raise HTTPException(403, "serve mode")
         from pydata_core import get_alias as _get_alias
@@ -550,6 +665,7 @@ def create_app(
 
     @app.put("/api/markdown/{cell_id}")
     async def put_markdown(cell_id: str, payload: dict):
+        project_name = _require_project()
         if read_only:
             raise HTTPException(403, "serve mode")
         markdown = payload.get("markdown", "")
@@ -562,10 +678,12 @@ def create_app(
 
     @app.get("/api/notebook")
     def api_notebook():
+        project_name = _require_project()
         return {"project": project_name, **notebook.load(project_name)}
 
     @app.get("/diff/{alias}", response_class=HTMLResponse)
     def diff_default(request: Request, alias: str):
+        project_name = _require_project()
         hashes = history_for(project_name, alias)
         if not hashes:
             raise HTTPException(404, f"alias {alias!r} has no history")
@@ -580,6 +698,7 @@ def create_app(
         return _render_diff(request, alias, va, vb)
 
     def _render_diff(request: Request, alias: str, va: int, vb: int):
+        project_name = _require_project()
         hashes = history_for(project_name, alias)
         if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
             raise HTTPException(404, "version out of range")
@@ -607,6 +726,7 @@ def create_app(
 
     @app.get("/api/aliases")
     def api_aliases():
+        project_name = _require_project()
         aliases = load_aliases(project_name)
         return {
             "project": project_name,
@@ -622,10 +742,12 @@ def create_app(
 
     @app.get("/api/errors")
     def api_errors(limit: int = 20):
+        project_name = _require_project()
         return {"project": project_name, "errors": list_errors(project_name, limit=limit)}
 
     @app.get("/errors/{error_id}", response_class=HTMLResponse)
     def error_detail(request: Request, error_id: str):
+        project_name = _require_project()
         rec = get_error(project_name, error_id)
         if rec is None:
             raise HTTPException(404, f"error {error_id} not found")

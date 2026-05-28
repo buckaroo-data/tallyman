@@ -23,7 +23,6 @@ from pydata_companion import create_app
 from pydata_core import ensure_project, resolve_project, set_active_project
 from pydata_core.paths import active_project_file_path
 
-
 # ---------------------------------------------------------------------------
 # GET /api/projects
 # ---------------------------------------------------------------------------

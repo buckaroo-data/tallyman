@@ -1,0 +1,50 @@
+{% extends "base.html" %}
+{% block title %}new project · pydata{% endblock %}
+{% block content %}
+<section class="empty-state">
+  <h2>create a project</h2>
+  <p class="meta">
+    No projects on disk yet. Name one to get started — lowercase letters,
+    digits, hyphens, underscores; up to 32 characters.
+  </p>
+  <form id="new-project-form" onsubmit="return createProject(event)">
+    <input
+      id="new-project-name"
+      type="text"
+      pattern="[a-z0-9][a-z0-9_-]{0,31}"
+      placeholder="project_name"
+      required
+      autofocus
+      autocomplete="off"
+    />
+    <label class="meta">
+      <input type="checkbox" id="new-project-fixture" />
+      seed with the shoe-orders demo fixture
+    </label>
+    <button type="submit">create</button>
+  </form>
+  <div id="new-project-error" role="alert" class="meta"></div>
+</section>
+
+<script>
+async function createProject(ev) {
+  ev.preventDefault();
+  const name = document.getElementById('new-project-name').value;
+  const with_fixture = document.getElementById('new-project-fixture').checked;
+  const err = document.getElementById('new-project-error');
+  err.textContent = '';
+  const r = await fetch('/api/projects/new', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({name, with_fixture}),
+  });
+  if (!r.ok) {
+    const data = await r.json().catch(() => ({}));
+    err.textContent = data.detail || ('error: HTTP ' + r.status);
+    return false;
+  }
+  window.location.assign('/catalog');
+  return false;
+}
+</script>
+{% endblock %}

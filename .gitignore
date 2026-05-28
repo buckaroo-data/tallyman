@@ -14,3 +14,5 @@ src/pydata_companion/static/buckaroo-embed.js
 src/pydata_companion/static/buckaroo-embed.css
 # xorq-backed catalog git repo (managed externally via `xorq catalog`)
 catalog/
+# Stray ./projects/ from anything run with PYDATA_HOME unset to repo root.
+projects/

@@ -1,7 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
 {% if errors %}
-<div class="error-banner">
+{# Dismiss state is keyed by the latest error id so a fresh failure re-opens the
+   banner; sticking on stale dismiss across a new failure would hide signal. #}
+<div class="error-banner" id="error-banner" data-latest-id="{{ errors[0].id }}">
+  <button type="button" class="dismiss" aria-label="dismiss" title="dismiss until a new failure" onclick="dismissErrorBanner()">×</button>
   <strong>recent build failures:</strong>
   <ul>
     {% for err in errors %}
@@ -15,6 +18,19 @@
     {% endfor %}
   </ul>
 </div>
+<script>
+  (function () {
+    const banner = document.getElementById('error-banner');
+    if (!banner) return;
+    const latest = banner.dataset.latestId;
+    const dismissedKey = 'pydata.errorBannerDismissed';
+    if (localStorage.getItem(dismissedKey) === latest) banner.classList.add('collapsed');
+    window.dismissErrorBanner = () => {
+      banner.classList.add('collapsed');
+      localStorage.setItem(dismissedKey, latest);
+    };
+  })();
+</script>
 {% endif %}
 <div class="layout">
   <aside class="panel" id="catalog-sidebar">

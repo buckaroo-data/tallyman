@@ -14,17 +14,22 @@
       --accent: #6ea8fe;
       --accent-soft: #1e2a44;
     }
-    html, body { background: var(--bg); color: var(--fg); margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace; }
-    body { font-size: 14px; }
+    html, body { background: var(--bg); color: var(--fg); margin: 0; font-family: -apple-system, BlinkMacSystemFont, "SF Mono", monospace; height: 100%; }
+    body { font-size: 14px; display: flex; flex-direction: column; overflow: hidden; }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    header { border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; align-items: center; gap: 16px; }
+    header { border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex: 0 0 auto; }
     header .brand { font-weight: 600; }
     header .project { color: var(--muted); }
     header nav a { margin-right: 12px; }
-    main { padding: 16px; }
-    .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; height: calc(100vh - 60px); }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; }
+    /* main is the single scrollable region. Pages that want a sidebar+detail
+       SPA layout use .layout (catalog tab); long-scrolling pages (notebook)
+       just flow naturally. Either way, the body never scrolls — fixes the
+       nested-scrollbar mess where header was sitting above a separately-
+       scrolling document. */
+    main { padding: 16px; flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+    .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; flex: 1 1 auto; min-height: 0; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; min-height: 0; }
     .entry-list { list-style: none; margin: 0; padding: 0; }
     .entry-list li { border-bottom: 1px solid var(--line); }
     .entry-list a { display: block; padding: 10px 12px; color: var(--fg); }
@@ -51,9 +56,13 @@
     .empty-state button { background: var(--accent); color: white; border: 0; border-radius: 4px; padding: 8px 16px; font-family: inherit; cursor: pointer; }
     .empty-state button:hover { opacity: 0.9; }
     .live { color: var(--accent); }
-    .error-banner { background: #2a1b1b; border: 1px solid #5a3a3a; color: #ffb4b4; padding: 10px 12px; border-radius: 4px; margin: 0 16px 12px; }
-    .error-banner ul { margin: 6px 0 0 0; padding-left: 20px; }
+    .error-banner { background: #2a1b1b; border: 1px solid #5a3a3a; color: #ffb4b4; padding: 10px 12px; border-radius: 4px; margin: 0 0 12px; position: relative; flex: 0 0 auto; }
+    .error-banner ul { margin: 6px 0 0 0; padding-left: 20px; max-height: 6em; overflow: auto; }
     .error-banner code { color: #ffd1d1; }
+    .error-banner .dismiss { position: absolute; top: 4px; right: 8px; background: transparent; border: 0; color: #ffb4b4; font-size: 16px; cursor: pointer; padding: 2px 6px; line-height: 1; }
+    .error-banner .dismiss:hover { color: #fff; }
+    .error-banner.collapsed ul { display: none; }
+    .error-banner.collapsed strong::after { content: " (dismissed — refresh to restore)"; font-weight: normal; opacity: 0.6; }
     .entry-list .alias { font-weight: 600; color: var(--fg); display: block; }
     .entry-list .vchip { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 10px; font-size: 11px; font-weight: 500; margin-left: 4px; }
     .entry-list .forensic-tag { background: #333; color: var(--muted); padding: 1px 6px; border-radius: 10px; font-size: 11px; margin-left: 4px; }
@@ -108,15 +117,12 @@
     .nb-chart { margin: 4px 0 8px; min-height: 180px; }
     /* Buckaroo React embed: background matches the widget's dark theme so
        there's no white flash between mount and first WebSocket payload.
-       autoHeight lets the grid size itself to its row count; max-height caps
-       it so large tables don't push content off the page. min-height keeps
-       the "connecting…" state visible. overflow: hidden clips any internal
-       AG Grid chrome that bleeds past the cap. */
-    /* Entry-detail: autoHeight lets the grid shrink to its row count, capped by max-height.
-       Notebook cells: inline height is computed server-side from row_count so the infinite
-       scroll model knows its viewport and fires the first page request correctly. */
-    .buckaroo-embed { background: #181d1f; border: 1px solid var(--line); border-radius: 4px; width: 100%; min-height: 120px; max-height: 60vh; overflow: hidden; }
-    .buckaroo-embed.nb-buckaroo { max-height: none; }
+       On entry-detail we give it a fixed height — AG Grid then uses its
+       internal scroll for >N rows instead of relying on autoHeight (which
+       expanded past max-height and clipped, leaving no way to see all rows).
+       On notebook cells we use a per-cell server-computed pixel height. */
+    .buckaroo-embed { background: #181d1f; border: 1px solid var(--line); border-radius: 4px; width: 100%; height: 60vh; min-height: 240px; }
+    .buckaroo-embed.nb-buckaroo { height: auto; }
     .edit-code-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; margin-left: 8px; }
     .edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
     .section-header { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; padding: 10px 12px 4px; border-top: 1px solid var(--line); }

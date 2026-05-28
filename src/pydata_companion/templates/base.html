@@ -42,6 +42,22 @@
     .entry-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
     .entry-header h2 { margin: 0 8px 0 0; }
     .entry-header .pill { margin-right: 0; }
+    /* entry-detail: flex column so the buckaroo embed can claim the rest of
+       the panel's height when metadata is collapsed. Metadata expanded
+       pushes buckaroo down to its min-height and lets .panel scroll. */
+    .entry-detail { display: flex; flex-direction: column; box-sizing: border-box; min-height: 0; }
+    .entry-detail > .entry-header,
+    .entry-detail > .prompt-row,
+    .entry-detail > .meta-aside,
+    .entry-detail > .chart-panel,
+    .entry-detail > .metadata-section,
+    .entry-detail > .pandas-preview { flex: 0 0 auto; }
+    .entry-detail > .buckaroo-embed { flex: 1 1 auto; height: auto; min-height: 240px; }
+    .prompt-row { display: flex; align-items: center; gap: 12px; margin: 4px 0 8px; }
+    .prompt-row .prompt-text { flex: 1 1 auto; min-width: 0; }
+    .prompt-row #metadata-toggle { flex: 0 0 auto; }
+    .metadata-section { margin-bottom: 12px; }
+    .metadata-section h3:first-child { margin-top: 0; }
     .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
     pre.code { background: #0a0c12; border: 1px solid var(--line); border-radius: 4px; padding: 10px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; }
     table.data-table { border-collapse: collapse; width: 100%; font-size: 12px; }
@@ -130,6 +146,8 @@
     .buckaroo-embed.nb-buckaroo { height: auto; }
     .edit-code-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; margin-left: 8px; }
     .edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
+    .meta-toggle-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 3px 10px; font-size: 11px; cursor: pointer; font-family: inherit; }
+    .meta-toggle-btn:hover { color: var(--fg); border-color: var(--accent); }
     .section-header { color: var(--muted); text-transform: uppercase; font-size: 10px; letter-spacing: 0.08em; padding: 10px 12px 4px; border-top: 1px solid var(--line); }
     .section-header:first-child { border-top: 0; }
   </style>

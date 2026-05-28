@@ -25,6 +25,11 @@
         <span class="nb-actions">
           {% if not read_only %}
           <button type="button" onclick="nbEdit('{{ c.cell_id }}')">edit</button>
+          {% endif %}
+          {% if c.entry_meta %}
+          <button type="button" onclick="nbToggleMeta('{{ c.cell_id }}')" id="meta-btn-{{ c.cell_id }}">expand metadata</button>
+          {% endif %}
+          {% if not read_only %}
           <button type="button" onclick="nbRemove('{{ c.cell_id }}')">×</button>
           {% endif %}
         </span>
@@ -62,7 +67,7 @@
       {% endif %}
 
       {% if c.entry_meta %}
-        <div class="nb-meta">
+        <div class="nb-meta" id="meta-{{ c.cell_id }}" hidden>
           {{ c.entry_meta.row_count }} rows · {{ c.entry_meta.execute_seconds }}s ·
           first prompt: <em>{{ c.entry_meta.prompt or '(none)' }}</em>
         </div>
@@ -122,6 +127,20 @@ if (nbList && window.Sortable) {
       });
     }
   });
+}
+
+function nbToggleMeta(cellId) {
+  const div = document.getElementById('meta-' + cellId);
+  const btn = document.getElementById('meta-btn-' + cellId);
+  if (!div) return;
+  const wasHidden = div.hasAttribute('hidden');
+  if (wasHidden) {
+    div.removeAttribute('hidden');
+    btn.textContent = 'hide metadata';
+  } else {
+    div.setAttribute('hidden', '');
+    btn.textContent = 'expand metadata';
+  }
 }
 
 async function nbRemove(cellId) {

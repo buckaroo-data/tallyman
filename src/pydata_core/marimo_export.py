@@ -9,6 +9,7 @@ The generated file is self-contained: it sets PYDATA_PROJECT via
 ``os.environ.setdefault`` so ``from_project`` / ``from_catalog`` resolve
 correctly when the user runs it outside the pydata-app environment.
 """
+
 from __future__ import annotations
 
 import re
@@ -36,6 +37,7 @@ def _indent(text: str, prefix: str = "    ") -> str:
 def _marimo_version() -> str:
     try:
         import marimo  # noqa: PLC0415
+
         return marimo.__version__
     except ImportError:
         return "0.10.0"
@@ -122,7 +124,7 @@ def notebook_to_marimo(project: str) -> str:
             md_content += "\n\n" + md_body
 
         # Escape triple-quotes inside markdown
-        md_content = md_content.replace('"""', r'\"\"\"')
+        md_content = md_content.replace('"""', r"\"\"\"")
 
         parts += [
             "",
@@ -172,6 +174,7 @@ def notebook_to_marimo(project: str) -> str:
 def export_notebook_path(project: str) -> Path:
     """Write the Marimo export to ``<project_dir>/notebook_marimo.py`` and return the path."""
     from pydata_core.paths import project_dir  # noqa: PLC0415
+
     content = notebook_to_marimo(project)
     out = project_dir(project) / "notebook_marimo.py"
     out.write_text(content)

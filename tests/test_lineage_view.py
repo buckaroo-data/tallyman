@@ -68,7 +68,7 @@ def test_lineage_overview_with_chain(fresh_companion_app, project: str, orders_p
     assert parent.content_hash in r.text or "by_region" in r.text
     assert child.content_hash[:10] in r.text
     # At least one edge should render.
-    assert "<line class=\"edge\"" in r.text
+    assert '<line class="edge"' in r.text
 
 
 def test_lineage_entry_view_renders_internal_dag(fresh_companion_app, project: str, orders_parquet: Path):
@@ -106,9 +106,7 @@ def test_api_lineage_returns_internal(fresh_companion_app, project: str, orders_
     assert body["internal"]["nodes"]
 
 
-def test_lineage_entry_page_includes_column_trees(
-    fresh_companion_app, project: str, orders_parquet: Path
-):
+def test_lineage_entry_page_includes_column_trees(fresh_companion_app, project: str, orders_parquet: Path):
     """T-17: the /lineage/<hash> page now surfaces per-column trees."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)

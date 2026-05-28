@@ -3,6 +3,7 @@
 Server-computed positions keep the templates dumb and the layout testable.
 No JS layout library needed for the small (3-12 node) DAGs the demo produces.
 """
+
 from __future__ import annotations
 
 from collections import defaultdict

@@ -8,6 +8,7 @@ protocol. All in-process tests cover semantics; this test covers wire.
 Slow (~3-5s per test because of process startup); kept in a single
 module so the suite cost is bounded.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -73,9 +74,7 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
 
 @pytest.mark.integration
 @needs_uv
-def test_stdio_round_trips_catalog_load_parquet(
-    isolated_home: Path, project: str, orders_parquet: Path
-):
+def test_stdio_round_trips_catalog_load_parquet(isolated_home: Path, project: str, orders_parquet: Path):
     async def go():
         async with _client(project, isolated_home) as client:
             result = await client.call_tool(
@@ -91,9 +90,7 @@ def test_stdio_round_trips_catalog_load_parquet(
 
 @pytest.mark.integration
 @needs_uv
-def test_stdio_create_revise_diff_round_trip(
-    isolated_home: Path, project: str, orders_parquet: Path
-):
+def test_stdio_create_revise_diff_round_trip(isolated_home: Path, project: str, orders_parquet: Path):
     async def go():
         async with _client(project, isolated_home) as client:
             code1 = f"""
@@ -107,12 +104,8 @@ t = from_project("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
-            r1 = await client.call_tool(
-                "catalog_create", {"name": "shoe_sales", "code": code1, "prompt": "v1"}
-            )
-            r2 = await client.call_tool(
-                "catalog_revise", {"name": "shoe_sales", "code": code2, "prompt": "v2"}
-            )
+            r1 = await client.call_tool("catalog_create", {"name": "shoe_sales", "code": code1, "prompt": "v1"})
+            r2 = await client.call_tool("catalog_revise", {"name": "shoe_sales", "code": code2, "prompt": "v2"})
             r3 = await client.call_tool("catalog_diff", {"name": "shoe_sales"})
             return r1.data, r2.data, r3.data
 

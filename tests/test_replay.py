@@ -1,4 +1,5 @@
 """T-19: `pydata replay` against a JSON storyboard."""
+
 from __future__ import annotations
 
 import json
@@ -39,9 +40,7 @@ def _storyboard(project: str, parquet: Path) -> dict:
     }
 
 
-def test_replay_runs_all_steps(
-    project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
-):
+def test_replay_runs_all_steps(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch):
     sb_file = tmp_path / "demo.json"
     sb_file.write_text(json.dumps(_storyboard(project, orders_parquet)))
 
@@ -59,9 +58,7 @@ def test_replay_runs_all_steps(
     assert "orders" in aliases and "by_region" in aliases
 
 
-def test_replay_stops_on_error_by_default(
-    project: str, orders_parquet: Path, tmp_path: Path, monkeypatch
-):
+def test_replay_stops_on_error_by_default(project: str, orders_parquet: Path, tmp_path: Path, monkeypatch):
     sb = {
         "project": project,
         "steps": [
@@ -77,9 +74,7 @@ def test_replay_stops_on_error_by_default(
     assert "step failed" in result.output
 
 
-def test_replay_continue_on_error(
-    project: str, orders_parquet: Path, tmp_path: Path, monkeypatch
-):
+def test_replay_continue_on_error(project: str, orders_parquet: Path, tmp_path: Path, monkeypatch):
     sb = {
         "project": project,
         "steps": [
@@ -95,9 +90,7 @@ def test_replay_continue_on_error(
     assert "1 failure" in result.output
 
 
-def test_replay_skip_field(
-    project: str, orders_parquet: Path, tmp_path: Path, monkeypatch
-):
+def test_replay_skip_field(project: str, orders_parquet: Path, tmp_path: Path, monkeypatch):
     sb = {
         "project": project,
         "steps": [
@@ -123,9 +116,7 @@ def test_replay_unknown_tool(project: str, tmp_path: Path):
     assert "unknown tool" in result.output.lower()
 
 
-def test_canonical_demo_storyboard_replays_to_completion(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_canonical_demo_storyboard_replays_to_completion(project: str, orders_parquet: Path, monkeypatch):
     """Sanity-check the committed `demo/storyboard.json`. Project name is
     overridden so we hit the isolated test fixture rather than the real
     `spike` project."""
@@ -133,9 +124,7 @@ def test_canonical_demo_storyboard_replays_to_completion(
     sb_path = repo_root / "demo" / "storyboard.json"
     assert sb_path.exists(), "demo/storyboard.json is missing"
     runner = CliRunner()
-    result = runner.invoke(
-        cli, ["replay", str(sb_path), "--project", project]
-    )
+    result = runner.invoke(cli, ["replay", str(sb_path), "--project", project])
     assert result.exit_code == 0, result.output
     assert get_alias(project, "shoe_sales") is not None
     # Two revisions of shoe_sales (V1 + V2) per the storyboard.

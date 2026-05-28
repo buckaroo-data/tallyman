@@ -1,4 +1,5 @@
 """T-16: edit code from the browser via PUT /api/code/<alias>."""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -26,9 +27,7 @@ expr = f.group_by("region").aggregate(n=f.count())
 """
 
 
-def test_put_code_revises_alias(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     v1_hash = get_alias(project, "shoe_sales")
@@ -60,9 +59,7 @@ def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: P
     assert r.status_code == 400
 
 
-def test_put_code_build_error_records_and_400s(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
@@ -107,6 +104,7 @@ def test_entry_detail_omits_edit_button_for_scratch(
 ):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_run
+
     out = catalog_run(_agg(project), prompt="exploratory")
     c = TestClient(fresh_companion_app)
     r = c.get(f"/catalog/{out['hash']}")
@@ -115,9 +113,7 @@ def test_entry_detail_omits_edit_button_for_scratch(
     assert _BUTTON_HTML not in r.text
 
 
-def test_entry_detail_omits_edit_button_in_serve_mode(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     from pydata_companion import create_app

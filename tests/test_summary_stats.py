@@ -10,6 +10,7 @@ Three layers:
 - MCP tools: the three ``catalog_*_summary_stat`` wrappers around the
   core module, exposing the same surface to an agent.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,16 +22,14 @@ from pydata_core import StatSourceError, list_stats, remove_stat, write_stat
 from pydata_core.paths import project_dir
 from pydata_core.summary_stats import stats_dir, validate_stat_source
 
-PERCENT_AT_SIGN = (
-    "def compute(col):\n"
-    "    return col.cast('string').contains('@').sum() / col.count()\n"
-)
+PERCENT_AT_SIGN = "def compute(col):\n    return col.cast('string').contains('@').sum() / col.count()\n"
 N_ROWS = "def compute(col):\n    return col.count()\n"
 
 
 # ---------------------------------------------------------------------------
 # pydata_core.summary_stats — write/list/remove + dry-run
 # ---------------------------------------------------------------------------
+
 
 def test_validate_accepts_a_simple_ibis_expression():
     validate_stat_source("n_rows", N_ROWS)
@@ -102,9 +101,8 @@ def test_write_does_not_create_disabled_dir_on_active_listing(project: str):
 # BuckarooManager.ensure_session — project_root in the /load_expr POST
 # ---------------------------------------------------------------------------
 
-def test_ensure_session_includes_project_root_in_load_expr_body(
-    project: str, orders_parquet: Path, monkeypatch
-):
+
+def test_ensure_session_includes_project_root_in_load_expr_body(project: str, orders_parquet: Path, monkeypatch):
     """The /load_expr POST must carry the project's absolute path so
     buckaroo's load_project_stat_klasses (PR #784) can scan its stats/
     directory."""
@@ -146,6 +144,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 # ---------------------------------------------------------------------------
 # MCP tools — thin wrappers, smoke-tested via direct imports
 # ---------------------------------------------------------------------------
+
 
 def test_mcp_add_remove_list_smoke(project: str):
     """Drive the three tools directly (no MCP transport) — they should

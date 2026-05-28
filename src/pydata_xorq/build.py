@@ -95,9 +95,7 @@ def build_and_persist(
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
-        raise BuildError(
-            f"variable {expr_name!r} not found in code. Available names: {names}"
-        )
+        raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
 
     # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
     # things into our catalog layout afterwards.

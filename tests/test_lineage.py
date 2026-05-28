@@ -57,9 +57,7 @@ def test_no_catalog_parents_for_a_root_entry(project: str, orders_parquet: Path)
 
 def test_catalog_parents_via_from_catalog(project: str, orders_parquet: Path):
     parent = build_and_persist(project, _agg_code(project), prompt="parent")
-    child = build_and_persist(
-        project, _from_catalog_code(project, parent.content_hash), prompt="child"
-    )
+    child = build_and_persist(project, _from_catalog_code(project, parent.content_hash), prompt="child")
     assert catalog_parents(project, child.content_hash) == [parent.content_hash]
 
 

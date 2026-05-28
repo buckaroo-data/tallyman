@@ -16,6 +16,7 @@ V0 has one default notebook per project at `notebooks/default.json`:
       ]
     }
 """
+
 from __future__ import annotations
 
 import json

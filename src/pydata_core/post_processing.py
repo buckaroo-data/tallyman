@@ -19,6 +19,7 @@ Soft-delete by default: ``remove_post_processing`` moves
 ``post_processing/<name>.py`` to ``post_processing/_disabled/<name>.py``
 (the ``_`` prefix on the subdirectory keeps buckaroo from scanning it).
 """
+
 from __future__ import annotations
 
 import builtins
@@ -32,11 +33,31 @@ from pydata_core.paths import post_processing_dir as _post_processing_dir
 # them in sync by hand for now — these are the names the function body
 # can resolve through builtin lookup.
 _SAFE_BUILTIN_NAMES = (
-    "True", "False", "None",
-    "abs", "min", "max", "round", "sum", "len",
-    "int", "float", "str", "bool", "list", "tuple", "dict", "set",
-    "range", "enumerate", "zip", "map", "filter",
-    "isinstance", "issubclass", "type",
+    "True",
+    "False",
+    "None",
+    "abs",
+    "min",
+    "max",
+    "round",
+    "sum",
+    "len",
+    "int",
+    "float",
+    "str",
+    "bool",
+    "list",
+    "tuple",
+    "dict",
+    "set",
+    "range",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "isinstance",
+    "issubclass",
+    "type",
 )
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -64,21 +85,25 @@ def list_post_processings(project: str) -> list[dict]:
         for p in sorted(active.glob("*.py")):
             if p.name.startswith("_"):
                 continue
-            out.append({
-                "name": p.stem,
-                "path": str(p),
-                "source": p.read_text(),
-                "disabled": False,
-            })
+            out.append(
+                {
+                    "name": p.stem,
+                    "path": str(p),
+                    "source": p.read_text(),
+                    "disabled": False,
+                }
+            )
     parked = disabled_dir(project)
     if parked.is_dir():
         for p in sorted(parked.glob("*.py")):
-            out.append({
-                "name": p.stem,
-                "path": str(p),
-                "source": p.read_text(),
-                "disabled": True,
-            })
+            out.append(
+                {
+                    "name": p.stem,
+                    "path": str(p),
+                    "source": p.read_text(),
+                    "disabled": True,
+                }
+            )
     return out
 
 
@@ -88,11 +113,13 @@ def _restricted_globals() -> dict:
     }
     try:
         from xorq.vendor import ibis as _ibis  # noqa: PLC0415
+
         globs["ibis"] = _ibis
     except ImportError:
         pass
     try:
         import xorq.api as _xo  # noqa: PLC0415
+
         globs["xorq"] = _xo
     except ImportError:
         pass
@@ -104,35 +131,29 @@ def validate_post_processing_source(name: str, source: str) -> None:
     table. Raises ``PostProcessingSourceError`` on any failure — the
     message is safe to surface back to the agent verbatim."""
     if not _NAME_RE.match(name):
-        raise PostProcessingSourceError(
-            f"post-processing name {name!r} is not a valid python identifier")
+        raise PostProcessingSourceError(f"post-processing name {name!r} is not a valid python identifier")
 
     ns: dict = {}
     try:
-        exec(compile(source, f"<post_processing: {name}>", "exec"),
-             _restricted_globals(), ns)
+        exec(compile(source, f"<post_processing: {name}>", "exec"), _restricted_globals(), ns)
     except SyntaxError as e:
         raise PostProcessingSourceError(f"syntax error: {e}") from None
     except Exception as e:
-        raise PostProcessingSourceError(
-            f"source raised at exec time: {e!r}") from None
+        raise PostProcessingSourceError(f"source raised at exec time: {e!r}") from None
 
     process = ns.get("process")
     if not callable(process):
-        raise PostProcessingSourceError(
-            "source must define a callable named 'process'")
+        raise PostProcessingSourceError("source must define a callable named 'process'")
 
     sig = inspect.signature(process)
     params = list(sig.parameters.values())
     if len(params) != 1:
-        raise PostProcessingSourceError(
-            f"process() must take exactly one parameter, got {len(params)}")
+        raise PostProcessingSourceError(f"process() must take exactly one parameter, got {len(params)}")
 
     try:
         import xorq.api as xo  # noqa: PLC0415
     except ImportError as e:
-        raise PostProcessingSourceError(
-            f"xorq is not installed: {e}") from None
+        raise PostProcessingSourceError(f"xorq is not installed: {e}") from None
 
     # A multi-row, multi-column memtable — post-processing functions
     # typically reference columns by name and may filter rows, so a
@@ -146,8 +167,7 @@ def validate_post_processing_source(name: str, source: str) -> None:
     try:
         result = process(table)
     except Exception as e:
-        raise PostProcessingSourceError(
-            f"process() raised when called with an expression: {e!r}") from None
+        raise PostProcessingSourceError(f"process() raised when called with an expression: {e!r}") from None
 
     # Accept either an ibis expression (has ``.execute``) or a pandas
     # DataFrame. Buckaroo's ``XorqDataflow.add_processing`` accepts both
@@ -156,13 +176,14 @@ def validate_post_processing_source(name: str, source: str) -> None:
         return
     try:
         import pandas as pd  # noqa: PLC0415
+
         if isinstance(result, pd.DataFrame):
             return
     except ImportError:
         pass
     raise PostProcessingSourceError(
-        f"process() must return an ibis expression or pandas DataFrame "
-        f"(got {type(result).__name__})")
+        f"process() must return an ibis expression or pandas DataFrame (got {type(result).__name__})"
+    )
 
 
 def write_post_processing(project: str, name: str, source: str) -> Path:
@@ -212,8 +233,7 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     parquet_path = entry_dir(project, content_hash) / "result.parquet"
     if not parquet_path.exists():
         raise PostProcessingRunError(
-            f"no result.parquet found for entry {entry_name_or_hash!r} "
-            f"(resolved hash: {content_hash})"
+            f"no result.parquet found for entry {entry_name_or_hash!r} (resolved hash: {content_hash})"
         )
 
     try:
@@ -246,14 +266,14 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     # Execute to get actual rows.
     try:
         import pandas as pd  # noqa: PLC0415
+
         if hasattr(result, "execute"):
             df = result.execute()
         elif isinstance(result, pd.DataFrame):
             df = result
         else:
             raise PostProcessingRunError(
-                f"process() must return an ibis expression or pandas DataFrame "
-                f"(got {type(result).__name__})"
+                f"process() must return an ibis expression or pandas DataFrame (got {type(result).__name__})"
             )
     except PostProcessingRunError:
         raise

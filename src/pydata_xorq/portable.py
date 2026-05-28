@@ -17,6 +17,7 @@ The verified-against-xorq experiment that established this is the docstring
 of `_load_expr_portable` below; if you're touching this module, re-run that
 experiment in a python repl before pushing.
 """
+
 from __future__ import annotations
 
 import shutil

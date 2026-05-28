@@ -41,6 +41,7 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
 # pydata_core.notebook storage
 # ---------------------------------------------------------------------------
 
+
 def test_load_empty(project: str):
     assert notebook.load(project) == {"cells": []}
 
@@ -114,6 +115,7 @@ def test_remove_alias_from_cells(project: str):
 # ---------------------------------------------------------------------------
 # MCP tools: catalog_create/revise/alias/rename interact with notebook
 # ---------------------------------------------------------------------------
+
 
 def test_catalog_create_appends_cell(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
@@ -200,6 +202,7 @@ def test_notebook_tool_errors_on_missing(project: str, monkeypatch):
 # Companion routes
 # ---------------------------------------------------------------------------
 
+
 def test_notebook_route_empty(fresh_companion_app):
     c = TestClient(fresh_companion_app)
     r = c.get("/notebook")
@@ -270,12 +273,11 @@ def test_api_notebook_unknown_action(fresh_companion_app):
     assert r.status_code == 400
 
 
-def test_notebook_renders_markdown_as_html(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
-):
+def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create as _cc
     from pydata_mcp.server import notebook_edit_markdown as _em
+
     _cc("shoe_sales", _agg_code(project))
     cell = notebook.load(project)["cells"][0]
     _em(cell["cell_id"], "## Title\n\nSome **bold** text.\n\n- one\n- two\n")
@@ -287,7 +289,7 @@ def test_notebook_renders_markdown_as_html(
     assert "<strong>bold</strong>" in r.text
     assert "<li>one</li>" in r.text
     # And the raw value is preserved on the data-attr for the edit toggle.
-    assert "data-raw=\"## Title" in r.text
+    assert 'data-raw="## Title' in r.text
 
 
 def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
@@ -295,19 +297,19 @@ def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
 ):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create as _cc
+
     _cc("shoe_sales", _agg_code(project), prompt="")  # empty markdown
     c = TestClient(fresh_companion_app)
     r = c.get("/notebook")
     assert "(no markdown — click edit to add a note)" in r.text
 
 
-def test_put_markdown_returns_rendered_html(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
-):
+def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """T-10: in-place updates need the server to send back rendered HTML
     so the client can swap it in without a reload."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create as _cc
+
     _cc("shoe_sales", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
     c = TestClient(fresh_companion_app)
@@ -318,12 +320,11 @@ def test_put_markdown_returns_rendered_html(
     assert body["markdown"] == "## Hello\n\nworld"
 
 
-def test_notebook_page_includes_sortable_js(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
-):
+def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """T-09: drag-reorder requires SortableJS available."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create as _cc
+
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get("/notebook")
@@ -335,6 +336,7 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_companion import create_app
     from pydata_mcp.server import catalog_create as _cc
+
     _cc("shoe_sales", _agg_code(project))
     app = create_app(project, read_only=True)
     c = TestClient(app)
@@ -343,9 +345,7 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
     assert 'class="nb-drag"' not in r.text
 
 
-def test_notebook_uses_buckaroo_embed_when_session_available(
-    project: str, orders_parquet, monkeypatch
-):
+def test_notebook_uses_buckaroo_embed_when_session_available(project: str, orders_parquet, monkeypatch):
     """Notebook cells render the Buckaroo React embed (BuckarooServerView)
     when the manager is plumbed in. Falls back to pandas.to_html otherwise."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
@@ -376,24 +376,24 @@ def test_notebook_uses_buckaroo_embed_when_session_available(
     # The IntersectionObserver fires /api/session/<hash> on scroll and sets
     # data-ws-url dynamically; buckaroo-embed.js then mounts the React embed.
     assert 'class="buckaroo-embed nb-buckaroo"' in r.text
-    assert 'data-hash=' in r.text
+    assert "data-hash=" in r.text
     assert 'data-ws-url="' not in r.text  # WS URL added dynamically, not in initial HTML
     # The HTML preview fallback should NOT render when Buckaroo is available.
     assert '<div class="nb-preview">' not in r.text
 
     # /api/session/<hash> returns the WS URL on demand.
     from pydata_core import get_alias
+
     content_hash = get_alias(project, "shoe_sales")
     sr = c.get(f"/api/session/{content_hash}")
     assert sr.status_code == 200
     assert sr.json()["ws_url"].startswith("ws://127.0.0.1:8700/ws/sess-")
 
 
-def test_notebook_falls_back_to_html_when_no_buckaroo(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
-):
+def test_notebook_falls_back_to_html_when_no_buckaroo(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create as _cc
+
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get("/notebook")

@@ -37,6 +37,7 @@ expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filte
 # pure-function diffs (no xorq build needed)
 # ---------------------------------------------------------------------------
 
+
 def test_code_diff_html_has_pygments_highlight():
     out = code_diff("a = 1\nb = 2\n", "a = 1\nb = 3\n")
     assert "highlight" in out  # Pygments wraps in <div class="highlight">
@@ -100,6 +101,7 @@ def test_key_diff_returns_none_when_no_keys():
 # full_diff against real xorq builds
 # ---------------------------------------------------------------------------
 
+
 def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
     from pydata_xorq import build_and_persist
 
@@ -117,6 +119,7 @@ def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
 # ---------------------------------------------------------------------------
 # catalog_diff MCP tool
 # ---------------------------------------------------------------------------
+
 
 def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
@@ -152,6 +155,7 @@ def test_catalog_diff_out_of_range(project: str, orders_parquet: Path, monkeypat
 # ---------------------------------------------------------------------------
 # /diff/<alias>/<va>/<vb> route
 # ---------------------------------------------------------------------------
+
 
 def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)

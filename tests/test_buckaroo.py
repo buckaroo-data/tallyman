@@ -8,6 +8,7 @@ Three layers:
 - companion-level: entry_detail with a stub manager that returns a
   fixed session id, verifying the iframe lands in the response.
 """
+
 from __future__ import annotations
 
 import json
@@ -37,6 +38,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 # unit: session map only
 # ---------------------------------------------------------------------------
 
+
 def test_unit_session_file_round_trip(project: str, orders_parquet: Path):
     # Build one entry so the project/hash on disk satisfies the prune check
     # that runs on _load_session_file.
@@ -60,9 +62,7 @@ def test_unit_ensure_session_short_circuits_when_not_running(project: str):
     assert mgr.ensure_session("anyhash", project) is None
 
 
-def test_unit_ensure_session_restarts_dead_subprocess(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_unit_ensure_session_restarts_dead_subprocess(project: str, orders_parquet: Path, monkeypatch):
     """If buckaroo's subprocess died since the last call (mid-session crash,
     OOM, signal), ensure_session attempts one restart instead of silently
     falling back forever. Without this, a one-time death turns the rest of
@@ -70,32 +70,43 @@ def test_unit_ensure_session_restarts_dead_subprocess(
     res = build_and_persist(project, _code(project))
 
     mgr = BuckarooManager()
+
     # Simulate a previously-running buckaroo that has now exited.
     class _DeadProc:
         returncode = 1
+
         def poll(self):
             return 1
+
     mgr.proc = _DeadProc()  # type: ignore[assignment]
     mgr.bound_port = None
 
     # Stub start() so the test doesn't actually spawn a subprocess —
     # it just flips state to "running" as a real start would.
     restart_calls = {"n": 0}
+
     class _LiveProc:
         returncode = None
         pid = 99999
+
         def poll(self):
             return None
+
     def fake_start(self):
         restart_calls["n"] += 1
         self.proc = _LiveProc()
         self.bound_port = 8700
+
     monkeypatch.setattr(BuckarooManager, "start", fake_start)
 
     # Stub the /load POST so we don't need a real server.
     class _Resp:
-        def raise_for_status(self): pass
-        def json(self): return {"session": "restored-session"}
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "restored-session"}
+
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
 
     sid = mgr.ensure_session(res.content_hash, project)
@@ -103,27 +114,31 @@ def test_unit_ensure_session_restarts_dead_subprocess(
     assert restart_calls["n"] == 1
 
 
-def test_unit_ensure_session_restart_throttled(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_unit_ensure_session_restart_throttled(project: str, orders_parquet: Path, monkeypatch):
     """If buckaroo restart fails, don't retry on every page hit — that
     would hammer the system with subprocess spawns. Throttle to one
     attempt per cooldown."""
     build_and_persist(project, _code(project))
 
     mgr = BuckarooManager()
+
     class _DeadProc:
         returncode = 1
+
         def poll(self):
             return 1
+
     mgr.proc = _DeadProc()  # type: ignore[assignment]
     mgr.bound_port = None
 
     from pydata_companion.buckaroo_lifecycle import BuckarooUnavailable
+
     restart_calls = {"n": 0}
+
     def failing_start(self):
         restart_calls["n"] += 1
         raise BuckarooUnavailable("simulated startup failure")
+
     monkeypatch.setattr(BuckarooManager, "start", failing_start)
 
     # First call attempts a restart.
@@ -143,9 +158,7 @@ def test_unit_status_shape(project: str):
     assert s["session_count"] == 0
 
 
-def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, orders_parquet: Path, monkeypatch):
     """When an entry has an xorq_build/ dir (every catalog entry does),
     ensure_session posts to /load_expr so Buckaroo serves it via the
     xorq backend with push-down sort/search rather than paging over a
@@ -162,8 +175,10 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
 
     class FakeResponse:
         status_code = 200
+
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"session": "abc123def456"}
 
@@ -192,6 +207,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
 # stress: tmp-dir lifecycle, concurrency
 # ---------------------------------------------------------------------------
 
+
 def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monkeypatch):
     """The tmp dir created by ensure_session must be deleted by stop().
 
@@ -207,8 +223,10 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
     class FakeResponse:
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"session": "s"}
+
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
 
     mgr.ensure_session(res.content_hash, project)
@@ -245,9 +263,7 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
         assert not p.exists(), p
 
 
-def test_unit_concurrent_same_hash_loads_once(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path, monkeypatch):
     """N threads racing on the same content_hash must produce exactly one
     /load_expr POST and one tmp dir — the session_lock serialises."""
     res = build_and_persist(project, _code(project))
@@ -261,6 +277,7 @@ def test_unit_concurrent_same_hash_loads_once(
     class FakeResponse:
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"session": "shared"}
 
@@ -290,14 +307,12 @@ def test_unit_concurrent_same_hash_loads_once(
     assert len(mgr._expanded_dirs) == 1
 
 
-def test_unit_concurrent_different_hashes_each_load_once(
-    project: str, orders_parquet: Path, monkeypatch
-):
+def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
     """Threads racing on N distinct content_hashes each get their own
     /load_expr POST + tmp dir; no cross-talk through the session_lock."""
-    hashes = [build_and_persist(
-        project, _code(project) + f"\nexpr = expr.mutate(_v={i})"
-    ).content_hash for i in range(5)]
+    hashes = [
+        build_and_persist(project, _code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash for i in range(5)
+    ]
 
     mgr = BuckarooManager()
     mgr.bound_port = 65000
@@ -310,6 +325,7 @@ def test_unit_concurrent_different_hashes_each_load_once(
     class FakeResponse:
         def raise_for_status(self):
             pass
+
         def json(self):
             return {"session": "any"}
 
@@ -343,6 +359,7 @@ def test_unit_concurrent_different_hashes_each_load_once(
 # integration: real subprocess + real /load
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.integration
 def test_integration_spawn_and_load(project: str, orders_parquet: Path):
     # Build at least one catalog entry so we have a result.parquet to /load.
@@ -359,9 +376,7 @@ def test_integration_spawn_and_load(project: str, orders_parquet: Path):
         # Cached lookup returns the same session id.
         assert mgr.ensure_session(res.content_hash, project) == session
         # Persisted on disk under the new envelope shape.
-        sessions_file = json.loads(
-            (mgr._session_file_path()).read_text()
-        )
+        sessions_file = json.loads((mgr._session_file_path()).read_text())
         assert sessions_file["sessions"][res.content_hash]["session_id"] == session
         assert sessions_file["sessions"][res.content_hash]["project"] == project
         assert sessions_file["buckaroo_started_at"] is not None
@@ -371,9 +386,7 @@ def test_integration_spawn_and_load(project: str, orders_parquet: Path):
 
 
 @pytest.mark.integration
-def test_integration_load_expr_returns_nonzero_rows(
-    project: str, orders_parquet: Path
-):
+def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet: Path):
     """Smoking-gun integration test for the placeholder-expansion fix.
 
     Without expansion, /load_expr loads the schema fine (it reads YAML
@@ -425,8 +438,10 @@ def test_integration_stop_cleans_up(project: str, orders_parquet: Path):
     assert mgr.proc is None
     # The pid is no longer alive (give it a moment).
     import time
+
     time.sleep(0.2)
     import os
+
     with pytest.raises(ProcessLookupError):
         os.kill(pid, 0)
 
@@ -434,6 +449,7 @@ def test_integration_stop_cleans_up(project: str, orders_parquet: Path):
 # ---------------------------------------------------------------------------
 # companion: entry_detail picks up the iframe when a session is available
 # ---------------------------------------------------------------------------
+
 
 class _StubBuckaroo:
     """A BuckarooManager-shaped stub that returns a predetermined session id."""
@@ -455,9 +471,7 @@ class _StubBuckaroo:
         return self.session
 
 
-def test_entry_detail_embeds_react_widget_when_buckaroo_present(
-    project: str, orders_parquet: Path
-):
+def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, orders_parquet: Path):
     from pydata_companion import create_app
 
     res = build_and_persist(project, _code(project))
@@ -476,9 +490,7 @@ def test_entry_detail_embeds_react_widget_when_buckaroo_present(
 _EMBED_TAG = '<div\n        class="buckaroo-embed"'
 
 
-def test_entry_detail_falls_back_when_buckaroo_absent(
-    fresh_companion_app, project: str, orders_parquet: Path
-):
+def test_entry_detail_falls_back_when_buckaroo_absent(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/catalog/{res.content_hash}")
@@ -488,9 +500,7 @@ def test_entry_detail_falls_back_when_buckaroo_absent(
     assert _EMBED_TAG not in r.text
 
 
-def test_entry_detail_falls_back_when_session_unavailable(
-    project: str, orders_parquet: Path
-):
+def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_parquet: Path):
     """When ensure_session returns None (Buckaroo died or /load failed) the
     page still renders — just falls back to the pandas preview."""
     from pydata_companion import create_app

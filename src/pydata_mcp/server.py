@@ -135,9 +135,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
 @mcp.tool()
 @_tag_project
-def catalog_load_parquet(
-    rel_path: str, prompt: str = "", name: str = ""
-) -> dict:
+def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dict:
     """Register a parquet file from the project's data/ directory as a catalog entry.
 
     Use this for simple "load this file" steps. The agent does not need to write
@@ -156,10 +154,7 @@ def catalog_load_parquet(
     project = resolve_project()
     if name and get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
-    code = (
-        "from pydata_xorq.io import from_project\n"
-        f"expr = from_project({rel_path!r})\n"
-    )
+    code = f"from pydata_xorq.io import from_project\nexpr = from_project({rel_path!r})\n"
     out = _run_and_record(project, code, prompt, tool="catalog_load_parquet")
     if "error" in out:
         return out
@@ -181,9 +176,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
     try:
         result = build_and_persist(project=project, code=code, prompt=prompt or None)
     except BuildError as exc:
-        rec = record_error(
-            project, code=code, message=str(exc), prompt=prompt or None, tool=tool
-        )
+        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool)
         _notify("build_failed", error_id=rec["id"], tool=tool)
         return {"error": str(exc), "error_id": rec["id"]}
     return {
@@ -430,11 +423,7 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
         "after": {"version": b_idx, "hash": b_hash},
         "schema": diff["schema"],
         "stats": diff["stats"],
-        "keyed_summary": (
-            {k: v for k, v in diff["keyed"].items() if k != "table_html"}
-            if diff["keyed"]
-            else None
-        ),
+        "keyed_summary": ({k: v for k, v in diff["keyed"].items() if k != "table_html"} if diff["keyed"] else None),
     }
 
 
@@ -640,6 +629,7 @@ def catalog_export_marimo() -> dict:
     except Exception as exc:
         return {"error": str(exc)}
     from pydata_core.notebook import load as _load  # noqa: PLC0415
+
     n = len(_load(project).get("cells", []))
     return {"path": str(path), "cells": n}
 
@@ -778,9 +768,7 @@ def project_new(name: str, with_fixture: bool = False) -> dict:
         ``{"error": "..."}`` on transport failure, invalid name (400),
         or collision (409).
     """
-    return _companion_post(
-        "/api/projects/new", {"name": name, "with_fixture": with_fixture}
-    )
+    return _companion_post("/api/projects/new", {"name": name, "with_fixture": with_fixture})
 
 
 def main() -> None:

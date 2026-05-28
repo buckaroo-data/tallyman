@@ -13,6 +13,7 @@ We don't reassert the ``/load_expr`` ``project_root`` plumbing here —
 it's covered by ``test_summary_stats.py`` and the same field carries
 both channels.
 """
+
 from __future__ import annotations
 
 import pytest
@@ -28,16 +29,14 @@ from pydata_core.post_processing import (
     validate_post_processing_source,
 )
 
-LOW_VOLUME = (
-    "def process(expr):\n"
-    "    return expr.filter(expr.a < 3)\n"
-)
+LOW_VOLUME = "def process(expr):\n    return expr.filter(expr.a < 3)\n"
 NOOP = "def process(expr):\n    return expr\n"
 
 
 # ---------------------------------------------------------------------------
 # pydata_core.post_processing — write/list/remove + dry-run
 # ---------------------------------------------------------------------------
+
 
 def test_validate_accepts_a_simple_filter():
     validate_post_processing_source("low_volume", LOW_VOLUME)
@@ -48,10 +47,7 @@ def test_validate_accepts_a_noop():
 
 
 def test_validate_accepts_pandas_return():
-    src = (
-        "def process(expr):\n"
-        "    return expr.to_pandas()\n"
-    )
+    src = "def process(expr):\n    return expr.to_pandas()\n"
     validate_post_processing_source("to_pandas", src)
 
 
@@ -120,6 +116,7 @@ def test_listing_with_no_directory_is_empty(project: str):
 # MCP tools — thin wrappers, smoke-tested via direct imports
 # ---------------------------------------------------------------------------
 
+
 def test_mcp_add_remove_list_smoke(project: str):
     from pydata_mcp.server import (
         catalog_add_post_processing,
@@ -145,9 +142,7 @@ def test_mcp_add_remove_list_smoke(project: str):
 def test_mcp_add_rejects_bad_source(project: str):
     from pydata_mcp.server import catalog_add_post_processing
 
-    resp = catalog_add_post_processing(
-        "evil", "import os\ndef process(expr): return expr\n"
-    )
+    resp = catalog_add_post_processing("evil", "import os\ndef process(expr): return expr\n")
     assert "error" in resp
     assert "source raised at exec time" in resp["error"]
 
@@ -162,6 +157,7 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
 # ---------------------------------------------------------------------------
 # catalog_run_post_processing — test against a real catalog entry
 # ---------------------------------------------------------------------------
+
 
 def _agg_code(project: str) -> str:
     return (
@@ -208,9 +204,7 @@ def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, m
 
     catalog_create("agg3", _agg_code(project))
     all_rows = catalog_run_post_processing("def process(expr):\n    return expr\n", "agg3")
-    filtered = catalog_run_post_processing(
-        "def process(expr):\n    return expr.filter(expr.n > 9999)\n", "agg3"
-    )
+    filtered = catalog_run_post_processing("def process(expr):\n    return expr.filter(expr.n > 9999)\n", "agg3")
     assert "error" not in all_rows
     assert "error" not in filtered
     assert filtered["row_count"] < all_rows["row_count"]

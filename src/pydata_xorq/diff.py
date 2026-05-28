@@ -14,6 +14,7 @@ to pick whichever is most legible for a given situation.
 
 Code and schema diffs are also computed; schema_diff feeds key inference.
 """
+
 from __future__ import annotations
 
 import difflib
@@ -182,11 +183,13 @@ def full_diff(
     b_schema = json.loads((b_entry / "schema.json").read_text()) if (b_entry / "schema.json").exists() else {}
     a_df = (
         pq.read_table(a_entry / "result.parquet").to_pandas()
-        if (a_entry / "result.parquet").exists() else pd.DataFrame()
+        if (a_entry / "result.parquet").exists()
+        else pd.DataFrame()
     )
     b_df = (
         pq.read_table(b_entry / "result.parquet").to_pandas()
-        if (b_entry / "result.parquet").exists() else pd.DataFrame()
+        if (b_entry / "result.parquet").exists()
+        else pd.DataFrame()
     )
     return {
         "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),

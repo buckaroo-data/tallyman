@@ -1,4 +1,5 @@
 """CLI behaviors that don't fit elsewhere."""
+
 from __future__ import annotations
 
 from pathlib import Path

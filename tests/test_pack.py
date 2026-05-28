@@ -1,4 +1,5 @@
 """Tests for `pydata pack`: tar a project dir into a portable .tgz."""
+
 from __future__ import annotations
 
 import tarfile
@@ -23,9 +24,7 @@ expr = t.group_by("region").aggregate(n=t.count())
     return res.content_hash
 
 
-def test_pack_creates_tgz(
-    project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path
-):
+def test_pack_creates_tgz(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path):
     h = _build_one(project, orders_parquet)
     set_alias(project, "by_region", h)
 
@@ -42,9 +41,7 @@ def test_pack_creates_tgz(
     assert any(f"{project}/artifacts/catalog/entries/{h}/" in n for n in names)
 
 
-def test_pack_skips_buckaroo_sessions(
-    project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path
-):
+def test_pack_skips_buckaroo_sessions(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path):
     # Write a stale sessions file that mustn't ship.
     from pydata_core import catalog_dir
 
@@ -70,9 +67,7 @@ def test_pack_unknown_project(isolated_home: Path, tmp_path: Path):
     assert "not found" in result.output
 
 
-def test_pack_round_trip_serves(
-    project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
-):
+def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch):
     """The full handoff loop: pack → extract to a random location →
     point PYDATA_PROJECT_PATH at the extract → serve read-only and verify
     every alias resolves."""

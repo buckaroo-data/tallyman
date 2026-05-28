@@ -7,6 +7,7 @@ machines yet — see plan.md), but recording the relative path here lays the
 groundwork for a future `pydata pack` step that rewrites the build to be
 machine-independent.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -27,9 +28,7 @@ def project_path(rel_path: str, project: str | None = None) -> Path:
     try:
         candidate.relative_to(base.resolve())
     except ValueError as exc:
-        raise ProjectDataNotFound(
-            f"{rel_path!r} resolves outside {base} (got {candidate})"
-        ) from exc
+        raise ProjectDataNotFound(f"{rel_path!r} resolves outside {base} (got {candidate})") from exc
     if not candidate.is_file():
         raise ProjectDataNotFound(f"{candidate} not found")
     return candidate
@@ -65,9 +64,7 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
     if not target.exists():
         latest = get_alias(proj, alias_or_hash)
         if latest is None:
-            raise ProjectDataNotFound(
-                f"catalog entry {alias_or_hash!r} not found in project {proj!r}"
-            )
+            raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
         target = entry_dir(proj, latest)
     parquet = target / "result.parquet"
     if not parquet.exists():

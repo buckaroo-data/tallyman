@@ -53,9 +53,7 @@ def test_catalog_load_parquet_missing(project: str, monkeypatch):
     assert "nope.parquet" in out["error"]
 
 
-def test_catalog_load_parquet_with_name_creates_alias(
-    project: str, orders_parquet, monkeypatch
-):
+def test_catalog_load_parquet_with_name_creates_alias(project: str, orders_parquet, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_load_parquet("orders.parquet", prompt="raw", name="orders")
     assert "error" not in out
@@ -69,9 +67,7 @@ def test_catalog_load_parquet_with_name_creates_alias(
     assert cells[0]["alias"] == "orders"
 
 
-def test_catalog_load_parquet_name_collision_rejected(
-    project: str, orders_parquet, monkeypatch
-):
+def test_catalog_load_parquet_name_collision_rejected(project: str, orders_parquet, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_load_parquet("orders.parquet", name="orders")
     out = catalog_load_parquet("orders.parquet", name="orders")
@@ -79,9 +75,7 @@ def test_catalog_load_parquet_name_collision_rejected(
     assert "already exists" in out["error"]
 
 
-def test_catalog_load_parquet_records_relative_path_only(
-    project: str, orders_parquet, monkeypatch
-):
+def test_catalog_load_parquet_records_relative_path_only(project: str, orders_parquet, monkeypatch):
     """The synthesized code uses `from_project(rel_path)` without an explicit
     project= arg, so a project rename wouldn't invalidate the build. (T-24.)"""
     monkeypatch.setenv("PYDATA_PROJECT", project)

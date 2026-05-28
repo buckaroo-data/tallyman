@@ -31,6 +31,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 # storage layer
 # ---------------------------------------------------------------------------
 
+
 def test_set_get_chart_round_trip(project: str):
     set_chart(project, "abc", SAMPLE_SPEC)
     got = get_chart(project, "abc")
@@ -73,6 +74,7 @@ def test_remove_chart(project: str):
 # catalog_chart MCP tool
 # ---------------------------------------------------------------------------
 
+
 def test_catalog_chart_by_hash(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
@@ -110,9 +112,8 @@ def test_catalog_chart_invalid_spec(project: str, orders_parquet: Path, monkeypa
 # companion rendering + data endpoint
 # ---------------------------------------------------------------------------
 
-def test_entry_detail_renders_chart_when_present(
-    fresh_companion_app, project: str, orders_parquet: Path
-):
+
+def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     set_chart(project, res.content_hash, SAMPLE_SPEC)
     c = TestClient(fresh_companion_app)
@@ -122,9 +123,7 @@ def test_entry_detail_renders_chart_when_present(
     assert '"mark": "bar"' in r.text or "&quot;mark&quot;: &quot;bar&quot;" in r.text
 
 
-def test_entry_detail_omits_chart_when_absent(
-    fresh_companion_app, project: str, orders_parquet: Path
-):
+def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/catalog/{res.content_hash}")
@@ -180,9 +179,7 @@ def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orde
     assert r.status_code == 400
 
 
-def test_api_data_default_limit_is_200(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_api_data_default_limit_is_200(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Defaults are demo-safe: aggregate fits, raw 2k-row loads cap at 200."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     # Use a passthrough expression (raw orders, 200 rows in the fixture).

@@ -65,16 +65,22 @@ def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create, catalog_run
 
-    catalog_create("shoe_sales", f"""
+    catalog_create(
+        "shoe_sales",
+        f"""
 from pydata_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
-""")
-    scratch = catalog_run(f"""
+""",
+    )
+    scratch = catalog_run(
+        f"""
 from pydata_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.order_by("region")
-""", prompt="exploratory")
+""",
+        prompt="exploratory",
+    )
 
     c = TestClient(fresh_companion_app)
     r = c.get(f"/catalog/{scratch['hash']}")
@@ -90,9 +96,7 @@ expr = t.order_by("region")
     assert "← back to catalog" not in r.text  # the old stub is gone
 
 
-def test_entry_detail_shows_build_artifacts(
-    fresh_companion_app, project: str, orders_parquet: Path
-):
+def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, orders_parquet: Path):
     """T-14: build artifacts (expr.yaml etc) are visible from the UI, with
     the portable ${PYDATA_PROJECT_ROOT} placeholder still in the text."""
     h = _build_one(project, orders_parquet)

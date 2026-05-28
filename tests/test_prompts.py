@@ -31,6 +31,7 @@ def test_re_run_appends_prompt(project: str, orders_parquet: Path):
 
 def test_manifest_prompt_remains_first(project: str, orders_parquet: Path):
     import json
+
     a = build_and_persist(project, _code(orders_parquet), prompt="first")
     build_and_persist(project, _code(orders_parquet), prompt="second")
     manifest = json.loads((a.entry_path / "manifest.json").read_text())

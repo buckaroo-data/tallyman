@@ -48,6 +48,7 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
 # storage layer
 # ---------------------------------------------------------------------------
 
+
 def test_set_alias_first_time(project: str):
     info = set_alias(project, "x", "h1")
     assert info == {"name": "x", "hash": "h1", "version": 1}
@@ -116,6 +117,7 @@ def test_rename_alias_collision(project: str):
 # ---------------------------------------------------------------------------
 # MCP tools
 # ---------------------------------------------------------------------------
+
 
 def test_catalog_create_assigns_alias(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
@@ -189,6 +191,7 @@ def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
 # companion rendering
 # ---------------------------------------------------------------------------
 
+
 def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, orders_parquet: Path):
     build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", build_and_persist(project, _filter_code(project)).content_hash)
@@ -233,9 +236,7 @@ def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, 
     assert v1.content_hash in r.text
 
 
-def test_catalog_renders_section_headers(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_catalog_renders_section_headers(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """T-13: named / forensic / scratch each get their own section."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create, catalog_revise, catalog_run

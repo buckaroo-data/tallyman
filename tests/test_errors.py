@@ -116,18 +116,20 @@ def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
     assert "tool: catalog_run" in r.text
 
 
-def test_error_detail_sidebar_has_full_catalog_list(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
-):
+def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """The error-detail sidebar also gets the full catalog list, with no
     current-highlight (errors aren't catalog entries)."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create
-    catalog_create("shoe_sales", f"""
+
+    catalog_create(
+        "shoe_sales",
+        f"""
 from pydata_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
-""")
+""",
+    )
     rec = record_error(project, code="x", message="boom", tool="catalog_run")
     c = TestClient(fresh_companion_app)
     r = c.get(f"/errors/{rec['id']}")

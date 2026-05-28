@@ -18,6 +18,7 @@ buckaroo from scanning it). Hard-delete is a manual ``rm`` under the
 project directory — matches the catalog-is-curated principle from
 ``plan.md``: deletions are deliberate.
 """
+
 from __future__ import annotations
 
 import builtins
@@ -32,11 +33,31 @@ from pydata_core.paths import stats_dir as _stats_dir
 # can resolve through builtin lookup. Notable absences: ``__import__``,
 # ``open``, ``exec``, ``eval``.
 _SAFE_BUILTIN_NAMES = (
-    "True", "False", "None",
-    "abs", "min", "max", "round", "sum", "len",
-    "int", "float", "str", "bool", "list", "tuple", "dict", "set",
-    "range", "enumerate", "zip", "map", "filter",
-    "isinstance", "issubclass", "type",
+    "True",
+    "False",
+    "None",
+    "abs",
+    "min",
+    "max",
+    "round",
+    "sum",
+    "len",
+    "int",
+    "float",
+    "str",
+    "bool",
+    "list",
+    "tuple",
+    "dict",
+    "set",
+    "range",
+    "enumerate",
+    "zip",
+    "map",
+    "filter",
+    "isinstance",
+    "issubclass",
+    "type",
 )
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -64,21 +85,25 @@ def list_stats(project: str) -> list[dict]:
         for p in sorted(active.glob("*.py")):
             if p.name.startswith("_"):
                 continue
-            out.append({
-                "name": p.stem,
-                "path": str(p),
-                "source": p.read_text(),
-                "disabled": False,
-            })
+            out.append(
+                {
+                    "name": p.stem,
+                    "path": str(p),
+                    "source": p.read_text(),
+                    "disabled": False,
+                }
+            )
     parked = disabled_dir(project)
     if parked.is_dir():
         for p in sorted(parked.glob("*.py")):
-            out.append({
-                "name": p.stem,
-                "path": str(p),
-                "source": p.read_text(),
-                "disabled": True,
-            })
+            out.append(
+                {
+                    "name": p.stem,
+                    "path": str(p),
+                    "source": p.read_text(),
+                    "disabled": True,
+                }
+            )
     return out
 
 
@@ -88,11 +113,13 @@ def _restricted_globals() -> dict:
     }
     try:
         from xorq.vendor import ibis as _ibis  # noqa: PLC0415
+
         globs["ibis"] = _ibis
     except ImportError:
         pass
     try:
         import xorq.api as _xo  # noqa: PLC0415
+
         globs["xorq"] = _xo
     except ImportError:
         pass
@@ -104,8 +131,7 @@ def validate_stat_source(name: str, source: str) -> None:
     table. Raises ``StatSourceError`` on any failure — the message is
     safe to surface back to the agent verbatim."""
     if not _NAME_RE.match(name):
-        raise StatSourceError(
-            f"stat name {name!r} is not a valid python identifier")
+        raise StatSourceError(f"stat name {name!r} is not a valid python identifier")
 
     ns: dict = {}
     try:
@@ -122,8 +148,7 @@ def validate_stat_source(name: str, source: str) -> None:
     sig = inspect.signature(compute)
     params = list(sig.parameters.values())
     if len(params) != 1:
-        raise StatSourceError(
-            f"compute() must take exactly one parameter, got {len(params)}")
+        raise StatSourceError(f"compute() must take exactly one parameter, got {len(params)}")
 
     try:
         import xorq.api as xo  # noqa: PLC0415
@@ -135,17 +160,14 @@ def validate_stat_source(name: str, source: str) -> None:
     try:
         result = compute(col)
     except Exception as e:
-        raise StatSourceError(
-            f"compute() raised when called with a column: {e!r}") from None
+        raise StatSourceError(f"compute() raised when called with a column: {e!r}") from None
 
     # Loose return-type check — any ibis Value has ``.execute()``. Strict
     # isinstance against ``ibis.expr.types.Value`` is brittle across xorq
     # versions, this is the contract every existing XORQ_STATS_V2 entry
     # honours anyway.
     if not hasattr(result, "execute"):
-        raise StatSourceError(
-            f"compute() must return an ibis expression "
-            f"(got {type(result).__name__})")
+        raise StatSourceError(f"compute() must return an ibis expression (got {type(result).__name__})")
 
 
 def write_stat(project: str, name: str, source: str) -> Path:

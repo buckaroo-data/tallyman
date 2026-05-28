@@ -9,6 +9,7 @@ Identity is the content hash; the alias is a *name* for a concept that may
 evolve. The latest hash is always the current best answer; older hashes
 remain in the catalog as forensic artifacts.
 """
+
 from __future__ import annotations
 
 import json

@@ -5,6 +5,7 @@ duration. They DO assert that the HTML/CSS/JS contract the SPA-lite
 controller depends on is in place: swap regions present, embed bundle
 referenced, navigation handlers attached.
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -32,9 +33,7 @@ def test_catalog_has_swap_regions(fresh_companion_app):
     assert 'id="catalog-detail"' in r.text
 
 
-def test_entry_detail_has_swap_regions(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_entry_detail_has_swap_regions(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
@@ -46,6 +45,7 @@ def test_entry_detail_has_swap_regions(
 
 def test_error_detail_has_swap_regions(fresh_companion_app, project: str):
     from pydata_core import record_error
+
     rec = record_error(project, code="x", message="m", tool="catalog_run")
     c = TestClient(fresh_companion_app)
     r = c.get(f"/errors/{rec['id']}")
@@ -59,8 +59,8 @@ def test_embed_bundle_referenced(fresh_companion_app):
     before the WebSocket payload lands."""
     c = TestClient(fresh_companion_app)
     r = c.get("/catalog")
-    assert '/static/buckaroo-embed.js' in r.text
-    assert '/static/buckaroo-embed.css' in r.text
+    assert "/static/buckaroo-embed.js" in r.text
+    assert "/static/buckaroo-embed.css" in r.text
     # CSS for .buckaroo-embed sets the dark background before the WS payload
     # arrives. Exact rule shape grew (sizing/border/overflow added alongside
     # the size-toggle work) — assert on the substring that names the colour.
@@ -77,9 +77,7 @@ def test_spa_lite_js_wired_up(fresh_companion_app):
     assert r"^\/catalog" in r.text
 
 
-def test_lineage_pages_fall_through_to_real_nav(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_lineage_pages_fall_through_to_real_nav(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """`/lineage` doesn't have swap regions today, so SPA-lite is
     expected to fall through to a regular navigation. Sanity-check
     that the lineage pages still render correctly (no swap regions

@@ -32,6 +32,7 @@ convention — Buckaroo's own state is rebuilt on first hit either way.
 This means: a `pydata serve` restart re-loads parquets lazily as entries
 are viewed; that's correct.
 """
+
 from __future__ import annotations
 
 import atexit
@@ -60,6 +61,7 @@ def _entry_parquet_exists(project: str, content_hash: str) -> bool:
     """
     p = entry_dir(project, content_hash)
     return (p / "result.parquet").exists() or (p / "xorq_build").is_dir()
+
 
 log = logging.getLogger("pydata.buckaroo")
 
@@ -199,9 +201,7 @@ class BuckarooManager:
             line = self.proc.stdout.readline()
             if not line:
                 if self.proc.poll() is not None:
-                    raise BuckarooUnavailable(
-                        f"buckaroo exited during startup (rc={self.proc.returncode})"
-                    )
+                    raise BuckarooUnavailable(f"buckaroo exited during startup (rc={self.proc.returncode})")
                 time.sleep(0.05)
                 continue
             line = line.strip()

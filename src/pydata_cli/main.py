@@ -61,15 +61,11 @@ def init_project(name: str, with_fixture: bool, force: bool) -> None:
     help="Manage a Buckaroo subprocess on :8700 for in-table recon.",
 )
 @click.option("--buckaroo-port", default=8700, type=int)
-def run_companion(
-    project: str | None, port: int, host: str, buckaroo: bool, buckaroo_port: int
-) -> None:
+def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buckaroo_port: int) -> None:
     """Start the companion FastAPI app."""
     project_name = resolve_project(project)
     if not project_dir(project_name).exists():
-        raise click.ClickException(
-            f"project '{project_name}' not found. Run `pydata init {project_name}` first."
-        )
+        raise click.ClickException(f"project '{project_name}' not found. Run `pydata init {project_name}` first.")
     os.environ.setdefault("PYDATA_PROJECT", project_name)
     click.echo(f"pydata run · project={project_name} · http://{host}:{port}")
 
@@ -84,10 +80,7 @@ def run_companion(
             bk.start()
             # T-35: include PID + bound port so `ps`/`lsof` disambiguation is
             # trivial when stale buckaroos linger from earlier debugging.
-            click.echo(
-                f"  buckaroo · {bk.base_url} pid={bk.proc.pid if bk.proc else '?'} "
-                f"(log: {buckaroo_log})"
-            )
+            click.echo(f"  buckaroo · {bk.base_url} pid={bk.proc.pid if bk.proc else '?'} (log: {buckaroo_log})")
         except BuckarooUnavailable as exc:
             click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
             bk = None
@@ -125,9 +118,7 @@ def run_mcp(project: str | None) -> None:
     help="Seconds to sleep between steps (for stage pacing).",
 )
 @click.option("--stop-on-error/--continue-on-error", default=True)
-def replay_storyboard(
-    storyboard: str, project: str | None, delay: float, stop_on_error: bool
-) -> None:
+def replay_storyboard(storyboard: str, project: str | None, delay: float, stop_on_error: bool) -> None:
     """Replay a storyboard JSON file by calling MCP tools in order.
 
     The storyboard is a JSON object of shape:
@@ -159,7 +150,7 @@ def replay_storyboard(
         click.echo("storyboard has no steps; nothing to do.")
         return
 
-    click.echo(f"replaying {len(steps)} step{'' if len(steps)==1 else 's'} (project={sb_project!r})")
+    click.echo(f"replaying {len(steps)} step{'' if len(steps) == 1 else 's'} (project={sb_project!r})")
     failures = 0
     for i, step in enumerate(steps, start=1):
         if step.get("skip"):
@@ -191,7 +182,7 @@ def replay_storyboard(
             time.sleep(delay)
 
     if failures:
-        click.echo(f"replay finished with {failures} failure{'' if failures==1 else 's'}")
+        click.echo(f"replay finished with {failures} failure{'' if failures == 1 else 's'}")
     else:
         click.echo("replay complete; no failures.")
 
@@ -217,7 +208,8 @@ def _summarise(result):
     help="Project name (defaults to PYDATA_PROJECT env or the positional arg).",
 )
 @click.option(
-    "-o", "--output",
+    "-o",
+    "--output",
     default=None,
     help="Output .tgz path. Defaults to ./<project>-<date>.tgz.",
 )
@@ -226,9 +218,7 @@ def _summarise(result):
     default=True,
     help="Skip xorq cache deps (smaller bundle, paths still portable).",
 )
-def pack_project(
-    project_name: str | None, project: str | None, output: str | None, exclude_cache: bool
-) -> None:
+def pack_project(project_name: str | None, project: str | None, output: str | None, exclude_cache: bool) -> None:
     """Tar a project directory into a portable .tgz artifact.
 
     The output bundle can be untarred anywhere and served read-only via
@@ -265,7 +255,7 @@ def pack_project(
         tar.add(src, arcname=name, filter=_filter)
 
     size = out_path.stat().st_size
-    click.echo(f"wrote {out_path} ({size/1024:.1f} KB)")
+    click.echo(f"wrote {out_path} ({size / 1024:.1f} KB)")
     click.echo(f"recipient: tar xzf {out_path.name} && pydata serve ./{name}")
 
 

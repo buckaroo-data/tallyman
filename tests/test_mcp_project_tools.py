@@ -190,9 +190,7 @@ def test_existing_tool_response_includes_project(project: str, orders_parquet: P
     assert out.get("project") == project
 
 
-def test_list_returning_tool_wrapped_with_project_and_items(
-    project: str, orders_parquet: Path
-):
+def test_list_returning_tool_wrapped_with_project_and_items(project: str, orders_parquet: Path):
     from pydata_mcp.server import catalog_list, catalog_load_parquet
 
     catalog_load_parquet("orders.parquet", prompt="raw")
@@ -240,8 +238,7 @@ def test_switch_warning_emitted_when_project_changes_between_calls(
     assert second["project"] == "beta"
     assert "warning" in second
     assert second["warning"] == (
-        "active project changed from 'alpha' to 'beta' since the last call; "
-        "proceeding with 'beta'"
+        "active project changed from 'alpha' to 'beta' since the last call; proceeding with 'beta'"
     )
 
 

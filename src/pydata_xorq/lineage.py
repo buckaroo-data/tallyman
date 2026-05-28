@@ -14,6 +14,7 @@ V0 only emits catalog edges when user code uses `pydata_xorq.io.from_catalog()`
 cross-references the catalog DAG is a forest of single-node trees rooted at
 each entry's data source.
 """
+
 from __future__ import annotations
 
 import json
@@ -55,9 +56,7 @@ def catalog_parents(project: str, content_hash: str) -> list[str]:
     parents: list[str] = []
     # The portable form references PLACEHOLDER paths like
     # ${PYDATA_PROJECT_ROOT}/artifacts/catalog/entries/<hash>/result.parquet.
-    rel_re = re.compile(
-        rf"^{re.escape(PLACEHOLDER)}/artifacts/catalog/entries/([0-9a-f]+)/result\.parquet$"
-    )
+    rel_re = re.compile(rf"^{re.escape(PLACEHOLDER)}/artifacts/catalog/entries/([0-9a-f]+)/result\.parquet$")
     for src in sources:
         m = rel_re.match(src)
         if m and m.group(1) != content_hash:

@@ -8,6 +8,7 @@ The spec is stored as-is — no Vega-Lite validation in Python (the
 schema is enormous). The browser renders or fails loudly; failed
 renders fall through to "no chart" semantics.
 """
+
 from __future__ import annotations
 
 import json

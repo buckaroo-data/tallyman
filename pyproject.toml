@@ -37,6 +37,7 @@ pydata = "pydata_cli.main:cli"
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "ruff>=0.15.15",
 ]
 
 [build-system]

@@ -368,6 +368,91 @@ bytes, decode in browser with hyparquet, vega-embed gets
 the chart-data scale we care about. Revisit only if a future caller
 needs `/api/data` for larger payloads.
 
+### ~~T-37 — Embed bundle: esbuild → Vite~~ ✅ 2026-05-24
+
+`packages/embed/` migrated from a hand-rolled esbuild script to Vite
+library mode. Key issue: `process.env.NODE_ENV` was not replaced at
+build time, causing `ReferenceError: process is not defined` at
+runtime. Fixed via `define: { "process.env.NODE_ENV":
+JSON.stringify("production") }` in `vite.config.ts`.
+
+Output: `src/pydata_companion/static/buckaroo-embed.{js,css}` (both
+in `.gitignore`; built locally before deploy / before demo). Build
+command: `pnpm -C packages/embed build`.
+
+### ~~T-38 — Charts in notebook view~~ ✅ 2026-05-24
+
+`notebook_view` now passes `chart_spec` per cell (via `get_chart`).
+Template renders a `.chart-panel.nb-chart` div with `data-spec` and
+`data-hash` attributes for any cell that has a chart. The shared
+`_vega_mount.html` partial (also used by entry_detail) fetches
+`/api/data/<hash>`, merges the rows into the Vega-Lite spec, and
+calls `vegaEmbed`. CSS: `.chart-panel` uses `display: block` to avoid
+collision with vega-embed's own `.vega-embed { display: inline-block }`
+rule.
+
+### ~~T-39 — Post-processing MCP tools~~ ✅ 2026-05-24
+
+Three new MCP tools mirror the summary-stats pattern:
+`catalog_add_post_processing(name, source)`,
+`catalog_remove_post_processing(name)`,
+`catalog_list_post_processings()`. Source is validated by
+`pydata_core.post_processing.validate_post_processing_source` (exec in
+restricted globals, dry-run against a 3-row memtable; accepts ibis
+expr or pandas DataFrame). Scripts land in
+`<project>/post_processing/<name>.py`; removal soft-deletes to
+`<project>/post_processing/_disabled/`. 15 tests in
+`tests/test_post_processing.py`, all passing.
+
+### ~~T-40 — Large-parquet memory spike~~ ✅ 2026-05-24
+
+Viewing a large expression (citibike, 57k rows) spiked companion RSS
+to ~7 GB because `catalog_entry` and `api_data` both called
+`pf.read()` unconditionally, materialising the full table into memory.
+
+Fix: `_read_head_rows(path, n)` uses PyArrow `iter_batches`, stopping
+once N rows are collected — O(N) memory regardless of file size.
+`catalog_entry` now only reads rows when Buckaroo is unavailable
+(falls back to the HTML preview); total-row count comes from
+`pf.metadata.num_rows` without reading data. `api_data` uses
+`_read_head_rows` capped at the requested `limit`.
+
+### ~~T-41 — Embed size-toggle~~ ✅ 2026-05-24 (CSS layer; grid resize blocked upstream)
+
+A cycle button on each notebook cell toggles `.nb-buckaroo` between
+three heights: 260 px (compact default), 75 vh (`data-size="3q"`),
+90 vh (`data-size="max"`). `nbCycleSize(cellId, btn)` drives the
+`data-size` attribute; no page reload. CSS transitions on
+`.buckaroo-embed` make it smooth.
+
+Caveat: the AG Grid inside `BuckarooServerView` does not actually grow
+when the host div expands, because `domLayout: 'autoHeight'` is not
+exposed via `BuckarooServerViewProps` and the viewport-change signal
+never reaches the grid. Tracked upstream as
+[buckaroo-data/buckaroo#846](https://github.com/buckaroo-data/buckaroo/issues/846).
+The CSS toggle is in place and will work once #846 is resolved.
+
+### T-42 — BuckarooServerView does not resize when host div grows (upstream #846)
+
+`BuckarooServerView` mounts an AG Grid with a fixed height derived
+from the initial container size. When the companion toggles the
+`.nb-buckaroo` div from 260 px to 75 vh, the host div grows but the
+grid remains 260 px tall — extra rows are hidden.
+
+Root cause: `domLayout: 'autoHeight'` is available in AG Grid but not
+wired into `BuckarooServerViewProps`; even if it were, the component
+needs to call `gridApi.sizeColumnsToFit()` or respond to a
+`ResizeObserver` on the host element.
+
+Filed upstream as
+[buckaroo-data/buckaroo#846](https://github.com/buckaroo-data/buckaroo/issues/846).
+
+- **Fix:** Once the upstream PR lands and `buckaroo-js-core` is
+  published, bump the version in `packages/embed/package.json` and
+  rebuild the bundle. No companion-side code changes needed.
+- **Verify:** Toggle size on a notebook cell with >10 rows; all rows
+  should be visible after toggle.
+
 ---
 
 ## P4 — design questions punted in V0.5

@@ -10,6 +10,22 @@
 
 ---
 
+## Talk framing (spoken in the first ~90s, before the demo starts)
+
+Notebooks dominate scientific data work because data is large and computation is expensive. The standard answer to "don't recompute that" is kernel memory — you run the expensive cell once, the result lives in the Python process, and you carefully work around it for the rest of the session.
+
+That's an adhoc, fragile cache. The failure mode is familiar: you have a dataframe that's right at the edge of your machine's memory. You spent twenty minutes figuring out how to do the join without OOM-killing the kernel. Now it's in memory and you need to keep it there. You won't re-run that cell. You won't restart the kernel. If the session dies, you start over. The notebook isn't reproducible — it's reproducible *except for that one cell*, which is the whole point.
+
+But the OOM isn't even the worst part. The worst part is what happens after. The kernel dies. You lose everything — not just the cell that crashed, but the five-minute load and the two-minute join you ran before it. So you restart, re-run the load, re-run the join, and now you're staring at the cell that crashed. You don't run it yet. You test it on a sample first. You start navigating the notebook non-linearly — you know which cells are safe to re-run and which ones might kill you. You stop restarting the kernel even when you should, because there are results in memory you can't afford to lose. The notebook has become a minefield. It looks like a reproducible document. It isn't. It's a record of one particular session that you're too scared to replay from the top.
+
+Marimo addresses a related but different problem: it enforces that the DAG of cell dependencies in your notebook can always be solved, so stale state from out-of-order execution can't hide. That's real progress. But it doesn't help you when the cell you're avoiding is expensive, not stale. Marimo will happily re-run an expensive cell every time its inputs change — which is exactly what you were trying to avoid.
+
+xorq gives you a better answer: describe the computation, and xorq caches the result by content hash. Re-run the cell — same hash, cache hit, instant. The kernel isn't the cache. The filesystem is.
+
+That's what this demo shows.
+
+---
+
 ## Pre-flight (run 60s before going on stage)
 
 ```sh
@@ -70,11 +86,11 @@ Each beat = one prompt typed into Claude Code. Watch the browser update live. Pr
 
 > We want to spot regions with too few transactions. Add a post-processing function `low_volume` that filters to rows where `n < 100`. Use `catalog_add_post_processing`.
 
-*Expected:* the tool writes `~/.pydata-app/projects/spike/post_processing/low_volume.py`, validates it against a small in-memory table (must define `process(expr) -> ibis expression | pandas DataFrame`), returns success. The file appears as a new option in the buckaroo embed's **post processing** dropdown on the next session load.
+*Expected:* the tool writes `~/.pydata-app/projects/spike/post_processing/low_volume.py`, validates it against a small in-memory table (must define `process(expr) -> ibis expression | DataFrame`), returns success. The file appears as a new option in the Buckaroo embed's **post processing** dropdown on the next session load.
 
 *Click the post-processing dropdown on the `shoe_sales` embed; pick `low_volume`.* Table re-renders to only the low-volume regions.
 
-*Presenter:* "Post-processing functions are reusable lenses on a result. Same surface as the LLM-authored summary stats from beat 3 — restricted globals, dry-run validator, soft-delete to `_disabled/` — but they transform the *table* rather than compute a per-column scalar. Over the demo we build up a validation library; one click in the dropdown switches lenses without touching the underlying expression."
+*Presenter:* "Post-processing functions are reusable lenses on a result. Same surface as the LLM-authored summary stats from beat 3 — restricted globals, dry-run validator, soft-delete to `_disabled/` — but they transform the *table* rather than compute a per-column scalar. As the session goes on we build up a validation library; one click in the dropdown switches lenses without touching the underlying expression."
 
 ### 6. Revise in place (~75s)
 
@@ -171,3 +187,24 @@ uv run pydata init spike            # fresh fixture, fresh catalog
 | **Total** | **~11 min** + ~1 min slack |
 
 If running long: drop beat 8 (chart) — it lands well but isn't load-bearing for the thesis. Never drop the hand-off; that beat is the entire point of "project directory as artifact".
+
+
+-- notes
+We need to talk about the thesis more.  "ntoebooks are used for scientific data because it is large and expensive to compute.  In kernel memory (better phrashing for this is needed) is an adhoc buggy cache that many notebook workflows depend on, but what you really want is a way to cache expensive computations.  Xorq provides a better way to do that. with xorq you can describe the computations you want, and they will be cached.  
+
+
+
+more about the buggy cache.  I frequently have notebooks where I have done something expensive, normally a download script, reading in a dataframe or some join operation.  Sometimes - especially with dataframes that are close to the size of my machine's memory, I will figure out how to just barely get an operation done without OOM killing my kernel, then I'll have a dataframe in memory that I have to carefully operate on.  When I'm at that state I'll have this one cell that I need to execute once, then do other adhoc analysis in the notebook without re-running that cell.
+
+This hurts notebook reproducability, because I'm specifically not re-executing all cells in sequence since that would disrupt my flow.  Marimo helps a little bit, but with a different problem, marimo makes sure that the graph of cell dependencies in your notebook can always be solved.  for me the only time my notebook goes out of linear dependency order is when I have been changing the order for adhoc experimentation.
+
+I have done a limited amount of AI assisted notebook coding, but I have found that it is like collaborating with another human on the same notebook.  I don't trust the state of the kernel and cells to change beneath me in a coherent way.  
+
+
+I joined xorq 3 months ago because I was excited about their core framework that regularlizes and unifies a lot of data engineering tasks into a declarative DSL that addresses cachability, reproducability, verifiable lineage into a coherent dsl.  This talk builds heavily on the xorq cache system to build a system for interactive data analysis that bridges the gap between what the pydata arrow stack is good at, claude does well, and what notebooks are good at.
+
+
+when working in a notebook on a data problem (before buckaroo) I generally start by loading the dataframe and typing `df.head()`  then I poke around a bit to get a feel for the data.  Buckaroo makes this manual inspection much quicker (it's still very relevant in the claude code world).  next I try to perform some operations on the dataframe, some types of transformations to expose a particular aspect or pattern in the data.  Claude is very helpful for these parts for writing the python code.
+
+In addition to transforms I often end up with little transforms that I apply to dataframes (simple cleaning routines).  when writing traditional notebooks, these adhoc transforms are messy throw away code, adding them to a library is cumbersome so they just die right there.  Claude and buckaroo can help with this too.  Buckaroo has a facility called post_processing functions which take a dataframe and return a dataframe,  they can be interactively applied.
+

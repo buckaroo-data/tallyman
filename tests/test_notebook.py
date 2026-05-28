@@ -366,7 +366,7 @@ def test_notebook_uses_buckaroo_embed_when_session_available(
         def ws_base_url(self):
             return "ws://127.0.0.1:8700"
 
-        def ensure_session(self, content_hash):
+        def ensure_session(self, content_hash, project):
             return f"sess-{content_hash[:6]}"
 
     app = create_app(project, buckaroo=_StubBuckaroo())  # type: ignore[arg-type]

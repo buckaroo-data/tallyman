@@ -37,35 +37,27 @@ expr = t.group_by("region").aggregate(n=t.count())
 # unit: session map only
 # ---------------------------------------------------------------------------
 
-def test_unit_session_file_round_trip(project: str):
-    mgr = BuckarooManager(project)
-    mgr._sessions["abc"] = "sess-1"
-    mgr._sessions["def"] = "sess-2"
+def test_unit_session_file_round_trip(project: str, orders_parquet: Path):
+    # Build one entry so the project/hash on disk satisfies the prune check
+    # that runs on _load_session_file.
+    res = build_and_persist(project, _code(project))
+    h = res.content_hash
+
+    mgr = BuckarooManager()
+    mgr._sessions[h] = {"session_id": "sess-1", "project": project}
     mgr._buckaroo_started_at = 123.456
     mgr._persist_sessions()
 
     # Fresh instance picks up persisted sessions and the start-time anchor.
-    mgr2 = BuckarooManager(project)
-    assert mgr2._sessions == {"abc": "sess-1", "def": "sess-2"}
+    mgr2 = BuckarooManager()
+    assert mgr2._sessions == {h: {"session_id": "sess-1", "project": project}}
     assert mgr2._buckaroo_started_at == 123.456
 
 
-def test_unit_legacy_session_file_still_loads(project: str):
-    """If we read a `buckaroo_sessions.json` written by V0.5 (no envelope),
-    the manager picks up the bare `{hash: session_id}` map."""
-    from pydata_core.paths import catalog_dir as _cd
-    p = _cd(project) / "buckaroo_sessions.json"
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps({"abc": "sess-1"}))
-    mgr = BuckarooManager(project)
-    assert mgr._sessions == {"abc": "sess-1"}
-    assert mgr._buckaroo_started_at is None
-
-
 def test_unit_ensure_session_short_circuits_when_not_running(project: str):
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     # is_running is False because we never called start().
-    assert mgr.ensure_session("anyhash") is None
+    assert mgr.ensure_session("anyhash", project) is None
 
 
 def test_unit_ensure_session_restarts_dead_subprocess(
@@ -77,7 +69,7 @@ def test_unit_ensure_session_restarts_dead_subprocess(
     the session into pandas-only with no log line the user would notice."""
     res = build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     # Simulate a previously-running buckaroo that has now exited.
     class _DeadProc:
         returncode = 1
@@ -106,7 +98,7 @@ def test_unit_ensure_session_restarts_dead_subprocess(
         def json(self): return {"session": "restored-session"}
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
 
-    sid = mgr.ensure_session(res.content_hash)
+    sid = mgr.ensure_session(res.content_hash, project)
     assert sid == "restored-session"
     assert restart_calls["n"] == 1
 
@@ -119,7 +111,7 @@ def test_unit_ensure_session_restart_throttled(
     attempt per cooldown."""
     build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     class _DeadProc:
         returncode = 1
         def poll(self):
@@ -135,16 +127,16 @@ def test_unit_ensure_session_restart_throttled(
     monkeypatch.setattr(BuckarooManager, "start", failing_start)
 
     # First call attempts a restart.
-    assert mgr.ensure_session("anyhash") is None
+    assert mgr.ensure_session("anyhash", project) is None
     assert restart_calls["n"] == 1
 
     # Second call within the cooldown window does NOT attempt another.
-    assert mgr.ensure_session("anyhash") is None
+    assert mgr.ensure_session("anyhash", project) is None
     assert restart_calls["n"] == 1
 
 
 def test_unit_status_shape(project: str):
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     s = mgr.status()
     assert s["running"] is False
     assert s["port"] is None
@@ -162,7 +154,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
 
     res = build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
 
@@ -181,7 +173,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(
         return FakeResponse()
 
     monkeypatch.setattr(mgr._client, "post", fake_post)
-    session = mgr.ensure_session(res.content_hash)
+    session = mgr.ensure_session(res.content_hash, project)
     assert session == "abc123def456"
     assert captured["url"].endswith("/load_expr"), captured["url"]
     assert captured["json"]["no_browser"] is True
@@ -208,7 +200,7 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
     """
     res = build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
 
@@ -219,7 +211,7 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
             return {"session": "s"}
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
 
-    mgr.ensure_session(res.content_hash)
+    mgr.ensure_session(res.content_hash, project)
     tmp = mgr._expanded_dirs[res.content_hash]
     assert tmp.is_dir()
 
@@ -238,7 +230,7 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
     for speed — we only care about the cleanup contract here).
     """
     N = 25
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     tmp_paths = []
     for i in range(N):
         d = Path(tempfile.mkdtemp(prefix="pydata_load_test_"))
@@ -260,7 +252,7 @@ def test_unit_concurrent_same_hash_loads_once(
     /load_expr POST and one tmp dir — the session_lock serialises."""
     res = build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
 
@@ -285,7 +277,7 @@ def test_unit_concurrent_same_hash_loads_once(
 
     def worker():
         barrier.wait()
-        results.append(mgr.ensure_session(res.content_hash))
+        results.append(mgr.ensure_session(res.content_hash, project))
 
     threads = [threading.Thread(target=worker) for _ in range(8)]
     for t in threads:
@@ -307,7 +299,7 @@ def test_unit_concurrent_different_hashes_each_load_once(
         project, _code(project) + f"\nexpr = expr.mutate(_v={i})"
     ).content_hash for i in range(5)]
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
 
@@ -334,7 +326,7 @@ def test_unit_concurrent_different_hashes_each_load_once(
 
     def worker(h):
         barrier.wait()
-        mgr.ensure_session(h)
+        mgr.ensure_session(h, project)
 
     threads = [threading.Thread(target=worker, args=(h,)) for h in hashes]
     for t in threads:
@@ -357,20 +349,21 @@ def test_integration_spawn_and_load(project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(project))
 
     # Use port=0 to dodge collisions with anything else on :8700.
-    mgr = BuckarooManager(project, port=0, startup_timeout=15.0)
+    mgr = BuckarooManager(port=0, startup_timeout=15.0)
     try:
         mgr.start()
         assert mgr.is_running
         assert mgr.bound_port is not None and mgr.bound_port > 0
-        session = mgr.ensure_session(res.content_hash)
+        session = mgr.ensure_session(res.content_hash, project)
         assert session is not None and len(session) >= 16
         # Cached lookup returns the same session id.
-        assert mgr.ensure_session(res.content_hash) == session
+        assert mgr.ensure_session(res.content_hash, project) == session
         # Persisted on disk under the new envelope shape.
         sessions_file = json.loads(
             (mgr._session_file_path()).read_text()
         )
-        assert sessions_file["sessions"][res.content_hash] == session
+        assert sessions_file["sessions"][res.content_hash]["session_id"] == session
+        assert sessions_file["sessions"][res.content_hash]["project"] == project
         assert sessions_file["buckaroo_started_at"] is not None
     finally:
         mgr.stop()
@@ -393,10 +386,10 @@ def test_integration_load_expr_returns_nonzero_rows(
     """
     res = build_and_persist(project, _code(project))
 
-    mgr = BuckarooManager(project, port=0, startup_timeout=15.0)
+    mgr = BuckarooManager(port=0, startup_timeout=15.0)
     try:
         mgr.start()
-        session_id = mgr.ensure_session(res.content_hash)
+        session_id = mgr.ensure_session(res.content_hash, project)
         assert session_id is not None
 
         # The tmp dir lives for the manager's lifetime; expr.yaml must be
@@ -423,7 +416,7 @@ def test_integration_load_expr_returns_nonzero_rows(
 
 @pytest.mark.integration
 def test_integration_stop_cleans_up(project: str, orders_parquet: Path):
-    mgr = BuckarooManager(project, port=0, startup_timeout=15.0)
+    mgr = BuckarooManager(port=0, startup_timeout=15.0)
     mgr.start()
     assert mgr.proc is not None
     pid = mgr.proc.pid
@@ -458,7 +451,7 @@ class _StubBuckaroo:
     def ws_base_url(self) -> str:
         return f"ws://127.0.0.1:{self.bound_port}"
 
-    def ensure_session(self, content_hash: str) -> str | None:
+    def ensure_session(self, content_hash: str, project: str) -> str | None:
         return self.session
 
 
@@ -509,7 +502,7 @@ def test_entry_detail_falls_back_when_session_unavailable(
         is_running = False
         base_url = "http://127.0.0.1:8700"
 
-        def ensure_session(self, content_hash):
+        def ensure_session(self, content_hash, project):
             return None
 
     app = create_app(project, buckaroo=_DownBuckaroo())  # type: ignore[arg-type]

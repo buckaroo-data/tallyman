@@ -239,7 +239,7 @@ def create_app(
                     text = f"(binary, {f.stat().st_size} bytes)"
                 build_artifacts.append({"name": f.name, "text": text})
         buckaroo_session = (
-            buckaroo.ensure_session(content_hash) if buckaroo is not None else None
+            buckaroo.ensure_session(content_hash, project_name) if buckaroo is not None else None
         )
         buckaroo_ws_base = (
             buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
@@ -584,7 +584,8 @@ def create_app(
         """
         if buckaroo is None or not buckaroo.is_running:
             return {"ws_url": None}
-        session_id = buckaroo.ensure_session(content_hash)
+        project_name = _require_project()
+        session_id = buckaroo.ensure_session(content_hash, project_name)
         if session_id is None:
             return {"ws_url": None}
         return {"ws_url": f"{buckaroo.ws_base_url}/ws/{session_id}"}

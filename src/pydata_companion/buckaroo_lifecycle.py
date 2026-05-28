@@ -47,9 +47,19 @@ from pathlib import Path
 
 import httpx
 
-from pydata_core import catalog_dir, entry_dir
+from pydata_core import entry_dir
 from pydata_core.paths import project_dir
 from pydata_xorq.portable import expand_to_tmp
+
+
+def _entry_parquet_exists(project: str, content_hash: str) -> bool:
+    """True if the project's catalog has an entry for *content_hash*.
+
+    Used by ``_load_session_file`` to prune stale session entries whose
+    project / hash combination no longer maps to anything on disk.
+    """
+    p = entry_dir(project, content_hash)
+    return (p / "result.parquet").exists() or (p / "xorq_build").is_dir()
 
 log = logging.getLogger("pydata.buckaroo")
 
@@ -81,24 +91,36 @@ class BuckarooUnavailable(RuntimeError):
 
 
 class BuckarooManager:
-    """Owns a Buckaroo server subprocess and the per-entry session cache."""
+    """Owns a Buckaroo server subprocess and a multi-project session cache.
+
+    Sessions are keyed by content hash (globally unique by construction), so
+    one subprocess can serve sessions backed by xorq builds from any project.
+    The owning project travels per-call via ``ensure_session(hash, project)``
+    and is recorded alongside the session id so a restart-reload knows which
+    project's parquet to find.
+
+    Session state persists in a single global file at
+    ``~/.pydata-app/buckaroo_sessions.json``. The per-project location used
+    by V0.5 (``<project>/artifacts/catalog/buckaroo_sessions.json``) is gone.
+    Will be replaced wholesale by a session-enumeration endpoint when
+    buckaroo-data/buckaroo#860 lands; until then the file is the bookkeeping.
+    """
 
     def __init__(
         self,
-        project: str,
         *,
         port: int = 8700,
         startup_timeout: float = 8.0,
         log_file: Path | None = None,
     ):
-        self.project = project
         self.requested_port = port
         self.bound_port: int | None = None
         self.startup_timeout = startup_timeout
         self.log_file = log_file
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
-        self._sessions: dict[str, str] = {}
+        # Schema: {<content_hash>: {"session_id": str, "project": str}}.
+        self._sessions: dict[str, dict] = {}
         self._session_lock = threading.Lock()
         self._buckaroo_started_at: float | None = None
         # Tmp dirs we created by expanding ${PYDATA_PROJECT_ROOT} placeholders
@@ -266,22 +288,39 @@ class BuckarooManager:
     # ------------------------------------------------------------------
 
     def _session_file_path(self) -> Path:
-        return catalog_dir(self.project) / "buckaroo_sessions.json"
+        from pydata_core.paths import buckaroo_sessions_path
+
+        return buckaroo_sessions_path()
 
     def _load_session_file(self) -> None:
+        """Load the global session map, dropping entries whose parquet has
+        disappeared since the last persist.
+
+        Schema: ``{"sessions": {hash: {session_id, project}}, "buckaroo_started_at": float}``.
+        Each entry's ``project`` is treated as a hint — if that project has
+        no entry for the hash, the session is stale and gets dropped.
+        """
         p = self._session_file_path()
-        if p.exists():
-            try:
-                data = json.loads(p.read_text())
-            except json.JSONDecodeError:
-                data = {}
-            # Support both the legacy shape ({hash: session_id}) and the new
-            # shape ({buckaroo_started_at, sessions: {...}}).
-            if "sessions" in data:
-                self._sessions = data.get("sessions", {})
-                self._buckaroo_started_at = data.get("buckaroo_started_at")
-            else:
-                self._sessions = data
+        if not p.exists():
+            return
+        try:
+            data = json.loads(p.read_text())
+        except json.JSONDecodeError:
+            return
+        self._buckaroo_started_at = data.get("buckaroo_started_at")
+        sessions = data.get("sessions", {})
+        # Defensive: silently drop entries that aren't the new shape.
+        kept: dict[str, dict] = {}
+        for h, info in sessions.items():
+            if not isinstance(info, dict):
+                continue
+            project = info.get("project")
+            if not project:
+                continue
+            if not _entry_parquet_exists(project, h):
+                continue
+            kept[h] = {"session_id": info["session_id"], "project": project}
+        self._sessions = kept
 
     def _persist_sessions(self) -> None:
         p = self._session_file_path()
@@ -331,13 +370,18 @@ class BuckarooManager:
         except BuckarooUnavailable as exc:
             log.warning("buckaroo restart failed: %s (will retry after cooldown)", exc)
 
-    def ensure_session(self, content_hash: str) -> str | None:
-        """Return a Buckaroo session_id for `content_hash`, creating it if needed.
+    def ensure_session(self, content_hash: str, project: str) -> str | None:
+        """Return a Buckaroo session_id for ``content_hash``, creating it if needed.
 
         Posts the entry's ``xorq_build/`` dir to Buckaroo's ``/load_expr``
         endpoint so the session is backed by the xorq expression (push-down
         sort/search against the underlying backend), not by paging over the
         materialised parquet.
+
+        ``project`` names the project that owns the parquet. Sessions cache
+        across projects via content hash (globally unique), so a second call
+        for the same hash from a different project returns the existing
+        session — the bytes are the same by definition.
 
         Returns None (instead of raising) if Buckaroo isn't running or the load
         fails — the companion falls back to the pandas.to_html preview in that
@@ -350,7 +394,7 @@ class BuckarooManager:
         self._maybe_restart()
         if not self.is_running or self.bound_port is None:
             return None
-        build_dir = entry_dir(self.project, content_hash) / "xorq_build"
+        build_dir = entry_dir(project, content_hash) / "xorq_build"
         if not build_dir.is_dir():
             return None
         with self._session_lock:
@@ -358,14 +402,14 @@ class BuckarooManager:
             if cached:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
-                return cached
+                return cached["session_id"]
             # Expand ${PYDATA_PROJECT_ROOT} to absolute paths in a tmp copy —
             # buckaroo's xorq_loading.load_expr_build_dir calls xorq.api.load_expr
             # directly and does no placeholder handling, so an unexpanded
             # build_dir produces a session whose paged reads return zero rows.
             expanded = self._expanded_dirs.get(content_hash)
             if expanded is None:
-                expanded = expand_to_tmp(build_dir, project_dir(self.project))
+                expanded = expand_to_tmp(build_dir, project_dir(project))
                 self._expanded_dirs[content_hash] = expanded
             try:
                 resp = self._client.post(
@@ -377,7 +421,7 @@ class BuckarooManager:
                         # for project-authored summary stats and folds them
                         # into the session's analysis_klasses. Older buckaroo
                         # builds ignore this field, so it's safe to always send.
-                        "project_root": str(project_dir(self.project)),
+                        "project_root": str(project_dir(project)),
                     },
                     timeout=10.0,
                 )
@@ -386,7 +430,7 @@ class BuckarooManager:
             except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
                 log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)
                 return None
-            self._sessions[content_hash] = session_id
+            self._sessions[content_hash] = {"session_id": session_id, "project": project}
             self._persist_sessions()
             return session_id
 

@@ -118,7 +118,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
     res = build_and_persist(project, code)
 
-    mgr = BuckarooManager(project)
+    mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
 
@@ -136,7 +136,7 @@ expr = t.group_by("region").aggregate(n=t.count())
         return FakeResponse()
 
     monkeypatch.setattr(mgr._client, "post", fake_post)
-    mgr.ensure_session(res.content_hash)
+    mgr.ensure_session(res.content_hash, project)
 
     posted_project_root = captured["json"].get("project_root")
     assert posted_project_root is not None

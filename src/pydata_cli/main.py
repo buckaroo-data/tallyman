@@ -79,7 +79,7 @@ def run_companion(
     bk: BuckarooManager | None = None
     if buckaroo:
         buckaroo_log = project_dir(project_name) / "buckaroo.log"
-        bk = BuckarooManager(project_name, port=buckaroo_port, log_file=buckaroo_log)
+        bk = BuckarooManager(port=buckaroo_port, log_file=buckaroo_log)
         try:
             bk.start()
             # T-35: include PID + bound port so `ps`/`lsof` disambiguation is

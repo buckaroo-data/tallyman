@@ -18,7 +18,6 @@ from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_core import ensure_project
 from pydata_core.paths import buckaroo_sessions_path
 
-
 # ---------------------------------------------------------------------------
 # Constructor shape
 # ---------------------------------------------------------------------------
@@ -80,7 +79,14 @@ def test_session_file_lives_at_global_location(isolated_home: Path):
     """The on-disk session map is one file under ``~/.pydata-app/``, not under
     any specific project's catalog. Schema includes the project per hash so
     a restart-reload knows which parquet to find."""
+    from pydata_core.paths import entry_dir
+
     ensure_project("alpha")
+    # Minimal entry so the prune check on _load_session_file lets the
+    # session through (entry_dir/result.parquet must exist).
+    (entry_dir("alpha", "abc")).mkdir(parents=True, exist_ok=True)
+    (entry_dir("alpha", "abc") / "result.parquet").write_bytes(b"placeholder")
+
     mgr = BuckarooManager()
     mgr._sessions["abc"] = {"session_id": "sess-1", "project": "alpha"}
     mgr._buckaroo_started_at = 123.456

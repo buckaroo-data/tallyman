@@ -2,17 +2,16 @@
 H3 pipeline benchmark — accurate per-step peak RSS measurement.
 Polls RSS every 0.25s in a background thread to catch true peak.
 """
-import threading
-import time
 import os
 import sys
+import threading
+import time
 
-import psutil
-import numpy as np
-import polars as pl
 import geopandas as gpd
 import h3
-import pyarrow.parquet as pq
+import numpy as np
+import polars as pl
+import psutil
 
 proc = psutil.Process(os.getpid())
 

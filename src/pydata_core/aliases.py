@@ -14,8 +14,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydata_core.paths import catalog_dir, ensure_project
 from pydata_core import xorq_catalog as _xcat
+from pydata_core.paths import catalog_dir, ensure_project
 
 
 class AliasExists(ValueError):

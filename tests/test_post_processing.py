@@ -173,7 +173,6 @@ def _agg_code(project: str) -> str:
 
 def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch):
     """run_post_processing resolves an alias and returns filtered rows."""
-    from pathlib import Path
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create, catalog_run_post_processing
 

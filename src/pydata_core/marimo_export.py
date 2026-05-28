@@ -15,7 +15,7 @@ import re
 import textwrap
 from pathlib import Path
 
-from pydata_core.aliases import get_alias, load_aliases, version_of_hash
+from pydata_core.aliases import load_aliases, version_of_hash
 from pydata_core.manifest import read_manifest
 from pydata_core.notebook import load as load_notebook
 from pydata_core.paths import entry_dir
@@ -129,7 +129,7 @@ def notebook_to_marimo(project: str) -> str:
             "",
             "@app.cell",
             "def _(mo):",
-            f'    mo.md(r"""',
+            '    mo.md(r"""',
             textwrap.indent(md_content, "    "),
             '    """)',
             "    return ()",

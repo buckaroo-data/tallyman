@@ -15,6 +15,7 @@ from pydata_core.aliases import (  # noqa: I001 (keep notebook import first)
 from pydata_core.charts import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
 from pydata_core.errors import get_error, list_errors, record_error
 from pydata_core.manifest import Manifest, read_manifest, write_manifest
+from pydata_core.marimo_export import export_notebook_path, notebook_to_marimo
 from pydata_core.notebook import CellNotFound
 from pydata_core.paths import (
     catalog_dir,
@@ -27,7 +28,6 @@ from pydata_core.paths import (
     pydata_home,
     resolve_project,
 )
-from pydata_core.marimo_export import export_notebook_path, notebook_to_marimo
 from pydata_core.post_processing import (
     PostProcessingRunError,
     PostProcessingSourceError,

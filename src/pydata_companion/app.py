@@ -482,6 +482,7 @@ def create_app(
     def export_marimo():
         """Download the default notebook as a Marimo Python file."""
         from fastapi.responses import Response  # noqa: PLC0415
+
         from pydata_core.marimo_export import notebook_to_marimo  # noqa: PLC0415
         content = notebook_to_marimo(project_name)
         filename = f"{project_name}_notebook.py"

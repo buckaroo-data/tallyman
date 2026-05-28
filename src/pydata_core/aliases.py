@@ -15,6 +15,7 @@ import json
 from pathlib import Path
 
 from pydata_core.paths import catalog_dir, ensure_project
+from pydata_core import xorq_catalog as _xcat
 
 
 class AliasExists(ValueError):
@@ -105,6 +106,9 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
 
     _write_json(_aliases_path(project), aliases)
     _write_json(_history_path(project), history)
+
+    _xcat.add_alias(content_hash, alias=name)
+
     return {
         "name": name,
         "hash": content_hash,
@@ -133,3 +137,4 @@ def remove_alias(project: str, name: str) -> None:
     history.pop(name, None)
     _write_json(_aliases_path(project), aliases)
     _write_json(_history_path(project), history)
+    _xcat.remove_alias(name)

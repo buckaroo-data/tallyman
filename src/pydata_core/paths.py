@@ -53,6 +53,22 @@ def resolve_project(explicit: str | None = None) -> str:
     return os.environ.get("PYDATA_PROJECT", DEFAULT_PROJECT)
 
 
+def catalog_repo_path() -> Path:
+    """Path to the xorq-backed catalog git repo.
+
+    Resolved at call time so tests can override via PYDATA_CATALOG_REPO.
+    Defaults to <repo_root>/catalog/ (detected from the installed package
+    location, which works for editable installs).
+    """
+    override = os.environ.get("PYDATA_CATALOG_REPO")
+    if override:
+        return Path(override)
+    # pydata_core/__init__.py lives at src/pydata_core/__init__.py
+    # → parents[0] = src/pydata_core, [1] = src, [2] = repo root
+    import pydata_core as _pkg  # local import to avoid circular at module load
+    return Path(_pkg.__file__).resolve().parents[2] / "catalog"
+
+
 def ensure_project(project: str) -> Path:
     p = project_dir(project)
     (p / "catalog" / "entries").mkdir(parents=True, exist_ok=True)

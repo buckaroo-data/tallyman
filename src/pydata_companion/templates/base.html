@@ -28,8 +28,11 @@
        nested-scrollbar mess where header was sitting above a separately-
        scrolling document. */
     main { padding: 16px; flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
-    .layout { display: grid; grid-template-columns: 320px 1fr; gap: 16px; flex: 1 1 auto; min-height: 0; }
-    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; min-height: 0; }
+    /* minmax(0, 1fr) lets the detail column shrink below its content's
+       intrinsic width — without it, a wide AG Grid inside expands the
+       grid track and forces a horizontal scroll on the whole panel. */
+    .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; flex: 1 1 auto; min-height: 0; }
+    .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; min-height: 0; min-width: 0; }
     .entry-list { list-style: none; margin: 0; padding: 0; }
     .entry-list li { border-bottom: 1px solid var(--line); }
     .entry-list a { display: block; padding: 10px 12px; color: var(--fg); }

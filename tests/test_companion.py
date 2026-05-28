@@ -108,10 +108,17 @@ def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, o
     assert "${PYDATA_PROJECT_ROOT}" in r.text
 
 
-def test_entry_detail_404(fresh_companion_app):
+def test_entry_detail_missing_redirects_to_catalog(fresh_companion_app):
+    # Stale URLs (post-restart, post-prune) self-heal: 303 to /catalog with the
+    # missing hash threaded through as a flash, not a hard 404.
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog/deadbeef")
-    assert r.status_code == 404
+    r = c.get("/catalog/deadbeef", follow_redirects=False)
+    assert r.status_code == 303
+    assert r.headers["location"] == "/catalog?missing=deadbeef"
+    # Followed: lands on catalog page and surfaces the missing hash.
+    r2 = c.get("/catalog/deadbeef")
+    assert r2.status_code == 200
+    assert "deadbeef" in r2.text
 
 
 def test_internal_notify_returns_subscriber_count(fresh_companion_app):

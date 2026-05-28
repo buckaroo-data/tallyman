@@ -23,11 +23,21 @@
     const banner = document.getElementById('error-banner');
     if (!banner) return;
     const latest = banner.dataset.latestId;
-    const dismissedKey = 'pydata.errorBannerDismissed';
-    if (localStorage.getItem(dismissedKey) === latest) banner.classList.add('collapsed');
+    // Two-stage dismiss keyed by latest error id. A fresh failure resets
+    // both stages so a real signal pops the banner back even if the user
+    // had it hidden for a previous error.
+    const collapsedKey = 'pydata.errorBannerCollapsed';
+    const hiddenKey = 'pydata.errorBannerHidden';
+    if (localStorage.getItem(hiddenKey) === latest) banner.classList.add('hidden');
+    else if (localStorage.getItem(collapsedKey) === latest) banner.classList.add('collapsed');
     window.dismissErrorBanner = () => {
-      banner.classList.add('collapsed');
-      localStorage.setItem(dismissedKey, latest);
+      if (banner.classList.contains('collapsed')) {
+        banner.classList.add('hidden');
+        localStorage.setItem(hiddenKey, latest);
+      } else {
+        banner.classList.add('collapsed');
+        localStorage.setItem(collapsedKey, latest);
+      }
     };
   })();
 </script>

@@ -5,14 +5,14 @@
     {% include "_catalog_sidebar.html" %}
   </aside>
   <section class="panel detail" id="catalog-detail">
-    <h2>
-      {% if alias %}
-        {{ alias }} <span class="vchip">V{{ version }}</span>
-      {% else %}
-        {{ manifest.content_hash }}
-      {% endif %}
-    </h2>
-    <div class="meta">
+    <div class="entry-header">
+      <h2>
+        {% if alias %}
+          {{ alias }} <span class="vchip">V{{ version }}</span>
+        {% else %}
+          {{ manifest.content_hash }}
+        {% endif %}
+      </h2>
       <span class="pill">{{ manifest.content_hash }}</span>
       <span class="pill">{{ manifest.row_count }} rows</span>
       <span class="pill">{{ manifest.execute_seconds }}s</span>
@@ -43,13 +43,14 @@
     {% endif %}
 
     {% if buckaroo_session and buckaroo_ws_base %}
-      <h3>result <span class="meta">· buckaroo · {{ manifest.row_count }} rows</span></h3>
       <div
         class="buckaroo-embed"
         data-ws-url="{{ buckaroo_ws_base }}/ws/{{ buckaroo_session }}"
       ></div>
     {% else %}
-      <h3>result {% if total_rows > preview_rows %}<span class="meta">(showing first {{ preview_rows }} of {{ total_rows }})</span>{% endif %}</h3>
+      {% if total_rows > preview_rows %}
+        <p class="meta">showing first {{ preview_rows }} of {{ total_rows }} rows</p>
+      {% endif %}
       <div style="overflow:auto; max-height: 50vh;">
         {{ table_html|safe }}
       </div>

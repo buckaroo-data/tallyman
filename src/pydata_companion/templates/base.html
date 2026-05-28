@@ -38,6 +38,10 @@
     .entry-list .prompt { display: block; margin-top: 2px; }
     .detail { padding: 16px; }
     .detail h2 { margin-top: 0; }
+    /* Entry header: title + meta pills on one line. */
+    .entry-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .entry-header h2 { margin: 0 8px 0 0; }
+    .entry-header .pill { margin-right: 0; }
     .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
     pre.code { background: #0a0c12; border: 1px solid var(--line); border-radius: 4px; padding: 10px; overflow: auto; font-family: ui-monospace, monospace; font-size: 12px; }
     table.data-table { border-collapse: collapse; width: 100%; font-size: 12px; }
@@ -62,7 +66,8 @@
     .error-banner .dismiss { position: absolute; top: 4px; right: 8px; background: transparent; border: 0; color: #ffb4b4; font-size: 16px; cursor: pointer; padding: 2px 6px; line-height: 1; }
     .error-banner .dismiss:hover { color: #fff; }
     .error-banner.collapsed ul { display: none; }
-    .error-banner.collapsed strong::after { content: " (dismissed — refresh to restore)"; font-weight: normal; opacity: 0.6; }
+    .error-banner.collapsed strong::after { content: " (click × again to hide)"; font-weight: normal; opacity: 0.6; }
+    .error-banner.hidden { display: none; }
     .entry-list .alias { font-weight: 600; color: var(--fg); display: block; }
     .entry-list .vchip { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 10px; font-size: 11px; font-weight: 500; margin-left: 4px; }
     .entry-list .forensic-tag { background: #333; color: var(--muted); padding: 1px 6px; border-radius: 10px; font-size: 11px; margin-left: 4px; }

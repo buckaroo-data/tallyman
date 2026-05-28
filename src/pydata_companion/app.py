@@ -107,6 +107,7 @@ def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
                 e["alias"] = None
                 e["version"] = None
                 e["is_current"] = False
+
     # Sort: current versions of named entries first (by alias), then forensic
     # versions, then scratch, each by mtime-desc within their bucket.
     def _bucket(e):
@@ -245,12 +246,8 @@ def create_app(
                 except UnicodeDecodeError:
                     text = f"(binary, {f.stat().st_size} bytes)"
                 build_artifacts.append({"name": f.name, "text": text})
-        buckaroo_session = (
-            buckaroo.ensure_session(content_hash, project_name) if buckaroo is not None else None
-        )
-        buckaroo_ws_base = (
-            buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
-        )
+        buckaroo_session = buckaroo.ensure_session(content_hash, project_name) if buckaroo is not None else None
+        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
         # Only read parquet when Buckaroo isn't there to render — its WS path
         # streams rows on demand from the xorq expression, so for buckaroo-up
@@ -266,9 +263,7 @@ def create_app(
                 # Stream just enough row groups to fill the fallback preview.
                 preview_rows = min(200, total_rows)
                 head_table = _read_head_rows(result_path, preview_rows)
-                table_html = head_table.to_pandas().to_html(
-                    classes="data-table", index=False, border=0
-                )
+                table_html = head_table.to_pandas().to_html(classes="data-table", index=False, border=0)
         else:
             total_rows = 0
         return templates.TemplateResponse(
@@ -454,9 +449,7 @@ def create_app(
         root = roots[0] if roots else (nodes_for_layout[0]["id"] if nodes_for_layout else None)
         # Catalog DAG: edges point from parent (data source) to child, so the
         # natural left-to-right layered layout fits without inversion.
-        layout = layered_positions(
-            nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80
-        )
+        layout = layered_positions(nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80)
         # Annotate nodes with their alias if any (for nicer labels in the SVG).
         aliases = load_aliases(project_name)
         by_latest = {h: a for a, h in aliases.items()}
@@ -496,9 +489,7 @@ def create_app(
         # data-flow display we want producer on the left. BFS from a *leaf*
         # gives us that — but the most reliable display is: BFS from the
         # root (consumer at the right by inverting later).
-        layout = layered_positions(
-            lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70
-        )
+        layout = layered_positions(lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70)
         cols = column_lineage(project_name, content_hash)
         return templates.TemplateResponse(
             request,
@@ -553,9 +544,7 @@ def create_app(
                     table = pq.read_table(entry / "result.parquet")
                     df = table.to_pandas()
                     n = min(20, len(df))
-                    preview_html = df.head(n).to_html(
-                        classes="data-table", index=False, border=0
-                    )
+                    preview_html = df.head(n).to_html(classes="data-table", index=False, border=0)
             info = version_of_hash(project_name, latest) if latest else None
             rendered_cells.append(
                 {
@@ -657,9 +646,8 @@ def create_app(
             res = _build_and_persist(project_name, code, prompt=payload.get("prompt") or None)
         except BuildError as exc:
             from pydata_core import record_error as _record_error
-            rec = _record_error(
-                project_name, code=code, message=str(exc), tool="api_code"
-            )
+
+            rec = _record_error(project_name, code=code, message=str(exc), tool="api_code")
             await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
             raise HTTPException(400, str(exc))
         info = _set_alias(project_name, alias, res.content_hash, expect_exists=True)
@@ -696,9 +684,7 @@ def create_app(
         if not hashes:
             raise HTTPException(404, f"alias {alias!r} has no history")
         if len(hashes) < 2:
-            raise HTTPException(
-                400, f"alias {alias!r} only has one version — nothing to diff"
-            )
+            raise HTTPException(400, f"alias {alias!r} only has one version — nothing to diff")
         return _render_diff(request, alias, len(hashes) - 1, len(hashes))
 
     @app.get("/diff/{alias}/{va:int}/{vb:int}", response_class=HTMLResponse)

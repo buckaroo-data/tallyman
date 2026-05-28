@@ -18,7 +18,7 @@
     body { font-size: 14px; display: flex; flex-direction: column; overflow: hidden; }
     a { color: var(--accent); text-decoration: none; }
     a:hover { text-decoration: underline; }
-    header { border-bottom: 1px solid var(--line); padding: 10px 16px; display: flex; align-items: center; gap: 16px; flex: 0 0 auto; }
+    header { border-bottom: 1px solid var(--line); padding: 6px 12px; display: flex; align-items: center; gap: 16px; flex: 0 0 auto; }
     header .brand { font-weight: 600; }
     header .project { color: var(--muted); }
     header nav a { margin-right: 12px; }
@@ -27,11 +27,15 @@
        just flow naturally. Either way, the body never scrolls — fixes the
        nested-scrollbar mess where header was sitting above a separately-
        scrolling document. */
-    main { padding: 16px; flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+    main { padding: 8px 12px; flex: 1 1 auto; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
     /* minmax(0, 1fr) lets the detail column shrink below its content's
        intrinsic width — without it, a wide AG Grid inside expands the
        grid track and forces a horizontal scroll on the whole panel. */
-    .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 16px; flex: 1 1 auto; min-height: 0; }
+    /* grid-template-rows: 1fr — without an explicit row size the grid row
+       defaults to auto and sizes to content, so the panels never claim the
+       viewport height. AG Grid inside .buckaroo-embed fills its container,
+       so without a definite parent height it shrinks to ~18 rows. */
+    .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); grid-template-rows: 1fr; gap: 10px; flex: 1 1 auto; min-height: 0; }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; min-height: 0; min-width: 0; }
     .entry-list { list-style: none; margin: 0; padding: 0; }
     .entry-list li { border-bottom: 1px solid var(--line); }
@@ -39,10 +43,10 @@
     .entry-list a:hover { background: var(--accent-soft); }
     .entry-list .hash { font-family: ui-monospace, monospace; color: var(--muted); font-size: 12px; }
     .entry-list .prompt { display: block; margin-top: 2px; }
-    .detail { padding: 16px; }
-    .detail h2 { margin-top: 0; }
+    .detail { padding: 10px 12px; }
+    .detail h2 { margin-top: 0; margin-bottom: 0; }
     /* Entry header: title + meta pills on one line. */
-    .entry-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+    .entry-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 8px; margin-bottom: 4px; }
     .entry-header h2 { margin: 0 8px 0 0; }
     .entry-header .pill { margin-right: 0; }
     /* entry-detail: flex column so the buckaroo embed can claim the rest of
@@ -56,7 +60,7 @@
     .entry-detail > .metadata-section,
     .entry-detail > .pandas-preview { flex: 0 0 auto; }
     .entry-detail > .buckaroo-embed { flex: 1 1 auto; height: auto; min-height: 240px; }
-    .prompt-row { display: flex; align-items: center; gap: 12px; margin: 4px 0 8px; }
+    .prompt-row { display: flex; align-items: center; gap: 12px; margin: 2px 0 6px; }
     .prompt-row .prompt-text { flex: 1 1 auto; min-width: 0; }
     .prompt-row #metadata-toggle { flex: 0 0 auto; }
     .metadata-section { margin-bottom: 12px; }

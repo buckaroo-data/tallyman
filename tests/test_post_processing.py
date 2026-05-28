@@ -131,14 +131,14 @@ def test_mcp_add_remove_list_smoke(project: str):
     assert "error" not in add
     assert add["name"] == "low_volume"
 
-    listed = catalog_list_post_processings()
+    listed = catalog_list_post_processings()["items"]
     assert any(p["name"] == "low_volume" and not p["disabled"] for p in listed)
 
     removed = catalog_remove_post_processing("low_volume")
     assert "error" not in removed
     assert removed["name"] == "low_volume"
 
-    listed_after = catalog_list_post_processings()
+    listed_after = catalog_list_post_processings()["items"]
     assert any(p["name"] == "low_volume" and p["disabled"] for p in listed_after)
 
 
@@ -156,7 +156,7 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
     from pydata_mcp.server import catalog_remove_post_processing
 
     resp = catalog_remove_post_processing("never_existed")
-    assert resp == {"error": "no post-processing named 'never_existed'"}
+    assert resp["error"] == "no post-processing named 'never_existed'"
 
 
 # ---------------------------------------------------------------------------

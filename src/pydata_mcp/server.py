@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sys
@@ -21,6 +22,7 @@ from pydata_core import (
     get_alias,
     history_for,
     list_post_processings,
+    list_projects,
     list_stats,
     notebook,
     record_error,
@@ -42,6 +44,50 @@ COMPANION_URL = os.environ.get("PYDATA_COMPANION_URL", "http://127.0.0.1:7860")
 
 mcp = FastMCP("pydata")
 
+# Tracks the active project name observed at the end of the previous tool
+# invocation, so the next call can detect a mid-conversation switch and
+# surface a ``warning`` field (design decision 14 of the project-switcher
+# plan). ``None`` until the first tool call seeds it.
+_last_project: str | None = None
+
+
+def _tag_project(fn):
+    """Wrap a tool function so every response carries the active project.
+
+    Behavior:
+
+    - If the wrapped tool returns a ``dict``, ``result.setdefault("project",
+      <current>)`` is applied so the LLM always knows which project the
+      call landed in.
+    - If the wrapped tool returns a list (e.g. ``catalog_list``), it is
+      wrapped as ``{"project": <current>, "items": [...]}``. This is a
+      documented breaking change to those tools' surface — the trade-off
+      is uniformity: every MCP response is now a dict with a ``project``
+      key.
+    - When ``_last_project`` differs from the current resolution, a
+      ``warning`` field is added with the wording from the design plan.
+    - On the very first tool call, no warning is emitted; ``_last_project``
+      is simply seeded.
+    """
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        global _last_project
+        result = fn(*args, **kwargs)
+        current = resolve_project()
+        if not isinstance(result, dict):
+            result = {"items": result}
+        result.setdefault("project", current)
+        if _last_project is not None and _last_project != current:
+            result["warning"] = (
+                f"active project changed from {_last_project!r} to {current!r} "
+                f"since the last call; proceeding with {current!r}"
+            )
+        _last_project = current
+        return result
+
+    return wrapped
+
 
 def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
     """Best-effort POST to the companion's /internal/notify. Never raise."""
@@ -57,6 +103,7 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_run(code: str, prompt: str = "") -> dict:
     """Execute a xorq expression script and persist it as a catalog entry.
 
@@ -87,6 +134,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_load_parquet(
     rel_path: str, prompt: str = "", name: str = ""
 ) -> dict:
@@ -149,6 +197,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
 
 
 @mcp.tool()
+@_tag_project
 def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     """Execute and persist a NAMED catalog entry (alias).
 
@@ -183,6 +232,7 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     """Persist a NEW VERSION of an existing alias.
 
@@ -209,6 +259,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_alias(hash: str, name: str) -> dict:
     """Promote an existing scratch (unnamed) entry to a named entry.
 
@@ -228,6 +279,7 @@ def catalog_alias(hash: str, name: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_rename(old_name: str, new_name: str) -> dict:
     """Rename an existing alias. Preserves version history and notebook position."""
     project = resolve_project()
@@ -244,6 +296,7 @@ def catalog_rename(old_name: str, new_name: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_unalias(name: str) -> dict:
     """Remove an alias (the named entries become scratch again).
 
@@ -262,6 +315,7 @@ def catalog_unalias(name: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def notebook_reorder(cell_id: str, new_index: int) -> dict:
     """Move a notebook cell to a new position (0-based)."""
     project = resolve_project()
@@ -274,6 +328,7 @@ def notebook_reorder(cell_id: str, new_index: int) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def notebook_remove(cell_id: str) -> dict:
     """Remove a cell from the notebook. The underlying catalog entry is unaffected."""
     project = resolve_project()
@@ -286,6 +341,7 @@ def notebook_remove(cell_id: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def notebook_edit_markdown(cell_id: str, markdown: str) -> dict:
     """Replace the markdown text shown above a cell."""
     project = resolve_project()
@@ -298,6 +354,7 @@ def notebook_edit_markdown(cell_id: str, markdown: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_chart(hash_or_alias: str, vega_spec: dict | str) -> dict:
     """Attach a Vega-Lite spec to a catalog entry.
 
@@ -332,6 +389,7 @@ def catalog_chart(hash_or_alias: str, vega_spec: dict | str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     """Diff two versions of an alias.
 
@@ -381,6 +439,7 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_add_summary_stat(name: str, source: str) -> dict:
     """Register a project-authored column summary stat.
 
@@ -418,6 +477,7 @@ def catalog_add_summary_stat(name: str, source: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_remove_summary_stat(name: str) -> dict:
     """Soft-delete a project-authored stat.
 
@@ -436,6 +496,7 @@ def catalog_remove_summary_stat(name: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_list_summary_stats() -> list[dict]:
     """List every project-authored summary stat (active + disabled).
 
@@ -447,6 +508,7 @@ def catalog_list_summary_stats() -> list[dict]:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_add_post_processing(name: str, source: str) -> dict:
     """Register a project-authored post-processing function.
 
@@ -486,6 +548,7 @@ def catalog_add_post_processing(name: str, source: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_remove_post_processing(name: str) -> dict:
     """Soft-delete a project-authored post-processing function.
 
@@ -503,6 +566,7 @@ def catalog_remove_post_processing(name: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_list_post_processings() -> list[dict]:
     """List every project-authored post-processing function (active + disabled).
 
@@ -514,6 +578,7 @@ def catalog_list_post_processings() -> list[dict]:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_run_post_processing(code: str, entry: str) -> dict:
     """Test a post-processing function against a real catalog entry's result.
 
@@ -553,6 +618,7 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_export_marimo() -> dict:
     """Export the project's notebook to a Marimo Python notebook file.
 
@@ -579,6 +645,7 @@ def catalog_export_marimo() -> dict:
 
 
 @mcp.tool()
+@_tag_project
 def catalog_list() -> list[dict]:
     """List every entry in the current project's catalog (most recent first).
 
@@ -600,6 +667,120 @@ def catalog_list() -> list[dict]:
             e["alias"] = None
             e["version"] = None
     return entries
+
+
+# ---------------------------------------------------------------------------
+# Project lifecycle tools (T-45)
+#
+# Read-side (``project_list``) touches the file directly via pydata_core,
+# so it works when the companion isn't running. Write-side
+# (``project_switch``, ``project_new``) POST to the companion's
+# /api/projects/* routes — the companion is the sole writer of the
+# active-project file so SSE event publishing stays honest. See
+# plans/project_switcher.md (decisions 1, 6, 8) for the rationale.
+# ---------------------------------------------------------------------------
+
+
+def _companion_post(path: str, payload: dict) -> dict:
+    """POST to the companion; normalise transport / HTTP errors into a
+    ``{"error": ...}`` dict that the MCP caller can render. The companion
+    URL is included so the LLM can tell the user which endpoint to bring
+    up if the request failed."""
+    url = f"{COMPANION_URL}{path}"
+    try:
+        with httpx.Client(timeout=10.0) as client:
+            resp = client.post(url, json=payload)
+    except httpx.HTTPError as exc:
+        return {
+            "error": (
+                f"companion not reachable at {COMPANION_URL}: {exc!s}. "
+                f"Project lifecycle tools require 'pydata run' to be active."
+            )
+        }
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json()
+        except Exception:
+            detail = resp.text
+        return {"error": f"companion at {url} returned {resp.status_code}: {detail}"}
+    try:
+        return resp.json()
+    except Exception as exc:
+        return {"error": f"companion at {url} returned non-JSON: {exc!s}"}
+
+
+@mcp.tool()
+@_tag_project
+def project_list() -> dict:
+    """List every project on disk and report which one is active.
+
+    Read-only; reads the active-project file and the projects directory
+    directly. Works when the companion process isn't running, so this is
+    the safe tool to call before deciding whether to switch.
+
+    Returns:
+        dict with keys: ``active`` (project name, or ``None`` if no file
+        exists yet) and ``available`` (alphabetically-sorted list of
+        every project name on disk).
+    """
+    return {"active": resolve_project(), "available": list_projects()}
+
+
+@mcp.tool()
+@_tag_project
+def project_switch(name: str) -> dict:
+    """Switch the active project for every subsequent companion + MCP call.
+
+    POSTs to the companion's ``/api/projects/switch`` — the companion
+    rewrites ``~/.pydata-app/active_project`` and broadcasts a
+    ``project_switched`` SSE event so any open browser tabs reload into
+    the new project.
+
+    Args:
+        name: An existing project (must already appear in
+            ``project_list().available``). 404 if the project doesn't
+            exist; 400 if the name is invalid.
+
+    Returns:
+        ``{"previous": "<old>", "active": "<name>"}`` on success.
+        ``{"error": "..."}`` if the companion is down, the URL is wrong,
+        or the request was rejected.
+
+    Example workflow::
+
+        project_list()                # see what's available
+        project_switch("forecast-q3") # all subsequent catalog_* calls
+                                       # now target forecast-q3
+    """
+    return _companion_post("/api/projects/switch", {"name": name})
+
+
+@mcp.tool()
+@_tag_project
+def project_new(name: str, with_fixture: bool = False) -> dict:
+    """Create a new project on disk and switch to it.
+
+    POSTs to the companion's ``/api/projects/new`` — the companion calls
+    ``ensure_project``, optionally writes the shoe-orders demo fixture,
+    flips the active-project file, and broadcasts ``project_switched``.
+
+    Args:
+        name: New project name. Must match ``^[a-z0-9][a-z0-9_-]{0,31}$``
+            and not collide with an existing project (409 on collision).
+        with_fixture: When ``True``, copy the shoe-orders demo parquet
+            into the new project's ``data/`` directory. Defaults to
+            ``False`` — the demo fixture is opt-in for MCP-driven
+            project creation; the CLI ``pydata init`` keeps the old
+            default-on behavior for demo workflows.
+
+    Returns:
+        ``{"name": "<name>", "active": "<name>"}`` on success.
+        ``{"error": "..."}`` on transport failure, invalid name (400),
+        or collision (409).
+    """
+    return _companion_post(
+        "/api/projects/new", {"name": name, "with_fixture": with_fixture}
+    )
 
 
 def main() -> None:

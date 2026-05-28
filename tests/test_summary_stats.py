@@ -161,14 +161,14 @@ def test_mcp_add_remove_list_smoke(project: str):
     assert "error" not in add
     assert add["name"] == "percent_at"
 
-    listed = catalog_list_summary_stats()
+    listed = catalog_list_summary_stats()["items"]
     assert any(s["name"] == "percent_at" and not s["disabled"] for s in listed)
 
     removed = catalog_remove_summary_stat("percent_at")
     assert "error" not in removed
     assert removed["name"] == "percent_at"
 
-    listed_after = catalog_list_summary_stats()
+    listed_after = catalog_list_summary_stats()["items"]
     assert any(s["name"] == "percent_at" and s["disabled"] for s in listed_after)
 
 
@@ -186,4 +186,4 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
     from pydata_mcp.server import catalog_remove_summary_stat
 
     resp = catalog_remove_summary_stat("never_existed")
-    assert resp == {"error": "no stat named 'never_existed'"}
+    assert resp["error"] == "no stat named 'never_existed'"

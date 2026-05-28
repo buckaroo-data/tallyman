@@ -33,7 +33,7 @@ def test_catalog_run_error_returns_dict(project: str, monkeypatch):
 def test_catalog_list_after_run(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_run(_code(orders_parquet), prompt="x")
-    rows = catalog_list()
+    rows = catalog_list()["items"]
     assert len(rows) == 1
     assert rows[0]["row_count"] == 4
 

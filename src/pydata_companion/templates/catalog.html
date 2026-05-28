@@ -1,5 +1,10 @@
 {% extends "base.html" %}
 {% block content %}
+{% if missing_hash %}
+<div class="flash meta" style="padding: 6px 10px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 4px;">
+  entry <code>{{ missing_hash }}</code> not found in project <code>{{ project }}</code> — showing catalog.
+</div>
+{% endif %}
 {% if errors %}
 {# Dismiss state is keyed by the latest error id so a fresh failure re-opens the
    banner; sticking on stale dismiss across a new failure would hide signal. #}

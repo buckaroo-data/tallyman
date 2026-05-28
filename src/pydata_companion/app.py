@@ -183,14 +183,19 @@ def create_app(
         return RedirectResponse("/catalog")
 
     @app.get("/catalog", response_class=HTMLResponse)
-    def catalog(request: Request):
+    def catalog(request: Request, missing: str | None = None):
         project_name = _require_project()
         entries = _annotate_entries(project_name, list_entries(project_name))
         errors = list_errors(project_name, limit=5)
         return templates.TemplateResponse(
             request,
             "catalog.html",
-            {"project": project_name, "entries": entries, "errors": errors},
+            {
+                "project": project_name,
+                "entries": entries,
+                "errors": errors,
+                "missing_hash": missing,
+            },
         )
 
     @app.get("/catalog/{content_hash}", response_class=HTMLResponse)
@@ -208,7 +213,9 @@ def create_app(
 
         entry = entry_dir(project_name, content_hash)
         if not entry.exists():
-            raise HTTPException(404, f"entry {content_hash} not found")
+            # Self-healing: stale browser URL (often from a pre-restart project)
+            # bounces to the catalog list with a one-shot flash, not a 404.
+            return RedirectResponse(f"/catalog?missing={content_hash}", status_code=303)
         manifest = json.loads((entry / "manifest.json").read_text())
         schema = json.loads((entry / "schema.json").read_text())
         code = (entry / "expr.py").read_text()

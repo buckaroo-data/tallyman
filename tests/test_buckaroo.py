@@ -172,6 +172,40 @@ def test_unit_forget_project_sessions_returns_zero_when_none_match(project: str)
     assert len(mgr._sessions) == 1
 
 
+def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatch):
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr._sessions = {
+        "hash_a": {"session_id": "sess-aaa", "project": project},
+        "hash_b": {"session_id": "sess-bbb", "project": project},
+        "hash_c": {"session_id": "sess-ccc", "project": "other_project"},
+    }
+
+    posted_urls: list[str] = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(mgr._client, "post", lambda url, **kw: (posted_urls.append(url), FakeResponse())[1])
+
+    reloaded = mgr.reload_project_sessions(project)
+    assert reloaded == 2
+    assert sorted(posted_urls) == sorted([
+        f"{mgr.base_url}/reload_expr/sess-aaa",
+        f"{mgr.base_url}/reload_expr/sess-bbb",
+    ])
+    # Sessions are NOT evicted — they remain cached for fast reconnect.
+    assert len(mgr._sessions) == 3
+
+
+def test_unit_reload_project_sessions_returns_zero_when_not_running(project: str):
+    mgr = BuckarooManager()
+    mgr._sessions = {"hash_a": {"session_id": "s1", "project": project}}
+    assert mgr.reload_project_sessions(project) == 0
+
+
 def test_unit_status_shape(project: str):
     mgr = BuckarooManager()
     s = mgr.status()

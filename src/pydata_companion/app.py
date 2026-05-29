@@ -367,8 +367,8 @@ def create_app(
         )
         if payload.kind in ("post_processing_changed", "summary_stat_changed"):
             if buckaroo:
-                dropped = buckaroo.forget_project_sessions(project_name)
-                log.info("evicted %d buckaroo session(s) for project %s", dropped, project_name)
+                reloaded = buckaroo.reload_project_sessions(project_name)
+                log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)
         await publish(payload.model_dump())
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 

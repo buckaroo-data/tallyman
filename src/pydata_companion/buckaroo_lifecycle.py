@@ -355,6 +355,39 @@ class BuckarooManager:
                 self._persist_sessions()
         return dropped
 
+    def reload_project_sessions(self, project: str) -> int:
+        """Hot-reload klasses for all live sessions belonging to *project*.
+
+        Calls POST /reload_expr/<session_id> (buckaroo 0.14.9+) on each
+        cached session for *project*. The session stays alive and its
+        analysis/post-processing klasses are updated in place — no eviction
+        or page-load round-trip to /load_expr is needed.
+
+        Returns the number of sessions reloaded. Falls back to 0 (with a
+        warning) if buckaroo isn't running or a reload call fails.
+        """
+        if not self.is_running or self.bound_port is None:
+            return 0
+        with self._session_lock:
+            targets = {
+                h: info["session_id"]
+                for h, info in self._sessions.items()
+                if info.get("project") == project
+            }
+        reloaded = 0
+        for content_hash, session_id in targets.items():
+            try:
+                resp = self._client.post(
+                    f"{self.base_url}/reload_expr/{session_id}",
+                    timeout=5.0,
+                )
+                resp.raise_for_status()
+                reloaded += 1
+                log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
+            except httpx.HTTPError as exc:
+                log.warning("buckaroo /reload_expr failed for session %s: %s", session_id, exc)
+        return reloaded
+
     # ------------------------------------------------------------------
     # session creation
     # ------------------------------------------------------------------
@@ -430,6 +463,8 @@ class BuckarooManager:
             if expanded is None:
                 expanded = expand_to_tmp(build_dir, project_dir(project))
                 self._expanded_dirs[content_hash] = expanded
+            stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
+            stat_cache.mkdir(parents=True, exist_ok=True)
             try:
                 resp = self._client.post(
                     f"{self.base_url}/load_expr",
@@ -441,6 +476,10 @@ class BuckarooManager:
                         # into the session's analysis_klasses. Older buckaroo
                         # builds ignore this field, so it's safe to always send.
                         "project_root": str(project_dir(project)),
+                        # Buckaroo 0.14.9+: persist computed summary stats to
+                        # disk so they survive a Buckaroo restart without full
+                        # recomputation on next /load_expr.
+                        "cache_storage_path": str(stat_cache),
                     },
                     timeout=10.0,
                 )

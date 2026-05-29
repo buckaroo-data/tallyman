@@ -50,6 +50,49 @@ def test_edit_mode_indicator_absent(fresh_companion_app):
     assert "read-only" not in r.text
 
 
+class _TrackingBuckaroo:
+    """Stub that records forget_project_sessions calls."""
+
+    def __init__(self):
+        self.forget_calls: list[str] = []
+        self.bound_port = None
+        self.is_running = False
+
+    def forget_project_sessions(self, project: str) -> int:
+        self.forget_calls.append(project)
+        return 0
+
+    def ensure_session(self, content_hash: str, project: str):
+        return None
+
+
+def test_notify_post_processing_changed_evicts_sessions(project: str):
+    stub = _TrackingBuckaroo()
+    app = create_app(project, buckaroo=stub)
+    c = TestClient(app)
+    r = c.post("/internal/notify", json={"kind": "post_processing_changed"})
+    assert r.status_code == 200
+    assert stub.forget_calls == [project]
+
+
+def test_notify_summary_stat_changed_evicts_sessions(project: str):
+    stub = _TrackingBuckaroo()
+    app = create_app(project, buckaroo=stub)
+    c = TestClient(app)
+    r = c.post("/internal/notify", json={"kind": "summary_stat_changed"})
+    assert r.status_code == 200
+    assert stub.forget_calls == [project]
+
+
+def test_notify_other_kind_does_not_evict_sessions(project: str):
+    stub = _TrackingBuckaroo()
+    app = create_app(project, buckaroo=stub)
+    c = TestClient(app)
+    r = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc"})
+    assert r.status_code == 200
+    assert stub.forget_calls == []
+
+
 def test_project_path_override_relocates_project(
     project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
 ):

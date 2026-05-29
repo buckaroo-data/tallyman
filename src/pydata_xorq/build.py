@@ -56,6 +56,46 @@ class BuildError(RuntimeError):
     pass
 
 
+def _user_imports_bare_ibis(code: str) -> bool:
+    """True if the user code imports the real `ibis` package directly.
+
+    `import xorq.vendor.ibis as ibis` is fine and does not match.
+    """
+    for raw_line in code.splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line == "import ibis" or line.startswith("import ibis "):
+            return True
+        if line.startswith("from ibis ") or line.startswith("from ibis."):
+            return True
+    return False
+
+
+def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
+    """Actionable hint when the user mixed `import ibis` with xorq.
+
+    Two signals — either one triggers the hint:
+      1. User code contains a bare `import ibis` / `from ibis ...`.
+      2. The exception message names xorq's vendored Expr class (the build
+         validator's signature for the same mistake — the expression was
+         constructed against `ibis.expr.types.core.Expr` instead of
+         `xorq.vendor.ibis.expr.types.core.Expr`).
+    """
+    has_bad_import = _user_imports_bare_ibis(code)
+    has_expr_mismatch = (
+        "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
+    )
+    if not (has_bad_import or has_expr_mismatch):
+        return ""
+    return (
+        "\n\nHint: this usually means the expression was built using "
+        "`import ibis` instead of `import xorq.vendor.ibis as ibis`. "
+        "Replace any `import ibis` (or `from ibis import ...`) with "
+        "`import xorq.vendor.ibis as ibis` and rebuild."
+    )
+
+
 def _import_script(code: str) -> tuple[object, Path]:
     """Write code to a temp file, import it, return (module, temp_path).
 
@@ -71,7 +111,10 @@ def _import_script(code: str) -> tuple[object, Path]:
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
-        raise BuildError(f"executing user code raised: {exc}\n{traceback.format_exc()}") from exc
+        hint = _ibis_import_hint(str(exc), code)
+        raise BuildError(
+            f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}"
+        ) from exc
     return module, tmp
 
 
@@ -104,7 +147,10 @@ def build_and_persist(
         try:
             build_path = Path(build_expr(expr_obj, builds_dir=builds_dir))
         except Exception as exc:
-            raise BuildError(f"build_expr failed: {exc}\n{traceback.format_exc()}") from exc
+            hint = _ibis_import_hint(str(exc), code)
+            raise BuildError(
+                f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}"
+            ) from exc
 
         content_hash = build_path.name
         target = entry_dir(project, content_hash)
@@ -145,14 +191,20 @@ def build_and_persist(
             cache_dir = get_xorq_cache_dir()
             loaded = load_expr(build_path, cache_dir=cache_dir)
         except Exception as exc:
-            raise BuildError(f"load_expr failed: {exc}\n{traceback.format_exc()}") from exc
+            hint = _ibis_import_hint(str(exc), code)
+            raise BuildError(
+                f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}"
+            ) from exc
 
         result_path = target / "result.parquet"
         t0 = time.monotonic()
         try:
             loaded.to_parquet(str(result_path))
         except Exception as exc:
-            raise BuildError(f"to_parquet failed: {exc}\n{traceback.format_exc()}") from exc
+            hint = _ibis_import_hint(str(exc), code)
+            raise BuildError(
+                f"to_parquet failed: {exc}{hint}\n{traceback.format_exc()}"
+            ) from exc
         execute_seconds = round(time.monotonic() - t0, 3)
 
     # Schema + row count via pyarrow (no pandas materialize needed).

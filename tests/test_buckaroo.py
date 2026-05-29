@@ -185,6 +185,8 @@ def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatc
     posted_urls: list[str] = []
 
     class FakeResponse:
+        status_code = 200
+
         def raise_for_status(self):
             pass
 
@@ -204,6 +206,43 @@ def test_unit_reload_project_sessions_returns_zero_when_not_running(project: str
     mgr = BuckarooManager()
     mgr._sessions = {"hash_a": {"session_id": "s1", "project": project}}
     assert mgr.reload_project_sessions(project) == 0
+
+
+def test_unit_reload_project_sessions_evicts_stale_session(project: str, monkeypatch):
+    """When /reload_expr returns 404 or 400, the session is evicted so the
+    next ensure_session call re-creates it cleanly."""
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr._sessions = {
+        "hash_a": {"session_id": "stale-session", "project": project},
+        "hash_b": {"session_id": "live-session", "project": project},
+    }
+
+    call_count = {"n": 0}
+
+    class StaleResponse:
+        status_code = 404
+
+        def raise_for_status(self):
+            pass
+
+    class LiveResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, **kw):
+        call_count["n"] += 1
+        return StaleResponse() if "stale-session" in url else LiveResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+
+    reloaded = mgr.reload_project_sessions(project)
+    assert reloaded == 1  # only live-session reloaded
+    assert "hash_a" not in mgr._sessions  # stale evicted
+    assert "hash_b" in mgr._sessions  # live kept
 
 
 def test_unit_status_shape(project: str):

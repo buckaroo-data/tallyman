@@ -110,34 +110,84 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     The provided code MUST bind a top-level variable named `expr` to a xorq/ibis
     expression. Imports allowed; all imports happen in a fresh module scope.
 
-    PREFERRED pattern — source data from the project catalog or data/ dir:
+    PREFERRED pattern:
+
         from pydata_xorq.io import from_project, from_catalog
         import xorq.vendor.ibis as ibis
-        t = from_project("file.parquet")          # reads from <project>/data/
-        t = from_catalog("alias_name")            # reads from a named catalog entry
+        t = from_catalog("alias_name")            # named catalog entry (alias or hash)
+        t = from_project("file.parquet")          # raw file under <project>/data/
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
 
-    KNOWN GOTCHAS — avoid these patterns:
-        # BAD: timestamp subtraction produces duration type that xorq cannot write to parquet.
-        #      Use epoch_seconds() arithmetic instead.
-        expr = t.mutate(dur=t.ts_end - t.ts_start)              # FAILS
-        expr = t.mutate(dur=t.ts_end.epoch_seconds()            # CORRECT
-                            - t.ts_start.epoch_seconds())
+    DATA SOURCING — choose between `from_catalog` and `from_project`:
+      - `from_catalog("name")` resolves catalog aliases AND bare content hashes.
+        Use this when the source appears in `catalog_list` output.
+      - `from_project("file.parquet")` reads raw files under `<project>/data/`.
+        Use this only for raw files visible on disk (not catalog aliases).
+      - When in doubt, call `catalog_list` first. A name that looks like a file
+        is often actually an alias — `from_project` on an alias raises
+        `ProjectDataNotFound`.
+
+    GOTCHAS — types and casts:
+
+        # BAD: timestamp subtraction yields IntervalColumn — fails on .mean()
+        #      AND on parquet write. Cast or use epoch_seconds() arithmetic.
+        expr = t.group_by("k").aggregate(avg=(t.b - t.a).mean())     # AttributeError on .mean()
+        expr = t.mutate(d=t.b - t.a)                                 # parquet write fails
+        # CORRECT:
+        expr = t.mutate(d=(t.b - t.a).cast("int64"))                 # microseconds
+        expr = t.mutate(d=t.b.epoch_seconds() - t.a.epoch_seconds()) # seconds
 
         # BAD: ibis.memtable() with date/timestamp values — pyarrow type coercion fails.
-        #      Use string columns and .cast('date') in the expression instead.
-        t = ibis.memtable({'d': [ibis.literal('2024-01-01').cast('date')]})  # FAILS
-        t = ibis.memtable({'d': ['2024-01-01']})                             # CORRECT
-        expr = t.mutate(d=t.d.cast('date'))
+        t = ibis.memtable({"d": [ibis.literal("2024-01-01").cast("date")]})  # FAILS
+        # CORRECT: use string columns and cast in the expression.
+        t = ibis.memtable({"d": ["2024-01-01"]})
+        expr = t.mutate(d=t.d.cast("date"))
 
-        # BAD: ibis._ wildcard in select() — not supported in xorq's vendored ibis.
-        expr = t.select(ibis._, new_col=t.x + 1)    # FAILS
-        expr = t.mutate(new_col=t.x + 1)            # CORRECT (prefer mutate for additions)
+    GOTCHAS — pandas reflexes that silently fail:
 
-        # BAD: from_project() with a filename not in <project>/data/ — raises immediately.
-        #      Call catalog_list first to see available aliases, or check data/ contents.
+        t.x.describe()        # No describe() — decompose into explicit aggregates.
+        t.ts.dt.hour          # No .dt accessor — call .hour() directly on the column.
+        t.select("*")         # No wildcard expansion — list columns or skip select().
+        t.select(ibis._, x=…) # No ibis._ wildcard — prefer mutate() for additions.
+        # CORRECT:
+        t.aggregate(mean=t.x.mean(), std=t.x.std(), min=t.x.min(), max=t.x.max())
+        t.mutate(h=t.ts.hour())
+        t.select("col_a", "col_b")                                   # explicit columns
+        t.mutate(new_col=t.x + 1)                                    # not select(ibis._, ...)
 
-    Use `xorq.vendor.ibis as ibis` if you need ibis directly. Do NOT `import ibis`.
+    GOTCHAS — referencing aggregate columns:
+
+        # BAD: when an aggregate alias collides with an ibis method name
+        # (count, min, max, mean, sum, std), attribute access returns the method.
+        agg = t.group_by("k").aggregate(count=t.x.count())
+        agg.filter(agg.count > 100)        # TypeError: '>' not supported between method and int
+        agg.order_by(agg.count.desc())     # AttributeError: 'function' has no attribute 'desc'
+        # CORRECT: reference by string, or pick a non-shadowing alias.
+        agg.filter(agg["count"] > 100)
+        agg.order_by(ibis.desc("count"))
+        agg = t.group_by("k").aggregate(n=t.x.count())   # avoids shadowing entirely
+
+    COLUMN ORDER — put new columns first:
+
+        When the expression adds a computed column to an existing table,
+        select the new column first so it appears at the left of the viewer.
+        # BAD:
+        expr = t.mutate(tripduration=(t.ended_at - t.started_at).cast("int64"))
+        # CORRECT — new column leads:
+        expr = t.select(
+            tripduration=(t.ended_at - t.started_at).cast("int64"),
+            *t.columns,
+        )
+        # Or equivalently with mutate + relocation:
+        expr = t.mutate(tripduration=(t.ended_at - t.started_at).cast("int64"))
+        expr = expr.select("tripduration", *[c for c in t.columns])
+
+    GOTCHAS — imports:
+
+        # FORBIDDEN: even one `import ibis` makes the expression unsavable.
+        # The expression constructs fine but explodes at catalog-save time with
+        # a TypeError about ibis vs xorq.vendor.ibis Expr classes. Always use:
+        import xorq.vendor.ibis as ibis
 
     Args:
         code: A self-contained Python script that binds `expr`.
@@ -220,12 +270,8 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     Errors if the alias already exists — use `catalog_revise` to update an
     existing alias instead.
 
-    Code conventions and gotchas are the same as `catalog_run` — see that
-    tool's docstring for the full list. Key points:
-      - Use `from pydata_xorq.io import from_project, from_catalog` for data sources.
-      - Timestamp differences must use `.epoch_seconds()` arithmetic, not direct
-        subtraction — the resulting duration type cannot be persisted to parquet.
-      - Prefer `mutate` over `select(ibis._, ...)` when adding columns.
+    Code conventions and gotchas are documented in `catalog_run`. The same
+    rules apply here.
 
     Args:
         name: The alias for this entry. Must not already exist in the project.
@@ -259,13 +305,9 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     The alias is repointed to the new content hash. The previous hash remains
     in the catalog as a forensic artifact and is recorded in alias_history.
 
-    Code conventions and gotchas are the same as `catalog_run` — see that
-    tool's docstring for the full list. Key points:
-      - Use `from pydata_xorq.io import from_catalog` to source from another
-        named entry (e.g. to add a derived column to an existing dataset).
-      - Timestamp differences must use `.epoch_seconds()` arithmetic, not direct
-        subtraction — the resulting duration type cannot be persisted to parquet.
-      - Prefer `mutate` over `select(ibis._, ...)` when adding columns.
+    Code conventions and gotchas are documented in `catalog_run`. The same
+    rules apply here. Use `from_catalog(name)` to chain off the previous
+    version of the alias (or any other named entry).
 
     Args:
         name: An existing alias.

@@ -375,17 +375,32 @@ class BuckarooManager:
                 if info.get("project") == project
             }
         reloaded = 0
+        to_evict: list[str] = []
         for content_hash, session_id in targets.items():
             try:
                 resp = self._client.post(
                     f"{self.base_url}/reload_expr/{session_id}",
                     timeout=5.0,
                 )
+                if resp.status_code in (404, 400):
+                    # Session is gone or is no longer an xorq session — evict
+                    # so the next ensure_session call re-creates it cleanly.
+                    log.warning(
+                        "buckaroo session %s (hash %s) is stale (%d); evicting",
+                        session_id, content_hash, resp.status_code,
+                    )
+                    to_evict.append(content_hash)
+                    continue
                 resp.raise_for_status()
                 reloaded += 1
                 log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
             except httpx.HTTPError as exc:
                 log.warning("buckaroo /reload_expr failed for session %s: %s", session_id, exc)
+        if to_evict:
+            with self._session_lock:
+                for h in to_evict:
+                    self._sessions.pop(h, None)
+            self._persist_sessions()
         return reloaded
 
     # ------------------------------------------------------------------

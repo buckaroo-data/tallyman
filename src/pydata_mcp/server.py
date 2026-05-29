@@ -110,10 +110,32 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     The provided code MUST bind a top-level variable named `expr` to a xorq/ibis
     expression. Imports allowed; all imports happen in a fresh module scope.
 
-    Use `xorq.api as xo` and the deferred readers:
-        import xorq.api as xo
-        t = xo.deferred_read_parquet("/path/to/file.parquet")
-        expr = t.group_by("region").aggregate(total=t.price.sum())
+    PREFERRED pattern — source data from the project catalog or data/ dir:
+        from pydata_xorq.io import from_project, from_catalog
+        import xorq.vendor.ibis as ibis
+        t = from_project("file.parquet")          # reads from <project>/data/
+        t = from_catalog("alias_name")            # reads from a named catalog entry
+        expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
+
+    KNOWN GOTCHAS — avoid these patterns:
+        # BAD: timestamp subtraction produces duration type that xorq cannot write to parquet.
+        #      Use epoch_seconds() arithmetic instead.
+        expr = t.mutate(dur=t.ts_end - t.ts_start)              # FAILS
+        expr = t.mutate(dur=t.ts_end.epoch_seconds()            # CORRECT
+                            - t.ts_start.epoch_seconds())
+
+        # BAD: ibis.memtable() with date/timestamp values — pyarrow type coercion fails.
+        #      Use string columns and .cast('date') in the expression instead.
+        t = ibis.memtable({'d': [ibis.literal('2024-01-01').cast('date')]})  # FAILS
+        t = ibis.memtable({'d': ['2024-01-01']})                             # CORRECT
+        expr = t.mutate(d=t.d.cast('date'))
+
+        # BAD: ibis._ wildcard in select() — not supported in xorq's vendored ibis.
+        expr = t.select(ibis._, new_col=t.x + 1)    # FAILS
+        expr = t.mutate(new_col=t.x + 1)            # CORRECT (prefer mutate for additions)
+
+        # BAD: from_project() with a filename not in <project>/data/ — raises immediately.
+        #      Call catalog_list first to see available aliases, or check data/ contents.
 
     Use `xorq.vendor.ibis as ibis` if you need ibis directly. Do NOT `import ibis`.
 
@@ -198,11 +220,16 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     Errors if the alias already exists — use `catalog_revise` to update an
     existing alias instead.
 
+    Code conventions and gotchas are the same as `catalog_run` — see that
+    tool's docstring for the full list. Key points:
+      - Use `from pydata_xorq.io import from_project, from_catalog` for data sources.
+      - Timestamp differences must use `.epoch_seconds()` arithmetic, not direct
+        subtraction — the resulting duration type cannot be persisted to parquet.
+      - Prefer `mutate` over `select(ibis._, ...)` when adding columns.
+
     Args:
         name: The alias for this entry. Must not already exist in the project.
-        code: A self-contained Python script that binds `expr`. Same conventions
-            as `catalog_run`. Use `from pydata_xorq.io import from_project` for
-            project-local data files.
+        code: A self-contained Python script that binds `expr`.
         prompt: Optional human-readable description.
 
     Returns:
@@ -231,6 +258,14 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
 
     The alias is repointed to the new content hash. The previous hash remains
     in the catalog as a forensic artifact and is recorded in alias_history.
+
+    Code conventions and gotchas are the same as `catalog_run` — see that
+    tool's docstring for the full list. Key points:
+      - Use `from pydata_xorq.io import from_catalog` to source from another
+        named entry (e.g. to add a derived column to an existing dataset).
+      - Timestamp differences must use `.epoch_seconds()` arithmetic, not direct
+        subtraction — the resulting duration type cannot be persisted to parquet.
+      - Prefer `mutate` over `select(ibis._, ...)` when adding columns.
 
     Args:
         name: An existing alias.

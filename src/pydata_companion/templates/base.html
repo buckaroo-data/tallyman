@@ -285,6 +285,8 @@
       // Global signal — every tab listens and reloads to pick up the new project.
       window.location.reload();
     });
+    sse.addEventListener('post_processing_changed', () => window.location.reload());
+    sse.addEventListener('summary_stat_changed', () => window.location.reload());
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
 
     // SPA-lite navigation: intercept clicks on /catalog/<hash> links and

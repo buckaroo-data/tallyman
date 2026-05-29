@@ -365,6 +365,10 @@ def create_app(
             payload.kind,
             getattr(payload, "hash", None),
         )
+        if payload.kind in ("post_processing_changed", "summary_stat_changed"):
+            if buckaroo:
+                dropped = buckaroo.forget_project_sessions(project_name)
+                log.info("evicted %d buckaroo session(s) for project %s", dropped, project_name)
         await publish(payload.model_dump())
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 

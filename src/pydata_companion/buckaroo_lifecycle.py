@@ -336,6 +336,25 @@ class BuckarooManager:
             )
         )
 
+    def forget_project_sessions(self, project: str) -> int:
+        """Evict all cached sessions for *project* and persist the result.
+
+        Returns the number of sessions dropped. Called when post-processing
+        or summary-stat files change so the next /load_expr picks up the
+        new definitions without requiring a manual Buckaroo restart.
+        """
+        with self._session_lock:
+            before = len(self._sessions)
+            self._sessions = {
+                h: info
+                for h, info in self._sessions.items()
+                if info.get("project") != project
+            }
+            dropped = before - len(self._sessions)
+            if dropped:
+                self._persist_sessions()
+        return dropped
+
     # ------------------------------------------------------------------
     # session creation
     # ------------------------------------------------------------------

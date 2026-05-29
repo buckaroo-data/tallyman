@@ -1,0 +1,59 @@
+{
+  "project": "spike",
+  "steps": [
+    {
+      "tool": "catalog_load_parquet",
+      "args": {"rel_path": "orders.parquet", "name": "orders", "prompt": "raw orders dataset"},
+      "narration": "beat 1: load the orders parquet and name it"
+    },
+    {
+      "tool": "catalog_create",
+      "args": {
+        "name": "shoe_sales",
+        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category == 'boots')\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
+        "prompt": "shoe sales (boots only) by region"
+      },
+      "narration": "beat 3: filter to shoes, name it"
+    },
+    {
+      "tool": "catalog_run",
+      "args": {
+        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('shoe_sales')\nexpr = t.order_by('total')\n",
+        "prompt": "verify shoe_sales totals are reasonable"
+      },
+      "narration": "beat 4: scratch verification — sort the result"
+    },
+    {
+      "tool": "catalog_revise",
+      "args": {
+        "name": "shoe_sales",
+        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category.isin(['boots', 'sneakers', 'sandals']))\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
+        "prompt": "include sneakers and sandals too"
+      },
+      "narration": "beat 5: revise to a broader shoes filter (V1 becomes forensic)"
+    },
+    {
+      "tool": "catalog_chart",
+      "args": {
+        "hash_or_alias": "shoe_sales",
+        "vega_spec": {
+          "mark": "bar",
+          "encoding": {
+            "x": {"field": "region", "type": "nominal"},
+            "y": {"field": "total", "type": "quantitative"}
+          }
+        }
+      },
+      "narration": "attach a vega-lite bar chart to shoe_sales"
+    },
+    {
+      "tool": "notebook_edit_markdown",
+      "args": {
+        "cell_id": "PLACEHOLDER",
+        "markdown": "## Shoe sales by region\n\nBroader bucket: boots, sneakers, sandals."
+      },
+      "narration": "beat 10: rewrite the markdown for the audience (skipped — needs cell_id resolution)",
+      "skip": true
+    }
+  ]
+}

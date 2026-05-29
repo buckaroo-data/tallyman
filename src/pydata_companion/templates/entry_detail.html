@@ -1,0 +1,183 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <aside class="panel" id="catalog-sidebar">
+    {% include "_catalog_sidebar.html" %}
+  </aside>
+  <section class="panel detail entry-detail" id="catalog-detail">
+    <div class="entry-header">
+      <h2>
+        {% if alias %}
+          {{ alias }} <span class="vchip">V{{ version }}</span>
+        {% else %}
+          {{ manifest.content_hash }}
+        {% endif %}
+      </h2>
+      <span class="pill">{{ manifest.content_hash }}</span>
+      <span class="pill">{{ manifest.row_count }} rows</span>
+      <span class="pill">{{ manifest.execute_seconds }}s</span>
+      <span class="pill">{{ manifest.created_at }}</span>
+    </div>
+    <div class="prompt-row">
+      <div class="prompt-text">
+        {% if manifest.prompt %}
+          <strong>prompt:</strong> {{ manifest.prompt }}
+        {% else %}
+          <span class="meta">no prompt recorded</span>
+        {% endif %}
+      </div>
+      <button type="button" id="metadata-toggle" class="meta-toggle-btn" onclick="toggleMetadata()">Show metadata</button>
+    </div>
+
+    {% if prompt_history and prompt_history|length > 1 %}
+      <details class="meta-aside">
+        <summary class="meta">{{ prompt_history|length }} prompts seen for this hash</summary>
+        <ul>
+          {% for p in prompt_history %}
+            <li><span class="meta">{{ p.at }}</span> — {{ p.prompt }}</li>
+          {% endfor %}
+        </ul>
+      </details>
+    {% endif %}
+
+    {% if chart_spec %}
+      <div
+        class="chart-panel"
+        data-hash="{{ manifest.content_hash }}"
+        data-spec='{{ chart_spec | tojson }}'
+      ></div>
+    {% endif %}
+
+    {# Metadata section — code, build artifacts, forensic history. Hidden by
+       default so the buckaroo embed fills the page; expanding it pushes
+       buckaroo down and lets .panel scroll naturally. #}
+    <div class="metadata-section" id="metadata-section" hidden>
+      <h3>
+        code
+        <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a>
+        {% if alias and not read_only %}
+          <button type="button" class="edit-code-btn" onclick="editCode()">edit + revise</button>
+        {% endif %}
+      </h3>
+      <pre class="code" id="code-block" data-raw="{{ code|e }}">{{ code }}</pre>
+      {% if alias and not read_only %}
+        <div id="code-edit-status" class="meta" style="display:none;"></div>
+      {% endif %}
+
+      {% if build_artifacts %}
+        <details>
+          <summary class="meta">build artifacts ({{ build_artifacts|length }} files — xorq's raw output, with ${PYDATA_PROJECT_ROOT} placeholders visible)</summary>
+          {% for f in build_artifacts %}
+            <h4 style="margin-bottom: 4px;">{{ f.name }}</h4>
+            <pre class="code">{{ f.text }}</pre>
+          {% endfor %}
+        </details>
+      {% endif %}
+
+      {% if forensic_history and forensic_history|length > 1 %}
+        <div class="forensic-history">
+          <strong>forensic history for {{ alias }}</strong>
+          <ol>
+            {% for h in forensic_history %}
+              <li class="{% if h.is_current %}current{% endif %}">
+                <a href="/catalog/{{ h.hash }}">V{{ h.version }} · {{ h.hash }}{% if h.is_current %} (current){% endif %}</a>
+              </li>
+            {% endfor %}
+          </ol>
+          <p class="meta">
+            diff:
+            {% for h in forensic_history %}
+              {% if not loop.last %}
+                <a href="/diff/{{ alias }}/{{ h.version }}/{{ h.version + 1 }}">V{{ h.version }}→V{{ h.version + 1 }}</a>{% if not loop.last %} · {% endif %}
+              {% endif %}
+            {% endfor %}
+          </p>
+        </div>
+      {% endif %}
+    </div>
+
+    {% if buckaroo_session and buckaroo_ws_base %}
+      <div
+        class="buckaroo-embed"
+        data-ws-url="{{ buckaroo_ws_base }}/ws/{{ buckaroo_session }}"
+      ></div>
+    {% else %}
+      {% if total_rows > preview_rows %}
+        <p class="meta">showing first {{ preview_rows }} of {{ total_rows }} rows</p>
+      {% endif %}
+      <div class="pandas-preview" style="overflow:auto;">
+        {{ table_html|safe }}
+      </div>
+    {% endif %}
+
+    {% if alias and not read_only %}
+      <script>
+        function editCode() {
+          const block = document.getElementById('code-block');
+          const raw = block.dataset.raw || '';
+          const btn = document.querySelector('.metadata-section .edit-code-btn');
+          const status = document.getElementById('code-edit-status');
+          const ta = document.createElement('textarea');
+          ta.className = 'nb-markdown-edit';
+          ta.style.minHeight = '200px';
+          ta.style.fontFamily = 'ui-monospace, monospace';
+          ta.style.fontSize = '12px';
+          ta.value = raw;
+          block.style.display = 'none';
+          btn.style.display = 'none';
+          block.insertAdjacentElement('afterend', ta);
+          ta.focus();
+          // Save bar.
+          const bar = document.createElement('div');
+          bar.style.cssText = 'margin: 6px 0; display: flex; gap: 8px;';
+          const save = document.createElement('button');
+          save.type = 'button';
+          save.textContent = 'save → revise';
+          const cancel = document.createElement('button');
+          cancel.type = 'button';
+          cancel.textContent = 'cancel';
+          bar.append(save, cancel);
+          ta.insertAdjacentElement('afterend', bar);
+          const teardown = () => { ta.remove(); bar.remove(); block.style.display = ''; btn.style.display = ''; status.style.display = 'none'; };
+          cancel.addEventListener('click', teardown);
+          save.addEventListener('click', async () => {
+            status.style.display = '';
+            status.textContent = 'building…';
+            const resp = await fetch('/api/code/{{ alias }}', {
+              method: 'PUT',
+              headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({code: ta.value, prompt: 'edited in browser'})
+            });
+            if (resp.ok) {
+              const body = await resp.json();
+              window.location.assign('/catalog/' + body.hash);
+            } else {
+              const msg = await resp.text();
+              status.textContent = 'build failed: ' + msg.slice(0, 200);
+            }
+          });
+        }
+      </script>
+    {% endif %}
+
+    <script>
+      function toggleMetadata() {
+        const section = document.getElementById('metadata-section');
+        const btn = document.getElementById('metadata-toggle');
+        const isHidden = section.hasAttribute('hidden');
+        if (isHidden) {
+          section.removeAttribute('hidden');
+          btn.textContent = 'Hide metadata';
+        } else {
+          section.setAttribute('hidden', '');
+          btn.textContent = 'Show metadata';
+        }
+      }
+    </script>
+  </section>
+</div>
+
+{% if chart_spec %}
+  {% include "_vega_mount.html" %}
+{% endif %}
+{% endblock %}

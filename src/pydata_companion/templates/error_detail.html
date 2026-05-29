@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="layout">
+  <aside class="panel" id="catalog-sidebar">
+    {% include "_catalog_sidebar.html" %}
+  </aside>
+  <section class="panel detail" id="catalog-detail">
+    <h2>build failure · {{ error.id }}</h2>
+    <div class="meta">
+      {% if error.tool %}<span class="pill">tool: {{ error.tool }}</span>{% endif %}
+      <span class="pill">{{ error.created_at }}</span>
+    </div>
+    {% if error.prompt %}
+      <p><strong>prompt:</strong> {{ error.prompt }}</p>
+    {% endif %}
+
+    <h3>error</h3>
+    <pre class="code">{{ error.message }}</pre>
+
+    <h3>code</h3>
+    <pre class="code">{{ error.code }}</pre>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,64 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel detail">
+  <h2>internal lineage · {{ content_hash }}</h2>
+  <p class="meta">
+    The expression DAG inside this entry. Each node is an operation
+    (Read, Aggregate, Field, Sum, …); each edge is a dependency
+    (consumer → producer). Root is the entry's output operation.
+    <a href="/catalog/{{ content_hash }}">back to entry</a>
+  </p>
+
+  {% if not lineage.nodes %}
+    <div class="dag-empty">no lineage data on disk.</div>
+  {% else %}
+    <div class="dag">
+      <svg width="{{ width }}" height="{{ height }}" xmlns="http://www.w3.org/2000/svg">
+        {%- for e in lineage.edges %}
+          {%- set src = positions[e[0]] %}
+          {%- set dst = positions[e[1]] %}
+          {%- if src and dst %}
+            <line class="edge"
+                  x1="{{ src[0] + 130 }}" y1="{{ src[1] + 20 }}"
+                  x2="{{ dst[0] }}" y2="{{ dst[1] + 20 }}"
+                  marker-end="url(#arrow)" />
+          {%- endif %}
+        {%- endfor %}
+        <defs>
+          <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+            <path d="M 0 0 L 10 5 L 0 10 z" fill="var(--muted)" />
+          </marker>
+        </defs>
+        {%- for n in lineage.nodes %}
+          {%- set pos = positions[n.id] %}
+          {%- if pos %}
+            <rect class="node-box {% if n.id == lineage.root %}root{% endif %}"
+                  x="{{ pos[0] }}" y="{{ pos[1] }}" width="130" height="40"
+                  rx="4" />
+            <text class="node-label" x="{{ pos[0] + 6 }}" y="{{ pos[1] + 16 }}">
+              {{ n.label or n.type }}
+            </text>
+            <text class="node-sublabel" x="{{ pos[0] + 6 }}" y="{{ pos[1] + 32 }}">
+              {{ n.type }}
+            </text>
+          {%- endif %}
+        {%- endfor %}
+      </svg>
+    </div>
+  {% endif %}
+
+  {% if column_trees %}
+    <h3 style="margin-top: 20px;">column lineage</h3>
+    <p class="meta">
+      For each output column, the operations that produced its value, all the
+      way back to source reads. From xorq's <code>build_column_trees</code>.
+    </p>
+    {% for col, tree in column_trees.items() %}
+      <details {% if loop.first %}open{% endif %}>
+        <summary><code>{{ col }}</code></summary>
+        <pre class="code" style="font-size: 11px; line-height: 1.4;">{{ tree }}</pre>
+      </details>
+    {% endfor %}
+  {% endif %}
+</section>
+{% endblock %}

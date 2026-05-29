@@ -1,0 +1,58 @@
+from __future__ import annotations
+
+import os
+import tempfile
+from pathlib import Path
+
+# Redirect xorq's cache dir BEFORE any xorq import. xorq freezes
+# XORQ_CACHE_DIR at module-load time (caching_utils.py notes
+# "modifying env var XORQ_CACHE_DIR won't have any impact after first import"),
+# so this has to happen here at conftest module level — before any test or
+# helper imports xorq. Without this, tests pollute the user's ~/.cache/xorq/.
+_TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="pydata_xorq_cache_"))
+os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
+
+import pytest  # noqa: E402
+
+from pydata_cli.fixtures import write_shoe_orders  # noqa: E402
+from pydata_core import data_dir, ensure_project, set_active_project  # noqa: E402
+
+
+@pytest.fixture
+def isolated_home(tmp_path: Path, monkeypatch) -> Path:
+    """Point PYDATA_HOME at a tmp dir for the duration of the test.
+
+    xorq's cache is redirected at conftest module load (see top of file)
+    because XORQ_CACHE_DIR is frozen at first xorq import.
+    """
+    monkeypatch.setenv("PYDATA_HOME", str(tmp_path))
+    return tmp_path
+
+
+@pytest.fixture
+def project(isolated_home: Path) -> str:
+    """Create a project and mark it active.
+
+    The active-project file lives under ``isolated_home`` (tmp), so the
+    write is automatically isolated per-test. In-process callers of
+    ``resolve_project()`` pick it up via the production code path —
+    no monkeypatching needed.
+    """
+    name = "test"
+    ensure_project(name)
+    set_active_project(name)
+    return name
+
+
+@pytest.fixture
+def orders_parquet(project: str) -> Path:
+    """Generate a deterministic shoe-orders fixture under project/data/."""
+    return write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=0)
+
+
+@pytest.fixture
+def fresh_companion_app(project: str):
+    """Create a companion app bound to the current isolated project."""
+    from pydata_companion import create_app
+
+    return create_app(project)

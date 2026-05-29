@@ -1,0 +1,71 @@
+[project]
+name = "pydata-app"
+version = "0.0.1"
+description = "Deconstructed notebook for the PyData London 2026 talk"
+requires-python = ">=3.13,<3.14"
+readme = "README.md"
+dependencies = [
+    "xorq==0.3.26",
+    "fastmcp>=2.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "jinja2>=3.1",
+    "httpx>=0.27",
+    "click>=8.1",
+    "pydantic>=2.7",
+    "pandas>=2.2",
+    "pyarrow>=16",
+    "sse-starlette>=2.1",
+    "tomli-w>=1.0",
+    # We pin requires-python to <3.14 because buckaroo's pyarrow constraint on
+    # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
+    "tornado>=6.0",
+    "polars",
+    "buckaroo==0.14.8",
+    "markdown>=3.10.2",
+    "pygments>=2.20.0",
+    "ibis-framework[duckdb]>=12.0.0",
+    "geopandas>=1.1.3",
+    "h3>=4.4.2",
+    "vl-convert-python>=1.9.0.post1",
+    "pillow>=12.2.0",
+]
+
+[project.scripts]
+pydata = "pydata_cli.main:cli"
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "ruff>=0.15.15",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/pydata_core",
+    "src/pydata_xorq",
+    "src/pydata_mcp",
+    "src/pydata_companion",
+    "src/pydata_cli",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-m 'not integration'"
+markers = [
+    "integration: spawns real subprocesses (Buckaroo, MCP stdio); ~3-15s each",
+]
+filterwarnings = [
+    "ignore::UserWarning:xorq.ibis_yaml.translate",
+]

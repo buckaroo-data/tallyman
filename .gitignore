@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+.pytest_cache/
+.DS_Store
+node_modules/
+src/pydata_companion/static/*.map
+# vite build output — rebuild via `cd packages/embed && pnpm build`
+src/pydata_companion/static/buckaroo-embed.js
+src/pydata_companion/static/buckaroo-embed.css
+# xorq-backed catalog git repo (managed externally via `xorq catalog`)
+catalog/
+# Stray ./projects/ from anything run with PYDATA_HOME unset to repo root.
+projects/

@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "pydata": {
+      "command": "uv",
+      "args": ["run", "pydata", "mcp"],
+      "cwd": "/Users/paddy/code/pydata-app",
+      "env": {
+        "PYDATA_PROJECT": "spike",
+        "PYDATA_COMPANION_URL": "http://127.0.0.1:7860"
+      }
+    }
+  }
+}

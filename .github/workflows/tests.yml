@@ -1,0 +1,60 @@
+name: tests
+
+on:
+  push:
+    branches: [main, "spike/**"]
+  pull_request:
+    branches: [main]
+
+# CI runs three sequential jobs: lint → fast tests → integration tests.
+#
+# - The embed bundle (Vite, packages/embed/) is NOT built in CI. Python
+#   tests reference /static/buckaroo-embed.js by URL only (test_fouc.py
+#   asserts on the *string* in rendered HTML, not on actually serving
+#   the file). If a test ever loads the bundle, add a Node + pnpm step
+#   before fast.
+# - Integration tests spawn the real buckaroo Tornado subprocess via
+#   pydata's BuckarooManager. buckaroo==0.14.6 is pinned in
+#   pyproject.toml as a normal PyPI dep, so plain `uv sync` is enough.
+
+jobs:
+  lint:
+    name: ruff
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: ruff check
+        # uvx runs the latest ruff without polluting the project venv;
+        # matches the local pre-push hook in ~/.claude/settings.json.
+        run: uvx ruff check
+
+  fast:
+    name: fast suite (excludes integration)
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: sync deps
+        run: uv sync
+      - name: pytest (fast)
+        # pyproject.toml's addopts already excludes `-m integration`;
+        # being explicit here so the job name matches the behaviour.
+        run: uv run pytest -m "not integration"
+
+  integration:
+    name: integration suite
+    runs-on: ubuntu-latest
+    needs: fast
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - run: uv sync
+      - run: uv run pytest -m integration

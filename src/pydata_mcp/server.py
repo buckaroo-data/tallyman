@@ -493,7 +493,12 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     if not a_dir.exists() or not b_dir.exists():
         return {"error": "one or both entries are missing on disk"}
 
-    diff = full_diff(a_dir, b_dir, a_label=f"V{a_idx}", b_label=f"V{b_idx}")
+    # Diff the two entries' (cache-resolving) expressions — streaming xorq
+    # aggregates, and self-healing if a result.parquet was evicted.
+    from pydata_xorq.result_cache import cached_result_expr
+    diff = full_diff(
+        a_dir, b_dir, a_label=f"V{a_idx}", b_label=f"V{b_idx}", backend="xorq",
+        a_expr=cached_result_expr(project, a_hash), b_expr=cached_result_expr(project, b_hash))
     return {
         "alias": name,
         "before": {"version": a_idx, "hash": a_hash},

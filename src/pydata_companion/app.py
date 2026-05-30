@@ -109,6 +109,106 @@ def _fmt_bytes(n: int) -> str:
     return f"{n} B"
 
 
+def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
+    """Build an xorq outer-join comparison expression for two entry exprs.
+
+    ``a`` / ``b`` are the two entries' (cache-wrapped) xorq expressions, so the
+    comparison composes ``expr1`` ⋈ ``expr2`` and each side resolves its own
+    cache when Buckaroo streams rows — nothing depends on a result.parquet.
+
+    Returns (build_path, column_config_overrides).  Column naming mirrors
+    col_join_dfs: non-key b-columns get a ``_v2`` suffix; ``membership``
+    (1=a_only, 2=b_only, 3=both) and per-column ``{col}_eq`` columns drive the
+    Buckaroo color mapping.
+    """
+    import tempfile
+
+    import xorq.api as xo
+    import xorq.vendor.ibis as ibis
+
+    a_schema = a.schema()
+    b_schema = b.schema()
+    a_non_keys = [c for c in a_schema if c not in keys]
+    b_non_keys = [c for c in b_schema if c not in keys]
+    shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
+
+    # Land both on one backend so the outer join (and the build Buckaroo
+    # streams from) is single-engine — a no-op when they already share one
+    # (e.g. both reading their result.parquet on the default xorq backend),
+    # which avoids an eager cross-backend transport.
+    from buckaroo.compare import _align_backends
+    a, b = _align_backends(a, b)
+
+    # Rename b's non-key columns to avoid ibis collision during outer join.
+    # ibis rename convention: {new_name: old_name}
+    b_renamed = b.rename({f"{c}_v2": c for c in b_non_keys})
+    joined = a.outer_join(b_renamed, [a[k] == b_renamed[k] for k in keys])
+
+    # Coalesced key columns + all data columns.
+    sel: list = [ibis.coalesce(a[k], b_renamed[k]).name(k) for k in keys]
+    for col in a_non_keys:
+        sel.append(joined[col])
+        if col in b_non_keys:
+            sel.append(joined[f"{col}_v2"])
+
+    # Membership sentinel: null on the b side → a_only; null on the a side → b_only.
+    a_sent = a_non_keys[0] if a_non_keys else keys[0]
+    b_sent = f"{b_non_keys[0]}_v2" if b_non_keys else keys[0]
+    membership = (
+        ibis.cases(
+            (joined[b_sent].isnull(), ibis.literal(1).cast("int8")),
+            (joined[a_sent].isnull(), ibis.literal(2).cast("int8")),
+            else_=ibis.literal(3).cast("int8"),
+        )
+        .name("membership")
+    )
+    sel.append(membership)
+
+    # Per-column equality: membership + 4 if equal, membership + 0 if not.
+    for col in shared_non_keys:
+        eq = (
+            membership
+            + ibis.cases(
+                (joined[col] == joined[f"{col}_v2"], ibis.literal(4).cast("int8")),
+                else_=ibis.literal(0).cast("int8"),
+            )
+        ).name(f"{col}_eq")
+        sel.append(eq)
+
+    expr = joined.select(*sel)
+
+    builds_dir = tempfile.mkdtemp(prefix="pydata_diff_")
+    build_path = Path(xo.build_expr(expr, builds_dir=builds_dir))
+
+    # Color config mirrors col_join_dfs: pink=a_only, teal=b_only, green=both.
+    eq_map = ["pink", "#73ae80", "#90b2b3", "#6c83b5"]
+    pk_color = "#6c5fc7"
+    pk_map = [pk_color] * 4
+    overrides: dict = {"membership": {"merge_rule": "hidden"}}
+    for col in a_non_keys:
+        if col in b_non_keys:
+            overrides[f"{col}_v2"] = {"merge_rule": "hidden"}
+            overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
+            overrides[col] = {
+                "tooltip_config": {"tooltip_type": "simple", "val_column": f"{col}_v2"},
+                "color_map_config": {
+                    "color_rule": "color_categorical",
+                    "map_name": eq_map,
+                    "val_column": f"{col}_eq",
+                },
+            }
+    for k in keys:
+        overrides[k] = {
+            "color_map_config": {
+                "color_rule": "color_categorical",
+                "map_name": pk_map,
+                "val_column": "membership",
+            }
+        }
+
+    return build_path, overrides
+
+
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
     """Add alias/version fields and sort: named entries (by alias) first, then scratch."""
     aliases = load_aliases(project)
@@ -447,7 +547,56 @@ def create_app(
         b_dir = entry_dir(project, b_hash)
         if not a_dir.exists() or not b_dir.exists():
             raise HTTPException(404, "one or both entries missing")
-        diff = full_diff(a_dir, b_dir, a_label=f"V{va}", b_label=f"V{vb}")
+        # Diff the two entry *expressions*, not their result.parquet files.
+        # cached_result_expr wraps each in xorq's snapshot cache when the
+        # computation is expensive (aggregate/join/sort/UDF/CSV) and leaves
+        # cheap parquet-read-and-project entries uncached — so each side
+        # resolves its own cache (hit → read, miss → recompute) and a deleted
+        # result.parquet never blanks the diff.
+        from pydata_xorq.primary_key import diff_keys
+        from pydata_xorq.result_cache import cached_result_expr
+        a_expr = cached_result_expr(project, a_hash)
+        b_expr = cached_result_expr(project, b_hash)
+        # Resolve the join key from cached lineage (detect-once, inherit across
+        # row-preserving revisions) instead of re-scanning both sides here.
+        keys = diff_keys(project, a_hash, b_hash) or None
+        diff = full_diff(a_dir, b_dir, a_label=f"V{va}", b_label=f"V{vb}",
+                         backend="xorq", a_expr=a_expr, b_expr=b_expr, keys=keys)
+
+        # Attempt a live Buckaroo comparison if the server is up — it streams
+        # rows from the composed comparison expression on demand.
+        compare_session = None
+        buckaroo_ws_base = None
+        if buckaroo is not None and buckaroo.is_running:
+            if not keys:
+                keys = diff["keyed"]["keys"] if diff.get("keyed") else None
+            if keys:
+                session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
+                try:
+                    build_path, overrides = _build_compare_expr(a_expr, b_expr, keys)
+                    # Persist Buckaroo's summary stats for this comparison so
+                    # re-opening the same pair reuses them instead of
+                    # recomputing over the full join (the bulk of /load_expr).
+                    from pydata_core.paths import diff_stat_cache_dir
+                    stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
+                    stat_cache.mkdir(parents=True, exist_ok=True)
+                    resp = buckaroo._client.post(
+                        f"{buckaroo.base_url}/load_expr",
+                        json={
+                            "session": session_id,
+                            "build_dir": str(build_path),
+                            "no_browser": True,
+                            "column_config_overrides": overrides,
+                            "cache_storage_path": str(stat_cache),
+                        },
+                        timeout=30.0,
+                    )
+                    if resp.status_code == 200:
+                        compare_session = session_id
+                        buckaroo_ws_base = buckaroo.ws_base_url
+                except Exception as exc:
+                    log.warning("diff /load_expr compare failed: %s", exc)
+
         return templates.TemplateResponse(
             request,
             "diff.html",
@@ -460,6 +609,8 @@ def create_app(
                 "b_hash": b_hash,
                 "hashes": hashes,
                 "diff": diff,
+                "compare_session": compare_session,
+                "buckaroo_ws_base": buckaroo_ws_base,
             },
         )
 

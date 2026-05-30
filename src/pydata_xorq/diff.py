@@ -13,7 +13,6 @@ from pathlib import Path
 
 import pandas as pd
 import pyarrow.parquet as pq
-
 from buckaroo.compare import (
     head_diff,
     head_diff_polars,
@@ -94,10 +93,20 @@ def full_diff(
     a_label: str = "before",
     b_label: str = "after",
     backend: str = "pandas",
+    a_expr=None,
+    b_expr=None,
+    keys: list[str] | None = None,
 ) -> dict:
     """Produce every diff flavour for two catalog entry directories.
 
     backend: "pandas" (default), "polars", or "xorq".
+
+    For the xorq backend, pass ``a_expr`` / ``b_expr`` — the two entries'
+    (cache-wrapped) expressions, e.g. from
+    ``pydata_xorq.result_cache.cached_result_expr``.  The diff then composes
+    ``expr1`` ⋈ ``expr2`` and each side resolves its own cache, so nothing
+    depends on ``<entry>/result.parquet`` existing.  Code and schema diffs
+    always come from the entry dirs.
     """
     a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
@@ -108,9 +117,20 @@ def full_diff(
     b_pq = b_entry / "result.parquet"
 
     if backend == "xorq":
-        stats = stats_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else []
-        head = head_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else {}
-        keyed = key_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else None
+        # Prefer the passed expressions (each carries its own cache node);
+        # fall back to reading result.parquet only when no expr is supplied.
+        if a_expr is not None and b_expr is not None:
+            a_src, b_src = a_expr, b_expr
+        elif a_pq.exists() and b_pq.exists():
+            a_src, b_src = a_pq, b_pq
+        else:
+            a_src = b_src = None
+        if a_src is not None:
+            stats = stats_diff_xorq(a_src, b_src)
+            head = head_diff_xorq(a_src, b_src)
+            keyed = key_diff_xorq(a_src, b_src, keys=keys)
+        else:
+            stats, head, keyed = [], {}, None
     elif backend == "polars":
         import polars as pl
         a_df_pl = pl.scan_parquet(a_pq).collect() if a_pq.exists() else pl.DataFrame()

@@ -30,6 +30,16 @@ def test_catalog_empty(fresh_companion_app, project: str):
     assert "no entries yet" in r.text
 
 
+def test_unknown_project_404s(fresh_companion_app, project: str):
+    """A /{project}/... route for a project not on disk must 404, not fall
+    through to an empty catalog. ``resolve_project()`` echoes its explicit
+    argument verbatim, so ``_validate_project`` can't lean on it."""
+    c = TestClient(fresh_companion_app)
+    assert c.get(f"/{project}/catalog").status_code == 200  # the real project resolves
+    assert c.get("/nope/catalog").status_code == 404  # unknown but well-formed name
+    assert c.get("/Bad-NAME/catalog").status_code == 404  # name fails the syntax rule
+
+
 def test_api_entries_empty(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entries")

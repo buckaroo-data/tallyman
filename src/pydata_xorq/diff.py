@@ -1,18 +1,8 @@
-"""Diff between two versions of an aliased catalog entry.
+"""Catalog-level diff: code, schema, and full entry comparison.
 
-Three kinds of data diff are computed and surfaced together; the demo gets
-to pick whichever is most legible for a given situation.
-
-- `head_diff`: literal side-by-side of the first N rows. Cheapest to
-  reason about; useless when row order is not meaningful.
-- `stats_diff`: column-by-column count / nulls / distinct / numeric mean.
-  Schema-shape-independent; surfaces "the distribution shifted" at a
-  glance.
-- `key_diff`: when both sides share key columns (typically aggregates),
-  outer-join on the keys and show per-key value changes. The most
-  informative diff for `region → total` style results.
-
-Code and schema diffs are also computed; schema_diff feeds key inference.
+The general DataFrame comparison utilities (stats_diff*, head_diff*,
+key_diff* for pandas/polars/xorq backends) live in buckaroo.compare and
+are re-exported here for backward compatibility.
 """
 
 from __future__ import annotations
@@ -24,13 +14,36 @@ from pathlib import Path
 import pandas as pd
 import pyarrow.parquet as pq
 
+from buckaroo.compare import (
+    head_diff,
+    head_diff_polars,
+    head_diff_xorq,
+    key_diff,
+    key_diff_polars,
+    key_diff_xorq,
+    stats_diff,
+    stats_diff_polars,
+    stats_diff_xorq,
+)
+
+__all__ = [
+    "code_diff",
+    "full_diff",
+    "head_diff",
+    "head_diff_polars",
+    "head_diff_xorq",
+    "key_diff",
+    "key_diff_polars",
+    "key_diff_xorq",
+    "schema_diff",
+    "stats_diff",
+    "stats_diff_polars",
+    "stats_diff_xorq",
+]
+
 
 def code_diff(a: str, b: str, *, a_label: str = "before", b_label: str = "after") -> str:
-    """Return a Pygments-rendered unified diff as HTML.
-
-    Embeds Pygments' "monokai" style inline so the output matches the
-    rest of the dark theme without requiring a global CSS file.
-    """
+    """Return a Pygments-rendered unified diff as HTML."""
     from pygments import highlight
     from pygments.formatters import HtmlFormatter
     from pygments.lexers import DiffLexer
@@ -74,127 +87,48 @@ def schema_diff(a_schema: dict, b_schema: dict) -> dict:
     }
 
 
-def head_diff(a: pd.DataFrame, b: pd.DataFrame, n: int = 10) -> dict:
-    """Side-by-side first-N rows as HTML tables."""
-    return {
-        "before": a.head(n).to_html(classes="data-table", index=False, border=0),
-        "after": b.head(n).to_html(classes="data-table", index=False, border=0),
-        "n": n,
-        "a_total": len(a),
-        "b_total": len(b),
-    }
-
-
-def _numeric_summary(s: pd.Series) -> dict | None:
-    if not pd.api.types.is_numeric_dtype(s) or s.empty:
-        return None
-    return {
-        "mean": float(s.mean()),
-        "min": float(s.min()),
-        "max": float(s.max()),
-        "sum": float(s.sum()),
-    }
-
-
-def stats_diff(a: pd.DataFrame, b: pd.DataFrame) -> list[dict]:
-    """Per-column count / null% / distinct / numeric summary for shared columns.
-
-    Returns a list keyed by column name (intersection of a.columns and b.columns).
-    Columns present in only one side appear with the missing side set to None.
-    """
-    cols = list(dict.fromkeys(list(a.columns) + list(b.columns)))
-    out = []
-    for col in cols:
-        sa = a[col] if col in a.columns else None
-        sb = b[col] if col in b.columns else None
-        out.append(
-            {
-                "name": col,
-                "before": _column_summary(sa),
-                "after": _column_summary(sb),
-            }
-        )
-    return out
-
-
-def _column_summary(s: pd.Series | None) -> dict | None:
-    if s is None:
-        return None
-    return {
-        "count": int(s.size),
-        "nulls": int(s.isnull().sum()),
-        "distinct": int(s.nunique(dropna=True)),
-        "numeric": _numeric_summary(s),
-    }
-
-
-def _infer_keys(a: pd.DataFrame, b: pd.DataFrame) -> list[str]:
-    """Heuristic: shared non-numeric columns whose distinct counts are small
-    relative to row count look like keys (region, category, ...).
-    """
-    shared = [c for c in a.columns if c in b.columns]
-    candidates: list[str] = []
-    for c in shared:
-        sa = a[c]
-        if pd.api.types.is_numeric_dtype(sa):
-            continue
-        if sa.nunique(dropna=False) <= max(20, int(len(sa) * 0.5)):
-            candidates.append(c)
-    return candidates
-
-
-def key_diff(a: pd.DataFrame, b: pd.DataFrame) -> dict | None:
-    """Outer-join a and b on inferred key columns; show per-key value changes.
-
-    Returns None if no key columns could be inferred or schemas don't permit
-    a meaningful join.
-    """
-    keys = _infer_keys(a, b)
-    if not keys:
-        return None
-    try:
-        merged = a.merge(b, on=keys, how="outer", suffixes=("_before", "_after"), indicator=True)
-    except Exception:
-        return None
-    only_left = int((merged["_merge"] == "left_only").sum())
-    only_right = int((merged["_merge"] == "right_only").sum())
-    both = int((merged["_merge"] == "both").sum())
-    merged = merged.drop(columns=["_merge"])
-    return {
-        "keys": keys,
-        "only_before": only_left,
-        "only_after": only_right,
-        "matched": both,
-        "table_html": merged.head(50).to_html(classes="data-table", index=False, border=0),
-    }
-
-
 def full_diff(
     a_entry: Path,
     b_entry: Path,
     *,
     a_label: str = "before",
     b_label: str = "after",
+    backend: str = "pandas",
 ) -> dict:
-    """Top-level: produce every flavor of diff for two catalog entry directories."""
+    """Produce every diff flavour for two catalog entry directories.
+
+    backend: "pandas" (default), "polars", or "xorq".
+    """
     a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
     a_schema = json.loads((a_entry / "schema.json").read_text()) if (a_entry / "schema.json").exists() else {}
     b_schema = json.loads((b_entry / "schema.json").read_text()) if (b_entry / "schema.json").exists() else {}
-    a_df = (
-        pq.read_table(a_entry / "result.parquet").to_pandas()
-        if (a_entry / "result.parquet").exists()
-        else pd.DataFrame()
-    )
-    b_df = (
-        pq.read_table(b_entry / "result.parquet").to_pandas()
-        if (b_entry / "result.parquet").exists()
-        else pd.DataFrame()
-    )
+
+    a_pq = a_entry / "result.parquet"
+    b_pq = b_entry / "result.parquet"
+
+    if backend == "xorq":
+        stats = stats_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else []
+        head = head_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else {}
+        keyed = key_diff_xorq(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else None
+    elif backend == "polars":
+        import polars as pl
+        a_df_pl = pl.scan_parquet(a_pq).collect() if a_pq.exists() else pl.DataFrame()
+        b_df_pl = pl.scan_parquet(b_pq).collect() if b_pq.exists() else pl.DataFrame()
+        stats = stats_diff_polars(a_df_pl, b_df_pl)
+        head = head_diff_polars(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else {}
+        keyed = key_diff_polars(a_df_pl, b_df_pl)
+    else:
+        a_df = pq.read_table(a_pq).to_pandas() if a_pq.exists() else pd.DataFrame()
+        b_df = pq.read_table(b_pq).to_pandas() if b_pq.exists() else pd.DataFrame()
+        stats = stats_diff(a_df, b_df)
+        head = head_diff(a_df, b_df)
+        keyed = key_diff(a_df, b_df)
+
     return {
         "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),
         "schema": schema_diff(a_schema, b_schema),
-        "head": head_diff(a_df, b_df),
-        "stats": stats_diff(a_df, b_df),
-        "keyed": key_diff(a_df, b_df),
+        "head": head,
+        "stats": stats,
+        "keyed": keyed,
     }

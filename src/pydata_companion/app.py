@@ -30,6 +30,7 @@ from pydata_core import (
     version_of_hash,
 )
 from pydata_core.notebook import CellNotFound
+from pydata_core.paths import project_dir, validate_project_name
 from pydata_xorq import (
     catalog_dag,
     column_lineage,
@@ -283,8 +284,18 @@ def create_app(
         return p
 
     def _validate_project(p: str) -> str:
-        """Validate a project name from a URL path parameter."""
-        if resolve_project(p) is None:
+        """Validate a project name from a URL path parameter.
+
+        Must be a syntactically legal name AND exist on disk, else 404.
+        ``resolve_project(p)`` can't do this — it echoes its explicit
+        argument verbatim, so it never signals an unknown project.
+        """
+        try:
+            validate_project_name(p)
+            exists = project_dir(p).is_dir()
+        except ValueError:
+            exists = False
+        if not exists:
             raise HTTPException(404, f"project {p!r} not found")
         return p
 

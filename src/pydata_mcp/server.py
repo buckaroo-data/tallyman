@@ -189,6 +189,50 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # a TypeError about ibis vs xorq.vendor.ibis Expr classes. Always use:
         import xorq.vendor.ibis as ibis
 
+    GOTCHAS — APIs that DON'T exist (do not invent these):
+
+        ibis.to_date(...) / ibis.re_replace(...)   # NOT real. Parse string dates with:
+        t.mutate(d=t.date_str.as_timestamp("%b %d %Y"))            # strptime-style format
+        ibis.struct(mean=..., std=...)             # struct() takes a dict, not kwargs.
+        # For several per-group stats use separate aggregate kwargs — NOT a struct:
+        t.group_by("k").aggregate(mean_x=t.x.mean(), std_x=t.x.std(), n=t.x.count())
+
+    WINDOW FUNCTIONS (rolling / lag):
+
+        w = ibis.window(group_by="symbol", order_by="d", preceding=2, following=0)
+        t.mutate(ma3=t.price.mean().over(w), prev=t.price.lag(1).over(w))
+        # kwargs are group_by/order_by/preceding/following — NOT partition_by / rows=(-2, 0).
+
+    CASE / binning — prefer ibis.cases() (ibis.case().when() is deprecated):
+
+        b = ibis.cases((t.x < 1, "lo"), (t.x < 2, "mid"), else_="hi")
+
+    MODELING — fit sklearn models as catalog entries, NEVER inside a
+    post-processing process() function (that sandbox blocks third-party
+    imports). The fit becomes part of the expression and the trained model is
+    serialized into the build — a content-hashed, diffable catalog entry:
+
+        import xorq.expr.datatypes as dt
+        from xorq.ml import deferred_fit_predict_sklearn, train_test_splits
+        from sklearn.linear_model import LinearRegression
+        t = from_catalog("diamond_features")
+        train, test = train_test_splits(t, test_sizes=0.25, random_seed=42)
+        deferred = deferred_fit_predict_sklearn(cls=LinearRegression, return_type=dt.float64)
+        instance = deferred(train, target="price", features=["carat", "depth", "x", "y", "z"])
+        expr = test.mutate(price_pred=instance.deferred_other.on_expr(test))   # rename the predict col
+        # SCORE in pure ibis on the prediction column. deferred_sklearn_metric does NOT
+        # survive build_and_persist (its MetricComputation op has no build serializer):
+        #   acc  = preds.aggregate(accuracy=(preds.species == preds.species_pred).mean())
+        #   rmse = preds.aggregate(rmse=((preds.price - preds.price_pred) ** 2).mean().sqrt())
+        # deferred_fit_transform_sklearn (transforms) and Pipeline/Step also exist.
+
+    DO NOT:
+        - fabricate placeholder values that look like real output (e.g. a
+          memtable of zeros) when you cannot compute the requested result —
+          return an error or a clearly-labelled column instead.
+        - pass a project= argument to from_project/from_catalog; the active
+          project is implicit.
+
     Args:
         code: A self-contained Python script that binds `expr`.
         prompt: Optional human-readable description (the user's intent).
@@ -590,6 +634,19 @@ def catalog_add_post_processing(name: str, source: str) -> dict:
     syntax / type / shape errors surface in the tool response, not later
     in the buckaroo log.
 
+    SANDBOX: ``process`` runs in a restricted namespace. You MAY use ``expr``
+    (an ibis table), the injected ``ibis`` module, and ``expr.execute()`` (a
+    pandas DataFrame whose methods you may call). You MAY NOT ``import`` third
+    party modules — ``import numpy/scipy/sklearn/pandas`` raises
+    ``ImportError('__import__ not found')``. To FIT A MODEL, use the xorq.ml
+    MODELING path on ``catalog_create`` instead (see its docstring); for stats
+    not in ibis, compute them with ibis aggregates.
+
+    VALIDATOR GOTCHA: the dry-run executes ``process`` against a tiny table with
+    columns ``{a, b}`` only, so a function that references real column names is
+    rejected at commit even when ``catalog_run_post_processing`` previewed it
+    fine. Guard for the dry-run, e.g. ``if "wine_type" not in expr.columns: return expr``.
+
     The function shows up as a new option in the embed's "post
     processing" dropdown the next time a catalog entry's buckaroo
     session is loaded (clicking a different entry, revising an alias,
@@ -658,6 +715,11 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
     entry's stored ``result.parquet`` — you see real output rows, not the
     small dry-run memtable that ``catalog_add_post_processing`` validates
     against.
+
+    SANDBOX: same restricted namespace as ``catalog_add_post_processing`` —
+    ``expr`` / ``ibis`` / ``expr.execute()`` are available, but ``import`` of
+    numpy/scipy/sklearn/pandas fails. Fit models via the xorq.ml MODELING path
+    on ``catalog_create``, not here.
 
     Typical workflow::
 
@@ -851,6 +913,36 @@ def project_new(name: str, with_fixture: bool = False) -> dict:
         or collision (409).
     """
     return _companion_post("/api/projects/new", {"name": name, "with_fixture": with_fixture})
+
+
+@mcp.prompt()
+def ds_modeling_workflow(dataset: str, target: str = "") -> str:
+    """Scaffold a data-science modeling workflow with the pydata catalog tools:
+    load -> engineer features -> split -> fit (via xorq.ml) -> score -> chart.
+
+    ``dataset`` is a parquet under the project's ``data/`` dir; ``target`` is
+    the column to predict (leave empty for unsupervised/clustering).
+    """
+    tgt = target or "<target column>"
+    return (
+        f"Build a modeling workflow on {dataset!r} predicting {tgt!r} using the pydata catalog tools.\n"
+        "1. catalog_load_parquet the dataset under a name.\n"
+        "2. catalog_create an engineered-feature entry — new computed columns first, "
+        "ibis.cases() for encodings, and add a stable row id for splitting/diffing.\n"
+        "3. Fit the model AS A CATALOG ENTRY with xorq.ml — never inside a post-processing "
+        "function (that sandbox blocks sklearn/scipy/numpy imports):\n"
+        "     import xorq.expr.datatypes as dt\n"
+        "     from xorq.ml import deferred_fit_predict_sklearn, train_test_splits\n"
+        "     train, test = train_test_splits(t, test_sizes=0.25, random_seed=42)\n"
+        "     deferred = deferred_fit_predict_sklearn(cls=<Estimator>, return_type=dt.float64)\n"
+        "     instance = deferred(train, target, features)\n"
+        "     expr = test.mutate(pred=instance.deferred_other.on_expr(test))\n"
+        "4. Score in PURE IBIS on the prediction column (e.g. accuracy=(t.y==t.pred).mean(), or "
+        "rmse=((t.y-t.pred)**2).mean().sqrt()) — deferred_sklearn_metric does NOT survive catalog "
+        "build. Attach a predicted-vs-actual chart.\n"
+        "Reminders: import xorq.vendor.ibis as ibis (never bare import ibis); no project= kwargs; "
+        "do not fabricate placeholder results."
+    )
 
 
 def main() -> None:

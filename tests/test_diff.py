@@ -3,12 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import polars as pl
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
 from pydata_mcp.server import catalog_create, catalog_diff, catalog_revise
-import polars as pl
-
 from pydata_xorq import (
     code_diff,
     full_diff,

@@ -3,9 +3,9 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 from pydata_core.paths import entry_dir, result_cache_dir
+from pydata_mcp.server import catalog_create, catalog_revise
 from pydata_xorq.build import list_entries
 from pydata_xorq.result_cache import cache_worthy, classify_build, ensure_result
-from pydata_mcp.server import catalog_create, catalog_revise
 
 
 def _agg_code(project: str) -> str:  # Aggregate → expensive → cache-worthy

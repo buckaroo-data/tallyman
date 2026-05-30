@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from pydata_core.paths import entry_dir
-from pydata_xorq.build import list_entries
-from pydata_xorq.primary_key import diff_keys, resolve_primary_key, _parent_hash
 from pydata_mcp.server import catalog_create, catalog_revise
+from pydata_xorq.build import list_entries
+from pydata_xorq.primary_key import _parent_hash, diff_keys, resolve_primary_key
 
 
 def _select(project: str, cols: str) -> str:

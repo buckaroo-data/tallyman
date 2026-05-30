@@ -14,7 +14,7 @@
   <ul>
     {% for err in errors %}
       <li>
-        <a href="/errors/{{ err.id }}">{{ err.id }}</a>
+        <a href="/{{ project }}/errors/{{ err.id }}">{{ err.id }}</a>
         {% if err.tool %}<code class="pill">{{ err.tool }}</code>{% endif %}
         <span class="meta"> · {{ err.created_at }}</span>
         {% if err.prompt %} · <em>{{ err.prompt }}</em>{% endif %}

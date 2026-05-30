@@ -54,7 +54,7 @@
     <div class="metadata-section" id="metadata-section" hidden>
       <h3>
         code
-        <a href="/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a>
+        <a href="/{{ project }}/lineage/{{ manifest.content_hash }}" class="meta">view internal lineage</a>
         {% if alias and not read_only %}
           <button type="button" class="edit-code-btn" onclick="editCode()">edit + revise</button>
         {% endif %}
@@ -80,7 +80,7 @@
           <ol>
             {% for h in forensic_history %}
               <li class="{% if h.is_current %}current{% endif %}">
-                <a href="/catalog/{{ h.hash }}">V{{ h.version }} · {{ h.hash }}{% if h.is_current %} (current){% endif %}</a>
+                <a href="/{{ project }}/catalog/{{ h.hash }}">V{{ h.version }} · {{ h.hash }}{% if h.is_current %} (current){% endif %}</a>
               </li>
             {% endfor %}
           </ol>
@@ -88,7 +88,7 @@
             diff:
             {% for h in forensic_history %}
               {% if not loop.last %}
-                <a href="/diff/{{ alias }}/{{ h.version }}/{{ h.version + 1 }}">V{{ h.version }}→V{{ h.version + 1 }}</a>{% if not loop.last %} · {% endif %}
+                <a href="/{{ project }}/diff/{{ alias }}/{{ h.version }}/{{ h.version + 1 }}">V{{ h.version }}→V{{ h.version + 1 }}</a>{% if not loop.last %} · {% endif %}
               {% endif %}
             {% endfor %}
           </p>
@@ -143,14 +143,14 @@
           save.addEventListener('click', async () => {
             status.style.display = '';
             status.textContent = 'building…';
-            const resp = await fetch('/api/code/{{ alias }}', {
+            const resp = await fetch('/{{ project }}/api/code/{{ alias }}', {
               method: 'PUT',
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify({code: ta.value, prompt: 'edited in browser'})
             });
             if (resp.ok) {
               const body = await resp.json();
-              window.location.assign('/catalog/' + body.hash);
+              window.location.assign('/{{ project }}/catalog/' + body.hash);
             } else {
               const msg = await resp.text();
               status.textContent = 'build failed: ' + msg.slice(0, 200);

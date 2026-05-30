@@ -8,9 +8,9 @@
       {%- set n = hashes|length %}
       Other pairs:
       {%- for i in range(1, n) %}
-        <a href="/diff/{{ alias }}/{{ i }}/{{ i + 1 }}">V{{ i }}→V{{ i + 1 }}</a>{% if not loop.last %} · {% endif %}
+        <a href="/{{ project }}/diff/{{ alias }}/{{ i }}/{{ i + 1 }}">V{{ i }}→V{{ i + 1 }}</a>{% if not loop.last %} · {% endif %}
       {%- endfor %}
-      {%- if n > 3 %} · <a href="/diff/{{ alias }}/1/{{ n }}">V1→V{{ n }}</a>{% endif %}
+      {%- if n > 3 %} · <a href="/{{ project }}/diff/{{ alias }}/1/{{ n }}">V1→V{{ n }}</a>{% endif %}
     {% endif %}
   </p>
 

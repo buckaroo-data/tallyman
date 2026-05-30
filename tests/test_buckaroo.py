@@ -573,7 +573,7 @@ def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, or
     bk: Any = _StubBuckaroo(session="abc123", port=8700)
     app = create_app(project, buckaroo=bk)
     c = TestClient(app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     assert 'class="buckaroo-embed"' in r.text
     assert 'data-ws-url="ws://127.0.0.1:8700/ws/abc123"' in r.text
@@ -588,7 +588,7 @@ _EMBED_TAG = '<div\n        class="buckaroo-embed"'
 def test_entry_detail_falls_back_when_buckaroo_absent(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     # The class name may appear inside build_metadata.json's captured git
     # diff (HTML-escaped); check for the actual mount-div tag instead.
@@ -612,7 +612,7 @@ def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_p
 
     app = create_app(project, buckaroo=_DownBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     assert _EMBED_TAG not in r.text
     assert "data-table" in r.text

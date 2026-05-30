@@ -69,3 +69,6 @@ markers = [
 filterwarnings = [
     "ignore::UserWarning:xorq.ibis_yaml.translate",
 ]
+
+[tool.uv.sources]
+buckaroo = { path = "../buckaroo", editable = true }

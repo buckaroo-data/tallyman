@@ -155,11 +155,11 @@ def test_companion_picks_up_switch_without_restart(isolated_home: Path, orders_p
     app = create_app()
     c = TestClient(app)
 
-    r1 = c.get("/catalog")
-    assert "project: alpha" in r1.text or "alpha" in r1.text  # header shows active
+    r1 = c.get("/alpha/catalog")
+    assert "alpha" in r1.text  # header shows active project
 
     c.post("/api/projects/switch", json={"name": "beta"})
-    r2 = c.get("/catalog")
+    r2 = c.get("/beta/catalog")
     assert "beta" in r2.text
 
 
@@ -236,7 +236,7 @@ def test_chrome_renders_dropdown_in_writable_mode(isolated_home: Path):
     set_active_project("alpha")
     app = create_app()
     c = TestClient(app)
-    r = c.get("/catalog")
+    r = c.get("/alpha/catalog")
     assert r.status_code == 200
     # The dropdown and + new button are present in normal mode.
     assert 'id="project-select"' in r.text
@@ -252,7 +252,7 @@ def test_chrome_hides_switcher_in_read_only_mode(isolated_home: Path, orders_par
     set_active_project("alpha")
     app = create_app(read_only=True)
     c = TestClient(app)
-    r = c.get("/catalog")
+    r = c.get("/alpha/catalog")
     assert r.status_code == 200
     assert 'id="project-select"' not in r.text
     assert 'id="new-project-btn"' not in r.text

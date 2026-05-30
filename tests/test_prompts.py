@@ -47,7 +47,7 @@ def test_entry_detail_renders_prompt_history(fresh_companion_app, project: str, 
     a = build_and_persist(project, _code(orders_parquet), prompt="alpha attempt")
     build_and_persist(project, _code(orders_parquet), prompt="beta attempt")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{a.content_hash}")
+    r = c.get(f"/{project}/catalog/{a.content_hash}")
     assert r.status_code == 200
     assert "alpha attempt" in r.text
     assert "beta attempt" in r.text

@@ -203,9 +203,9 @@ def test_notebook_tool_errors_on_missing(project: str, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_notebook_route_empty(fresh_companion_app):
+def test_notebook_route_empty(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert r.status_code == 200
     assert "no named entries yet" in r.text
 
@@ -214,7 +214,7 @@ def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="region totals")
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert r.status_code == 200
     assert "shoe_sales" in r.text
     assert "region totals" in r.text
@@ -228,7 +228,7 @@ def test_api_notebook_reorder(fresh_companion_app, project: str, orders_parquet:
     cells = notebook.load(project)["cells"]
     c = TestClient(fresh_companion_app)
     r = c.patch(
-        "/api/notebook",
+        f"/{project}/api/notebook",
         json={"action": "reorder", "cell_id": cells[0]["cell_id"], "new_index": 1},
     )
     assert r.status_code == 200
@@ -241,7 +241,7 @@ def test_api_notebook_remove(fresh_companion_app, project: str, orders_parquet: 
     cells = notebook.load(project)["cells"]
     c = TestClient(fresh_companion_app)
     r = c.patch(
-        "/api/notebook",
+        f"/{project}/api/notebook",
         json={"action": "remove", "cell_id": cells[0]["cell_id"]},
     )
     assert r.status_code == 200
@@ -253,7 +253,7 @@ def test_api_markdown_put(fresh_companion_app, project: str, orders_parquet: Pat
     catalog_create("a", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
     c = TestClient(fresh_companion_app)
-    r = c.put(f"/api/markdown/{cell['cell_id']}", json={"markdown": "edited"})
+    r = c.put(f"/{project}/api/markdown/{cell['cell_id']}", json={"markdown": "edited"})
     assert r.status_code == 200
     assert notebook.find_cell_by_alias(project, "a")["markdown"] == "edited"
 
@@ -263,13 +263,13 @@ def test_serve_mode_rejects_notebook_mutations(project: str):
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    assert c.patch("/api/notebook", json={"action": "remove", "cell_id": "x"}).status_code == 403
-    assert c.put("/api/markdown/x", json={"markdown": "y"}).status_code == 403
+    assert c.patch(f"/{project}/api/notebook", json={"action": "remove", "cell_id": "x"}).status_code == 403
+    assert c.put(f"/{project}/api/markdown/x", json={"markdown": "y"}).status_code == 403
 
 
-def test_api_notebook_unknown_action(fresh_companion_app):
+def test_api_notebook_unknown_action(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.patch("/api/notebook", json={"action": "purge", "cell_id": "x"})
+    r = c.patch(f"/{project}/api/notebook", json={"action": "purge", "cell_id": "x"})
     assert r.status_code == 400
 
 
@@ -282,7 +282,7 @@ def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, or
     cell = notebook.load(project)["cells"][0]
     _em(cell["cell_id"], "## Title\n\nSome **bold** text.\n\n- one\n- two\n")
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert r.status_code == 200
     # Rendered html markers, NOT the raw markdown characters.
     assert "<h2>Title</h2>" in r.text
@@ -300,7 +300,7 @@ def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
 
     _cc("shoe_sales", _agg_code(project), prompt="")  # empty markdown
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert "(no markdown — click edit to add a note)" in r.text
 
 
@@ -313,7 +313,7 @@ def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, o
     _cc("shoe_sales", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
     c = TestClient(fresh_companion_app)
-    r = c.put(f"/api/markdown/{cell['cell_id']}", json={"markdown": "## Hello\n\nworld"})
+    r = c.put(f"/{project}/api/markdown/{cell['cell_id']}", json={"markdown": "## Hello\n\nworld"})
     assert r.status_code == 200
     body = r.json()
     assert "<h2>Hello</h2>" in body["html"]
@@ -327,7 +327,7 @@ def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, o
 
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert "Sortable.min.js" in r.text
     assert 'class="nb-drag"' in r.text
 
@@ -340,7 +340,7 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
     _cc("shoe_sales", _agg_code(project))
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     assert "Sortable.min.js" not in r.text
     assert 'class="nb-drag"' not in r.text
 
@@ -371,7 +371,7 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
 
     app = create_app(project, buckaroo=_StubBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     # Lazy loading: initial HTML has data-hash placeholder, not data-ws-url.
     # The IntersectionObserver fires /api/session/<hash> on scroll and sets
     # data-ws-url dynamically; buckaroo-embed.js then mounts the React embed.
@@ -385,7 +385,7 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
     from pydata_core import get_alias
 
     content_hash = get_alias(project, "shoe_sales")
-    sr = c.get(f"/api/session/{content_hash}")
+    sr = c.get(f"/{project}/api/session/{content_hash}")
     assert sr.status_code == 200
     assert sr.json()["ws_url"].startswith("ws://127.0.0.1:8700/ws/sess-")
 
@@ -396,7 +396,7 @@ def test_notebook_falls_back_to_html_when_no_buckaroo(fresh_companion_app, proje
 
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get("/notebook")
+    r = c.get(f"/{project}/notebook")
     # No Buckaroo manager → HTML preview, no embed.
     assert 'class="buckaroo-embed nb-buckaroo"' not in r.text
     assert '<div class="nb-preview">' in r.text

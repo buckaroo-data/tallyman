@@ -31,22 +31,22 @@ def test_read_only_mode_serves_get_routes(project: str, orders_parquet: Path):
     set_alias(project, "shoe_sales", res.content_hash)
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    assert c.get("/catalog").status_code == 200
-    assert c.get(f"/catalog/{res.content_hash}").status_code == 200
-    assert c.get("/api/entries").status_code == 200
-    assert c.get("/api/aliases").status_code == 200
+    assert c.get(f"/{project}/catalog").status_code == 200
+    assert c.get(f"/{project}/catalog/{res.content_hash}").status_code == 200
+    assert c.get(f"/{project}/api/entries").status_code == 200
+    assert c.get(f"/{project}/api/aliases").status_code == 200
 
 
 def test_read_only_mode_indicator_in_header(project: str):
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert "read-only" in r.text
 
 
-def test_edit_mode_indicator_absent(fresh_companion_app):
+def test_edit_mode_indicator_absent(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert "read-only" not in r.text
 
 
@@ -121,8 +121,8 @@ def test_project_path_override_relocates_project(
     # Serve mode should render correctly against the relocated project.
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "shoe_sales" in r.text
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200

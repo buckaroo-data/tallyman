@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 import markdown as md_lib
@@ -115,6 +116,76 @@ def _fmt_bytes(n: int) -> str:
     if n >= 1_000:
         return f"{n / 1_000:.1f} KB"
     return f"{n} B"
+
+
+# A disk-usage call walks every file under a project. The pill is refetched on
+# every page mount and every new_entry SSE event across tabs, so cache the
+# result briefly (api_disk_usage) to coalesce those bursts into one walk.
+_DISK_USAGE_TTL = 3.0
+
+
+def _compute_disk_usage(project: str) -> dict:
+    """Walk a project's on-disk footprint and return the disk_usage payload.
+
+    Covers raw input data, each entry's result.parquet / xorq_build /
+    .buckaroo_stat_cache, and the two project-level caches added in #12 — the
+    xorq ParquetSnapshotCache (result_cache/) and the per-pair Buckaroo diff
+    stat cache (diff_stat_cache/), either of which can dwarf the rest.
+
+    This is the expensive path; callers should rate-limit it via the
+    api_disk_usage TTL cache rather than invoking per request.
+    """
+    from pydata_core.paths import data_dir as _data_dir
+    from pydata_core.paths import diff_stat_cache_root as _diff_stat_cache_root
+    from pydata_core.paths import entries_dir as _entries_dir
+    from pydata_core.paths import result_cache_dir as _result_cache_dir
+
+    # raw input files
+    data = _dir_size(_data_dir(project))
+
+    root = _entries_dir(project)
+    results = builds = cache = 0
+    if root.is_dir():
+        for entry in root.iterdir():
+            if not entry.is_dir():
+                continue
+            p = entry / "result.parquet"
+            if p.exists():
+                try:
+                    results += p.stat().st_size
+                except OSError:
+                    pass
+            b = entry / "xorq_build"
+            if b.is_dir():
+                builds += _dir_size(b)
+            c = entry / ".buckaroo_stat_cache"
+            if c.is_dir():
+                cache += _dir_size(c)
+
+    # Project-level caches (#12), previously uncounted. _dir_size returns 0 for
+    # a dir that doesn't exist yet, so no existence guard needed.
+    result_cache = _dir_size(_result_cache_dir(project))
+    diff_cache = _dir_size(_diff_stat_cache_root(project))
+
+    total = data + results + builds + cache + result_cache + diff_cache
+    return {
+        "data": data,
+        "results": results,
+        "builds": builds,
+        "cache": cache,
+        "result_cache": result_cache,
+        "diff_cache": diff_cache,
+        "total": total,
+        "formatted": {
+            "data": _fmt_bytes(data),
+            "results": _fmt_bytes(results),
+            "builds": _fmt_bytes(builds),
+            "cache": _fmt_bytes(cache),
+            "result_cache": _fmt_bytes(result_cache),
+            "diff_cache": _fmt_bytes(diff_cache),
+            "total": _fmt_bytes(total),
+        },
+    }
 
 
 def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
@@ -879,48 +950,21 @@ def create_app(
         project = _validate_project(project)
         return {"project": project, "errors": list_errors(project, limit=limit)}
 
+    # Per-app, per-project TTL cache so a burst of page mounts / new_entry
+    # refreshes shares one filesystem walk. App-scoped (not module-level) so
+    # test apps over isolated homes never read each other's cached totals.
+    _disk_usage_cache: dict[str, tuple[float, dict]] = {}
+
     @app.get("/{project}/api/disk_usage")
     def api_disk_usage(project: str):
         project = _validate_project(project)
-        from pydata_core.paths import data_dir as _data_dir
-        from pydata_core.paths import entries_dir as _entries_dir
-
-        # raw input files
-        data = _dir_size(_data_dir(project))
-
-        root = _entries_dir(project)
-        results = builds = cache = 0
-        if root.is_dir():
-            for entry in root.iterdir():
-                if not entry.is_dir():
-                    continue
-                p = entry / "result.parquet"
-                if p.exists():
-                    try:
-                        results += p.stat().st_size
-                    except OSError:
-                        pass
-                b = entry / "xorq_build"
-                if b.is_dir():
-                    builds += _dir_size(b)
-                c = entry / ".buckaroo_stat_cache"
-                if c.is_dir():
-                    cache += _dir_size(c)
-        total = data + results + builds + cache
-        return {
-            "data": data,
-            "results": results,
-            "builds": builds,
-            "cache": cache,
-            "total": total,
-            "formatted": {
-                "data": _fmt_bytes(data),
-                "results": _fmt_bytes(results),
-                "builds": _fmt_bytes(builds),
-                "cache": _fmt_bytes(cache),
-                "total": _fmt_bytes(total),
-            },
-        }
+        now = time.monotonic()
+        cached = _disk_usage_cache.get(project)
+        if cached is not None and now - cached[0] < _DISK_USAGE_TTL:
+            return cached[1]
+        payload = _compute_disk_usage(project)
+        _disk_usage_cache[project] = (now, payload)
+        return payload
 
     @app.get("/{project}/cache", response_class=HTMLResponse)
     def cache_inspector(request: Request, project: str):

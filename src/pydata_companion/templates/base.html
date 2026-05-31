@@ -252,7 +252,7 @@
         const disk = document.getElementById('disk-pill');
         if (disk) {
           disk.textContent = 'disk: ' + d.formatted.total;
-          disk.title = 'data: ' + d.formatted.data + '\nresults: ' + d.formatted.results + '\nbuilds: ' + d.formatted.builds + '\nstat cache: ' + d.formatted.cache;
+          disk.title = 'data: ' + d.formatted.data + '\nresults: ' + d.formatted.results + '\nbuilds: ' + d.formatted.builds + '\nstat cache: ' + d.formatted.cache + '\nresult cache: ' + d.formatted.result_cache + '\ndiff cache: ' + d.formatted.diff_cache;
         }
         const cache = document.getElementById('cache-pill');
         if (cache) {
@@ -262,6 +262,14 @@
       } catch (e) {}
     }
     loadDiskUsage();
+
+    // Coalesce rapid new_entry refreshes into one fetch. The server also caches
+    // the walk (TTL), so this just trims redundant round-trips from a burst.
+    let _diskTimer = null;
+    function scheduleDiskUsage() {
+      clearTimeout(_diskTimer);
+      _diskTimer = setTimeout(loadDiskUsage, 400);
+    }
     {% endif %}
 
     const PROJECT = "{{ project | default('') }}";
@@ -280,7 +288,7 @@
     sse.addEventListener('new_entry', (e) => {
       const data = JSON.parse(e.data);
       if (!eventForThisProject(data)) return;
-      loadDiskUsage();
+      scheduleDiskUsage();
       const path = window.location.pathname;
       if (path === CATALOG) {
         window.location.reload();

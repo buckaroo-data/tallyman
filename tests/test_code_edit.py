@@ -33,7 +33,7 @@ def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parque
     v1_hash = get_alias(project, "shoe_sales")
 
     c = TestClient(fresh_companion_app)
-    r = c.put("/api/code/shoe_sales", json={"code": _filter(project)})
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _filter(project)})
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["alias"] == "shoe_sales"
@@ -45,9 +45,9 @@ def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parque
     assert history_for(project, "shoe_sales") == [v1_hash, body["hash"]]
 
 
-def test_put_code_missing_alias_404(fresh_companion_app):
+def test_put_code_missing_alias_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.put("/api/code/nonexistent", json={"code": "expr = 1"})
+    r = c.put(f"/{project}/api/code/nonexistent", json={"code": "expr = 1"})
     assert r.status_code == 404
 
 
@@ -55,7 +55,7 @@ def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: P
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.put("/api/code/shoe_sales", json={"code": "   "})
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": "   "})
     assert r.status_code == 400
 
 
@@ -63,7 +63,7 @@ def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.put("/api/code/shoe_sales", json={"code": "expr = undefined_thing"})
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": "expr = undefined_thing"})
     assert r.status_code == 400
 
     # The error was recorded via record_error with tool="api_code".
@@ -80,7 +80,7 @@ def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.put("/api/code/shoe_sales", json={"code": _filter(project)})
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _filter(project)})
     assert r.status_code == 403
 
 
@@ -93,7 +93,7 @@ def test_entry_detail_renders_edit_code_button_for_named(
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{out['hash']}")
+    r = c.get(f"/{project}/catalog/{out['hash']}")
     assert r.status_code == 200
     assert _BUTTON_HTML in r.text
     assert 'id="code-block"' in r.text
@@ -107,7 +107,7 @@ def test_entry_detail_omits_edit_button_for_scratch(
 
     out = catalog_run(_agg(project), prompt="exploratory")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{out['hash']}")
+    r = c.get(f"/{project}/catalog/{out['hash']}")
     # Note: build artifacts may include git-diff text that mentions the
     # edit-code button HTML; we check for the rendered class string only.
     assert _BUTTON_HTML not in r.text
@@ -120,5 +120,5 @@ def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_parqu
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get(f"/catalog/{out['hash']}")
+    r = c.get(f"/{project}/catalog/{out['hash']}")
     assert _BUTTON_HTML not in r.text

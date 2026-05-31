@@ -7,7 +7,7 @@
     Cells are anchored on aliases; revising an alias updates the cell in place
     and keeps prior versions in forensic history (visible from the catalog tab).
     {% if not read_only %}Drag a cell by its handle to reorder.{% endif %}
-    <a href="/export/marimo" style="margin-left: 12px;">↓ export to marimo</a>
+    <a href="/{{ project }}/export/marimo" style="margin-left: 12px;">↓ export to marimo</a>
   </p>
 
   {% if not cells %}
@@ -21,7 +21,7 @@
         {% if not read_only %}<span class="nb-drag" title="drag to reorder">⋮⋮</span>{% endif %}
         <span class="alias">{{ c.alias }}</span>
         {% if c.version %}<span class="vchip">V{{ c.version }}</span>{% endif %}
-        {% if c.latest_hash %}<a class="pill" href="/catalog/{{ c.latest_hash }}">{{ c.latest_hash }}</a>{% endif %}
+        {% if c.latest_hash %}<a class="pill" href="/{{ project }}/catalog/{{ c.latest_hash }}">{{ c.latest_hash }}</a>{% endif %}
         <span class="nb-actions">
           {% if not read_only %}
           <button type="button" onclick="nbEdit('{{ c.cell_id }}')">edit</button>
@@ -95,7 +95,7 @@
       obs.unobserve(el);
       const hash = el.dataset.hash;
       if (!hash) continue;
-      fetch('/api/session/' + hash)
+      fetch('/{{ project }}/api/session/' + hash)
         .then(r => r.json())
         .then(data => { if (data.ws_url) el.dataset.wsUrl = data.ws_url; })
         .catch(() => {});
@@ -120,7 +120,7 @@ if (nbList && window.Sortable) {
     onEnd: async (evt) => {
       if (evt.oldIndex === evt.newIndex) return;
       const cellId = evt.item.dataset.cellId;
-      await fetch('/api/notebook', {
+      await fetch('/{{ project }}/api/notebook', {
         method: 'PATCH',
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({action: 'reorder', cell_id: cellId, new_index: evt.newIndex})
@@ -168,7 +168,7 @@ function nbEdit(cellId) {
   const save = async () => {
     if (ta.dataset.saved === '1') return;
     ta.dataset.saved = '1';
-    const resp = await fetch('/api/markdown/' + cellId, {
+    const resp = await fetch('/{{ project }}/api/markdown/' + cellId, {
       method: 'PUT',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({markdown: ta.value})

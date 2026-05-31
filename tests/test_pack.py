@@ -92,8 +92,8 @@ def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_hom
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "by_region" in r.text
-    r = c.get(f"/catalog/{h}")
+    r = c.get(f"/{project}/catalog/{h}")
     assert r.status_code == 200

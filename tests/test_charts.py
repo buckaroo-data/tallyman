@@ -117,7 +117,7 @@ def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: s
     res = build_and_persist(project, _agg_code(project))
     set_chart(project, res.content_hash, SAMPLE_SPEC)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     assert "vega-embed" in r.text
     assert '"mark": "bar"' in r.text or "&quot;mark&quot;: &quot;bar&quot;" in r.text
@@ -126,7 +126,7 @@ def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: s
 def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     # The .vega-embed CSS class is always in <style>; the rendering div
     # with id="vega-chart-..." is what indicates a chart was attached.
     assert f'id="vega-chart-{res.content_hash}"' not in r.text
@@ -135,7 +135,7 @@ def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str,
 def test_api_data_endpoint(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/api/data/{res.content_hash}")
+    r = c.get(f"/{project}/api/data/{res.content_hash}")
     assert r.status_code == 200
     body = r.json()
     assert "data" in body
@@ -144,16 +144,16 @@ def test_api_data_endpoint(fresh_companion_app, project: str, orders_parquet: Pa
     assert {row["region"] for row in body["data"]} == {"NE", "MW", "S", "W"}
 
 
-def test_api_data_404_on_missing(fresh_companion_app):
+def test_api_data_404_on_missing(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get("/api/data/deadbeef").status_code == 404
+    assert c.get(f"/{project}/api/data/deadbeef").status_code == 404
 
 
 def test_api_data_limit_truncates(fresh_companion_app, project: str, orders_parquet: Path):
     """Sanity-check that limit is plumbed through."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/api/data/{res.content_hash}?limit=2")
+    r = c.get(f"/{project}/api/data/{res.content_hash}?limit=2")
     body = r.json()
     assert len(body["data"]) == 2
     assert body["total"] == 4
@@ -164,8 +164,8 @@ def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_par
     """T-20: offset+limit cursor pagination."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    a = c.get(f"/api/data/{res.content_hash}?offset=0&limit=2").json()
-    b = c.get(f"/api/data/{res.content_hash}?offset=2&limit=2").json()
+    a = c.get(f"/{project}/api/data/{res.content_hash}?offset=0&limit=2").json()
+    b = c.get(f"/{project}/api/data/{res.content_hash}?offset=2&limit=2").json()
     # All 4 regions across the two pages, no overlap.
     seen = {row["region"] for row in a["data"]} | {row["region"] for row in b["data"]}
     assert seen == {"NE", "MW", "S", "W"}
@@ -175,7 +175,7 @@ def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_par
 def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/api/data/{res.content_hash}?limit=-1")
+    r = c.get(f"/{project}/api/data/{res.content_hash}?limit=-1")
     assert r.status_code == 400
 
 
@@ -189,7 +189,7 @@ expr = from_project("orders.parquet")
 """
     res = build_and_persist(project, code)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/api/data/{res.content_hash}")  # no offset/limit
+    r = c.get(f"/{project}/api/data/{res.content_hash}")  # no offset/limit
     body = r.json()
     assert body["total"] == 200  # the test fixture
     assert len(body["data"]) == 200  # the test fixture is the same size as default cap

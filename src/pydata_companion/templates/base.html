@@ -38,9 +38,10 @@
     .layout { display: grid; grid-template-columns: 220px minmax(0, 1fr); grid-template-rows: 1fr; gap: 10px; flex: 1 1 auto; min-height: 0; }
     .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 6px; overflow: auto; min-height: 0; min-width: 0; }
     .entry-list { list-style: none; margin: 0; padding: 0; }
-    .entry-list li { border-bottom: 1px solid var(--line); }
-    .entry-list a { display: block; padding: 10px 12px; color: var(--fg); }
-    .entry-list a:hover { background: var(--accent-soft); }
+    .entry-list li { border-bottom: 1px solid var(--line); display: flex; align-items: center; }
+    .entry-list li > a:first-child { flex: 1; display: block; padding: 10px 12px; color: var(--fg); min-width: 0; }
+    .entry-list li > a:first-child:hover { background: var(--accent-soft); }
+    .entry-list a { color: var(--fg); }
     .entry-list .hash { font-family: ui-monospace, monospace; color: var(--muted); font-size: 12px; }
     .entry-list .prompt { display: block; margin-top: 2px; }
     .detail { padding: 10px 12px; }
@@ -100,6 +101,8 @@
     .entry-list li.current a { color: var(--fg); }
     .entry-list li.current.forensic a { opacity: 1; }
     .entry-list li.current .alias { color: var(--accent); }
+    .entry-list .diff-link { font-size: 11px; color: var(--muted); text-decoration: none; padding: 1px 7px; border: 1px solid var(--line); border-radius: 10px; margin-right: 8px; white-space: nowrap; flex-shrink: 0; }
+    .entry-list .diff-link:hover { color: var(--accent); border-color: var(--accent); }
     .forensic-history { background: var(--panel); border: 1px solid var(--line); border-radius: 4px; padding: 8px 12px; margin-top: 12px; }
     .forensic-history ol { margin: 4px 0 0 0; padding-left: 20px; }
     .forensic-history .current { color: var(--accent); font-weight: 500; }
@@ -178,11 +181,13 @@
       </span>
     {% endif %}
     <nav>
-      <a href="/catalog">catalog</a>
-      <a href="/notebook">notebook</a>
-      <a href="/lineage">lineage</a>
+      {% if project %}<a href="/{{ project }}/catalog">catalog</a>{% endif %}
+      {% if project %}<a href="/{{ project }}/notebook">notebook</a>{% endif %}
+      {% if project %}<a href="/{{ project }}/lineage">lineage</a>{% endif %}
     </nav>
     {% if read_only %}<span class="pill" style="color: var(--muted)">read-only · serve mode</span>{% endif %}
+    {% if project %}<span id="disk-pill" class="pill" style="cursor:default" title="loading…">disk: …</span>{% endif %}
+    {% if project %}<span id="cache-pill" class="pill" style="cursor:default" title="loading…">stat cache: …</span>{% endif %}
     <span id="sse-status" class="pill">connecting…</span>
   </header>
   <main>
@@ -215,7 +220,7 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name}),
       });
-      if (r.ok) window.location.reload();
+      if (r.ok) window.location.assign('/' + name + '/catalog');
       else {
         const data = await r.json().catch(() => ({}));
         alert('switch failed: ' + (data.detail || r.status));
@@ -229,7 +234,7 @@
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({name, with_fixture: false}),
       });
-      if (r.ok) window.location.reload();
+      if (r.ok) window.location.assign('/' + name + '/catalog');
       else {
         const data = await r.json().catch(() => ({}));
         alert('create failed: ' + (data.detail || r.status));
@@ -237,60 +242,79 @@
     }
     loadProjects();
 
-    // Cross-project event filter: ignore SSE events whose `project` field
-    // doesn't match this tab's active project. Untagged events (legacy
-    // emitters, plus project_switched which is global) always run.
-    const activeProject = document.body.dataset.activeProject;
+    {% if project %}
+    async function loadDiskUsage() {
+      try {
+        const r = await fetch('/' + "{{ project }}" + '/api/disk_usage');
+        if (!r.ok) return;
+        const d = await r.json();
+        const disk = document.getElementById('disk-pill');
+        if (disk) {
+          disk.textContent = 'disk: ' + d.formatted.total;
+          disk.title = 'data: ' + d.formatted.data + '\nresults: ' + d.formatted.results + '\nbuilds: ' + d.formatted.builds + '\nstat cache: ' + d.formatted.cache;
+        }
+        const cache = document.getElementById('cache-pill');
+        if (cache) {
+          cache.textContent = 'stat cache: ' + d.formatted.cache;
+          cache.title = 'buckaroo summary stat cache across all entries';
+        }
+      } catch (e) {}
+    }
+    loadDiskUsage();
+    {% endif %}
+
+    const PROJECT = "{{ project | default('') }}";
+    const CATALOG = '/' + PROJECT + '/catalog';
+    const NOTEBOOK = '/' + PROJECT + '/notebook';
+
     function eventForThisProject(data) {
-      return !data || !data.project || data.project === activeProject;
+      return !PROJECT || !data || !data.project || data.project === PROJECT;
     }
 
     const status = document.getElementById('sse-status');
-    const sse = new EventSource('/api/sse');
+    {% if project %}
+    const sse = new EventSource('/' + PROJECT + '/api/sse');
     sse.addEventListener('hello', () => { status.textContent = 'live'; status.classList.add('live'); });
     sse.addEventListener('ping', () => {});
     sse.addEventListener('new_entry', (e) => {
       const data = JSON.parse(e.data);
       if (!eventForThisProject(data)) return;
+      loadDiskUsage();
       const path = window.location.pathname;
-      if (path === '/catalog') {
-        // Refresh the index so the new entry appears.
+      if (path === CATALOG) {
         window.location.reload();
-      } else if (path.startsWith('/catalog/')) {
-        // Already viewing a specific entry — focus the new one.
-        window.location.assign('/catalog/' + data.hash);
+      } else if (path.startsWith(CATALOG + '/')) {
+        window.location.assign(CATALOG + '/' + data.hash);
       }
-      // Other tabs (/notebook, /lineage, /diff): don't yank the user.
     });
     sse.addEventListener('build_failed', (e) => {
       const data = (() => { try { return JSON.parse(e.data); } catch { return {}; } })();
       if (!eventForThisProject(data)) return;
-      // Reload the current page so the failure banner re-renders.
-      // (No-op on tabs that don't show the banner; cheap either way.)
       window.location.reload();
     });
     sse.addEventListener('notebook_changed', (e) => {
       const data = (() => { try { return JSON.parse(e.data); } catch { return {}; } })();
       if (!eventForThisProject(data)) return;
-      if (window.location.pathname === '/notebook') window.location.reload();
+      if (window.location.pathname === NOTEBOOK) window.location.reload();
     });
     sse.addEventListener('chart_attached', (e) => {
       const data = JSON.parse(e.data);
       if (!eventForThisProject(data)) return;
-      // Reload only if we're viewing the entry the chart was attached to.
-      const path = window.location.pathname;
-      if (path === '/catalog/' + data.hash) window.location.reload();
+      if (window.location.pathname === CATALOG + '/' + data.hash) window.location.reload();
     });
-    sse.addEventListener('project_switched', () => {
-      // Global signal — every tab listens and reloads to pick up the new project.
-      window.location.reload();
+    sse.addEventListener('project_switched', (e) => {
+      const data = JSON.parse(e.data);
+      window.location.assign('/' + data.name + '/catalog');
     });
+    sse.addEventListener('post_processing_changed', () => window.location.reload());
+    sse.addEventListener('summary_stat_changed', () => window.location.reload());
     sse.onerror = () => { status.textContent = 'offline'; status.classList.remove('live'); };
+    {% else %}
+    if (status) status.textContent = '';
+    {% endif %}
 
-    // SPA-lite navigation: intercept clicks on /catalog/<hash> links and
-    // swap only the sidebar + detail regions, avoiding the full-page
-    // chrome flash. Falls through to a real navigation if the target
-    // page doesn't include both swap regions (e.g. a /lineage page).
+    // SPA-lite navigation: intercept clicks on /{project}/catalog/<hash> links
+    // and swap only the sidebar + detail regions.
     async function spaNavigate(url, push) {
       try {
         const resp = await fetch(url, {headers: {'X-Requested-With': 'pydata-spa'}});
@@ -307,13 +331,9 @@
         }
         oldSidebar.replaceChildren(...newSidebar.childNodes);
         oldDetail.replaceChildren(...newDetail.childNodes);
-        // Title (helps the tab strip stay accurate)
         const newTitle = doc.querySelector('title');
         if (newTitle) document.title = newTitle.textContent;
         if (push) history.pushState({pydata: true}, '', url);
-        // Run any <script> tags that came back in the swap (notably
-        // the chart-render and edit-code blocks). innerHTML doesn't
-        // execute them; we re-create + replace to trigger execution.
         oldDetail.querySelectorAll('script').forEach((s) => {
           const repl = document.createElement('script');
           for (const a of s.attributes) repl.setAttribute(a.name, a.value);
@@ -328,16 +348,16 @@
     document.addEventListener('click', (e) => {
       const a = e.target.closest('a[href]');
       if (!a) return;
-      // Modifier keys / new tab / external → leave alone.
       if (e.metaKey || e.ctrlKey || e.shiftKey || e.altKey) return;
       if (a.target && a.target !== '_self') return;
       const href = a.getAttribute('href');
       if (!href) return;
-      // Only handle in-app same-origin links that hit one of the
-      // swap-equipped routes.
       const u = new URL(href, window.location.origin);
       if (u.origin !== window.location.origin) return;
-      if (!(/^\/catalog($|\/)|^\/errors\//.test(u.pathname))) return;
+      // Intercept /{project}/catalog and /{project}/errors links for SPA swap.
+      const catalogPat = new RegExp('^/' + PROJECT + '/catalog($|/)');
+      const errorsPat  = new RegExp('^/' + PROJECT + '/errors/');
+      if (!catalogPat.test(u.pathname) && !errorsPat.test(u.pathname)) return;
       e.preventDefault();
       spaNavigate(u.pathname + u.search, true);
     });

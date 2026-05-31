@@ -6,7 +6,20 @@ from pydata_xorq.build import (
     load_entry,
     read_prompts,
 )
-from pydata_xorq.diff import code_diff, full_diff, head_diff, key_diff, schema_diff, stats_diff
+from pydata_xorq.diff import (
+    code_diff,
+    full_diff,
+    head_diff,
+    head_diff_polars,
+    head_diff_xorq,
+    key_diff,
+    key_diff_polars,
+    key_diff_xorq,
+    schema_diff,
+    stats_diff,
+    stats_diff_polars,
+    stats_diff_xorq,
+)
 from pydata_xorq.io import ProjectDataNotFound, from_catalog, from_project, project_path
 from pydata_xorq.lineage import (
     catalog_dag,
@@ -29,7 +42,11 @@ __all__ = [
     "from_project",
     "full_diff",
     "head_diff",
+    "head_diff_polars",
+    "head_diff_xorq",
     "key_diff",
+    "key_diff_polars",
+    "key_diff_xorq",
     "list_entries",
     "load_entry",
     "project_path",
@@ -38,4 +55,6 @@ __all__ = [
     "read_prompts",
     "schema_diff",
     "stats_diff",
+    "stats_diff_polars",
+    "stats_diff_xorq",
 ]

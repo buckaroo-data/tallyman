@@ -196,7 +196,7 @@ def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, ord
     build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", build_and_persist(project, _filter_code(project)).content_hash)
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "shoe_sales" in r.text
     assert "V1" in r.text
@@ -208,7 +208,7 @@ def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, o
     v2 = build_and_persist(project, _filter_code(project))
     set_alias(project, "shoe_sales", v2.content_hash)
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     # The V1 entry should be marked forensic since V2 is the current alias.
     assert "forensic" in r.text
@@ -219,7 +219,7 @@ def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, o
     res = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", res.content_hash)
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog/shoe_sales")
+    r = c.get(f"/{project}/catalog/shoe_sales")
     assert r.status_code == 200
     assert res.content_hash in r.text
 
@@ -230,7 +230,7 @@ def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, 
     v2 = build_and_persist(project, _filter_code(project))
     set_alias(project, "shoe_sales", v2.content_hash)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{v2.content_hash}")
+    r = c.get(f"/{project}/catalog/{v2.content_hash}")
     assert r.status_code == 200
     assert "forensic history" in r.text
     assert v1.content_hash in r.text
@@ -245,7 +245,7 @@ def test_catalog_renders_section_headers(fresh_companion_app, project: str, orde
     catalog_revise("shoe_sales", _filter_code(project))  # V1 becomes forensic
     catalog_run(_filter_code(project), prompt="scratch")  # though may match a hash above
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "named (" in r.text
     assert "forensic (" in r.text
@@ -256,7 +256,7 @@ def test_api_aliases_returns_history(fresh_companion_app, project: str):
     set_alias(project, "a", "h2")
     set_alias(project, "b", "x1")
     c = TestClient(fresh_companion_app)
-    r = c.get("/api/aliases")
+    r = c.get(f"/{project}/api/aliases")
     assert r.status_code == 200
     body = r.json()
     names = {a["name"]: a for a in body["aliases"]}

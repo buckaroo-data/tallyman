@@ -150,6 +150,79 @@ def test_unit_ensure_session_restart_throttled(project: str, orders_parquet: Pat
     assert restart_calls["n"] == 1
 
 
+def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatch):
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr._sessions = {
+        "hash_a": {"session_id": "sess-aaa", "project": project},
+        "hash_b": {"session_id": "sess-bbb", "project": project},
+        "hash_c": {"session_id": "sess-ccc", "project": "other_project"},
+    }
+
+    posted_urls: list[str] = []
+
+    class FakeResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    monkeypatch.setattr(mgr._client, "post", lambda url, **kw: (posted_urls.append(url), FakeResponse())[1])
+
+    reloaded = mgr.reload_project_sessions(project)
+    assert reloaded == 2
+    assert sorted(posted_urls) == sorted([
+        f"{mgr.base_url}/reload_expr/sess-aaa",
+        f"{mgr.base_url}/reload_expr/sess-bbb",
+    ])
+    # Sessions are NOT evicted — they remain cached for fast reconnect.
+    assert len(mgr._sessions) == 3
+
+
+def test_unit_reload_project_sessions_returns_zero_when_not_running(project: str):
+    mgr = BuckarooManager()
+    mgr._sessions = {"hash_a": {"session_id": "s1", "project": project}}
+    assert mgr.reload_project_sessions(project) == 0
+
+
+def test_unit_reload_project_sessions_evicts_stale_session(project: str, monkeypatch):
+    """When /reload_expr returns 404 or 400, the session is evicted so the
+    next ensure_session call re-creates it cleanly."""
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr._sessions = {
+        "hash_a": {"session_id": "stale-session", "project": project},
+        "hash_b": {"session_id": "live-session", "project": project},
+    }
+
+    call_count = {"n": 0}
+
+    class StaleResponse:
+        status_code = 404
+
+        def raise_for_status(self):
+            pass
+
+    class LiveResponse:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+    def fake_post(url, **kw):
+        call_count["n"] += 1
+        return StaleResponse() if "stale-session" in url else LiveResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+
+    reloaded = mgr.reload_project_sessions(project)
+    assert reloaded == 1  # only live-session reloaded
+    assert "hash_a" not in mgr._sessions  # stale evicted
+    assert "hash_b" in mgr._sessions  # live kept
+
+
 def test_unit_status_shape(project: str):
     mgr = BuckarooManager()
     s = mgr.status()
@@ -478,7 +551,7 @@ def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, or
     bk: Any = _StubBuckaroo(session="abc123", port=8700)
     app = create_app(project, buckaroo=bk)
     c = TestClient(app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     assert 'class="buckaroo-embed"' in r.text
     assert 'data-ws-url="ws://127.0.0.1:8700/ws/abc123"' in r.text
@@ -493,7 +566,7 @@ _EMBED_TAG = '<div\n        class="buckaroo-embed"'
 def test_entry_detail_falls_back_when_buckaroo_absent(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     # The class name may appear inside build_metadata.json's captured git
     # diff (HTML-escaped); check for the actual mount-div tag instead.
@@ -517,7 +590,7 @@ def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_p
 
     app = create_app(project, buckaroo=_DownBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
-    r = c.get(f"/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/catalog/{res.content_hash}")
     assert r.status_code == 200
     assert _EMBED_TAG not in r.text
     assert "data-table" in r.text

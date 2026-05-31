@@ -49,9 +49,9 @@ def test_layered_positions_handles_disconnected_node():
     assert "orphan" in out["positions"]
 
 
-def test_lineage_overview_empty(fresh_companion_app):
+def test_lineage_overview_empty(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/lineage")
+    r = c.get(f"/{project}/lineage")
     assert r.status_code == 200
     assert "no entries in this project yet" in r.text
 
@@ -62,7 +62,7 @@ def test_lineage_overview_with_chain(fresh_companion_app, project: str, orders_p
     child = build_and_persist(project, _from_catalog_code(project, "by_region"))
 
     c = TestClient(fresh_companion_app)
-    r = c.get("/lineage")
+    r = c.get(f"/{project}/lineage")
     assert r.status_code == 200
     # SVG nodes for both hashes should appear.
     assert parent.content_hash in r.text or "by_region" in r.text
@@ -74,22 +74,22 @@ def test_lineage_overview_with_chain(fresh_companion_app, project: str, orders_p
 def test_lineage_entry_view_renders_internal_dag(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/lineage/{res.content_hash}")
+    r = c.get(f"/{project}/lineage/{res.content_hash}")
     assert r.status_code == 200
     assert "Aggregate" in r.text
     assert "Read" in r.text
 
 
-def test_lineage_entry_404(fresh_companion_app):
+def test_lineage_entry_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get("/lineage/deadbeef").status_code == 404
+    assert c.get(f"/{project}/lineage/deadbeef").status_code == 404
 
 
 def test_api_catalog_dag_returns_nodes_and_edges(fresh_companion_app, project: str, orders_parquet: Path):
     parent = build_and_persist(project, _agg_code(project))
     child = build_and_persist(project, _from_catalog_code(project, parent.content_hash))
     c = TestClient(fresh_companion_app)
-    r = c.get("/api/catalog_dag")
+    r = c.get(f"/{project}/api/catalog_dag")
     assert r.status_code == 200
     body = r.json()
     assert len(body["nodes"]) >= 2
@@ -99,7 +99,7 @@ def test_api_catalog_dag_returns_nodes_and_edges(fresh_companion_app, project: s
 def test_api_lineage_returns_internal(fresh_companion_app, project: str, orders_parquet: Path):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/api/lineage/{res.content_hash}")
+    r = c.get(f"/{project}/api/lineage/{res.content_hash}")
     assert r.status_code == 200
     body = r.json()
     assert "internal" in body
@@ -110,7 +110,7 @@ def test_lineage_entry_page_includes_column_trees(fresh_companion_app, project: 
     """T-17: the /lineage/<hash> page now surfaces per-column trees."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/lineage/{res.content_hash}")
+    r = c.get(f"/{project}/lineage/{res.content_hash}")
     assert r.status_code == 200
     assert "column lineage" in r.text
     # All three output columns from the agg expression should be present.

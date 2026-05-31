@@ -3,6 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import polars as pl
+import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
 from pydata_mcp.server import catalog_create, catalog_diff, catalog_revise
@@ -10,9 +12,15 @@ from pydata_xorq import (
     code_diff,
     full_diff,
     head_diff,
+    head_diff_polars,
+    head_diff_xorq,
     key_diff,
+    key_diff_polars,
+    key_diff_xorq,
     schema_diff,
     stats_diff,
+    stats_diff_polars,
+    stats_diff_xorq,
 )
 
 
@@ -91,10 +99,16 @@ def test_key_diff_outer_join():
     assert d["only_after"] == 1  # W
 
 
-def test_key_diff_returns_none_when_no_keys():
+def test_key_diff_detects_unique_numeric_key():
+    # buckaroo 0.14.10's approximate-PK detection keys on any unique column,
+    # numeric included (the pre-release heuristic skipped numeric columns).
     a = pd.DataFrame({"x": [1, 2, 3]})
     b = pd.DataFrame({"x": [1, 2, 4]})
-    assert key_diff(a, b) is None  # no non-numeric shared columns
+    d = key_diff(a, b)
+    assert d["keys"] == ["x"]
+    assert d["matched"] == 2  # 1, 2
+    assert d["only_before"] == 1  # 3
+    assert d["only_after"] == 1  # 4
 
 
 # ---------------------------------------------------------------------------
@@ -162,7 +176,7 @@ def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: P
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get("/diff/shoe_sales")
+    r = c.get(f"/{project}/diff/shoe_sales")
     assert r.status_code == 200
     assert "shoe_sales" in r.text
     assert "stats per column" in r.text
@@ -175,7 +189,7 @@ def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: 
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get("/diff/shoe_sales/1/2")
+    r = c.get(f"/{project}/diff/shoe_sales/1/2")
     assert r.status_code == 200
     assert "V1" in r.text and "V2" in r.text
 
@@ -184,10 +198,173 @@ def test_diff_route_single_version_400(fresh_companion_app, project: str, orders
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get("/diff/shoe_sales")
+    r = c.get(f"/{project}/diff/shoe_sales")
     assert r.status_code == 400
 
 
-def test_diff_route_no_alias_404(fresh_companion_app):
+def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get("/diff/missing").status_code == 404
+    assert c.get(f"/{project}/diff/missing").status_code == 404
+
+
+def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    # Diffing a version against itself is nothing-to-diff — reject like the
+    # single-version case rather than rendering an all-equal diff.
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/diff/shoe_sales/2/2")
+    assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# polars backend
+# ---------------------------------------------------------------------------
+
+_A_PL = pl.DataFrame({"region": ["NE", "MW", "S"], "n": [10, 20, 30]})
+_B_PL = pl.DataFrame({"region": ["NE", "S", "W"], "n": [15, 25, 35]})
+
+
+def test_stats_diff_polars_matches_pandas():
+    a_pd = _A_PL.to_pandas()
+    b_pd = _B_PL.to_pandas()
+    pd_result = {r["name"]: r for r in stats_diff(a_pd, b_pd)}
+    pl_result = {r["name"]: r for r in stats_diff_polars(_A_PL, _B_PL)}
+    assert set(pd_result) == set(pl_result)
+    for col in pd_result:
+        assert pd_result[col]["before"]["distinct"] == pl_result[col]["before"]["distinct"]
+        assert pd_result[col]["before"]["nulls"] == pl_result[col]["before"]["nulls"]
+        if pd_result[col]["before"]["numeric"]:
+            assert abs(pd_result[col]["before"]["numeric"]["sum"] - pl_result[col]["before"]["numeric"]["sum"]) < 1e-6
+
+
+def test_stats_diff_polars_numeric_summary():
+    df = pl.DataFrame({"x": [1.0, 2.0, 3.0], "label": ["a", "b", "c"]})
+    result = {r["name"]: r for r in stats_diff_polars(df, df)}
+    assert result["x"]["before"]["numeric"]["mean"] == 2.0
+    assert result["x"]["before"]["numeric"]["sum"] == 6.0
+    assert result["label"]["before"]["numeric"] is None
+
+
+def test_key_diff_polars_membership():
+    d = key_diff_polars(_A_PL, _B_PL)
+    assert d is not None
+    assert d["keys"] == ["region"]
+    assert d["matched"] == 2
+    assert d["only_before"] == 1
+    assert d["only_after"] == 1
+
+
+def test_key_diff_polars_detects_unique_numeric_key():
+    # See test_key_diff_detects_unique_numeric_key: a unique column is a key
+    # regardless of dtype under 0.14.10's approximate-PK detection.
+    a = pl.DataFrame({"x": [1, 2, 3]})
+    b = pl.DataFrame({"x": [4, 5, 6]})
+    d = key_diff_polars(a, b)
+    assert d["keys"] == ["x"]
+    assert d["matched"] == 0  # no shared values
+    assert d["only_before"] == 3
+    assert d["only_after"] == 3
+
+
+def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):
+    from pydata_xorq import build_and_persist
+    res = build_and_persist(project, _agg_code(project))
+    from pydata_core import entry_dir
+    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    d = head_diff_polars(pq_path, pq_path, n=2)
+    assert d["n"] == 2
+    assert d["a_total"] == d["b_total"]
+    assert "<table" in d["before"]
+
+
+def test_full_diff_polars_backend(project: str, orders_parquet: Path):
+    from pydata_core import entry_dir
+    from pydata_xorq import build_and_persist
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="polars")
+    assert diff["keyed"] is not None
+    assert "stats" in diff
+
+
+# ---------------------------------------------------------------------------
+# xorq backend
+# ---------------------------------------------------------------------------
+
+
+def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
+    from pydata_core import entry_dir
+    from pydata_xorq import build_and_persist
+    res = build_and_persist(project, _agg_code(project))
+    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    pd_result = {r["name"]: r for r in stats_diff(
+        pq.read_table(pq_path).to_pandas(),
+        pq.read_table(pq_path).to_pandas(),
+    )}
+    xq_result = {r["name"]: r for r in stats_diff_xorq(pq_path, pq_path)}
+    assert set(pd_result) == set(xq_result)
+    for col in pd_result:
+        assert pd_result[col]["before"]["distinct"] == xq_result[col]["before"]["distinct"]
+        assert pd_result[col]["before"]["nulls"] == xq_result[col]["before"]["nulls"]
+        if pd_result[col]["before"]["numeric"] and xq_result[col]["before"]["numeric"]:
+            assert abs(
+                pd_result[col]["before"]["numeric"]["sum"] - xq_result[col]["before"]["numeric"]["sum"]
+            ) < 1e-6
+
+
+def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path):
+    from pydata_core import entry_dir
+    from pydata_xorq import build_and_persist
+    res = build_and_persist(project, _agg_code(project))
+    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    d = head_diff_xorq(pq_path, pq_path, n=3)
+    assert d["n"] == 3
+    assert "<table" in d["before"]
+
+
+def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
+    from pydata_core import entry_dir
+    from pydata_xorq import build_and_persist
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_pq = entry_dir(project, a.content_hash) / "result.parquet"
+    b_pq = entry_dir(project, b.content_hash) / "result.parquet"
+    d = key_diff_xorq(a_pq, b_pq)
+    assert d is not None
+    assert "region" in d["keys"]
+    # All 4 regions have boots so both sides have the same keys; the diff
+    # surfaces value changes (total, n), not missing rows.
+    assert d["matched"] == 4
+    assert d["only_before"] == 0
+    assert d["only_after"] == 0
+    assert "<table" in d["table_html"]
+
+
+def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
+    from pydata_core import entry_dir
+    from pydata_xorq import build_and_persist
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="xorq")
+    assert diff["keyed"] is not None
+    assert diff["keyed"]["matched"] == 4
+    assert "stats" in diff
+
+
+def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parquet: Path):
+    # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
+    # Re-rendering the same diff must reuse one session-scoped build dir, not
+    # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
+    from pydata_companion.app import _build_compare_expr
+    from pydata_xorq import build_and_persist
+    from pydata_xorq.result_cache import cached_result_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_expr = cached_result_expr(project, a.content_hash)
+    b_expr = cached_result_expr(project, b.content_hash)
+    p1, _ = _build_compare_expr(a_expr, b_expr, ["region"])
+    p2, _ = _build_compare_expr(a_expr, b_expr, ["region"])
+    assert p1 == p2

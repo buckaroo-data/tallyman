@@ -16,23 +16,33 @@ expr = t.group_by("region").aggregate(n=t.count())
     return build_and_persist(project, code, prompt="by region").content_hash
 
 
-def test_root_redirects(fresh_companion_app):
+def test_root_redirects(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
     r = c.get("/", follow_redirects=False)
     assert r.status_code in (302, 307)
-    assert r.headers["location"].endswith("/catalog")
+    assert r.headers["location"].endswith(f"/{project}/catalog")
 
 
-def test_catalog_empty(fresh_companion_app):
+def test_catalog_empty(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "no entries yet" in r.text
 
 
+def test_unknown_project_404s(fresh_companion_app, project: str):
+    """A /{project}/... route for a project not on disk must 404, not fall
+    through to an empty catalog. ``resolve_project()`` echoes its explicit
+    argument verbatim, so ``_validate_project`` can't lean on it."""
+    c = TestClient(fresh_companion_app)
+    assert c.get(f"/{project}/catalog").status_code == 200  # the real project resolves
+    assert c.get("/nope/catalog").status_code == 404  # unknown but well-formed name
+    assert c.get("/Bad-NAME/catalog").status_code == 404  # name fails the syntax rule
+
+
 def test_api_entries_empty(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/api/entries")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
     assert r.json() == {"project": project, "entries": []}
 
@@ -40,7 +50,7 @@ def test_api_entries_empty(fresh_companion_app, project: str):
 def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_parquet: Path):
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert h in r.text
     assert "by region" in r.text
@@ -49,7 +59,7 @@ def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_p
 def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_parquet: Path):
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{h}")
+    r = c.get(f"/{project}/catalog/{h}")
     assert r.status_code == 200
     assert h in r.text
     assert "region" in r.text  # column header
@@ -83,7 +93,7 @@ expr = t.order_by("region")
     )
 
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{scratch['hash']}")
+    r = c.get(f"/{project}/catalog/{scratch['hash']}")
     assert r.status_code == 200
     # Section headers are rendered on the detail-page sidebar too.
     assert "named (" in r.text
@@ -101,22 +111,22 @@ def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, o
     the portable ${PYDATA_PROJECT_ROOT} placeholder still in the text."""
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{h}")
+    r = c.get(f"/{project}/catalog/{h}")
     assert "build artifacts" in r.text
     assert "expr.yaml" in r.text
     # The portable build references ${PYDATA_PROJECT_ROOT}, not absolute paths.
     assert "${PYDATA_PROJECT_ROOT}" in r.text
 
 
-def test_entry_detail_missing_redirects_to_catalog(fresh_companion_app):
-    # Stale URLs (post-restart, post-prune) self-heal: 303 to /catalog with the
-    # missing hash threaded through as a flash, not a hard 404.
+def test_entry_detail_missing_redirects_to_catalog(fresh_companion_app, project: str):
+    # Stale URLs (post-restart, post-prune) self-heal: 303 to /{project}/catalog
+    # with the missing hash threaded through as a flash, not a hard 404.
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog/deadbeef", follow_redirects=False)
+    r = c.get(f"/{project}/catalog/deadbeef", follow_redirects=False)
     assert r.status_code == 303
-    assert r.headers["location"] == "/catalog?missing=deadbeef"
+    assert r.headers["location"] == f"/{project}/catalog?missing=deadbeef"
     # Followed: lands on catalog page and surfaces the missing hash.
-    r2 = c.get("/catalog/deadbeef")
+    r2 = c.get(f"/{project}/catalog/deadbeef")
     assert r2.status_code == 200
     assert "deadbeef" in r2.text
 

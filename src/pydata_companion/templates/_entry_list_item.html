@@ -1,5 +1,5 @@
 <li class="{% if e.alias %}named{% if not e.is_current %} forensic{% endif %}{% else %}scratch{% endif %}{% if current_hash and e.content_hash == current_hash %} current{% endif %}">
-  <a href="/catalog/{{ e.content_hash }}"{% if current_hash and e.content_hash == current_hash %} aria-current="page"{% endif %}>
+  <a href="/{{ project }}/catalog/{{ e.content_hash }}"{% if current_hash and e.content_hash == current_hash %} aria-current="page"{% endif %}>
     {% if e.alias %}
       <span class="alias">
         {{ e.alias }}{% if e.version %} <span class="vchip">V{{ e.version }}</span>{% endif %}
@@ -11,4 +11,7 @@
     <span class="prompt">{{ e.prompt or "(no prompt)" }}</span>
     <span class="meta">{{ e.row_count }} rows · {{ e.execute_seconds }}s</span>
   </a>
+  {% if e.alias and e.is_current and e.version_count > 1 %}
+  <a class="diff-link" href="/{{ project }}/diff/{{ e.alias }}" title="Diff V{{ e.version - 1 }} → V{{ e.version }}">diff</a>
+  {% endif %}
 </li>

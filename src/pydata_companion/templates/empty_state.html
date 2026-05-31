@@ -43,7 +43,7 @@ async function createProject(ev) {
     err.textContent = data.detail || ('error: HTTP ' + r.status);
     return false;
   }
-  window.location.assign('/catalog');
+  window.location.assign('/' + name + '/catalog');
   return false;
 }
 </script>

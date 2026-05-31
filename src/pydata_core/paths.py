@@ -126,6 +126,26 @@ def entry_dir(project: str, content_hash: str) -> Path:
     return entries_dir(project) / content_hash
 
 
+def result_cache_dir(project: str) -> Path:
+    """Root for xorq's ParquetSnapshotCache of catalog-entry results.
+
+    Materialised results are content-addressed parquet files written here by
+    xorq, not the per-entry result.parquet — so a deleted cache file simply
+    recomputes on next access.
+    """
+    return catalog_dir(project) / "result_cache"
+
+
+def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
+    """Buckaroo summary-stat cache for a comparison (diff) session.
+
+    Keyed by the entry pair, not the joined data — Buckaroo stores only the
+    small per-column summary stats here, so re-opening the same diff reuses
+    them instead of recomputing over the full join.
+    """
+    return catalog_dir(project) / "diff_stat_cache" / f"{a_hash[:12]}-{b_hash[:12]}"
+
+
 def post_processing_dir(project: str) -> Path:
     return artifacts_dir(project) / "post_processing"
 

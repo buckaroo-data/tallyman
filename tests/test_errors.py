@@ -45,7 +45,7 @@ def test_catalog_run_failure_records_error(project: str, monkeypatch):
 def test_companion_catalog_renders_errors(fresh_companion_app, project: str):
     record_error(project, code="x", message="boom please notice me", prompt="p")
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "build failures" in r.text
     assert "boom please notice me" in r.text
@@ -54,22 +54,22 @@ def test_companion_catalog_renders_errors(fresh_companion_app, project: str):
 def test_companion_error_detail_route(fresh_companion_app, project: str):
     rec = record_error(project, code="x = 1\nexpr = nope", message="full traceback here")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/errors/{rec['id']}")
+    r = c.get(f"/{project}/errors/{rec['id']}")
     assert r.status_code == 200
     assert "full traceback here" in r.text
     assert "expr = nope" in r.text
 
 
-def test_companion_error_detail_404(fresh_companion_app):
+def test_companion_error_detail_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get("/errors/missing").status_code == 404
+    assert c.get(f"/{project}/errors/missing").status_code == 404
 
 
 def test_companion_api_errors(fresh_companion_app, project: str):
     record_error(project, code="x", message="m1")
     record_error(project, code="y", message="m2")
     c = TestClient(fresh_companion_app)
-    r = c.get("/api/errors")
+    r = c.get(f"/{project}/api/errors")
     assert r.status_code == 200
     body = r.json()
     assert body["project"] == project
@@ -104,7 +104,7 @@ def test_catalog_create_failure_records_tool_name(project: str, monkeypatch):
 def test_catalog_banner_shows_tool_pill(fresh_companion_app, project: str):
     record_error(project, code="x", message="boom", tool="catalog_revise")
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert "catalog_revise" in r.text
 
@@ -112,7 +112,7 @@ def test_catalog_banner_shows_tool_pill(fresh_companion_app, project: str):
 def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
     rec = record_error(project, code="x", message="boom", tool="catalog_run")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/errors/{rec['id']}")
+    r = c.get(f"/{project}/errors/{rec['id']}")
     assert "tool: catalog_run" in r.text
 
 
@@ -132,7 +132,7 @@ expr = t.group_by("region").aggregate(n=t.count())
     )
     rec = record_error(project, code="x", message="boom", tool="catalog_run")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/errors/{rec['id']}")
+    r = c.get(f"/{project}/errors/{rec['id']}")
     assert "named (" in r.text
     assert "shoe_sales" in r.text
     # No item should be highlighted on an error-detail page — `aria-current`

@@ -69,3 +69,29 @@ def test_build_user_code_raises(project: str):
 
 def test_list_entries_empty(project: str):
     assert list_entries(project) == []
+
+
+def test_build_hints_bare_ibis_import(project: str, orders_parquet: Path):
+    # `import ibis` triggers an AttributeError at user-code exec time because
+    # the real ibis package doesn't expose all the methods xorq does. The
+    # BuildError should include a hint pointing at xorq.vendor.ibis.
+    code = f"""
+import xorq.api as xo
+import ibis
+t = xo.deferred_read_parquet({str(orders_parquet)!r})
+expr = t.mutate(flag=ibis.case().when(t.price > 50, "hi").else_("lo").end())
+"""
+    with pytest.raises(BuildError, match="import xorq.vendor.ibis as ibis"):
+        build_and_persist(project, code)
+
+
+def test_build_no_hint_on_unrelated_error(project: str, orders_parquet: Path):
+    code = f"""
+import xorq.api as xo
+import xorq.vendor.ibis as ibis
+t = xo.deferred_read_parquet({str(orders_parquet)!r})
+expr = t.nonexistent_column.sum()
+"""
+    with pytest.raises(BuildError) as excinfo:
+        build_and_persist(project, code)
+    assert "import xorq.vendor.ibis as ibis" not in str(excinfo.value).split("Traceback")[0]

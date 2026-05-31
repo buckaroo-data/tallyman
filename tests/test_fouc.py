@@ -23,11 +23,11 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
-def test_catalog_has_swap_regions(fresh_companion_app):
+def test_catalog_has_swap_regions(fresh_companion_app, project: str):
     """Both #catalog-sidebar and #catalog-detail must be present so the
     SPA-lite swap can find them and avoid a full reload."""
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert r.status_code == 200
     assert 'id="catalog-sidebar"' in r.text
     assert 'id="catalog-detail"' in r.text
@@ -37,7 +37,7 @@ def test_entry_detail_has_swap_regions(fresh_companion_app, project: str, orders
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/catalog/{out['hash']}")
+    r = c.get(f"/{project}/catalog/{out['hash']}")
     assert r.status_code == 200
     assert 'id="catalog-sidebar"' in r.text
     assert 'id="catalog-detail"' in r.text
@@ -48,17 +48,17 @@ def test_error_detail_has_swap_regions(fresh_companion_app, project: str):
 
     rec = record_error(project, code="x", message="m", tool="catalog_run")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/errors/{rec['id']}")
+    r = c.get(f"/{project}/errors/{rec['id']}")
     assert 'id="catalog-sidebar"' in r.text
     assert 'id="catalog-detail"' in r.text
 
 
-def test_embed_bundle_referenced(fresh_companion_app):
+def test_embed_bundle_referenced(fresh_companion_app, project: str):
     """The compiled buckaroo-embed bundle + its dark-background placeholder
     CSS live in base.html so embed divs render on top of the right colour
     before the WebSocket payload lands."""
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     assert "/static/buckaroo-embed.js" in r.text
     assert "/static/buckaroo-embed.css" in r.text
     # CSS for .buckaroo-embed sets the dark background before the WS payload
@@ -67,14 +67,14 @@ def test_embed_bundle_referenced(fresh_companion_app):
     assert ".buckaroo-embed" in r.text and "#181d1f" in r.text
 
 
-def test_spa_lite_js_wired_up(fresh_companion_app):
+def test_spa_lite_js_wired_up(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    r = c.get("/catalog")
+    r = c.get(f"/{project}/catalog")
     # SPA-lite controller signatures.
     assert "spaNavigate" in r.text
     assert "history.pushState" in r.text
-    # Routes the click handler activates on — the JS regex escapes / as \/.
-    assert r"^\/catalog" in r.text
+    # Routes the click handler activates on — pattern includes the project prefix.
+    assert "catalogPat" in r.text
 
 
 def test_lineage_pages_fall_through_to_real_nav(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
@@ -85,6 +85,6 @@ def test_lineage_pages_fall_through_to_real_nav(fresh_companion_app, project: st
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/lineage/{out['hash']}")
+    r = c.get(f"/{project}/lineage/{out['hash']}")
     assert r.status_code == 200
     assert 'id="catalog-sidebar"' not in r.text

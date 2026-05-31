@@ -33,7 +33,7 @@
           {%- set pos = positions[n.hash] %}
           {%- set ann = annotated.get(n.hash, {}) %}
           {%- if pos %}
-            <a href="/catalog/{{ n.hash }}">
+            <a href="/{{ project }}/catalog/{{ n.hash }}">
               <rect class="node-box {% if ann.alias %}named{% endif %}"
                     x="{{ pos[0] }}" y="{{ pos[1] }}" width="110" height="40"
                     rx="4" />

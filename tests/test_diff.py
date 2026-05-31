@@ -99,10 +99,16 @@ def test_key_diff_outer_join():
     assert d["only_after"] == 1  # W
 
 
-def test_key_diff_returns_none_when_no_keys():
+def test_key_diff_detects_unique_numeric_key():
+    # buckaroo 0.14.10's approximate-PK detection keys on any unique column,
+    # numeric included (the pre-release heuristic skipped numeric columns).
     a = pd.DataFrame({"x": [1, 2, 3]})
     b = pd.DataFrame({"x": [1, 2, 4]})
-    assert key_diff(a, b) is None  # no non-numeric shared columns
+    d = key_diff(a, b)
+    assert d["keys"] == ["x"]
+    assert d["matched"] == 2  # 1, 2
+    assert d["only_before"] == 1  # 3
+    assert d["only_after"] == 1  # 4
 
 
 # ---------------------------------------------------------------------------
@@ -239,10 +245,16 @@ def test_key_diff_polars_membership():
     assert d["only_after"] == 1
 
 
-def test_key_diff_polars_no_keys():
+def test_key_diff_polars_detects_unique_numeric_key():
+    # See test_key_diff_detects_unique_numeric_key: a unique column is a key
+    # regardless of dtype under 0.14.10's approximate-PK detection.
     a = pl.DataFrame({"x": [1, 2, 3]})
     b = pl.DataFrame({"x": [4, 5, 6]})
-    assert key_diff_polars(a, b) is None
+    d = key_diff_polars(a, b)
+    assert d["keys"] == ["x"]
+    assert d["matched"] == 0  # no shared values
+    assert d["only_before"] == 3
+    assert d["only_after"] == 3
 
 
 def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):

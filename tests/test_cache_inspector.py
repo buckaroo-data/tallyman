@@ -35,7 +35,7 @@ def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, 
     assert r.status_code == 200
     body = r.text
     assert "Parquet result cache" in body
-    assert "shoe_sales" in body          # alias-name column
+    assert "shoe_sales" in body  # alias-name column
     assert "Created" in body and "Size" in body
     # every materialised entry's short hash appears
     for e in list_entries(project):
@@ -60,11 +60,11 @@ def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_
     assert r.status_code == 200
     assert r.json()["deleted"] == h
 
-    assert not pq_path.exists()                       # parquet gone
+    assert not pq_path.exists()  # parquet gone
     assert (stat_cache / "marker").read_text() == "keep me"  # stat cache kept
-    assert (edir / "expr.py").exists()                # code kept
-    assert (edir / "manifest.json").exists()          # entry kept
-    assert h in history_for(project, "shoe_sales")    # alias history intact
+    assert (edir / "expr.py").exists()  # code kept
+    assert (edir / "manifest.json").exists()  # entry kept
+    assert h in history_for(project, "shoe_sales")  # alias history intact
 
 
 def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_parquet, monkeypatch):

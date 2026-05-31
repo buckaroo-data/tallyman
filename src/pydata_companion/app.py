@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import markdown as md_lib
@@ -98,6 +99,12 @@ def _dir_size(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+# A catalog entry's content hash is the lowercase-hex name of its entry dir
+# (xorq's build_path.name; same charset lineage.catalog_parents matches). Used
+# to reject path-param junk before it can name anything under the entries tree.
+_CONTENT_HASH_RE = re.compile(r"\A[0-9a-f]+\Z")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -251,6 +258,36 @@ def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
         return (2,)
 
     return sorted(entries, key=_bucket)
+
+
+def _cache_rows(project: str) -> list[dict]:
+    """One row per catalog entry, describing its materialised result.parquet.
+
+    Sorted by parquet size descending so the biggest reclaimable caches are
+    on top.  The .buckaroo_stat_cache and xorq_build dirs are intentionally
+    ignored here — this pane is only about the main parquet result cache.
+    """
+    rows = []
+    for e in _annotate_entries(project, list_entries(project)):
+        h = e["content_hash"]
+        pq_path = entry_dir(project, h) / "result.parquet"
+        present = pq_path.exists()
+        size = pq_path.stat().st_size if present else 0
+        rows.append({
+            "content_hash": h,
+            "alias": e.get("alias"),
+            "version": e.get("version"),
+            "version_count": e.get("version_count"),
+            "is_current": e.get("is_current", False),
+            "created_at": e.get("created_at"),
+            "row_count": e.get("row_count"),
+            "prompt": e.get("prompt"),
+            "size": size,
+            "size_fmt": _fmt_bytes(size),
+            "present": present,
+        })
+    rows.sort(key=lambda r: r["size"], reverse=True)
+    return rows
 
 
 def create_app(
@@ -883,6 +920,46 @@ def create_app(
                 "cache": _fmt_bytes(cache),
                 "total": _fmt_bytes(total),
             },
+        }
+
+    @app.get("/{project}/cache", response_class=HTMLResponse)
+    def cache_inspector(request: Request, project: str):
+        project = _validate_project(project)
+        rows = _cache_rows(project)
+        total = sum(r["size"] for r in rows)
+        return templates.TemplateResponse(
+            request,
+            "cache.html",
+            {
+                "project": project,
+                "rows": rows,
+                "total_fmt": _fmt_bytes(total),
+                "present_count": sum(1 for r in rows if r["present"]),
+                "entry_count": len(rows),
+            },
+        )
+
+    @app.post("/{project}/api/cache/delete/{content_hash}")
+    def cache_delete(project: str, content_hash: str):
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "read-only mode")
+        if not _CONTENT_HASH_RE.match(content_hash):
+            raise HTTPException(400, f"malformed content hash {content_hash!r}")
+        pq_path = entry_dir(project, content_hash) / "result.parquet"
+        if not pq_path.exists():
+            raise HTTPException(404, "no result.parquet to delete for this entry")
+        size = pq_path.stat().st_size
+        pq_path.unlink()
+        # The alias/history/code are untouched — re-running the entry's
+        # expression re-materialises result.parquet on demand.
+        rows = _cache_rows(project)
+        total = sum(r["size"] for r in rows)
+        return {
+            "deleted": content_hash,
+            "reclaimed": size,
+            "reclaimed_fmt": _fmt_bytes(size),
+            "total_fmt": _fmt_bytes(total),
         }
 
     # ------------------------------------------------------------------

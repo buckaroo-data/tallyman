@@ -184,6 +184,7 @@
       {% if project %}<a href="/{{ project }}/catalog">catalog</a>{% endif %}
       {% if project %}<a href="/{{ project }}/notebook">notebook</a>{% endif %}
       {% if project %}<a href="/{{ project }}/lineage">lineage</a>{% endif %}
+      {% if project %}<a href="/{{ project }}/cache">cache</a>{% endif %}
     </nav>
     {% if read_only %}<span class="pill" style="color: var(--muted)">read-only · serve mode</span>{% endif %}
     {% if project %}<span id="disk-pill" class="pill" style="cursor:default" title="loading…">disk: …</span>{% endif %}

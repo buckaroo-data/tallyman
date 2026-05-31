@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+{% block title %}pydata · {{ project }} · cache{% endblock %}
+{% block content %}
+<div class="cache-pane">
+  <div class="cache-summary">
+    <strong>Parquet result cache</strong>
+    <span class="meta">
+      {{ entry_count }} entries · {{ present_count }} materialised ·
+      <span id="cache-total">{{ total_fmt }}</span> on disk
+    </span>
+    <span class="meta cache-note">Deleting frees the parquet only — code, build and stat cache stay; the entry re-materialises on next run.</span>
+  </div>
+
+  {% if rows %}
+  <table class="data-table cache-table">
+    <thead>
+      <tr>
+        <th class="num">Size ▼</th>
+        <th class="num">Rows</th>
+        <th>Created</th>
+        <th>Alias</th>
+        <th>Hash</th>
+        <th>Prompt</th>
+        {% if not read_only %}<th></th>{% endif %}
+      </tr>
+    </thead>
+    <tbody>
+      {% for r in rows %}
+      <tr data-hash="{{ r.content_hash }}" data-size="{{ r.size }}" class="{% if not r.present %}evicted{% endif %}{% if r.is_current %} current{% endif %}">
+        <td class="num size">{% if r.present %}{{ r.size_fmt }}{% else %}<span class="muted">evicted</span>{% endif %}</td>
+        <td class="num">{% if r.row_count is not none %}{{ "{:,}".format(r.row_count) }}{% else %}—{% endif %}</td>
+        <td class="created">{{ (r.created_at or "")[:19].replace("T", " ") or "—" }}</td>
+        <td class="alias">
+          {% if r.alias %}
+            <span class="alias-name">{{ r.alias }}</span>
+            {% if r.version is not none %}<span class="vchip">v{{ r.version }}{% if r.version_count %}/{{ r.version_count }}{% endif %}</span>{% endif %}
+            {% if r.is_current %}<span class="current-tag">current</span>{% endif %}
+          {% else %}
+            <span class="muted">— scratch —</span>
+          {% endif %}
+        </td>
+        <td><a class="hash" href="/{{ project }}/catalog/{{ r.content_hash }}">{{ r.content_hash[:12] }}</a></td>
+        <td class="prompt" title="{{ r.prompt or '' }}">{{ (r.prompt or "")[:80] }}{% if r.prompt and r.prompt|length > 80 %}…{% endif %}</td>
+        {% if not read_only %}
+        <td class="action">
+          {% if r.present %}
+          <button class="del-btn" onclick="deleteCache('{{ r.content_hash }}', this)">delete</button>
+          {% endif %}
+        </td>
+        {% endif %}
+      </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+  {% else %}
+  <p class="meta">No catalog entries yet.</p>
+  {% endif %}
+</div>
+
+<style>
+  .cache-pane { padding: 4px 2px; }
+  .cache-summary { display: flex; align-items: baseline; gap: 14px; flex-wrap: wrap; margin-bottom: 12px; }
+  .cache-summary strong { font-size: 15px; }
+  .cache-summary .cache-note { flex-basis: 100%; }
+  table.cache-table { table-layout: auto; }
+  table.cache-table td, table.cache-table th { vertical-align: middle; white-space: nowrap; }
+  table.cache-table th.num, table.cache-table td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  table.cache-table td.size { font-weight: 600; }
+  table.cache-table td.created { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; }
+  table.cache-table .alias-name { font-weight: 600; }
+  table.cache-table .vchip { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 10px; font-size: 11px; margin-left: 4px; }
+  table.cache-table .current-tag { color: var(--accent); font-size: 11px; margin-left: 6px; }
+  table.cache-table .hash { font-family: ui-monospace, monospace; color: var(--muted); font-size: 12px; }
+  table.cache-table .prompt { color: var(--muted); max-width: 360px; overflow: hidden; text-overflow: ellipsis; }
+  table.cache-table .muted { color: var(--muted); }
+  table.cache-table tr.evicted td.size { color: var(--muted); }
+  .del-btn { background: transparent; border: 1px solid #5a3a3a; color: #ff9b9b; border-radius: 4px; padding: 2px 10px; font-size: 11px; cursor: pointer; font-family: inherit; }
+  .del-btn:hover { background: #2a1b1b; color: #ffb4b4; border-color: #7a4a4a; }
+  .del-btn:disabled { opacity: 0.5; cursor: default; }
+</style>
+
+<script>
+  async function deleteCache(hash, btn) {
+    if (!confirm('Delete the result.parquet cache for ' + hash.slice(0, 12) + '?\n\nThe entry, code and alias stay — it re-materialises on next run.')) return;
+    btn.disabled = true;
+    btn.textContent = 'deleting…';
+    try {
+      const r = await fetch('/' + PROJECT + '/api/cache/delete/' + hash, {method: 'POST'});
+      if (!r.ok) {
+        const d = await r.json().catch(() => ({}));
+        alert('delete failed: ' + (d.detail || r.status));
+        btn.disabled = false; btn.textContent = 'delete';
+        return;
+      }
+      const d = await r.json();
+      const row = btn.closest('tr');
+      row.classList.add('evicted');
+      row.querySelector('td.size').innerHTML = '<span class="muted">evicted</span>';
+      btn.remove();
+      const total = document.getElementById('cache-total');
+      if (total && d.total_fmt) total.textContent = d.total_fmt;
+    } catch (e) {
+      alert('delete failed: ' + e);
+      btn.disabled = false; btn.textContent = 'delete';
+    }
+  }
+</script>
+{% endblock %}

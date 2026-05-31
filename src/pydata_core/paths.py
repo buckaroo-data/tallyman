@@ -136,6 +136,11 @@ def result_cache_dir(project: str) -> Path:
     return catalog_dir(project) / "result_cache"
 
 
+def diff_stat_cache_root(project: str) -> Path:
+    """Parent of all per-pair diff stat caches for a project."""
+    return catalog_dir(project) / "diff_stat_cache"
+
+
 def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
     """Buckaroo summary-stat cache for a comparison (diff) session.
 
@@ -143,7 +148,7 @@ def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
     small per-column summary stats here, so re-opening the same diff reuses
     them instead of recomputing over the full join.
     """
-    return catalog_dir(project) / "diff_stat_cache" / f"{a_hash[:12]}-{b_hash[:12]}"
+    return diff_stat_cache_root(project) / f"{a_hash[:12]}-{b_hash[:12]}"
 
 
 def post_processing_dir(project: str) -> Path:

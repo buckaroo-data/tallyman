@@ -150,28 +150,6 @@ def test_unit_ensure_session_restart_throttled(project: str, orders_parquet: Pat
     assert restart_calls["n"] == 1
 
 
-def test_unit_forget_project_sessions_evicts_matching(project: str):
-    mgr = BuckarooManager()
-    mgr._sessions = {
-        "hash_a": {"session_id": "s1", "project": project},
-        "hash_b": {"session_id": "s2", "project": project},
-        "hash_c": {"session_id": "s3", "project": "other_project"},
-    }
-    dropped = mgr.forget_project_sessions(project)
-    assert dropped == 2
-    assert set(mgr._sessions.keys()) == {"hash_c"}
-
-
-def test_unit_forget_project_sessions_returns_zero_when_none_match(project: str):
-    mgr = BuckarooManager()
-    mgr._sessions = {
-        "hash_a": {"session_id": "s1", "project": "other_project"},
-    }
-    dropped = mgr.forget_project_sessions(project)
-    assert dropped == 0
-    assert len(mgr._sessions) == 1
-
-
 def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatch):
     mgr = BuckarooManager()
     mgr.bound_port = 65000

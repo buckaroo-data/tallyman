@@ -178,8 +178,14 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
 
     expr = joined.select(*sel)
 
-    builds_dir = tempfile.mkdtemp(prefix="pydata_diff_")
-    build_path = Path(xo.build_expr(expr, builds_dir=builds_dir))
+    # One session-scoped parent dir, not a fresh mkdtemp per page view: the
+    # comparison expr is deterministic, so build_expr lands it in a stable
+    # content-hash subdir here. Re-rendering the same diff reuses that subdir
+    # instead of leaking a new /tmp dir on every load. (Disk reclamation of
+    # this tree is handled separately.)
+    builds_dir = Path(tempfile.gettempdir()) / "pydata_diff_builds"
+    builds_dir.mkdir(parents=True, exist_ok=True)
+    build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
 
     # Color config mirrors col_join_dfs: pink=a_only, teal=b_only, green=both.
     eq_map = ["pink", "#73ae80", "#90b2b3", "#6c83b5"]
@@ -552,6 +558,8 @@ def create_app(
         hashes = history_for(project, alias)
         if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
             raise HTTPException(404, "version out of range")
+        if va == vb:
+            raise HTTPException(400, f"V{va} → V{vb} is the same version — nothing to diff")
         a_hash = hashes[va - 1]
         b_hash = hashes[vb - 1]
         a_dir = entry_dir(project, a_hash)

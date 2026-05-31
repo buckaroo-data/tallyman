@@ -207,6 +207,17 @@ def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     assert c.get(f"/{project}/diff/missing").status_code == 404
 
 
+def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    # Diffing a version against itself is nothing-to-diff — reject like the
+    # single-version case rather than rendering an all-equal diff.
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/diff/shoe_sales/2/2")
+    assert r.status_code == 400
+
+
 # ---------------------------------------------------------------------------
 # polars backend
 # ---------------------------------------------------------------------------
@@ -340,3 +351,20 @@ def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
     assert diff["keyed"] is not None
     assert diff["keyed"]["matched"] == 4
     assert "stats" in diff
+
+
+def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parquet: Path):
+    # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
+    # Re-rendering the same diff must reuse one session-scoped build dir, not
+    # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
+    from pydata_companion.app import _build_compare_expr
+    from pydata_xorq import build_and_persist
+    from pydata_xorq.result_cache import cached_result_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_expr = cached_result_expr(project, a.content_hash)
+    b_expr = cached_result_expr(project, b.content_hash)
+    p1, _ = _build_compare_expr(a_expr, b_expr, ["region"])
+    p2, _ = _build_compare_expr(a_expr, b_expr, ["region"])
+    assert p1 == p2

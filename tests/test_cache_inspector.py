@@ -103,6 +103,8 @@ def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_
     # only ever resolve outside the entries tree, so reject it as a bad request
     # rather than letting it fall through to the "no result.parquet" 404 — that
     # 404 reads as "valid entry, already evicted", which a malformed hash isn't.
-    for bad in ("NOPE-not-a-hash", "..", "Deadbeef"):
+    # (Dot-segments like ".." are normalised away by the client before routing,
+    # so the guard's job is the charset check, not path-traversal defence.)
+    for bad in ("NOPE-not-a-hash", "Deadbeef", "abc def"):
         r = c.post(f"/{project}/api/cache/delete/{bad}")
         assert r.status_code == 400, f"{bad!r} should be a 400, got {r.status_code}"

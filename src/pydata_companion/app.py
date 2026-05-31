@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 from pathlib import Path
 
 import markdown as md_lib
@@ -98,6 +99,12 @@ def _dir_size(path: Path) -> int:
             except OSError:
                 pass
     return total
+
+
+# A catalog entry's content hash is the lowercase-hex name of its entry dir
+# (xorq's build_path.name; same charset lineage.catalog_parents matches). Used
+# to reject path-param junk before it can name anything under the entries tree.
+_CONTENT_HASH_RE = re.compile(r"\A[0-9a-f]+\Z")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -937,6 +944,8 @@ def create_app(
         project = _validate_project(project)
         if read_only:
             raise HTTPException(403, "read-only mode")
+        if not _CONTENT_HASH_RE.match(content_hash):
+            raise HTTPException(400, f"malformed content hash {content_hash!r}")
         pq_path = entry_dir(project, content_hash) / "result.parquet"
         if not pq_path.exists():
             raise HTTPException(404, "no result.parquet to delete for this entry")

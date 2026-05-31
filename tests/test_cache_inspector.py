@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from pydata_companion import create_app
 from pydata_core.aliases import history_for
 from pydata_core.paths import entry_dir
 from pydata_mcp.server import catalog_create, catalog_revise
@@ -74,3 +75,22 @@ def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_p
     assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 200
     # second delete: parquet already gone
     assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 404
+
+
+def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    h = list_entries(project)[0]["content_hash"]
+    pq_path = entry_dir(project, h) / "result.parquet"
+    assert pq_path.exists()
+
+    c = TestClient(create_app(project, read_only=True))
+    # serve mode: the parquet must not be deletable...
+    assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 403
+    assert pq_path.exists()  # untouched
+    # ...and no clickable delete button may render in the pane. (The
+    # deleteCache() JS helper and .del-btn CSS live in the always-emitted
+    # script/style blocks; the per-row onclick invocation is the gated affordance.)
+    body = c.get(f"/{project}/cache").text
+    assert "Parquet result cache" in body
+    assert 'onclick="deleteCache(' not in body

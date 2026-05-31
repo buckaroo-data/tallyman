@@ -94,3 +94,15 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
     body = c.get(f"/{project}/cache").text
     assert "Parquet result cache" in body
     assert 'onclick="deleteCache(' not in body
+
+
+def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    c = TestClient(fresh_companion_app)
+    # A content hash is lowercase hex (it names an entry dir). A junk value can
+    # only ever resolve outside the entries tree, so reject it as a bad request
+    # rather than letting it fall through to the "no result.parquet" 404 — that
+    # 404 reads as "valid entry, already evicted", which a malformed hash isn't.
+    for bad in ("NOPE-not-a-hash", "..", "Deadbeef"):
+        r = c.post(f"/{project}/api/cache/delete/{bad}")
+        assert r.status_code == 400, f"{bad!r} should be a 400, got {r.status_code}"

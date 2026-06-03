@@ -299,6 +299,44 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
 .error-banner.collapsed ul { display: none; }
 .error-banner.hidden { display: none; }
 
+/* ── New-entry notice (#27) ──
+   Floats over the top of the UI so a new expression announces itself without
+   shifting layout or stealing the view; click to navigate, × to dismiss. */
+.new-entry-notice {
+  position: fixed;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 50;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  background: var(--accent-soft);
+  border: 1px solid var(--accent);
+  border-radius: 14px;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.4);
+}
+.new-entry-notice .view {
+  background: transparent;
+  border: 0;
+  color: var(--fg);
+  font-family: inherit;
+  font-size: 12px;
+  padding: 5px 6px 5px 12px;
+  cursor: pointer;
+}
+.new-entry-notice .view:hover { color: var(--accent); }
+.new-entry-notice .dismiss {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 4px 10px 4px 4px;
+}
+.new-entry-notice .dismiss:hover { color: var(--fg); }
+
 /* ── Empty state ── */
 .empty-state { max-width: 520px; margin: 60px auto; padding: 16px; }
 .empty-state h2 { margin-top: 0; }

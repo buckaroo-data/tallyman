@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { Routes, Route, Navigate, useNavigate, useParams } from "react-router-dom";
 import { Header } from "./components/Header";
+import { NewEntryPill } from "./components/NewEntryPill";
 import { SSEProvider } from "./SSEContext";
 import { CatalogPage } from "./pages/CatalogPage";
 import { NotebookPage } from "./pages/NotebookPage";
@@ -29,7 +30,12 @@ function RootRedirect() {
 
 function ProjectLayout({ children }: { children: React.ReactNode }) {
   const { project } = useParams<{ project: string }>();
-  return <SSEProvider project={project ?? null}>{children}</SSEProvider>;
+  return (
+    <SSEProvider project={project ?? null}>
+      {project && <NewEntryPill project={project} />}
+      {children}
+    </SSEProvider>
+  );
 }
 
 export default function App() {

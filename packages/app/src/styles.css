@@ -108,6 +108,7 @@ main {
 }
 /* Alias text truncates; the version chip stays pinned and visible. */
 .entry-list .alias {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;

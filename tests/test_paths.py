@@ -15,6 +15,7 @@ from pydata_core import (
 )
 from pydata_core.paths import (
     active_project_file_path,
+    delete_project,
     errors_path,
     exports_dir,
     post_processing_dir,
@@ -191,3 +192,44 @@ def test_active_project_file_path_under_pydata_home(isolated_home: Path):
 
 def test_projects_root_under_pydata_home(isolated_home: Path):
     assert projects_root() == isolated_home / "projects"
+
+
+# ---------------------------------------------------------------------------
+# delete_project — removes the on-disk tree and clears the active-project file
+# ---------------------------------------------------------------------------
+
+
+def test_delete_project_removes_directory(isolated_home: Path):
+    ensure_project("alpha")
+    assert project_dir("alpha").is_dir()
+    delete_project("alpha")
+    assert not project_dir("alpha").exists()
+
+
+def test_delete_project_clears_active_file_when_it_points_at_deleted(isolated_home: Path):
+    ensure_project("alpha")
+    set_active_project("alpha")
+    assert active_project_file_path().exists()
+    delete_project("alpha")
+    # Active file is cleared so resolve_project() falls back to None.
+    assert not active_project_file_path().exists()
+    assert resolve_project() is None
+
+
+def test_delete_project_keeps_active_file_for_other_project(isolated_home: Path):
+    ensure_project("alpha")
+    ensure_project("beta")
+    set_active_project("alpha")
+    delete_project("beta")
+    # Deleting a non-active project leaves the active pointer untouched.
+    assert resolve_project() == "alpha"
+
+
+def test_delete_project_unknown_raises(isolated_home: Path):
+    with pytest.raises(FileNotFoundError):
+        delete_project("no_such")
+
+
+def test_delete_project_validates_name(isolated_home: Path):
+    with pytest.raises(ValueError):
+        delete_project("Bad/Name")

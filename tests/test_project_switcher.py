@@ -21,7 +21,7 @@ from fastapi.testclient import TestClient
 
 from pydata_companion import create_app
 from pydata_core import ensure_project, resolve_project, set_active_project
-from pydata_core.paths import active_project_file_path
+from pydata_core.paths import active_project_file_path, project_dir
 
 # ---------------------------------------------------------------------------
 # GET /api/projects
@@ -139,6 +139,91 @@ def test_api_projects_new_400_on_invalid_name(isolated_home: Path):
     c = TestClient(app)
     r = c.post("/api/projects/new", json={"name": "Bad/Name"})
     assert r.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# POST /api/projects/delete
+# ---------------------------------------------------------------------------
+
+
+def test_api_projects_delete_removes_and_reports(isolated_home: Path):
+    ensure_project("alpha")
+    ensure_project("beta")
+    ensure_project("gamma")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": ["beta", "gamma"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert sorted(body["deleted"]) == ["beta", "gamma"]
+    assert body["errors"] == []
+    # Active project untouched; only it remains.
+    assert body["active"] == "alpha"
+    assert body["remaining"] == ["alpha"]
+    assert resolve_project() == "alpha"
+
+
+def test_api_projects_delete_active_reassigns(isolated_home: Path):
+    ensure_project("alpha")
+    ensure_project("beta")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": ["alpha"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted"] == ["alpha"]
+    # Deleting the active project promotes a survivor.
+    assert body["active"] == "beta"
+    assert resolve_project() == "beta"
+
+
+def test_api_projects_delete_last_project_clears_active(isolated_home: Path):
+    ensure_project("alpha")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": ["alpha"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["active"] is None
+    assert body["remaining"] == []
+    assert resolve_project() is None
+
+
+def test_api_projects_delete_reports_errors_for_unknown(isolated_home: Path):
+    ensure_project("alpha")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": ["no_such"]})
+    assert r.status_code == 200
+    body = r.json()
+    assert body["deleted"] == []
+    assert len(body["errors"]) == 1
+    assert body["errors"][0]["name"] == "no_such"
+
+
+def test_api_projects_delete_400_on_empty_list(isolated_home: Path):
+    ensure_project("alpha")
+    set_active_project("alpha")
+    app = create_app()
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": []})
+    assert r.status_code == 400
+
+
+def test_api_projects_delete_403_in_read_only_mode(isolated_home: Path):
+    ensure_project("alpha")
+    ensure_project("beta")
+    set_active_project("alpha")
+    app = create_app(read_only=True)
+    c = TestClient(app)
+    r = c.post("/api/projects/delete", json={"names": ["beta"]})
+    assert r.status_code == 403
+    # Nothing was deleted.
+    assert project_dir("beta").is_dir()
 
 
 # ---------------------------------------------------------------------------

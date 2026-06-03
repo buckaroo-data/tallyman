@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -300,3 +301,20 @@ def list_projects() -> list[str]:
             continue
         out.append(child.name)
     return out
+
+
+def delete_project(name: str) -> None:
+    """Permanently remove a project directory from disk.
+
+    Clears the active-project file when it points at *name*, so the next
+    ``resolve_project()`` returns None and the UI lands on the empty
+    state. Raises ``ValueError`` on an invalid name and
+    ``FileNotFoundError`` when the project doesn't exist.
+    """
+    validate_project_name(name)
+    p = project_dir(name)
+    if not p.is_dir():
+        raise FileNotFoundError(f"project {name!r} not found")
+    shutil.rmtree(p)
+    if _read_active_project_file() == name:
+        active_project_file_path().unlink(missing_ok=True)

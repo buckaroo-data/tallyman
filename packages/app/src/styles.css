@@ -382,3 +382,24 @@ table.cache-table .muted { color: var(--muted); }
 .del-btn { background: transparent; border: 1px solid #5a3a3a; color: #ff9b9b; border-radius: 4px; padding: 2px 10px; font-size: 11px; cursor: pointer; font-family: inherit; }
 .del-btn:hover { background: #2a1b1b; color: #ffb4b4; border-color: #7a4a4a; }
 .del-btn:disabled { opacity: 0.5; cursor: default; }
+
+/* projects management page */
+.projects-page { max-width: 600px; margin: 32px auto; padding: 16px; }
+.projects-page h2 { margin-top: 0; margin-bottom: 16px; }
+.project-list { list-style: none; margin: 0 0 16px; padding: 0; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.project-list li { display: flex; align-items: center; gap: 10px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.project-list li:last-child { border-bottom: 0; }
+.project-list li.active-project { background: var(--accent-soft); }
+.project-list input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; flex-shrink: 0; cursor: pointer; }
+.project-list input[type=checkbox]:disabled { cursor: default; }
+.project-list .proj-name { flex: 1; font-family: ui-monospace, monospace; }
+.project-list .active-badge { color: var(--accent); font-size: 11px; border: 1px solid var(--accent); border-radius: 10px; padding: 1px 7px; }
+.projects-actions { display: flex; align-items: center; gap: 10px; }
+.projects-actions .meta { margin-bottom: 0; }
+.projects-actions .meta.err { color: #ffb4b4; }
+.ghost-btn { background: transparent; border: 1px solid var(--line); color: var(--muted); border-radius: 4px; padding: 6px 12px; font-family: inherit; font-size: 12px; cursor: pointer; }
+.ghost-btn:hover:not(:disabled) { color: var(--fg); border-color: var(--accent); }
+.ghost-btn:disabled { opacity: 0.5; cursor: default; }
+.danger-btn { background: #5a1e1e; color: #ffb4b4; border: 1px solid #7a3a3a; border-radius: 4px; padding: 6px 16px; font-family: inherit; font-size: 13px; cursor: pointer; }
+.danger-btn:hover:not(:disabled) { background: #7a2525; }
+.danger-btn:disabled { opacity: 0.4; cursor: default; }

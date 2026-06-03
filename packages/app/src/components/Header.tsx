@@ -81,6 +81,7 @@ export function Header() {
           <Link to={`/${project}/notebook`}>notebook</Link>
           <Link to={`/${project}/lineage`}>lineage</Link>
           <Link to={`/${project}/cache`}>cache</Link>
+          <Link to="/projects">projects</Link>
         </nav>
       )}
 

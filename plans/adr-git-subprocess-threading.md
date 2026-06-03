@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-06-03)
 - **Context ticket:** buckaroo-data/nokernel-notebooks#25
-- **Affected code:** `src/pydata_xorq/_git_state_guard.py`, the `run_git()` primitive in `git_multithread_reliable.py`, `xorq.common.utils.logging_utils.get_git_state`
+- **Affected code:** `src/pydata_xorq/_git_state_guard.py`, the `run_git()` primitive in `tests/git_multithread_reliable.py`, `xorq.common.utils.logging_utils.get_git_state`
 
 ## Problem
 
@@ -27,7 +27,7 @@ Two conclusions: the parent process never dies (the abort kills the forked child
 
 ## Decision
 
-1. **Spawn every runtime git call fork-free via `os.posix_spawn`.** Use the `run_git()` pattern from `git_multithread_reliable.py` (dup2 stdout to a temp file, stderr to `/dev/null`, `posix_spawn`, `waitpid`, check `WIFSIGNALED`/`WEXITSTATUS`). Calling `os.posix_spawn` directly avoids depending on CPython's `subprocess` heuristics (an absolute path alone is not enough on this build because `CLOSEFROM` is False; it would also need `close_fds=False`).
+1. **Spawn every runtime git call fork-free via `os.posix_spawn`.** Use the `run_git()` pattern from `tests/git_multithread_reliable.py` (dup2 stdout to a temp file, stderr to `/dev/null`, `posix_spawn`, `waitpid`, check `WIFSIGNALED`/`WEXITSTATUS`). Calling `os.posix_spawn` directly avoids depending on CPython's `subprocess` heuristics (an absolute path alone is not enough on this build because `CLOSEFROM` is False; it would also need `close_fds=False`).
 
 2. **Wrap each call in catch-and-degrade.** Any failure — signal death, missing git, timeout, odd repo state — returns placeholder provenance (`{"commit": "unknown", "diff": "", "diff_cached": ""}`) instead of raising. Provenance must never fail a write.
 
@@ -41,11 +41,11 @@ The fix stays in-repo (the guard swaps `lu.get_git_state`), not in xorq.
 
 - **Capture once at single-threaded startup + cache forever.** Rejected: xorq calls git per build, so this both freezes provenance and protects only the first call.
 - **Separate long-lived git-worker process with IPC.** Rejected as disproportionate. It would give the same safety as `posix_spawn` (git forked from a clean context) but adds IPC, lifecycle, and restart logic for three commands run per build. Kept as a back-pocket escape hatch if `posix_spawn` ever proves insufficient.
-- **Absolute path + `close_fds=False` via `subprocess`.** Works but depends on CPython internals that the docstring in `git_multithread_reliable.py` documents as fragile. Calling `os.posix_spawn` directly is more robust.
+- **Absolute path + `close_fds=False` via `subprocess`.** Works but depends on CPython internals that the docstring in `tests/git_multithread_reliable.py` documents as fragile. Calling `os.posix_spawn` directly is more robust.
 
 ## Consequences
 
 - The macOS fork-from-multithreaded crash becomes structurally impossible for git provenance (item 1), and harmless even if it somehow occurred (item 2): the server stays up, worst case is "unknown" provenance for one build.
 - Provenance is fresh per build again (item 3).
 - `posix_spawn` protects against the fork hazard, not GIL starvation. It is not a defense against a future workload with many CPU-bound threads; that is a separate problem (process pool / subinterpreters / free-threaded build) and out of scope here.
-- Tests should use a faithful backdrop (idle / CoreFoundation-touching threads), not tight-allocation churn, so they exercise the real spawn path instead of an interpreter-starvation artifact. `repro_git_state_segfault.py` already proves containment deterministically with a fake SIGSEGV-on-invoke git.
+- Tests should use a faithful backdrop (idle / CoreFoundation-touching threads), not tight-allocation churn, so they exercise the real spawn path instead of an interpreter-starvation artifact. `tests/repro_git_state_segfault.py` already proves containment deterministically with a fake SIGSEGV-on-invoke git.

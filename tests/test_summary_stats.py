@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 
 from pydata_core import StatSourceError, list_stats, remove_stat, write_stat
-from pydata_core.paths import project_dir
 from pydata_core.summary_stats import stats_dir, validate_stat_source
 
 PERCENT_AT_SIGN = "def compute(col):\n    return col.cast('string').contains('@').sum() / col.count()\n"

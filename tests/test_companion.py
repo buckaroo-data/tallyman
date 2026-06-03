@@ -128,6 +128,26 @@ def test_entry_detail_missing_returns_404(fresh_companion_app, project: str):
     assert c.get(f"/{project}/api/entry/deadbeef").status_code == 404
 
 
+def test_read_endpoints_reject_malformed_content_hash(fresh_companion_app, project: str):
+    """Non-hex content_hash params 400, not a misleading 404 (or 500).
+
+    A content hash names an entry dir, so it's lowercase hex — the same guard the
+    cache-delete route already applies. The read endpoints let junk fall through
+    to a "not found" 404, and a "." / ".." segment could even 500 by resolving
+    onto a real dir with no manifest. ``deadbeef`` (valid hex but absent) still
+    404s, and aliases still resolve on the routes that accept them (test_aliases
+    covers that) — only the charset is rejected here.
+    """
+    c = TestClient(fresh_companion_app)
+    for path in [
+        f"/{project}/api/data/NOPE",
+        f"/{project}/api/entry/Deadbeef",          # uppercase: not lowercase hex
+        f"/{project}/api/lineage/not-a-hash",
+        f"/{project}/api/lineage_layout/not-a-hash",
+    ]:
+        assert c.get(path).status_code == 400, path
+
+
 def test_internal_notify_returns_subscriber_count(fresh_companion_app):
     c = TestClient(fresh_companion_app)
     r = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc"})

@@ -49,7 +49,7 @@ from pathlib import Path
 import httpx
 
 from pydata_core import entry_dir
-from pydata_core.paths import project_dir
+from pydata_core.paths import artifacts_dir, project_dir
 from pydata_xorq.portable import expand_to_tmp
 
 
@@ -467,11 +467,12 @@ class BuckarooManager:
                     json={
                         "build_dir": str(expanded),
                         "no_browser": True,
-                        # Buckaroo PR #784 scans <project_root>/stats/*.py
-                        # for project-authored summary stats and folds them
-                        # into the session's analysis_klasses. Older buckaroo
-                        # builds ignore this field, so it's safe to always send.
-                        "project_root": str(project_dir(project)),
+                        # Buckaroo scans <project_root>/stats/*.py and
+                        # <project_root>/post_processing/*.py for project-authored
+                        # klasses. pydata stores both under artifacts/, so pass
+                        # artifacts_dir, not project_dir. Older buckaroo builds
+                        # ignore this field, so it's safe to always send.
+                        "project_root": str(artifacts_dir(project)),
                         # Buckaroo 0.14.9+: persist computed summary stats to
                         # disk so they survive a Buckaroo restart without full
                         # recomputation on next /load_expr.

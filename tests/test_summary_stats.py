@@ -138,7 +138,10 @@ expr = t.group_by("region").aggregate(n=t.count())
 
     posted_project_root = captured["json"].get("project_root")
     assert posted_project_root is not None
-    assert Path(posted_project_root) == project_dir(project)
+    # project_root must point to artifacts_dir so buckaroo finds
+    # stats/ and post_processing/ under it.
+    from pydata_core.paths import artifacts_dir
+    assert Path(posted_project_root) == artifacts_dir(project)
 
 
 # ---------------------------------------------------------------------------

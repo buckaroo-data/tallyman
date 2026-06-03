@@ -135,6 +135,33 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
         </details>
       )}
 
+      {forensic_history.length > 1 && (
+        <div className="forensic-history">
+          <strong>versions of {alias}</strong>
+          <ol>
+            {forensic_history.map((h) => (
+              <li key={h.hash} className={h.is_current ? "current" : ""}>
+                <Link to={`/${project}/catalog/${h.hash}`}>
+                  V{h.version} · {h.hash}
+                  {h.is_current && " (current)"}
+                </Link>
+              </li>
+            ))}
+          </ol>
+          <p className="meta">
+            diff:{" "}
+            {forensic_history.slice(0, -1).map((h) => (
+              <span key={h.version}>
+                <Link to={`/${project}/diff/${alias}/${h.version}/${h.version + 1}`}>
+                  V{h.version}→V{h.version + 1}
+                </Link>{" "}
+                ·{" "}
+              </span>
+            ))}
+          </p>
+        </div>
+      )}
+
       {chart_spec && (
         <VegaChart spec={chart_spec} dataHash={manifest.content_hash} project={project} />
       )}
@@ -190,33 +217,6 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
                 </div>
               ))}
             </details>
-          )}
-
-          {forensic_history.length > 1 && (
-            <div className="forensic-history">
-              <strong>forensic history for {alias}</strong>
-              <ol>
-                {forensic_history.map((h) => (
-                  <li key={h.hash} className={h.is_current ? "current" : ""}>
-                    <Link to={`/${project}/catalog/${h.hash}`}>
-                      V{h.version} · {h.hash}
-                      {h.is_current && " (current)"}
-                    </Link>
-                  </li>
-                ))}
-              </ol>
-              <p className="meta">
-                diff:{" "}
-                {forensic_history.slice(0, -1).map((h) => (
-                  <span key={h.version}>
-                    <Link to={`/${project}/diff/${alias}/${h.version}/${h.version + 1}`}>
-                      V{h.version}→V{h.version + 1}
-                    </Link>{" "}
-                    ·{" "}
-                  </span>
-                ))}
-              </p>
-            </div>
           )}
         </div>
       )}
@@ -277,6 +277,9 @@ export function CatalogPage() {
   const { version } = useSSE();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [errors, setErrors] = useState<AppError[]>([]);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
+    () => localStorage.getItem("catalog.sidebarCollapsed") === "1",
+  );
 
   useEffect(() => {
     if (!project) return;
@@ -284,14 +287,24 @@ export function CatalogPage() {
     api.errors(project, 5).then((d) => setErrors(d.errors)).catch(() => {});
   }, [project, version]);
 
+  useEffect(() => {
+    localStorage.setItem("catalog.sidebarCollapsed", sidebarCollapsed ? "1" : "0");
+  }, [sidebarCollapsed]);
+
   if (!project) return null;
 
   return (
     <main style={{ padding: "8px 12px", flex: "1 1 auto", minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column" }}>
       <ErrorBanner errors={errors} project={project} />
-      <div className="layout" style={{ flex: "1 1 auto", minHeight: 0 }}>
-        <aside className="panel">
-          <CatalogSidebar entries={entries} project={project} currentHash={hash} />
+      <div className={`layout${sidebarCollapsed ? " sidebar-collapsed" : ""}`} style={{ flex: "1 1 auto", minHeight: 0 }}>
+        <aside className="panel sidebar-panel">
+          <CatalogSidebar
+            entries={entries}
+            project={project}
+            currentHash={hash}
+            collapsed={sidebarCollapsed}
+            onToggleCollapse={() => setSidebarCollapsed((v) => !v)}
+          />
         </aside>
         <section className="panel" id="catalog-detail">
           {hash ? (

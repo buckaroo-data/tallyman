@@ -53,6 +53,7 @@ main {
   flex: 1 1 auto;
   min-height: 0;
 }
+.layout.sidebar-collapsed { grid-template-columns: 32px minmax(0, 1fr); }
 
 .panel {
   background: var(--panel);
@@ -94,15 +95,32 @@ main {
   font-weight: 500;
   margin-left: 4px;
 }
-.entry-list .forensic-tag {
-  background: #333;
-  color: var(--muted);
-  padding: 1px 6px;
-  border-radius: 10px;
-  font-size: 11px;
-  margin-left: 4px;
+.entry-main {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
 }
-.entry-list li.forensic a { opacity: 0.65; }
+.entry-name {
+  display: flex;
+  align-items: baseline;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+/* Alias text truncates; the version chip stays pinned and visible. */
+.entry-list .alias {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.entry-list .vchip { flex-shrink: 0; }
+.entry-list .meta-inline {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+/* Compact view: tighter rows, single line per entry (prompt on hover only). */
+.entry-list.compact li > a:first-child { padding: 6px 12px; }
 .entry-list li.current { background: var(--accent-soft); border-left: 3px solid var(--accent); }
 .entry-list li.current a { color: var(--fg); }
 .entry-list li.current .alias { color: var(--accent); }
@@ -128,6 +146,46 @@ main {
   border-top: 1px solid var(--line);
 }
 .section-header:first-child { border-top: 0; }
+
+/* ── Sidebar chrome (toolbar / collapse) ── */
+.sidebar-toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--line);
+}
+.view-toggle { display: inline-flex; border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+.view-toggle button {
+  background: transparent;
+  color: var(--muted);
+  border: 0;
+  padding: 3px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.view-toggle button + button { border-left: 1px solid var(--line); }
+.view-toggle button:hover { color: var(--fg); }
+.view-toggle button.active { background: var(--accent-soft); color: var(--accent); }
+.sidebar-toggle {
+  background: transparent;
+  color: var(--muted);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  width: 22px;
+  height: 22px;
+  line-height: 1;
+  font-size: 14px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.sidebar-toggle:hover { color: var(--fg); border-color: var(--accent); }
+.sidebar-rail { display: flex; justify-content: center; padding: 6px 4px; }
 
 /* ── Entry detail ── */
 .entry-header {

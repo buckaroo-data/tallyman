@@ -285,6 +285,17 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
   line-height: 1;
 }
 .error-banner .dismiss:hover { color: #fff; }
+.error-banner .clear-errors {
+  background: transparent;
+  border: 1px solid #5a3a3a;
+  color: #ffb4b4;
+  border-radius: 4px;
+  font-size: 11px;
+  padding: 1px 8px;
+  cursor: pointer;
+  font-family: inherit;
+}
+.error-banner .clear-errors:hover { color: #fff; border-color: #ffb4b4; }
 .error-banner.collapsed ul { display: none; }
 .error-banner.hidden { display: none; }
 

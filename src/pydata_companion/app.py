@@ -20,6 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
 from pydata_core import (
     alias_for_hash,
+    clear_errors,
     entry_dir,
     get_chart,
     get_error,
@@ -812,6 +813,14 @@ def create_app(
     def api_errors(project: str, limit: int = 20):
         project = _validate_project(project)
         return {"project": project, "errors": list_errors(project, limit=limit)}
+
+    @app.delete("/{project}/api/errors")
+    def api_clear_errors(project: str):
+        """Permanently drop all build-failure records for a project."""
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "companion is in read-only (serve) mode")
+        return {"project": project, "cleared": clear_errors(project)}
 
     # Per-app, per-project TTL cache so a burst of page mounts / new_entry
     # refreshes shares one filesystem walk. App-scoped (not module-level) so

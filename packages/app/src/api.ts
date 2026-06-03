@@ -112,6 +112,12 @@ export const api = {
   errorDetail: (project: string, errorId: string): Promise<{ project: string; error: AppError }> =>
     get(`/${project}/api/error/${errorId}`),
 
+  clearErrors: (project: string): Promise<{ project: string; cleared: number }> =>
+    fetch(`/${project}/api/errors`, { method: "DELETE" }).then((r) => {
+      if (!r.ok) throw new Error(`clear failed: HTTP ${r.status}`);
+      return r.json() as Promise<{ project: string; cleared: number }>;
+    }),
+
   session: (project: string, hash: string): Promise<{ ws_url: string | null }> =>
     get(`/${project}/api/session/${hash}`),
 

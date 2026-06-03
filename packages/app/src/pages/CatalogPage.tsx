@@ -9,23 +9,42 @@ import type { Entry, AppError, EntryDetail } from "../types";
 
 // ── Error banner ──────────────────────────────────────────────────────────────
 
-function ErrorBanner({ errors, project }: { errors: AppError[]; project: string }) {
+function ErrorBanner({
+  errors,
+  project,
+  onCleared,
+}: {
+  errors: AppError[];
+  project: string;
+  onCleared: () => void;
+}) {
   const [hidden, setHidden] = useState(false);
   const [collapsed, setCollapsed] = useState(false);
 
   if (errors.length === 0 || hidden) return null;
+
+  const handleClear = () => {
+    api
+      .clearErrors(project)
+      .then(onCleared)
+      .catch(() => {});
+  };
 
   return (
     <div className="error-banner">
       <button
         type="button"
         className="dismiss"
-        aria-label="dismiss"
+        aria-label="hide"
+        title="hide for now"
         onClick={() => (collapsed ? setHidden(true) : setCollapsed(true))}
       >
         ×
       </button>
-      <strong>recent build failures:</strong>
+      <strong>recent build failures:</strong>{" "}
+      <button type="button" className="clear-errors" onClick={handleClear}>
+        clear all
+      </button>
       {!collapsed && (
         <ul>
           {errors.map((err) => (
@@ -295,7 +314,7 @@ export function CatalogPage() {
 
   return (
     <main style={{ padding: "8px 12px", flex: "1 1 auto", minHeight: 0, overflow: "auto", display: "flex", flexDirection: "column" }}>
-      <ErrorBanner errors={errors} project={project} />
+      <ErrorBanner errors={errors} project={project} onCleared={() => setErrors([])} />
       <div className={`layout${sidebarCollapsed ? " sidebar-collapsed" : ""}`} style={{ flex: "1 1 auto", minHeight: 0 }}>
         <aside className="panel sidebar-panel">
           <CatalogSidebar

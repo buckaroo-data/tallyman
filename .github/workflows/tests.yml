@@ -52,6 +52,8 @@ jobs:
           cache-dependency-path: packages/app/pnpm-lock.yaml
       - name: build React SPA
         run: pnpm -C packages/app install --frozen-lockfile && pnpm -C packages/app build
+      - name: vitest (React unit)
+        run: pnpm -C packages/app test
       - name: sync deps
         run: uv sync
       - name: pytest (fast)

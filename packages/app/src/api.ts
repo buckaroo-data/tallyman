@@ -41,6 +41,14 @@ export const api = {
   createProject: (name: string, withFixture: boolean) =>
     post<{ name: string; active: string }>("/api/projects/new", { name, with_fixture: withFixture }),
 
+  deleteProjects: (names: string[]) =>
+    post<{
+      deleted: string[];
+      errors: { name: string; error: string }[];
+      active: string | null;
+      remaining: string[];
+    }>("/api/projects/delete", { names }),
+
   entries: (project: string): Promise<{ project: string; entries: Entry[] }> =>
     get(`/${project}/api/entries`),
 

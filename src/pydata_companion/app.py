@@ -1050,6 +1050,34 @@ def create_app(
         await publish({"kind": "project_switched", "name": name})
         return {"name": name, "active": name}
 
+    @app.post("/api/projects/delete")
+    async def api_projects_delete(payload: dict):
+        if read_only:
+            raise HTTPException(403, "companion is in read-only (serve) mode")
+        from pydata_core.paths import delete_project as _delete_project  # noqa: PLC0415
+        from pydata_core.paths import list_projects as _list_projects  # noqa: PLC0415
+        from pydata_core.paths import set_active_project as _sap  # noqa: PLC0415
+
+        names = (payload or {}).get("names", [])
+        if not isinstance(names, list) or not names:
+            raise HTTPException(400, "names must be a non-empty list")
+        deleted, errors = [], []
+        for name in names:
+            try:
+                _delete_project(name)
+                deleted.append(name)
+            except (FileNotFoundError, ValueError) as exc:
+                errors.append({"name": name, "error": str(exc)})
+        remaining = _list_projects()
+        active = _current_project()
+        # If the active project was deleted, promote a survivor (or clear).
+        if active not in remaining:
+            active = remaining[0] if remaining else None
+            if active:
+                _sap(active)
+        await publish({"kind": "project_switched", "name": active or ""})
+        return {"deleted": deleted, "errors": errors, "active": active, "remaining": remaining}
+
     # ------------------------------------------------------------------
     # SPA catch-all: serve React index.html for all unmatched GET routes.
     # Must be registered last so API routes above take priority.

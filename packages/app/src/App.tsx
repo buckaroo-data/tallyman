@@ -9,6 +9,7 @@ import { LineageEntryPage } from "./pages/LineageEntryPage";
 import { DiffPage } from "./pages/DiffPage";
 import { CachePage } from "./pages/CachePage";
 import { EmptyStatePage } from "./pages/EmptyStatePage";
+import { ProjectsPage } from "./pages/ProjectsPage";
 import { api } from "./api";
 
 function RootRedirect() {
@@ -55,6 +56,7 @@ export default function App() {
             </ProjectLayout>
           }
         />
+        <Route path="/projects" element={<><Header /><ProjectsPage /></>} />
         <Route path="/" element={<><Header /><RootRedirect /></>} />
         <Route path="*" element={<><Header /><EmptyStatePage /></>} />
       </Routes>

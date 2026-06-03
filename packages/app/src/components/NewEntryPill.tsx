@@ -67,7 +67,7 @@ export function NewEntryPill({ project }: { project: string }) {
         className="dismiss"
         aria-label="dismiss"
         title="dismiss"
-        onClick={() => setNotice(emptyNotice)}
+        onClick={() => update(emptyNotice)}
       >
         ×
       </button>

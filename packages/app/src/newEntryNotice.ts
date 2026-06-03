@@ -1,14 +1,16 @@
 // Decides how a `new_entry` SSE event affects the UI without stealing the
-// view (#27). The split is whether the user is currently looking at this page:
+// view (#27). A new entry always announces itself via a dismissable pill that
+// coalesces a burst into one running count and points at the latest entry. The
+// pill never navigates on its own — the user clicks it — so the view is never
+// yanked out from under them regardless of focus.
 //
-//   - Foreground (page focused): never navigate. Accumulate a single pill that
-//     coalesces a burst into one running count and points at the latest entry.
-//   - Background (another window/tab focused): navigate straight to the entry,
-//     so it's already on screen when the user comes back.
+// Earlier this branched on `document.hasFocus()` and auto-navigated when the
+// tab was backgrounded. That silently moved the view in the common workflow of
+// a viewer parked on a second monitor while expressions are created from
+// another session, so the pill never appeared. `focused` is retained in the
+// signature (the component still passes it) but no longer changes behavior.
 //
-// Pure and transport-independent so it can be unit-tested in isolation; the
-// component layer supplies `focused` (document.hasFocus()) and performs the
-// navigation.
+// Pure and transport-independent so it can be unit-tested in isolation.
 
 export interface NoticeState {
   /** How many new entries have landed since the pill was last cleared. */
@@ -39,13 +41,9 @@ export function receiveNewEntry(
 ): NoticeResult {
   if (!entry.hash) return { state, navigateTo: null };
 
-  if (!focused) {
-    // Backgrounded: move the view directly and drop any pending pill — the
-    // user isn't watching, so there's nothing to protect.
-    return { state: emptyNotice, navigateTo: entry.hash };
-  }
-
-  // Foreground: announce via the pill, coalescing onto the newest entry.
+  // Always announce via the pill, coalescing onto the newest entry; never
+  // auto-navigate. `focused` is intentionally unused (see file header).
+  void focused;
   return {
     state: {
       count: state.count + 1,

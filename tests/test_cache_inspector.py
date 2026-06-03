@@ -8,6 +8,11 @@ from pydata_core.paths import entry_dir
 from pydata_mcp.server import catalog_create, catalog_revise
 from pydata_xorq.build import list_entries
 
+# The cache pane is a React page (CachePage) backed by JSON: GET
+# /{project}/api/result_cache lists materialised parquets, DELETE
+# /{project}/api/result_cache/{hash} evicts one. These tests exercise that
+# contract; the rendering itself is the SPA's job.
+
 
 def _agg_code(project: str) -> str:
     return f"""
@@ -31,15 +36,18 @@ def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, 
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/cache")
+    r = c.get(f"/{project}/api/result_cache")
     assert r.status_code == 200
-    body = r.text
-    assert "Parquet result cache" in body
-    assert "shoe_sales" in body  # alias-name column
-    assert "Created" in body and "Size" in body
-    # every materialised entry's short hash appears
+    body = r.json()
+    aliases = [e["alias"] for e in body["entries"] if e["alias"]]
+    assert "shoe_sales" in aliases  # alias surfaced on the row
+    # every materialised entry shows up in the listing
+    listed = {e["hash"] for e in body["entries"]}
     for e in list_entries(project):
-        assert e["content_hash"][:12] in body
+        assert e["content_hash"] in listed
+    # rows carry size + created metadata for the table
+    assert all("size_formatted" in e and "created" in e for e in body["entries"])
+    assert "total_formatted" in body
 
 
 def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):
@@ -56,9 +64,9 @@ def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_
     assert (edir / "expr.py").exists()
 
     c = TestClient(fresh_companion_app)
-    r = c.post(f"/{project}/api/cache/delete/{h}")
+    r = c.delete(f"/{project}/api/result_cache/{h}")
     assert r.status_code == 200
-    assert r.json()["deleted"] == h
+    assert r.json()["hash"] == h
 
     assert not pq_path.exists()  # parquet gone
     assert (stat_cache / "marker").read_text() == "keep me"  # stat cache kept
@@ -72,9 +80,9 @@ def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_p
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
     c = TestClient(fresh_companion_app)
-    assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 200
+    assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 200
     # second delete: parquet already gone
-    assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 404
+    assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 404
 
 
 def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch):
@@ -85,15 +93,9 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
     assert pq_path.exists()
 
     c = TestClient(create_app(project, read_only=True))
-    # serve mode: the parquet must not be deletable...
-    assert c.post(f"/{project}/api/cache/delete/{h}").status_code == 403
+    # serve mode: the parquet must not be deletable.
+    assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 403
     assert pq_path.exists()  # untouched
-    # ...and no clickable delete button may render in the pane. (The
-    # deleteCache() JS helper and .del-btn CSS live in the always-emitted
-    # script/style blocks; the per-row onclick invocation is the gated affordance.)
-    body = c.get(f"/{project}/cache").text
-    assert "Parquet result cache" in body
-    assert 'onclick="deleteCache(' not in body
 
 
 def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_parquet, monkeypatch):
@@ -103,8 +105,6 @@ def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_
     # only ever resolve outside the entries tree, so reject it as a bad request
     # rather than letting it fall through to the "no result.parquet" 404 — that
     # 404 reads as "valid entry, already evicted", which a malformed hash isn't.
-    # (Dot-segments like ".." are normalised away by the client before routing,
-    # so the guard's job is the charset check, not path-traversal defence.)
     for bad in ("NOPE-not-a-hash", "Deadbeef", "abc def"):
-        r = c.post(f"/{project}/api/cache/delete/{bad}")
+        r = c.delete(f"/{project}/api/result_cache/{bad}")
         assert r.status_code == 400, f"{bad!r} should be a 400, got {r.status_code}"

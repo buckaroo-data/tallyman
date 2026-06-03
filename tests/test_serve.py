@@ -38,10 +38,13 @@ def test_read_only_mode_serves_get_routes(project: str, orders_parquet: Path):
 
 
 def test_read_only_mode_indicator_in_header(project: str):
+    # Serve mode enforces read-only at the API layer (403 on writes).
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog")
-    assert "read-only" in r.text
+    # Reads still work.
+    assert c.get(f"/{project}/api/entries").status_code == 200
+    # Project switching is rejected.
+    assert c.post("/api/projects/switch", json={"name": "other"}).status_code == 403
 
 
 def test_edit_mode_indicator_absent(fresh_companion_app, project: str):
@@ -121,8 +124,9 @@ def test_project_path_override_relocates_project(
     # Serve mode should render correctly against the relocated project.
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
-    assert "shoe_sales" in r.text
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
+    aliases = [e["alias"] for e in r.json()["entries"] if e["alias"]]
+    assert "shoe_sales" in aliases
+    r = c.get(f"/{project}/api/entry/{res.content_hash}")
     assert r.status_code == 200

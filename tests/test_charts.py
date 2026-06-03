@@ -114,22 +114,24 @@ def test_catalog_chart_invalid_spec(project: str, orders_parquet: Path, monkeypa
 
 
 def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: str, orders_parquet: Path):
+    """Entry API includes chart_spec when a chart has been attached."""
     res = build_and_persist(project, _agg_code(project))
     set_chart(project, res.content_hash, SAMPLE_SPEC)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/api/entry/{res.content_hash}")
     assert r.status_code == 200
-    assert "vega-embed" in r.text
-    assert '"mark": "bar"' in r.text or "&quot;mark&quot;: &quot;bar&quot;" in r.text
+    body = r.json()
+    assert body["chart_spec"] is not None
+    assert body["chart_spec"]["mark"] == "bar"
 
 
 def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str, orders_parquet: Path):
+    """Entry API returns null chart_spec when no chart is attached."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
-    # The .vega-embed CSS class is always in <style>; the rendering div
-    # with id="vega-chart-..." is what indicates a chart was attached.
-    assert f'id="vega-chart-{res.content_hash}"' not in r.text
+    r = c.get(f"/{project}/api/entry/{res.content_hash}")
+    assert r.status_code == 200
+    assert r.json()["chart_spec"] is None
 
 
 def test_api_data_endpoint(fresh_companion_app, project: str, orders_parquet: Path):

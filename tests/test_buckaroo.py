@@ -545,37 +545,22 @@ class _StubBuckaroo:
 
 
 def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, orders_parquet: Path):
+    """API returns buckaroo_session and buckaroo_ws_base when Buckaroo is running."""
     from pydata_companion import create_app
 
     res = build_and_persist(project, _code(project))
     bk: Any = _StubBuckaroo(session="abc123", port=8700)
     app = create_app(project, buckaroo=bk)
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/api/entry/{res.content_hash}")
     assert r.status_code == 200
-    assert 'class="buckaroo-embed"' in r.text
-    assert 'data-ws-url="ws://127.0.0.1:8700/ws/abc123"' in r.text
-    # Pandas preview is still in the page but tucked behind a <details>.
-    assert "<details" in r.text
-    assert "data-table" in r.text
-
-
-_EMBED_TAG = '<div\n        class="buckaroo-embed"'
-
-
-def test_entry_detail_falls_back_when_buckaroo_absent(fresh_companion_app, project: str, orders_parquet: Path):
-    res = build_and_persist(project, _code(project))
-    c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
-    assert r.status_code == 200
-    # The class name may appear inside build_metadata.json's captured git
-    # diff (HTML-escaped); check for the actual mount-div tag instead.
-    assert _EMBED_TAG not in r.text
+    body = r.json()
+    assert body["buckaroo_session"] == "abc123"
+    assert body["buckaroo_ws_base"] == "ws://127.0.0.1:8700"
 
 
 def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_parquet: Path):
-    """When ensure_session returns None (Buckaroo died or /load failed) the
-    page still renders — just falls back to the pandas preview."""
+    """When ensure_session returns None, API returns null for buckaroo fields."""
     from pydata_companion import create_app
 
     res = build_and_persist(project, _code(project))
@@ -590,7 +575,8 @@ def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_p
 
     app = create_app(project, buckaroo=_DownBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog/{res.content_hash}")
+    r = c.get(f"/{project}/api/entry/{res.content_hash}")
     assert r.status_code == 200
-    assert _EMBED_TAG not in r.text
-    assert "data-table" in r.text
+    body = r.json()
+    assert body["buckaroo_session"] is None
+    assert body["buckaroo_ws_base"] is None

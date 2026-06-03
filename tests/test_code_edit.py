@@ -84,41 +84,41 @@ def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch
     assert r.status_code == 403
 
 
-_BUTTON_HTML = 'class="edit-code-btn"'
-
-
-def test_entry_detail_renders_edit_code_button_for_named(
+def test_entry_detail_has_alias_for_named(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):
+    """Named entries include alias and code in the JSON API response."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{out['hash']}")
+    r = c.get(f"/{project}/api/entry/{out['hash']}")
     assert r.status_code == 200
-    assert _BUTTON_HTML in r.text
-    assert 'id="code-block"' in r.text
+    body = r.json()
+    assert body["alias"] == "shoe_sales"
+    assert body["code"].strip() != ""
 
 
-def test_entry_detail_omits_edit_button_for_scratch(
+def test_entry_detail_no_alias_for_scratch(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):
+    """Scratch entries have no alias in the JSON API response."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_run
 
     out = catalog_run(_agg(project), prompt="exploratory")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{out['hash']}")
-    # Note: build artifacts may include git-diff text that mentions the
-    # edit-code button HTML; we check for the rendered class string only.
-    assert _BUTTON_HTML not in r.text
+    r = c.get(f"/{project}/api/entry/{out['hash']}")
+    assert r.status_code == 200
+    assert r.json()["alias"] is None
 
 
 def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_parquet: Path, monkeypatch):
+    """read_only mode returns 403 on PUT /api/code/."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
-    out = catalog_create("shoe_sales", _agg(project))
+    catalog_create("shoe_sales", _agg(project))
     from pydata_companion import create_app
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog/{out['hash']}")
-    assert _BUTTON_HTML not in r.text
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _filter(project)})
+    assert r.status_code == 403

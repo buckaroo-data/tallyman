@@ -176,12 +176,14 @@ def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: P
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/diff/shoe_sales")
+    r = c.get(f"/{project}/api/diff_data/shoe_sales/1/2")
     assert r.status_code == 200
-    assert "shoe_sales" in r.text
-    assert "stats per column" in r.text
-    assert "head — side by side" in r.text
-    assert "schema" in r.text
+    body = r.json()
+    assert body["alias"] == "shoe_sales"
+    assert body["va"] == 1 and body["vb"] == 2
+    assert "stats" in body["diff"]
+    assert "schema" in body["diff"]
+    assert "head" in body["diff"]
 
 
 def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
@@ -189,32 +191,33 @@ def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: 
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/diff/shoe_sales/1/2")
+    r = c.get(f"/{project}/api/diff_data/shoe_sales/1/2")
     assert r.status_code == 200
-    assert "V1" in r.text and "V2" in r.text
+    body = r.json()
+    assert body["va"] == 1 and body["vb"] == 2
 
 
 def test_diff_route_single_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    # Only 1 version: requesting vb=2 is out of range → 404.
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/diff/shoe_sales")
-    assert r.status_code == 400
+    r = c.get(f"/{project}/api/diff_data/shoe_sales/1/2")
+    assert r.status_code == 404
 
 
 def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get(f"/{project}/diff/missing").status_code == 404
+    assert c.get(f"/{project}/api/diff_data/missing/1/2").status_code == 404
 
 
 def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    # Diffing a version against itself is nothing-to-diff — reject like the
-    # single-version case rather than rendering an all-equal diff.
+    # Diffing a version against itself is rejected.
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/diff/shoe_sales/2/2")
+    r = c.get(f"/{project}/api/diff_data/shoe_sales/2/2")
     assert r.status_code == 400
 
 

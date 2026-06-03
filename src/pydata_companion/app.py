@@ -111,6 +111,19 @@ def _dir_size(path: Path) -> int:
 _CONTENT_HASH_RE = re.compile(r"\A[0-9a-f]+\Z")
 
 
+def _require_hash(content_hash: str) -> None:
+    """Reject a content_hash path param that isn't lowercase hex.
+
+    A content hash names an entry dir, so it's lowercase hex. Anything else can
+    only ever resolve outside the entries tree — a junk value, or a "."/".."
+    segment that lands on a real dir with no manifest and 500s. A 400 reads
+    truer than the "not found" 404 those would otherwise hit. Endpoints that
+    also accept an alias must resolve the alias first, then guard the remainder.
+    """
+    if not _CONTENT_HASH_RE.match(content_hash):
+        raise HTTPException(400, f"malformed content hash {content_hash!r}")
+
+
 def _fmt_bytes(n: int) -> str:
     if n >= 1_000_000_000:
         return f"{n / 1_000_000_000:.2f} GB"
@@ -468,6 +481,7 @@ def create_app(
     @app.get("/{project}/api/data/{content_hash}")
     def api_data(project: str, content_hash: str, offset: int = 0, limit: int = 200):
         project = _validate_project(project)
+        _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
         entry = entry_dir(project, content_hash)
@@ -506,6 +520,8 @@ def create_app(
         if content_hash in aliases:
             alias = content_hash
             content_hash = aliases[alias]
+        else:
+            _require_hash(content_hash)
 
         entry = entry_dir(project, content_hash)
         if not entry.exists():
@@ -571,6 +587,7 @@ def create_app(
     @app.get("/{project}/api/lineage/{content_hash}")
     def api_lineage(project: str, content_hash: str):
         project = _validate_project(project)
+        _require_hash(content_hash)
         if not entry_dir(project, content_hash).exists():
             raise HTTPException(404)
         return {
@@ -619,6 +636,8 @@ def create_app(
         aliases = load_aliases(project)
         if content_hash in aliases:
             content_hash = aliases[content_hash]
+        else:
+            _require_hash(content_hash)
         if not entry_dir(project, content_hash).exists():
             raise HTTPException(404)
         lin = read_internal_lineage(project, content_hash)
@@ -877,11 +896,9 @@ def create_app(
         project = _validate_project(project)
         if read_only:
             raise HTTPException(403, "serve mode")
-        # content_hash names an entry dir, so it's lowercase hex. Reject any
-        # other charset up front — it can only ever resolve outside the entries
-        # tree, and a 400 reads truer than the "already evicted" 404 below.
-        if not _CONTENT_HASH_RE.match(content_hash):
-            raise HTTPException(400, f"malformed content hash {content_hash!r}")
+        # Reject a non-hex hash up front: a 400 reads truer than the
+        # "already evicted" 404 below (see _require_hash).
+        _require_hash(content_hash)
         p = entry_dir(project, content_hash) / "result.parquet"
         if not p.exists():
             raise HTTPException(404, "result.parquet not found")

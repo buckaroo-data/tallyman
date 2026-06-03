@@ -132,6 +132,12 @@ def build_and_persist(
     from xorq.common.utils.caching_utils import get_xorq_cache_dir
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
+    from pydata_xorq._git_state_guard import install_git_state_guard
+
+    # git-provenance capture in xorq's compiler can crash (git SIGSEGV when forked
+    # from the long-lived server) and abort the whole build. Make it best-effort.
+    install_git_state_guard()
+
     ensure_project(project)
 
     module, tmp_script = _import_script(code)

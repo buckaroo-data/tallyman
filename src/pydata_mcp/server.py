@@ -880,7 +880,7 @@ def project_list() -> dict:
         exists yet) and ``available`` (alphabetically-sorted list of
         every project name on disk).
     """
-    return {"active": resolve_project(), "available": list_projects()}
+    return {"active": _resolve_active_project(), "available": list_projects()}
 
 
 @mcp.tool()

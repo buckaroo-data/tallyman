@@ -236,6 +236,7 @@ def test_external_disk_change_does_not_override_in_process_project(
     set_active_project("beta")
     second = srv.project_list()
     assert second["project"] == "alpha"  # sticky to first-call value
+    assert second["active"] == "alpha"   # active field must match, not read disk
     assert "warning" not in second
 
 

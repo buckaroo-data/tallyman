@@ -22,7 +22,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
-def test_spa_catch_all_serves_index_html(fresh_companion_app, project: str):
+def test_spa_catch_all_serves_index_html(built_spa, fresh_companion_app, project: str):
     """UI routes return the React SPA index.html with a #root div."""
     c = TestClient(fresh_companion_app)
     for path in [
@@ -46,7 +46,7 @@ def test_api_routes_return_json_not_spa(fresh_companion_app, project: str):
     assert "entries" in body
 
 
-def test_unknown_project_spa_still_200(fresh_companion_app, project: str):
+def test_unknown_project_spa_still_200(built_spa, fresh_companion_app, project: str):
     """SPA catch-all serves for unknown project names; API returns 404."""
     c = TestClient(fresh_companion_app)
     # UI route: React app handles the unknown project gracefully

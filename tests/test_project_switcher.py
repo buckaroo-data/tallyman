@@ -165,7 +165,7 @@ def test_companion_picks_up_switch_without_restart(isolated_home: Path, orders_p
 # ---------------------------------------------------------------------------
 
 
-def test_empty_state_landing_when_no_projects(isolated_home: Path, monkeypatch):
+def test_empty_state_landing_when_no_projects(built_spa, isolated_home: Path, monkeypatch):
     """No projects → root serves the React SPA (empty state rendered client-side)."""
     monkeypatch.delenv("PYDATA_PROJECT", raising=False)
     assert not active_project_file_path().exists()

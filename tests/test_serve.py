@@ -26,7 +26,7 @@ def test_read_only_mode_rejects_notify(fresh_companion_app, project: str):
     assert r.status_code == 403
 
 
-def test_read_only_mode_serves_get_routes(project: str, orders_parquet: Path):
+def test_read_only_mode_serves_get_routes(built_spa, project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(project))
     set_alias(project, "shoe_sales", res.content_hash)
     app = create_app(project, read_only=True)
@@ -47,7 +47,7 @@ def test_read_only_mode_indicator_in_header(project: str):
     assert c.post("/api/projects/switch", json={"name": "other"}).status_code == 403
 
 
-def test_edit_mode_indicator_absent(fresh_companion_app, project: str):
+def test_edit_mode_indicator_absent(built_spa, fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/catalog")
     assert "read-only" not in r.text

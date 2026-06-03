@@ -50,6 +50,18 @@ mcp = FastMCP("pydata")
 # plan). ``None`` until the first tool call seeds it.
 _last_project: str | None = None
 
+# Session-local active project. Set in-process by project_switch/project_new
+# so that switching once is sticky for all subsequent calls in this MCP
+# process, regardless of what another Claude session or shell command writes to
+# ~/.pydata-app/active_project between calls. Falls back to the disk file if
+# never explicitly set (first run, or direct-file manipulation).
+_mcp_active_project: str | None = None
+
+
+def _resolve_active_project() -> str:
+    """Active project for this MCP process: in-process override beats disk."""
+    return _mcp_active_project or resolve_project()
+
 
 def _tag_project(fn):
     """Wrap a tool function so every response carries the active project.
@@ -72,9 +84,13 @@ def _tag_project(fn):
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
-        global _last_project
+        global _last_project, _mcp_active_project
         result = fn(*args, **kwargs)
-        current = resolve_project()
+        current = _resolve_active_project()
+        # Seed in-process state on the very first call so future calls are
+        # sticky even if the disk file changes after this point.
+        if _mcp_active_project is None:
+            _mcp_active_project = current
         if not isinstance(result, dict):
             result = {"items": result}
         result.setdefault("project", current)
@@ -148,12 +164,19 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         t.x.describe()        # No describe() — decompose into explicit aggregates.
         t.ts.dt.hour          # No .dt accessor — call .hour() directly on the column.
         t.select("*")         # No wildcard expansion — list columns or skip select().
-        t.select(ibis._, x=…) # No ibis._ wildcard — prefer mutate() for additions.
+        t.select(ibis._, x=…) # No ibis._ wildcard selector — prefer mutate() for additions.
         # CORRECT:
         t.aggregate(mean=t.x.mean(), std=t.x.std(), min=t.x.min(), max=t.x.max())
         t.mutate(h=t.ts.hour())
         t.select("col_a", "col_b")                                   # explicit columns
         t.mutate(new_col=t.x + 1)                                    # not select(ibis._, ...)
+
+    GOTCHAS — xorq vs ibis deferred accessor:
+
+        xo._.column_name       # AttributeError: module 'xorq' has no attribute '_'
+        # xorq has no `_` deferred proxy. Use ibis._:
+        ibis._.column_name     # correct — `ibis` from `import xorq.vendor.ibis as ibis`
+        t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat
 
     GOTCHAS — referencing aggregate columns:
 
@@ -240,7 +263,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     Returns:
         dict with keys: hash, row_count, execute_seconds, schema, entry_path.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     out = _run_and_record(project, code, prompt, tool="catalog_run")
     if "error" in out:
         return out
@@ -267,7 +290,7 @@ def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dic
     Returns:
         Same shape as catalog_run, plus `alias`/`version` when `name` is set.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     if name and get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
     code = f"from pydata_xorq.io import from_project\nexpr = from_project({rel_path!r})\n"
@@ -325,7 +348,7 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     Returns:
         Same shape as catalog_run, plus `alias` and `version`.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
     out = _run_and_record(project, code, prompt, tool="catalog_create")
@@ -358,7 +381,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
         code: A self-contained Python script that binds `expr`.
         prompt: Optional human-readable description of what changed.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     if get_alias(project, name) is None:
         return {"error": f"alias {name!r} does not exist. Use catalog_create to create it."}
     out = _run_and_record(project, code, prompt, tool="catalog_revise")
@@ -380,7 +403,7 @@ def catalog_alias(hash: str, name: str) -> dict:
     Use this when an entry was created via `catalog_run` and you decide
     post-hoc that it deserves a name. Errors if the alias already exists.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     if not entry_dir(project, hash).exists():
         return {"error": f"no catalog entry for hash {hash!r}"}
     if get_alias(project, name) is not None:
@@ -396,7 +419,7 @@ def catalog_alias(hash: str, name: str) -> dict:
 @_tag_project
 def catalog_rename(old_name: str, new_name: str) -> dict:
     """Rename an existing alias. Preserves version history and notebook position."""
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         info = rename_alias(project, old_name, new_name)
     except AliasNotFound:
@@ -417,7 +440,7 @@ def catalog_unalias(name: str) -> dict:
     Catalog entries themselves remain; only the named handle is dropped. Any
     notebook cells anchored on this alias are removed.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     if get_alias(project, name) is None:
         return {"error": f"alias {name!r} does not exist"}
     remove_alias(project, name)
@@ -432,7 +455,7 @@ def catalog_unalias(name: str) -> dict:
 @_tag_project
 def notebook_reorder(cell_id: str, new_index: int) -> dict:
     """Move a notebook cell to a new position (0-based)."""
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         cell = notebook.reorder(project, cell_id, new_index)
     except CellNotFound:
@@ -445,7 +468,7 @@ def notebook_reorder(cell_id: str, new_index: int) -> dict:
 @_tag_project
 def notebook_remove(cell_id: str) -> dict:
     """Remove a cell from the notebook. The underlying catalog entry is unaffected."""
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         notebook.remove(project, cell_id)
     except CellNotFound:
@@ -458,7 +481,7 @@ def notebook_remove(cell_id: str) -> dict:
 @_tag_project
 def notebook_edit_markdown(cell_id: str, markdown: str) -> dict:
     """Replace the markdown text shown above a cell."""
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         cell = notebook.edit_markdown(project, cell_id, markdown)
     except CellNotFound:
@@ -487,7 +510,7 @@ def catalog_chart(hash_or_alias: str, vega_spec: dict | str) -> dict:
          "encoding": {"x": {"field": "region", "type": "nominal"},
                       "y": {"field": "total", "type": "quantitative"}}}
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     target_hash = hash_or_alias
     if not entry_dir(project, target_hash).exists():
         resolved = get_alias(project, hash_or_alias)
@@ -514,7 +537,7 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
         name: An existing alias.
         va, vb: 1-based version indices, or negative for from-end (-1 = latest).
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     hashes = history_for(project, name)
     if not hashes:
         return {"error": f"alias {name!r} has no history"}
@@ -582,7 +605,7 @@ def catalog_add_summary_stat(name: str, source: str) -> dict:
         name: filename stem (no ``.py``). Must be a valid python identifier.
         source: the file body. Must define ``compute(col) -> ibis_expr``.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         path = write_stat(project, name, source)
     except StatSourceError as exc:
@@ -602,7 +625,7 @@ def catalog_remove_summary_stat(name: str) -> dict:
     sessions on the next load. To hard-delete, ``rm`` the file under
     ``stats/_disabled/`` manually.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     new_path = remove_stat(project, name)
     if new_path is None:
         return {"error": f"no stat named {name!r}"}
@@ -618,7 +641,7 @@ def catalog_list_summary_stats() -> list[dict]:
     Returns ``[{name, path, source, disabled}]`` sorted with active stats
     first, then disabled (parked) ones.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     return list_stats(project)
 
 
@@ -666,7 +689,7 @@ def catalog_add_post_processing(name: str, source: str) -> dict:
         name: filename stem (no ``.py``). Must be a valid python identifier.
         source: file body. Must define ``process(expr) -> ibis_expr | DataFrame``.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         path = write_post_processing(project, name, source)
     except PostProcessingSourceError as exc:
@@ -685,7 +708,7 @@ def catalog_remove_post_processing(name: str) -> dict:
     subdirectory is ignored by buckaroo's scanner so the option
     disappears from the dropdown on the next session load.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     new_path = remove_post_processing(project, name)
     if new_path is None:
         return {"error": f"no post-processing named {name!r}"}
@@ -701,7 +724,7 @@ def catalog_list_post_processings() -> list[dict]:
     Returns ``[{name, path, source, disabled}]`` sorted with active
     entries first, then disabled (parked) ones.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     return list_post_processings(project)
 
 
@@ -743,7 +766,7 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
         dict with keys: ``entry`` (resolved hash), ``row_count``, ``columns``,
         ``preview`` (first 20 rows as list-of-dicts). On error, ``{"error": ...}``.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         return run_post_processing(project, entry, code)
     except PostProcessingRunError as exc:
@@ -767,7 +790,7 @@ def catalog_export_marimo() -> dict:
         dict with keys: ``path`` (absolute path of the written file),
         ``cells`` (number of notebook cells exported).
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     try:
         path = export_notebook_path(project)
     except Exception as exc:
@@ -787,7 +810,7 @@ def catalog_list() -> list[dict]:
     corresponds to a named version. Scratch entries (no alias) are also
     included.
     """
-    project = resolve_project()
+    project = _resolve_active_project()
     entries = list_entries(project)
     for e in entries:
         a = alias_for_hash(project, e["content_hash"])
@@ -886,7 +909,11 @@ def project_switch(name: str) -> dict:
         project_switch("forecast-q3") # all subsequent catalog_* calls
                                        # now target forecast-q3
     """
-    return _companion_post("/api/projects/switch", {"name": name})
+    global _mcp_active_project
+    result = _companion_post("/api/projects/switch", {"name": name})
+    if "error" not in result:
+        _mcp_active_project = name
+    return result
 
 
 @mcp.tool()
@@ -912,7 +939,11 @@ def project_new(name: str, with_fixture: bool = False) -> dict:
         ``{"error": "..."}`` on transport failure, invalid name (400),
         or collision (409).
     """
-    return _companion_post("/api/projects/new", {"name": name, "with_fixture": with_fixture})
+    global _mcp_active_project
+    result = _companion_post("/api/projects/new", {"name": name, "with_fixture": with_fixture})
+    if "error" not in result:
+        _mcp_active_project = name
+    return result
 
 
 @mcp.prompt()

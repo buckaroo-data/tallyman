@@ -73,21 +73,29 @@ def _user_imports_bare_ibis(code: str) -> bool:
 
 
 def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
-    """Actionable hint when the user mixed `import ibis` with xorq.
+    """Actionable hint for the three most common ibis/xorq import mistakes.
 
-    Two signals — either one triggers the hint:
+    Signals:
       1. User code contains a bare `import ibis` / `from ibis ...`.
-      2. The exception message names xorq's vendored Expr class (the build
-         validator's signature for the same mistake — the expression was
-         constructed against `ibis.expr.types.core.Expr` instead of
-         `xorq.vendor.ibis.expr.types.core.Expr`).
+      2. The exception message names xorq's vendored Expr class (expression
+         built against the wrong ibis instance).
+      3. `xorq._` used instead of `ibis._` (xorq has no `_` deferred proxy;
+         it lives on `xorq.vendor.ibis`).
     """
     has_bad_import = _user_imports_bare_ibis(code)
     has_expr_mismatch = (
         "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
     )
-    if not (has_bad_import or has_expr_mismatch):
+    has_xorq_underscore = (
+        "has no attribute '_'" in exc_msg and "xorq" in exc_msg
+    )
+    if not (has_bad_import or has_expr_mismatch or has_xorq_underscore):
         return ""
+    if has_xorq_underscore and not has_bad_import:
+        return (
+            "\n\nHint: `xorq` has no `_` deferred accessor. Use `ibis._` "
+            "where `ibis` comes from `import xorq.vendor.ibis as ibis`."
+        )
     return (
         "\n\nHint: this usually means the expression was built using "
         "`import ibis` instead of `import xorq.vendor.ibis as ibis`. "

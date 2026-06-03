@@ -19,7 +19,6 @@ from typing import Any
 import pytest
 
 from pydata_core import StatSourceError, list_stats, remove_stat, write_stat
-from pydata_core.paths import project_dir
 from pydata_core.summary_stats import stats_dir, validate_stat_source
 
 PERCENT_AT_SIGN = "def compute(col):\n    return col.cast('string').contains('@').sum() / col.count()\n"
@@ -138,7 +137,10 @@ expr = t.group_by("region").aggregate(n=t.count())
 
     posted_project_root = captured["json"].get("project_root")
     assert posted_project_root is not None
-    assert Path(posted_project_root) == project_dir(project)
+    # project_root must point to artifacts_dir so buckaroo finds
+    # stats/ and post_processing/ under it.
+    from pydata_core.paths import artifacts_dir
+    assert Path(posted_project_root) == artifacts_dir(project)
 
 
 # ---------------------------------------------------------------------------

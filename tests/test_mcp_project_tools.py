@@ -216,15 +216,14 @@ def test_project_list_includes_project_field(isolated_home: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_switch_warning_emitted_when_project_changes_between_calls(
+def test_external_disk_change_does_not_override_in_process_project(
     isolated_home: Path,
 ):
-    """Two tool calls with the active-project file changing between them:
-    the second response carries the documented warning string."""
+    """Once the MCP server seeds its in-process project on the first tool call,
+    external writes to the active-project file have no effect — the session is
+    sticky to whatever project was active on the first call (or was set via
+    project_switch)."""
     from pydata_mcp import server as srv
-
-    # Reset module state so test order doesn't matter.
-    srv._last_project = None
 
     ensure_project("alpha")
     ensure_project("beta")
@@ -233,13 +232,42 @@ def test_switch_warning_emitted_when_project_changes_between_calls(
     assert first["project"] == "alpha"
     assert "warning" not in first  # first call: no warning, just seed
 
+    # External disk change — should NOT affect the in-process session.
     set_active_project("beta")
     second = srv.project_list()
-    assert second["project"] == "beta"
-    assert "warning" in second
-    assert second["warning"] == (
-        "active project changed from 'alpha' to 'beta' since the last call; proceeding with 'beta'"
-    )
+    assert second["project"] == "alpha"  # sticky to first-call value
+    assert "warning" not in second
+
+
+def test_switch_warning_emitted_when_project_switch_called(
+    isolated_home: Path, monkeypatch
+):
+    """project_switch() updates _mcp_active_project so subsequent calls see
+    the new project; the switch response itself carries the change warning."""
+    from pydata_mcp import server as srv
+
+    ensure_project("alpha")
+    ensure_project("beta")
+    set_active_project("alpha")
+
+    # Seed in-process project via a regular tool call.
+    srv.project_list()
+    assert srv._mcp_active_project == "alpha"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"previous": "alpha", "active": "beta"})
+
+    monkeypatch.setattr(srv.httpx, "Client", _mock_transport(handler))
+    switched = srv.project_switch("beta")
+    # The switch response warns that the project changed.
+    assert switched["project"] == "beta"
+    assert "warning" in switched
+    assert "alpha" in switched["warning"] and "beta" in switched["warning"]
+
+    # Subsequent calls use the new project without further warnings.
+    next_call = srv.project_list()
+    assert next_call["project"] == "beta"
+    assert "warning" not in next_call
 
 
 def test_no_warning_when_project_unchanged(isolated_home: Path):
@@ -254,10 +282,12 @@ def test_no_warning_when_project_unchanged(isolated_home: Path):
 
 
 @pytest.fixture(autouse=True)
-def _reset_last_project():
-    """Each test starts with a clean module-level last-project state."""
+def _reset_mcp_server_state():
+    """Each test starts with clean module-level MCP server state."""
     from pydata_mcp import server as srv
 
     srv._last_project = None
+    srv._mcp_active_project = None
     yield
     srv._last_project = None
+    srv._mcp_active_project = None

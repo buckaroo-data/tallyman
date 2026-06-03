@@ -75,11 +75,19 @@ function MarkdownCell({
   }
 
   if (rendered) {
-    return <div className="nb-markdown" dangerouslySetInnerHTML={{ __html: rendered }} />;
+    return (
+      <div
+        className="nb-markdown"
+        title="click to edit"
+        style={{ cursor: "text" }}
+        onClick={() => setEditing(true)}
+        dangerouslySetInnerHTML={{ __html: rendered }}
+      />
+    );
   }
   return (
-    <div className="nb-markdown">
-      <em className="meta">(no markdown — click edit to add a note)</em>
+    <div className="nb-markdown" style={{ cursor: "text" }} onClick={() => setEditing(true)}>
+      <em className="meta">(click to add a note)</em>
     </div>
   );
 }

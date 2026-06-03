@@ -90,6 +90,20 @@ export function DiffPage() {
           </p>
         </div>
 
+        {/* Keyed-diff zero-match warning */}
+        {diff.keyed && diff.keyed.matched === 0 && (diff.keyed.only_before > 0 || diff.keyed.only_after > 0) && (
+          <div style={{
+            background: "#3a2000",
+            border: "1px solid #b86a00",
+            borderRadius: 4,
+            padding: "8px 12px",
+            fontSize: 13,
+            color: "#ffc266",
+          }}>
+            <strong>Key mismatch:</strong> the auto-detected key ({diff.keyed.keys.map(k => <code key={k} style={{ margin: "0 2px" }}>{k}</code>)}) matched 0 of {diff.keyed.only_before + diff.keyed.only_after} rows across both versions — every value changed, so this column is not a stable join key. The keyed diff table below is not meaningful. The stats and head comparison are still accurate.
+          </div>
+        )}
+
         {/* Schema summary */}
         <div style={{ display: "flex", gap: 16, flexWrap: "wrap", fontSize: 13 }}>
           <span className="meta">

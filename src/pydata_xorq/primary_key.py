@@ -109,8 +109,15 @@ def resolve_primary_key(
     from pydata_xorq.result_cache import cached_result_expr
 
     expr = cached_result_expr(project, content_hash)
-    keys = _detect_pk_xorq(
-        expr, threshold=threshold, max_group=max_group, columns=list(cols)) or []
+    # _rank_pk_xorq re-sorts candidates by distinctness regardless of the order we
+    # pass, so reordering doesn't help.  Instead: try _pk-named columns in isolation
+    # first (they're likely explicit PKs), then fall back to the full column set.
+    pk_cols = [c for c in cols if "_pk" in c]
+    keys = (pk_cols and _detect_pk_xorq(
+        expr, threshold=threshold, max_group=max_group, columns=pk_cols)) or []
+    if not keys:
+        keys = _detect_pk_xorq(
+            expr, threshold=threshold, max_group=max_group, columns=list(cols)) or []
     _write_cached(project, content_hash, keys)
     return keys
 

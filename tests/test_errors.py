@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from pydata_core import get_error, list_errors, record_error
+from pydata_core import clear_errors, get_error, list_errors, record_error
 from pydata_mcp.server import catalog_run
 
 
@@ -146,3 +146,36 @@ expr = t.group_by("region").aggregate(n=t.count())
     error_r = c.get(f"/{project}/api/error/{rec['id']}")
     assert error_r.status_code == 200
     assert error_r.json()["error"]["tool"] == "catalog_run"
+
+
+def test_clear_errors_removes_all(project: str):
+    record_error(project, code="a", message="m1")
+    record_error(project, code="b", message="m2")
+    cleared = clear_errors(project)
+    assert cleared == 2
+    assert list_errors(project) == []
+
+
+def test_clear_errors_empty_is_noop(project: str):
+    assert clear_errors(project) == 0
+
+
+def test_companion_clear_errors_route(fresh_companion_app, project: str):
+    record_error(project, code="x", message="boom")
+    record_error(project, code="y", message="bang")
+    c = TestClient(fresh_companion_app)
+    r = c.delete(f"/{project}/api/errors")
+    assert r.status_code == 200
+    assert r.json()["cleared"] == 2
+    # Errors stay gone across subsequent reads (the bug being fixed: a
+    # client-only dismiss reappeared on every page visit).
+    assert c.get(f"/{project}/api/errors").json()["errors"] == []
+
+
+def test_companion_clear_errors_serve_mode_403(project: str):
+    record_error(project, code="x", message="boom")
+    from pydata_companion import create_app
+
+    app = create_app(project, read_only=True)
+    c = TestClient(app)
+    assert c.delete(f"/{project}/api/errors").status_code == 403

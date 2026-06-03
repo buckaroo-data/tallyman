@@ -28,18 +28,23 @@ describe("receiveNewEntry", () => {
     expect(r.state.alias).toBe("latest");
   });
 
-  it("background: navigates directly so the result is on screen on return", () => {
-    const r = receiveNewEntry(emptyNotice, { hash: "xyz" }, false);
-    expect(r.navigateTo).toBe("xyz");
-    // No pill accumulates while backgrounded — the view already moved.
-    expect(r.state).toEqual(emptyNotice);
+  it("background: announces via a pill and never auto-navigates", () => {
+    // The viewer parked on a second monitor is permanently backgrounded; it
+    // must still raise the pill rather than silently moving the view (#27
+    // follow-up). The pill never navigates on its own, so the view is safe.
+    const r = receiveNewEntry(emptyNotice, { hash: "xyz", alias: "orders" }, false);
+    expect(r.navigateTo).toBeNull();
+    expect(r.state.count).toBe(1);
+    expect(r.state.hash).toBe("xyz");
+    expect(r.state.alias).toBe("orders");
   });
 
-  it("background: a direct navigation clears any pending foreground pill", () => {
+  it("background: coalesces onto a pending pill instead of clearing it", () => {
     const pending = receiveNewEntry(emptyNotice, { hash: "a" }, true).state;
     expect(pending.count).toBe(1);
     const r = receiveNewEntry(pending, { hash: "b" }, false);
-    expect(r.navigateTo).toBe("b");
-    expect(r.state).toEqual(emptyNotice);
+    expect(r.navigateTo).toBeNull();
+    expect(r.state.count).toBe(2);
+    expect(r.state.hash).toBe("b");
   });
 });

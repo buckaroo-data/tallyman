@@ -871,9 +871,12 @@ def _companion_post(path: str, payload: dict) -> dict:
 def project_list() -> dict:
     """List every project on disk and report which one is active.
 
-    Read-only; reads the active-project file and the projects directory
-    directly. Works when the companion process isn't running, so this is
-    the safe tool to call before deciding whether to switch.
+    Read-only. ``active`` reflects this process's sticky in-process
+    project (consistent with every other tool), falling back to the
+    active-project file only if it was never explicitly set; ``available``
+    is read from the projects directory on disk. Works when the companion
+    process isn't running, so this is the safe tool to call before
+    deciding whether to switch.
 
     Returns:
         dict with keys: ``active`` (project name, or ``None`` if no file

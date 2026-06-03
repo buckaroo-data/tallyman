@@ -92,8 +92,10 @@ def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_hom
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
-    assert "by_region" in r.text
-    r = c.get(f"/{project}/catalog/{h}")
+    aliases = [e["alias"] for e in r.json()["entries"] if e["alias"]]
+    assert "by_region" in aliases
+    r = c.get(f"/{project}/api/entry/{h}")
     assert r.status_code == 200
+    assert r.json()["content_hash"] == h

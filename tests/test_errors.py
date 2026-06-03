@@ -45,24 +45,26 @@ def test_catalog_run_failure_records_error(project: str, monkeypatch):
 def test_companion_catalog_renders_errors(fresh_companion_app, project: str):
     record_error(project, code="x", message="boom please notice me", prompt="p")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/errors")
     assert r.status_code == 200
-    assert "build failures" in r.text
-    assert "boom please notice me" in r.text
+    body = r.json()
+    messages = [e["message"] for e in body["errors"]]
+    assert any("boom please notice me" in m for m in messages)
 
 
 def test_companion_error_detail_route(fresh_companion_app, project: str):
     rec = record_error(project, code="x = 1\nexpr = nope", message="full traceback here")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/errors/{rec['id']}")
+    r = c.get(f"/{project}/api/error/{rec['id']}")
     assert r.status_code == 200
-    assert "full traceback here" in r.text
-    assert "expr = nope" in r.text
+    body = r.json()
+    assert "full traceback here" in body["error"]["message"]
+    assert "expr = nope" in body["error"]["code"]
 
 
 def test_companion_error_detail_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
-    assert c.get(f"/{project}/errors/missing").status_code == 404
+    assert c.get(f"/{project}/api/error/missing").status_code == 404
 
 
 def test_companion_api_errors(fresh_companion_app, project: str):
@@ -104,21 +106,22 @@ def test_catalog_create_failure_records_tool_name(project: str, monkeypatch):
 def test_catalog_banner_shows_tool_pill(fresh_companion_app, project: str):
     record_error(project, code="x", message="boom", tool="catalog_revise")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/errors")
     assert r.status_code == 200
-    assert "catalog_revise" in r.text
+    tools = [e["tool"] for e in r.json()["errors"]]
+    assert "catalog_revise" in tools
 
 
 def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
     rec = record_error(project, code="x", message="boom", tool="catalog_run")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/errors/{rec['id']}")
-    assert "tool: catalog_run" in r.text
+    r = c.get(f"/{project}/api/error/{rec['id']}")
+    assert r.status_code == 200
+    assert r.json()["error"]["tool"] == "catalog_run"
 
 
 def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_parquet, monkeypatch):
-    """The error-detail sidebar also gets the full catalog list, with no
-    current-highlight (errors aren't catalog entries)."""
+    """Entries and error APIs return independent data for the React sidebar."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create
 
@@ -132,11 +135,14 @@ expr = t.group_by("region").aggregate(n=t.count())
     )
     rec = record_error(project, code="x", message="boom", tool="catalog_run")
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/errors/{rec['id']}")
-    assert "named (" in r.text
-    assert "shoe_sales" in r.text
-    # No item should be highlighted on an error-detail page — `aria-current`
-    # is the cleanest signal; the `.current` CSS rule lives in base.html so
-    # it always matches and isn't a useful check.
-    assert 'aria-current="page"' not in r.text
-    assert "← back to catalog" not in r.text
+
+    # Entries endpoint has the named entry.
+    entries_r = c.get(f"/{project}/api/entries")
+    assert entries_r.status_code == 200
+    aliases = [e["alias"] for e in entries_r.json()["entries"] if e["alias"]]
+    assert "shoe_sales" in aliases
+
+    # Error endpoint has the error.
+    error_r = c.get(f"/{project}/api/error/{rec['id']}")
+    assert error_r.status_code == 200
+    assert error_r.json()["error"]["tool"] == "catalog_run"

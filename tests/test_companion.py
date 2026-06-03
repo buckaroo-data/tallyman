@@ -24,20 +24,19 @@ def test_root_redirects(fresh_companion_app, project: str):
 
 
 def test_catalog_empty(fresh_companion_app, project: str):
+    # UI routes now serve the React SPA; data checks go through the API.
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
-    assert "no entries yet" in r.text
+    assert r.json()["entries"] == []
 
 
 def test_unknown_project_404s(fresh_companion_app, project: str):
-    """A /{project}/... route for a project not on disk must 404, not fall
-    through to an empty catalog. ``resolve_project()`` echoes its explicit
-    argument verbatim, so ``_validate_project`` can't lean on it."""
+    """Project validation happens at the API layer; UI routes serve the SPA."""
     c = TestClient(fresh_companion_app)
-    assert c.get(f"/{project}/catalog").status_code == 200  # the real project resolves
-    assert c.get("/nope/catalog").status_code == 404  # unknown but well-formed name
-    assert c.get("/Bad-NAME/catalog").status_code == 404  # name fails the syntax rule
+    assert c.get(f"/{project}/api/entries").status_code == 200  # valid project
+    assert c.get("/nope/api/entries").status_code == 404         # unknown project
+    assert c.get("/Bad-NAME/api/entries").status_code == 404     # invalid name
 
 
 def test_api_entries_empty(fresh_companion_app, project: str):
@@ -50,28 +49,35 @@ def test_api_entries_empty(fresh_companion_app, project: str):
 def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_parquet: Path):
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
-    assert h in r.text
-    assert "by region" in r.text
+    entries = r.json()["entries"]
+    hashes = [e["content_hash"] for e in entries]
+    assert h in hashes
+    prompts = [e["prompt"] for e in entries]
+    assert "by region" in prompts
 
 
 def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_parquet: Path):
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{h}")
+    r = c.get(f"/{project}/api/entry/{h}")
     assert r.status_code == 200
-    assert h in r.text
-    assert "region" in r.text  # column header
-    assert "data-table" in r.text
+    body = r.json()
+    assert body["content_hash"] == h
+    col_names = [f["name"] for f in body["schema"]["fields"]]
+    assert "region" in col_names
+
+    # Data endpoint still serves rows.
+    rd = c.get(f"/{project}/api/data/{h}")
+    assert rd.status_code == 200
+    assert rd.json()["total"] > 0
 
 
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):
-    """Sidebar shows full catalog (named/forensic/scratch sections) on every
-    detail page; the currently-displayed entry is highlighted via a .current
-    class and aria-current."""
+    """Entries API returns named/forensic/scratch entries with correct flags."""
     monkeypatch.setenv("PYDATA_PROJECT", project)
     from pydata_mcp.server import catalog_create, catalog_run
 
@@ -93,42 +99,53 @@ expr = t.order_by("region")
     )
 
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{scratch['hash']}")
+    r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
-    # Section headers are rendered on the detail-page sidebar too.
-    assert "named (" in r.text
-    assert "scratch (" in r.text
-    # The currently-viewed entry is the scratch one — it gets .current.
-    assert 'class="scratch current"' in r.text
-    assert 'aria-current="page"' in r.text
-    # And the named entry is NOT marked current.
-    assert 'class="named current"' not in r.text
-    assert "← back to catalog" not in r.text  # the old stub is gone
+    entries = r.json()["entries"]
+    named = [e for e in entries if e["alias"] and e["is_current"]]
+    scratches = [e for e in entries if not e["alias"]]
+    assert any(e["alias"] == "shoe_sales" for e in named)
+    assert any(e["content_hash"] == scratch["hash"] for e in scratches)
 
 
 def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, orders_parquet: Path):
-    """T-14: build artifacts (expr.yaml etc) are visible from the UI, with
-    the portable ${PYDATA_PROJECT_ROOT} placeholder still in the text."""
+    """Build artifacts (expr.yaml etc) appear in the entry JSON."""
     h = _build_one(project, orders_parquet)
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/{h}")
-    assert "build artifacts" in r.text
-    assert "expr.yaml" in r.text
-    # The portable build references ${PYDATA_PROJECT_ROOT}, not absolute paths.
-    assert "${PYDATA_PROJECT_ROOT}" in r.text
+    r = c.get(f"/{project}/api/entry/{h}")
+    assert r.status_code == 200
+    body = r.json()
+    artifact_names = [a["name"] for a in body["build_artifacts"]]
+    assert any("yaml" in n for n in artifact_names)
+    # Portable build references ${PYDATA_PROJECT_ROOT}, not absolute paths.
+    artifact_texts = " ".join(a["text"] for a in body["build_artifacts"])
+    assert "${PYDATA_PROJECT_ROOT}" in artifact_texts
 
 
-def test_entry_detail_missing_redirects_to_catalog(fresh_companion_app, project: str):
-    # Stale URLs (post-restart, post-prune) self-heal: 303 to /{project}/catalog
-    # with the missing hash threaded through as a flash, not a hard 404.
+def test_entry_detail_missing_returns_404(fresh_companion_app, project: str):
+    """Unknown hashes return 404 from the API (React app handles the UI gracefully)."""
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/catalog/deadbeef", follow_redirects=False)
-    assert r.status_code == 303
-    assert r.headers["location"] == f"/{project}/catalog?missing=deadbeef"
-    # Followed: lands on catalog page and surfaces the missing hash.
-    r2 = c.get(f"/{project}/catalog/deadbeef")
-    assert r2.status_code == 200
-    assert "deadbeef" in r2.text
+    assert c.get(f"/{project}/api/entry/deadbeef").status_code == 404
+
+
+def test_read_endpoints_reject_malformed_content_hash(fresh_companion_app, project: str):
+    """Non-hex content_hash params 400, not a misleading 404 (or 500).
+
+    A content hash names an entry dir, so it's lowercase hex — the same guard the
+    cache-delete route already applies. The read endpoints let junk fall through
+    to a "not found" 404, and a "." / ".." segment could even 500 by resolving
+    onto a real dir with no manifest. ``deadbeef`` (valid hex but absent) still
+    404s, and aliases still resolve on the routes that accept them (test_aliases
+    covers that) — only the charset is rejected here.
+    """
+    c = TestClient(fresh_companion_app)
+    for path in [
+        f"/{project}/api/data/NOPE",
+        f"/{project}/api/entry/Deadbeef",          # uppercase: not lowercase hex
+        f"/{project}/api/lineage/not-a-hash",
+        f"/{project}/api/lineage_layout/not-a-hash",
+    ]:
+        assert c.get(path).status_code == 400, path
 
 
 def test_internal_notify_returns_subscriber_count(fresh_companion_app):

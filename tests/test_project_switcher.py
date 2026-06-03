@@ -147,20 +147,17 @@ def test_api_projects_new_400_on_invalid_name(isolated_home: Path):
 
 
 def test_companion_picks_up_switch_without_restart(isolated_home: Path, orders_parquet: Path):
-    """Switching projects via the API changes what /catalog renders, without
-    rebuilding the app. Validates the closure-capture removal."""
+    """Switching projects via the API updates the active project without restarting."""
     ensure_project("alpha")
     ensure_project("beta")
     set_active_project("alpha")
     app = create_app()
     c = TestClient(app)
 
-    r1 = c.get("/alpha/catalog")
-    assert "alpha" in r1.text  # header shows active project
-
+    assert c.get("/api/projects").json()["active"] == "alpha"
     c.post("/api/projects/switch", json={"name": "beta"})
-    r2 = c.get("/beta/catalog")
-    assert "beta" in r2.text
+    assert c.get("/api/projects").json()["active"] == "beta"
+    assert c.get("/beta/api/entries").status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -168,17 +165,18 @@ def test_companion_picks_up_switch_without_restart(isolated_home: Path, orders_p
 # ---------------------------------------------------------------------------
 
 
-def test_empty_state_landing_when_no_projects(isolated_home: Path, monkeypatch):
-    """No projects, no file, no env → companion serves landing page for /
-    and routes for /api/projects/new still work."""
+def test_empty_state_landing_when_no_projects(built_spa, isolated_home: Path, monkeypatch):
+    """No projects → root serves the React SPA (empty state rendered client-side)."""
     monkeypatch.delenv("PYDATA_PROJECT", raising=False)
     assert not active_project_file_path().exists()
     app = create_app()
     c = TestClient(app, follow_redirects=False)
     r = c.get("/")
     assert r.status_code == 200
-    # Page is the landing form — text won't be the catalog/notebook chrome.
-    assert "create" in r.text.lower() or "new project" in r.text.lower()
+    # React SPA serves; empty state is handled client-side.
+    assert '<div id="root">' in r.text
+    # API confirms no active project
+    assert c.get("/api/projects").json()["active"] is None
 
 
 def test_empty_state_landing_creates_first_project(isolated_home: Path, monkeypatch):
@@ -232,30 +230,31 @@ def test_sse_project_switched_event_fires(isolated_home: Path):
 
 
 def test_chrome_renders_dropdown_in_writable_mode(isolated_home: Path):
+    """In writable mode, project switching API works and no 403 is returned."""
     ensure_project("alpha")
+    ensure_project("beta")
     set_active_project("alpha")
     app = create_app()
     c = TestClient(app)
-    r = c.get("/alpha/catalog")
+    r = c.get("/api/projects")
     assert r.status_code == 200
-    # The dropdown and + new button are present in normal mode.
-    assert 'id="project-select"' in r.text
-    assert 'id="new-project-btn"' in r.text
-    # Body carries the active-project tag for the SSE filter.
-    assert 'data-active-project="alpha"' in r.text
+    body = r.json()
+    assert body["active"] == "alpha"
+    assert "alpha" in body["available"]
+    # Switch works (not 403) in writable mode.
+    r2 = c.post("/api/projects/switch", json={"name": "beta"})
+    assert r2.status_code == 200
 
 
 def test_chrome_hides_switcher_in_read_only_mode(isolated_home: Path, orders_parquet: Path):
-    """pydata serve mode: dropdown and + new button are gone, replaced by the
-    static `project: <name>` label."""
+    """pydata serve mode: project switching is rejected (403)."""
     ensure_project("alpha")
     set_active_project("alpha")
     app = create_app(read_only=True)
     c = TestClient(app)
-    r = c.get("/alpha/catalog")
-    assert r.status_code == 200
-    assert 'id="project-select"' not in r.text
-    assert 'id="new-project-btn"' not in r.text
-    # Static label still shows which project we're viewing.
-    assert "project: alpha" in r.text
-    assert "serve mode" in r.text
+    # Reads work in read_only mode.
+    assert c.get("/alpha/api/entries").status_code == 200
+    # Project switching is rejected.
+    ensure_project("beta")
+    r = c.post("/api/projects/switch", json={"name": "beta"})
+    assert r.status_code == 403

@@ -75,6 +75,7 @@ def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, order
     if older.exists():
         older.unlink()
     c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/diff/proj/1/2")
+    r = c.get(f"/{project}/api/diff_data/proj/1/2")
     assert r.status_code == 200
-    assert "stats per column" in r.text or "data-ws-url" in r.text
+    diff = r.json()["diff"]
+    assert "stats" in diff or "keyed" in diff

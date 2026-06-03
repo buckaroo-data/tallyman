@@ -8,11 +8,10 @@ on:
 
 # CI runs three sequential jobs: lint → fast tests → integration tests.
 #
-# - The embed bundle (Vite, packages/embed/) is NOT built in CI. Python
-#   tests reference /static/buckaroo-embed.js by URL only (test_fouc.py
-#   asserts on the *string* in rendered HTML, not on actually serving
-#   the file). If a test ever loads the bundle, add a Node + pnpm step
-#   before fast.
+# - The React SPA (packages/app/) IS built in the fast job: the SPA-serving
+#   tests assert the real built index.html (#root div), so dist/ must exist
+#   or create_app's catch-all returns 503. The embed bundle (packages/embed/)
+#   is still NOT built — nothing serves it under test.
 # - Integration tests spawn the real buckaroo Tornado subprocess via
 #   pydata's BuckarooManager. buckaroo==0.14.6 is pinned in
 #   pyproject.toml as a normal PyPI dep, so plain `uv sync` is enough.
@@ -40,6 +39,19 @@ jobs:
       - uses: astral-sh/setup-uv@v3
         with:
           enable-cache: true
+      # The SPA-serving tests hit create_app's catch-all, which reads
+      # packages/app/dist/index.html. Build it here (pnpm 9 matches the
+      # lockfileVersion 9.0) so those routes return the page, not a 503.
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+          cache-dependency-path: packages/app/pnpm-lock.yaml
+      - name: build React SPA
+        run: pnpm -C packages/app install --frozen-lockfile && pnpm -C packages/app build
       - name: sync deps
         run: uv sync
       - name: pytest (fast)

@@ -56,3 +56,20 @@ def fresh_companion_app(project: str):
     from pydata_companion import create_app
 
     return create_app(project)
+
+
+@pytest.fixture
+def built_spa():
+    """Skip when the React SPA hasn't been built.
+
+    The SPA-serving routes (``/`` with no project, and the catch-all behind
+    every UI path) read ``packages/app/dist/index.html``, which is gitignored
+    and only exists after ``pnpm -C packages/app build``. CI builds it before
+    the fast suite; a bare local ``pytest`` would otherwise see these tests
+    fail with the 503 "React app not built" response. Tests that assert on
+    served SPA HTML depend on this fixture so they skip cleanly instead.
+    """
+    from pydata_companion.app import _REACT_DIST
+
+    if not (_REACT_DIST / "index.html").exists():
+        pytest.skip("React SPA not built — run `pnpm -C packages/app build`")

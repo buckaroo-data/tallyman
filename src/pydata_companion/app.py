@@ -14,7 +14,6 @@ import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
@@ -46,8 +45,12 @@ from pydata_xorq.layout import layered_positions
 log = logging.getLogger("pydata.companion")
 
 PKG_DIR = Path(__file__).resolve().parent
-TEMPLATES_DIR = PKG_DIR / "templates"
 STATIC_DIR = PKG_DIR / "static"
+
+# React SPA dist relative to the repo root (parents[2] == repo root from
+# src/pydata_companion/app.py). Works for dev; when installed as a package
+# without a bundled dist the server returns 503 with a helpful build message.
+_REACT_DIST = Path(__file__).resolve().parents[2] / "packages" / "app" / "dist"
 
 
 class NotifyPayload(BaseModel):
@@ -106,6 +109,19 @@ def _dir_size(path: Path) -> int:
 # (xorq's build_path.name; same charset lineage.catalog_parents matches). Used
 # to reject path-param junk before it can name anything under the entries tree.
 _CONTENT_HASH_RE = re.compile(r"\A[0-9a-f]+\Z")
+
+
+def _require_hash(content_hash: str) -> None:
+    """Reject a content_hash path param that isn't lowercase hex.
+
+    A content hash names an entry dir, so it's lowercase hex. Anything else can
+    only ever resolve outside the entries tree — a junk value, or a "."/".."
+    segment that lands on a real dir with no manifest and 500s. A 400 reads
+    truer than the "not found" 404 those would otherwise hit. Endpoints that
+    also accept an alias must resolve the alias first, then guard the remainder.
+    """
+    if not _CONTENT_HASH_RE.match(content_hash):
+        raise HTTPException(400, f"malformed content hash {content_hash!r}")
 
 
 def _fmt_bytes(n: int) -> str:
@@ -331,34 +347,14 @@ def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
     return sorted(entries, key=_bucket)
 
 
-def _cache_rows(project: str) -> list[dict]:
-    """One row per catalog entry, describing its materialised result.parquet.
-
-    Sorted by parquet size descending so the biggest reclaimable caches are
-    on top.  The .buckaroo_stat_cache and xorq_build dirs are intentionally
-    ignored here — this pane is only about the main parquet result cache.
-    """
-    rows = []
-    for e in _annotate_entries(project, list_entries(project)):
-        h = e["content_hash"]
-        pq_path = entry_dir(project, h) / "result.parquet"
-        present = pq_path.exists()
-        size = pq_path.stat().st_size if present else 0
-        rows.append({
-            "content_hash": h,
-            "alias": e.get("alias"),
-            "version": e.get("version"),
-            "version_count": e.get("version_count"),
-            "is_current": e.get("is_current", False),
-            "created_at": e.get("created_at"),
-            "row_count": e.get("row_count"),
-            "prompt": e.get("prompt"),
-            "size": size,
-            "size_fmt": _fmt_bytes(size),
-            "present": present,
-        })
-    rows.sort(key=lambda r: r["size"], reverse=True)
-    return rows
+def _serve_spa() -> HTMLResponse:
+    index = _REACT_DIST / "index.html"
+    if index.exists():
+        return HTMLResponse(index.read_text())
+    raise HTTPException(
+        503,
+        "React app not built — run: cd packages/app && pnpm install && pnpm build",
+    )
 
 
 def create_app(
@@ -382,10 +378,11 @@ def create_app(
             pass
 
     app = FastAPI(title="pydata companion")
-    templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
-    templates.env.globals["read_only"] = read_only
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+    # Serve React SPA assets (built by `cd packages/app && pnpm build`).
+    if (_REACT_DIST / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=str(_REACT_DIST / "assets")), name="spa-assets")
 
     def _current_project() -> str | None:
         return resolve_project() or seed
@@ -426,338 +423,15 @@ def create_app(
     # ------------------------------------------------------------------
 
     @app.get("/", include_in_schema=False)
-    def root(request: Request):
-        if _current_project() is None:
-            from pydata_core.paths import list_projects
-
-            return templates.TemplateResponse(
-                request,
-                "empty_state.html",
-                {"available_projects": list_projects()},
-            )
-        return RedirectResponse(f"/{_current_project()}/catalog")
+    def root():
+        p = _current_project()
+        if p:
+            return RedirectResponse(f"/{p}/catalog")
+        return _serve_spa()
 
     # ------------------------------------------------------------------
-    # Project-prefixed HTML routes
+    # File-download routes (non-HTML, kept from original)
     # ------------------------------------------------------------------
-
-    @app.get("/{project}/catalog", response_class=HTMLResponse)
-    def catalog(request: Request, project: str, missing: str | None = None):
-        project = _validate_project(project)
-        entries = _annotate_entries(project, list_entries(project))
-        errors = list_errors(project, limit=5)
-        return templates.TemplateResponse(
-            request,
-            "catalog.html",
-            {
-                "project": project,
-                "entries": entries,
-                "errors": errors,
-                "missing_hash": missing,
-            },
-        )
-
-    @app.get("/{project}/catalog/{content_hash}", response_class=HTMLResponse)
-    def catalog_entry(request: Request, project: str, content_hash: str):
-        project = _validate_project(project)
-        alias = None
-        version = None
-        forensic_history: list[dict] = []
-
-        aliases = load_aliases(project)
-        if content_hash in aliases:
-            alias = content_hash
-            content_hash = aliases[alias]
-
-        entry = entry_dir(project, content_hash)
-        if not entry.exists():
-            return RedirectResponse(f"/{project}/catalog?missing={content_hash}", status_code=303)
-        manifest = json.loads((entry / "manifest.json").read_text())
-        schema = json.loads((entry / "schema.json").read_text())
-        code = (entry / "expr.py").read_text()
-
-        if alias is None:
-            alias = alias_for_hash(project, content_hash)
-        info = version_of_hash(project, content_hash)
-        if info is not None:
-            alias = alias or info[0]
-            version = info[1]
-        if alias is not None:
-            hist_hashes = history_for(project, alias)
-            for i, h in enumerate(hist_hashes, start=1):
-                forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
-
-        prompt_history = read_prompts(entry)
-        chart_spec = get_chart(project, content_hash)
-        sidebar_entries = _annotate_entries(project, list_entries(project))
-        build_artifacts = []
-        build_dir = entry / "xorq_build"
-        if build_dir.is_dir():
-            for f in sorted(build_dir.iterdir()):
-                if not f.is_file():
-                    continue
-                try:
-                    text = f.read_text()
-                except UnicodeDecodeError:
-                    text = f"(binary, {f.stat().st_size} bytes)"
-                build_artifacts.append({"name": f.name, "text": text})
-        buckaroo_session = buckaroo.ensure_session(content_hash, project) if buckaroo is not None else None
-        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
-
-        table_html = ""
-        preview_rows = 0
-        result_path = entry / "result.parquet"
-        if result_path.exists():
-            total_rows = pq.ParquetFile(result_path).metadata.num_rows
-            if buckaroo_session is None:
-                preview_rows = min(200, total_rows)
-                head_table = _read_head_rows(result_path, preview_rows)
-                table_html = head_table.to_pandas().to_html(classes="data-table", index=False, border=0)
-        else:
-            total_rows = 0
-        return templates.TemplateResponse(
-            request,
-            "entry_detail.html",
-            {
-                "project": project,
-                "manifest": manifest,
-                "schema": schema,
-                "code": code,
-                "table_html": table_html,
-                "preview_rows": preview_rows,
-                "total_rows": total_rows,
-                "prompt_history": prompt_history,
-                "alias": alias,
-                "version": version,
-                "forensic_history": forensic_history,
-                "chart_spec": chart_spec,
-                "buckaroo_session": buckaroo_session,
-                "buckaroo_ws_base": buckaroo_ws_base,
-                "build_artifacts": build_artifacts,
-                "entries": sidebar_entries,
-                "current_hash": content_hash,
-            },
-        )
-
-    @app.get("/{project}/lineage", response_class=HTMLResponse)
-    def lineage_overview(request: Request, project: str):
-        project = _validate_project(project)
-        dag = catalog_dag(project)
-        node_id = lambda n: n["hash"]  # noqa: E731
-        nodes_for_layout = [{"id": node_id(n), **n} for n in dag["nodes"]]
-        targets = {e["to"] for e in dag["edges"]}
-        roots = [n["id"] for n in nodes_for_layout if n["id"] not in targets]
-        root = roots[0] if roots else (nodes_for_layout[0]["id"] if nodes_for_layout else None)
-        layout = layered_positions(nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80)
-        aliases = load_aliases(project)
-        by_latest = {h: a for a, h in aliases.items()}
-        annotated_by_hash: dict[str, dict] = {}
-        for n in dag["nodes"]:
-            h = n["hash"]
-            info = version_of_hash(project, h)
-            annotated_by_hash[h] = {
-                "alias": by_latest.get(h) or (info[0] if info else None),
-                "version": info[1] if info else None,
-            }
-        return templates.TemplateResponse(
-            request,
-            "lineage.html",
-            {
-                "project": project,
-                "nodes": dag["nodes"],
-                "edges": dag["edges"],
-                "positions": layout["positions"],
-                "width": layout["width"],
-                "height": layout["height"],
-                "annotated": annotated_by_hash,
-                "kind": "catalog",
-            },
-        )
-
-    @app.get("/{project}/lineage/{content_hash}", response_class=HTMLResponse)
-    def lineage_entry(request: Request, project: str, content_hash: str):
-        project = _validate_project(project)
-        aliases = load_aliases(project)
-        if content_hash in aliases:
-            content_hash = aliases[content_hash]
-        if not entry_dir(project, content_hash).exists():
-            raise HTTPException(404, f"entry {content_hash} not found")
-        lin = read_internal_lineage(project, content_hash)
-        layout = layered_positions(lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70)
-        cols = column_lineage(project, content_hash)
-        return templates.TemplateResponse(
-            request,
-            "lineage_entry.html",
-            {
-                "project": project,
-                "content_hash": content_hash,
-                "lineage": lin,
-                "positions": layout["positions"],
-                "width": layout["width"],
-                "height": layout["height"],
-                "column_trees": cols,
-            },
-        )
-
-    @app.get("/{project}/notebook", response_class=HTMLResponse)
-    def notebook_view(request: Request, project: str):
-        project = _validate_project(project)
-        data = notebook.load(project)
-        aliases = load_aliases(project)
-        buckaroo_available = buckaroo is not None and buckaroo.is_running
-        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo_available else None
-        rendered_cells = []
-        for c in data["cells"]:
-            latest = aliases.get(c["alias"])
-            entry_meta = None
-            preview_html = ""
-            schema = None
-            if latest is not None:
-                entry = entry_dir(project, latest)
-                if (entry / "manifest.json").exists():
-                    entry_meta = json.loads((entry / "manifest.json").read_text())
-                    schema = json.loads((entry / "schema.json").read_text())
-                if not buckaroo_available and (entry / "result.parquet").exists():
-                    table = pq.read_table(entry / "result.parquet")
-                    df = table.to_pandas()
-                    n = min(20, len(df))
-                    preview_html = df.head(n).to_html(classes="data-table", index=False, border=0)
-            info = version_of_hash(project, latest) if latest else None
-            rendered_cells.append(
-                {
-                    **c,
-                    "latest_hash": latest,
-                    "version": info[1] if info else None,
-                    "entry_meta": entry_meta,
-                    "schema": schema,
-                    "preview_html": preview_html,
-                    "markdown_html": _render_markdown(c.get("markdown", "")),
-                    "buckaroo_available": buckaroo_available,
-                    "chart_spec": get_chart(project, latest) if latest else None,
-                }
-            )
-        return templates.TemplateResponse(
-            request,
-            "notebook.html",
-            {
-                "project": project,
-                "cells": rendered_cells,
-                "buckaroo_ws_base": buckaroo_ws_base,
-                "buckaroo_available": buckaroo_available,
-            },
-        )
-
-    @app.get("/{project}/diff/{alias}", response_class=HTMLResponse)
-    def diff_default(request: Request, project: str, alias: str):
-        project = _validate_project(project)
-        hashes = history_for(project, alias)
-        if not hashes:
-            raise HTTPException(404, f"alias {alias!r} has no history")
-        if len(hashes) < 2:
-            raise HTTPException(400, f"alias {alias!r} only has one version — nothing to diff")
-        return _render_diff(request, project, alias, len(hashes) - 1, len(hashes))
-
-    @app.get("/{project}/diff/{alias}/{va:int}/{vb:int}", response_class=HTMLResponse)
-    def diff_versions(request: Request, project: str, alias: str, va: int, vb: int):
-        project = _validate_project(project)
-        return _render_diff(request, project, alias, va, vb)
-
-    def _render_diff(request: Request, project: str, alias: str, va: int, vb: int):
-        hashes = history_for(project, alias)
-        if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
-            raise HTTPException(404, "version out of range")
-        if va == vb:
-            raise HTTPException(400, f"V{va} → V{vb} is the same version — nothing to diff")
-        a_hash = hashes[va - 1]
-        b_hash = hashes[vb - 1]
-        a_dir = entry_dir(project, a_hash)
-        b_dir = entry_dir(project, b_hash)
-        if not a_dir.exists() or not b_dir.exists():
-            raise HTTPException(404, "one or both entries missing")
-        # Diff the two entry *expressions*, not their result.parquet files.
-        # cached_result_expr wraps each in xorq's snapshot cache when the
-        # computation is expensive (aggregate/join/sort/UDF/CSV) and leaves
-        # cheap parquet-read-and-project entries uncached — so each side
-        # resolves its own cache (hit → read, miss → recompute) and a deleted
-        # result.parquet never blanks the diff.
-        from pydata_xorq.primary_key import diff_keys
-        from pydata_xorq.result_cache import cached_result_expr
-        a_expr = cached_result_expr(project, a_hash)
-        b_expr = cached_result_expr(project, b_hash)
-        # Resolve the join key from cached lineage (detect-once, inherit across
-        # row-preserving revisions) instead of re-scanning both sides here.
-        keys = diff_keys(project, a_hash, b_hash) or None
-        diff = full_diff(a_dir, b_dir, a_label=f"V{va}", b_label=f"V{vb}",
-                         backend="xorq", a_expr=a_expr, b_expr=b_expr, keys=keys)
-
-        # Attempt a live Buckaroo comparison if the server is up — it streams
-        # rows from the composed comparison expression on demand.
-        compare_session = None
-        buckaroo_ws_base = None
-        if buckaroo is not None and buckaroo.is_running:
-            if not keys:
-                keys = diff["keyed"]["keys"] if diff.get("keyed") else None
-            if keys:
-                session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
-                try:
-                    build_path, overrides = _build_compare_expr(a_expr, b_expr, keys)
-                    # Persist Buckaroo's summary stats for this comparison so
-                    # re-opening the same pair reuses them instead of
-                    # recomputing over the full join (the bulk of /load_expr).
-                    from pydata_core.paths import diff_stat_cache_dir
-                    stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
-                    stat_cache.mkdir(parents=True, exist_ok=True)
-                    resp = buckaroo._client.post(
-                        f"{buckaroo.base_url}/load_expr",
-                        json={
-                            "session": session_id,
-                            "build_dir": str(build_path),
-                            "no_browser": True,
-                            "column_config_overrides": overrides,
-                            "cache_storage_path": str(stat_cache),
-                        },
-                        timeout=30.0,
-                    )
-                    if resp.status_code == 200:
-                        compare_session = session_id
-                        buckaroo_ws_base = buckaroo.ws_base_url
-                except Exception as exc:
-                    log.warning("diff /load_expr compare failed: %s", exc)
-
-        return templates.TemplateResponse(
-            request,
-            "diff.html",
-            {
-                "project": project,
-                "alias": alias,
-                "va": va,
-                "vb": vb,
-                "a_hash": a_hash,
-                "b_hash": b_hash,
-                "hashes": hashes,
-                "diff": diff,
-                "compare_session": compare_session,
-                "buckaroo_ws_base": buckaroo_ws_base,
-            },
-        )
-
-    @app.get("/{project}/errors/{error_id}", response_class=HTMLResponse)
-    def error_detail(request: Request, project: str, error_id: str):
-        project = _validate_project(project)
-        rec = get_error(project, error_id)
-        if rec is None:
-            raise HTTPException(404, f"error {error_id} not found")
-        sidebar_entries = _annotate_entries(project, list_entries(project))
-        return templates.TemplateResponse(
-            request,
-            "error_detail.html",
-            {
-                "project": project,
-                "error": rec,
-                "entries": sidebar_entries,
-                "current_hash": None,
-            },
-        )
 
     @app.get("/{project}/export/marimo")
     def export_marimo(project: str):
@@ -775,7 +449,7 @@ def create_app(
         )
 
     # ------------------------------------------------------------------
-    # Project-prefixed API routes (called from JS)
+    # Project-prefixed JSON API routes
     # ------------------------------------------------------------------
 
     @app.get("/{project}/api/sse")
@@ -807,6 +481,7 @@ def create_app(
     @app.get("/{project}/api/data/{content_hash}")
     def api_data(project: str, content_hash: str, offset: int = 0, limit: int = 200):
         project = _validate_project(project)
+        _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
         entry = entry_dir(project, content_hash)
@@ -836,9 +511,83 @@ def create_app(
             "entries": _annotate_entries(project, list_entries(project)),
         }
 
+    @app.get("/{project}/api/entry/{content_hash}")
+    def api_entry_detail(project: str, content_hash: str):
+        """Full entry detail for the React SPA — resolves aliases."""
+        project = _validate_project(project)
+        aliases = load_aliases(project)
+        alias = None
+        if content_hash in aliases:
+            alias = content_hash
+            content_hash = aliases[alias]
+        else:
+            _require_hash(content_hash)
+
+        entry = entry_dir(project, content_hash)
+        if not entry.exists():
+            raise HTTPException(404, f"entry {content_hash!r} not found")
+
+        manifest = json.loads((entry / "manifest.json").read_text())
+        schema = json.loads((entry / "schema.json").read_text())
+        code = (entry / "expr.py").read_text()
+
+        if alias is None:
+            alias = alias_for_hash(project, content_hash)
+        info = version_of_hash(project, content_hash)
+        if info is not None:
+            alias = alias or info[0]
+            version = info[1]
+        else:
+            version = None
+
+        forensic_history: list[dict] = []
+        if alias:
+            hist_hashes = history_for(project, alias)
+            for i, h in enumerate(hist_hashes, start=1):
+                forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
+
+        prompt_history = read_prompts(entry)
+        chart_spec = get_chart(project, content_hash)
+
+        build_artifacts: list[dict] = []
+        build_dir = entry / "xorq_build"
+        if build_dir.is_dir():
+            for f in sorted(build_dir.iterdir()):
+                if not f.is_file():
+                    continue
+                try:
+                    text = f.read_text()
+                except UnicodeDecodeError:
+                    text = f"(binary, {f.stat().st_size} bytes)"
+                build_artifacts.append({"name": f.name, "text": text})
+
+        buckaroo_session = buckaroo.ensure_session(content_hash, project) if buckaroo else None
+        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
+
+        result_path = entry / "result.parquet"
+        total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
+
+        return {
+            "project": project,
+            "content_hash": content_hash,
+            "manifest": manifest,
+            "schema": schema,
+            "code": code,
+            "alias": alias,
+            "version": version,
+            "forensic_history": forensic_history,
+            "prompt_history": prompt_history,
+            "chart_spec": chart_spec,
+            "build_artifacts": build_artifacts,
+            "total_rows": total_rows,
+            "buckaroo_session": buckaroo_session,
+            "buckaroo_ws_base": buckaroo_ws_base,
+        }
+
     @app.get("/{project}/api/lineage/{content_hash}")
     def api_lineage(project: str, content_hash: str):
         project = _validate_project(project)
+        _require_hash(content_hash)
         if not entry_dir(project, content_hash).exists():
             raise HTTPException(404)
         return {
@@ -850,6 +599,60 @@ def create_app(
         project = _validate_project(project)
         return {"project": project, **catalog_dag(project)}
 
+    @app.get("/{project}/api/catalog_dag_layout")
+    def api_catalog_dag_layout(project: str):
+        """Catalog DAG with pre-computed layout positions for the React SPA."""
+        project = _validate_project(project)
+        dag = catalog_dag(project)
+        nodes_for_layout = [{"id": n["hash"], **n} for n in dag["nodes"]]
+        targets = {e["to"] for e in dag["edges"]}
+        roots = [n["id"] for n in nodes_for_layout if n["id"] not in targets]
+        root = roots[0] if roots else (nodes_for_layout[0]["id"] if nodes_for_layout else None)
+        layout = layered_positions(nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80)
+        aliases = load_aliases(project)
+        by_latest = {h: a for a, h in aliases.items()}
+        annotated: dict[str, dict] = {}
+        for n in dag["nodes"]:
+            h = n["hash"]
+            info = version_of_hash(project, h)
+            annotated[h] = {
+                "alias": by_latest.get(h) or (info[0] if info else None),
+                "version": info[1] if info else None,
+            }
+        return {
+            "project": project,
+            "nodes": dag["nodes"],
+            "edges": dag["edges"],
+            "positions": layout["positions"],
+            "width": layout["width"],
+            "height": layout["height"],
+            "annotated": annotated,
+        }
+
+    @app.get("/{project}/api/lineage_layout/{content_hash}")
+    def api_lineage_layout(project: str, content_hash: str):
+        """Internal expression lineage with layout positions for the React SPA."""
+        project = _validate_project(project)
+        aliases = load_aliases(project)
+        if content_hash in aliases:
+            content_hash = aliases[content_hash]
+        else:
+            _require_hash(content_hash)
+        if not entry_dir(project, content_hash).exists():
+            raise HTTPException(404)
+        lin = read_internal_lineage(project, content_hash)
+        layout = layered_positions(lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70)
+        cols = column_lineage(project, content_hash)
+        return {
+            "project": project,
+            "content_hash": content_hash,
+            "lineage": lin,
+            "positions": layout["positions"],
+            "width": layout["width"],
+            "height": layout["height"],
+            "column_trees": cols,
+        }
+
     @app.get("/{project}/api/session/{content_hash}")
     def get_session(project: str, content_hash: str):
         project = _validate_project(project)
@@ -860,74 +663,134 @@ def create_app(
             return {"ws_url": None}
         return {"ws_url": f"{buckaroo.ws_base_url}/ws/{session_id}"}
 
-    @app.patch("/{project}/api/notebook")
-    async def patch_notebook(project: str, payload: dict):
-        project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
-        action = payload.get("action")
-        cell_id = payload.get("cell_id", "")
-        try:
-            if action == "reorder":
-                notebook.reorder(project, cell_id, int(payload["new_index"]))
-            elif action == "remove":
-                notebook.remove(project, cell_id)
-            else:
-                raise HTTPException(400, f"unknown action {action!r}")
-        except CellNotFound:
-            raise HTTPException(404, f"cell {cell_id!r} not found")
-        await publish({"kind": "notebook_changed"})
-        return {"ok": True}
-
-    @app.put("/{project}/api/code/{alias}")
-    async def put_code(project: str, alias: str, payload: dict):
-        project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
-        from pydata_core import get_alias as _get_alias
-        from pydata_core import set_alias as _set_alias
-        from pydata_xorq import build_and_persist as _build_and_persist
-        from pydata_xorq.build import BuildError
-
-        if _get_alias(project, alias) is None:
-            raise HTTPException(404, f"alias {alias!r} not found")
-        code = payload.get("code", "")
-        if not code.strip():
-            raise HTTPException(400, "code is empty")
-        try:
-            res = _build_and_persist(project, code, prompt=payload.get("prompt") or None)
-        except BuildError as exc:
-            from pydata_core import record_error as _record_error
-
-            rec = _record_error(project, code=code, message=str(exc), tool="api_code")
-            await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
-            raise HTTPException(400, str(exc))
-        info = _set_alias(project, alias, res.content_hash, expect_exists=True)
-        await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
-        return {
-            "hash": res.content_hash,
-            "alias": alias,
-            "version": info["version"],
-            "row_count": res.row_count,
-        }
-
-    @app.put("/{project}/api/markdown/{cell_id}")
-    async def put_markdown(project: str, cell_id: str, payload: dict):
-        project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
-        markdown = payload.get("markdown", "")
-        try:
-            cell = notebook.edit_markdown(project, cell_id, markdown)
-        except CellNotFound:
-            raise HTTPException(404, f"cell {cell_id!r} not found")
-        await publish({"kind": "notebook_changed"})
-        return {**cell, "html": _render_markdown(cell["markdown"])}
-
     @app.get("/{project}/api/notebook")
     def api_notebook(project: str):
         project = _validate_project(project)
         return {"project": project, **notebook.load(project)}
+
+    @app.get("/{project}/api/notebook_full")
+    def api_notebook_full(project: str):
+        """Notebook with pre-resolved entry metadata for the React SPA."""
+        project = _validate_project(project)
+        data = notebook.load(project)
+        aliases = load_aliases(project)
+        buckaroo_available = buckaroo is not None and buckaroo.is_running
+        buckaroo_ws_base = buckaroo.ws_base_url if buckaroo_available else None
+        cells = []
+        for c in data["cells"]:
+            latest = aliases.get(c["alias"])
+            entry_meta = None
+            schema = None
+            total_rows = 0
+            chart_spec = None
+            buckaroo_session = None
+            if latest is not None:
+                entry = entry_dir(project, latest)
+                if (entry / "manifest.json").exists():
+                    entry_meta = json.loads((entry / "manifest.json").read_text())
+                    schema = json.loads((entry / "schema.json").read_text())
+                result_path = entry / "result.parquet"
+                if result_path.exists():
+                    total_rows = pq.ParquetFile(result_path).metadata.num_rows
+                chart_spec = get_chart(project, latest)
+                if buckaroo_available:
+                    buckaroo_session = buckaroo.ensure_session(latest, project)
+            info = version_of_hash(project, latest) if latest else None
+            cells.append({
+                **c,
+                "latest_hash": latest,
+                "version": info[1] if info else None,
+                "entry_meta": entry_meta,
+                "schema": schema,
+                "total_rows": total_rows,
+                "chart_spec": chart_spec,
+                "buckaroo_session": buckaroo_session,
+            })
+        return {
+            "project": project,
+            "cells": cells,
+            "buckaroo_ws_base": buckaroo_ws_base,
+            "buckaroo_available": buckaroo_available,
+        }
+
+    @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
+    def api_diff_data(project: str, alias: str, va: int, vb: int):
+        """Diff data as JSON for the React SPA."""
+        project = _validate_project(project)
+        hashes = history_for(project, alias)
+        if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
+            raise HTTPException(404, "version out of range")
+        if va == vb:
+            raise HTTPException(400, f"V{va} → V{vb} is the same version")
+        a_hash = hashes[va - 1]
+        b_hash = hashes[vb - 1]
+        a_dir = entry_dir(project, a_hash)
+        b_dir = entry_dir(project, b_hash)
+        if not a_dir.exists() or not b_dir.exists():
+            raise HTTPException(404, "one or both entries missing")
+
+        from pydata_xorq.primary_key import diff_keys  # noqa: PLC0415
+        from pydata_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+        a_expr = cached_result_expr(project, a_hash)
+        b_expr = cached_result_expr(project, b_hash)
+        keys = diff_keys(project, a_hash, b_hash) or None
+        diff = full_diff(
+            a_dir, b_dir,
+            a_label=f"V{va}", b_label=f"V{vb}",
+            backend="xorq", a_expr=a_expr, b_expr=b_expr, keys=keys,
+        )
+
+        compare_session = None
+        buckaroo_ws_base_url = None
+        if buckaroo is not None and buckaroo.is_running:
+            if not keys:
+                keys = diff["keyed"]["keys"] if diff.get("keyed") else None
+            if keys:
+                session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
+                try:
+                    build_path, overrides = _build_compare_expr(a_expr, b_expr, keys)
+                    from pydata_core.paths import diff_stat_cache_dir  # noqa: PLC0415
+                    stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
+                    stat_cache.mkdir(parents=True, exist_ok=True)
+                    resp = buckaroo._client.post(
+                        f"{buckaroo.base_url}/load_expr",
+                        json={
+                            "session": session_id,
+                            "build_dir": str(build_path),
+                            "no_browser": True,
+                            "column_config_overrides": overrides,
+                            "cache_storage_path": str(stat_cache),
+                        },
+                        timeout=30.0,
+                    )
+                    if resp.status_code == 200:
+                        compare_session = session_id
+                        buckaroo_ws_base_url = buckaroo.ws_base_url
+                except Exception as exc:
+                    log.warning("diff /load_expr compare failed: %s", exc)
+
+        return {
+            "project": project,
+            "alias": alias,
+            "va": va,
+            "vb": vb,
+            "a_hash": a_hash,
+            "b_hash": b_hash,
+            "hashes": hashes,
+            "diff": diff,
+            "compare_session": compare_session,
+            "buckaroo_ws_base": buckaroo_ws_base_url,
+        }
+
+    @app.get("/{project}/api/error/{error_id}")
+    def api_error_single(project: str, error_id: str):
+        """Single error record for the React SPA."""
+        project = _validate_project(project)
+        rec = get_error(project, error_id)
+        if rec is None:
+            raise HTTPException(404, f"error {error_id!r} not found")
+        return {"project": project, "error": rec}
 
     @app.get("/{project}/api/aliases")
     def api_aliases(project: str):
@@ -966,45 +829,148 @@ def create_app(
         _disk_usage_cache[project] = (now, payload)
         return payload
 
-    @app.get("/{project}/cache", response_class=HTMLResponse)
-    def cache_inspector(request: Request, project: str):
+    @app.get("/{project}/api/result_cache")
+    def api_result_cache(project: str):
         project = _validate_project(project)
-        rows = _cache_rows(project)
-        total = sum(r["size"] for r in rows)
-        return templates.TemplateResponse(
-            request,
-            "cache.html",
-            {
-                "project": project,
-                "rows": rows,
-                "total_fmt": _fmt_bytes(total),
-                "present_count": sum(1 for r in rows if r["present"]),
-                "entry_count": len(rows),
-            },
-        )
+        import datetime  # noqa: PLC0415
 
-    @app.post("/{project}/api/cache/delete/{content_hash}")
-    def cache_delete(project: str, content_hash: str):
+        from pydata_core.paths import entries_dir as _entries_dir  # noqa: PLC0415
+
+        root = _entries_dir(project)
+        entries = []
+        if root.is_dir():
+            for entry in root.iterdir():
+                if not entry.is_dir():
+                    continue
+                p = entry / "result.parquet"
+                if not p.exists():
+                    continue
+                try:
+                    stat = p.stat()
+                    size = stat.st_size
+                    created = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                except OSError:
+                    continue
+                content_hash = entry.name
+                try:
+                    row_count = pq.ParquetFile(p).metadata.num_rows
+                except Exception:
+                    row_count = 0
+                alias = alias_for_hash(project, content_hash)
+                info = version_of_hash(project, content_hash)
+                version = info[1] if info else None
+                is_current = alias is not None
+                if not is_current and info is not None:
+                    alias = info[0]
+                    is_current = False
+                manifest_path = entry / "manifest.json"
+                prompt = None
+                if manifest_path.exists():
+                    try:
+                        m = json.loads(manifest_path.read_text())
+                        prompt = m.get("prompt")
+                    except Exception:
+                        pass
+                entries.append({
+                    "hash": content_hash,
+                    "size": size,
+                    "size_formatted": _fmt_bytes(size),
+                    "row_count": row_count,
+                    "created": created,
+                    "alias": alias,
+                    "version": version,
+                    "is_current": is_current,
+                    "prompt": prompt,
+                })
+        entries.sort(key=lambda e: -e["size"])
+        total = sum(e["size"] for e in entries)
+        return {
+            "project": project,
+            "entries": entries,
+            "total": total,
+            "total_formatted": _fmt_bytes(total),
+        }
+
+    @app.delete("/{project}/api/result_cache/{content_hash}")
+    async def api_delete_result_cache(project: str, content_hash: str):
         project = _validate_project(project)
         if read_only:
-            raise HTTPException(403, "read-only mode")
-        if not _CONTENT_HASH_RE.match(content_hash):
-            raise HTTPException(400, f"malformed content hash {content_hash!r}")
-        pq_path = entry_dir(project, content_hash) / "result.parquet"
-        if not pq_path.exists():
-            raise HTTPException(404, "no result.parquet to delete for this entry")
-        size = pq_path.stat().st_size
-        pq_path.unlink()
-        # The alias/history/code are untouched — re-running the entry's
-        # expression re-materialises result.parquet on demand.
-        rows = _cache_rows(project)
-        total = sum(r["size"] for r in rows)
+            raise HTTPException(403, "serve mode")
+        # Reject a non-hex hash up front: a 400 reads truer than the
+        # "already evicted" 404 below (see _require_hash).
+        _require_hash(content_hash)
+        p = entry_dir(project, content_hash) / "result.parquet"
+        if not p.exists():
+            raise HTTPException(404, "result.parquet not found")
+        try:
+            p.unlink()
+        except OSError as exc:
+            raise HTTPException(500, str(exc))
+        return {"ok": True, "hash": content_hash}
+
+    @app.patch("/{project}/api/notebook")
+    async def patch_notebook(project: str, payload: dict):
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        action = payload.get("action")
+        cell_id = payload.get("cell_id", "")
+        try:
+            if action == "reorder":
+                notebook.reorder(project, cell_id, int(payload["new_index"]))
+            elif action == "remove":
+                notebook.remove(project, cell_id)
+            else:
+                raise HTTPException(400, f"unknown action {action!r}")
+        except CellNotFound:
+            raise HTTPException(404, f"cell {cell_id!r} not found")
+        await publish({"kind": "notebook_changed"})
+        return {"ok": True}
+
+    @app.put("/{project}/api/code/{alias}")
+    async def put_code(project: str, alias: str, payload: dict):
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        from pydata_core import get_alias as _get_alias  # noqa: PLC0415
+        from pydata_core import set_alias as _set_alias  # noqa: PLC0415
+        from pydata_xorq import build_and_persist as _build_and_persist  # noqa: PLC0415
+        from pydata_xorq.build import BuildError  # noqa: PLC0415
+
+        if _get_alias(project, alias) is None:
+            raise HTTPException(404, f"alias {alias!r} not found")
+        code = payload.get("code", "")
+        if not code.strip():
+            raise HTTPException(400, "code is empty")
+        try:
+            res = _build_and_persist(project, code, prompt=payload.get("prompt") or None)
+        except BuildError as exc:
+            from pydata_core import record_error as _record_error  # noqa: PLC0415
+
+            rec = _record_error(project, code=code, message=str(exc), tool="api_code")
+            await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
+            raise HTTPException(400, str(exc))
+        info = _set_alias(project, alias, res.content_hash, expect_exists=True)
+        await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
         return {
-            "deleted": content_hash,
-            "reclaimed": size,
-            "reclaimed_fmt": _fmt_bytes(size),
-            "total_fmt": _fmt_bytes(total),
+            "hash": res.content_hash,
+            "alias": alias,
+            "version": info["version"],
+            "row_count": res.row_count,
         }
+
+    @app.put("/{project}/api/markdown/{cell_id}")
+    async def put_markdown(project: str, cell_id: str, payload: dict):
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        markdown = payload.get("markdown", "")
+        try:
+            cell = notebook.edit_markdown(project, cell_id, markdown)
+        except CellNotFound:
+            raise HTTPException(404, f"cell {cell_id!r} not found")
+        await publish({"kind": "notebook_changed"})
+        return {**cell, "html": _render_markdown(cell["markdown"])}
 
     # ------------------------------------------------------------------
     # Project-agnostic routes (no project prefix)
@@ -1029,7 +995,7 @@ def create_app(
 
     @app.get("/api/projects")
     def api_projects():
-        from pydata_core.paths import list_projects as _list_projects
+        from pydata_core.paths import list_projects as _list_projects  # noqa: PLC0415
 
         return {
             "active": _current_project(),
@@ -1042,8 +1008,8 @@ def create_app(
             raise HTTPException(403, "companion is in read-only (serve) mode")
         name = (payload or {}).get("name", "")
         try:
-            from pydata_core.paths import set_active_project as _sap
-            from pydata_core.paths import validate_project_name as _vpn
+            from pydata_core.paths import set_active_project as _sap  # noqa: PLC0415
+            from pydata_core.paths import validate_project_name as _vpn  # noqa: PLC0415
 
             _vpn(name)
         except ValueError as exc:
@@ -1060,14 +1026,14 @@ def create_app(
     async def api_projects_new(payload: dict):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
-        from pydata_core import ensure_project as _ensure_project
-        from pydata_core.paths import projects_root as _projects_root
-        from pydata_core.paths import set_active_project as _sap
+        from pydata_core import ensure_project as _ensure_project  # noqa: PLC0415
+        from pydata_core.paths import projects_root as _projects_root  # noqa: PLC0415
+        from pydata_core.paths import set_active_project as _sap  # noqa: PLC0415
 
         name = (payload or {}).get("name", "")
         with_fixture = bool((payload or {}).get("with_fixture", False))
         try:
-            from pydata_core.paths import validate_project_name as _vpn
+            from pydata_core.paths import validate_project_name as _vpn  # noqa: PLC0415
 
             _vpn(name)
         except ValueError as exc:
@@ -1083,5 +1049,24 @@ def create_app(
         _sap(name)
         await publish({"kind": "project_switched", "name": name})
         return {"name": name, "active": name}
+
+    # ------------------------------------------------------------------
+    # SPA catch-all: serve React index.html for all unmatched GET routes.
+    # Must be registered last so API routes above take priority.
+    # ------------------------------------------------------------------
+
+    @app.get("/{full_path:path}", response_class=HTMLResponse, include_in_schema=False)
+    def spa_catch_all(full_path: str = ""):
+        # An unmatched path under the API namespace must 404 as JSON rather than
+        # falling through to index.html — otherwise a mistyped or removed
+        # endpoint returns 200 HTML and the client's response.json() throws an
+        # opaque parse error instead of surfacing the 404. Key on segment
+        # position (top-level "/api/…" or project-prefixed "/{project}/api/…"),
+        # not a substring, so a content segment named "api" (e.g. an alias in
+        # "/{project}/diff/api/1/2") still routes to the SPA.
+        parts = full_path.split("/")
+        if parts[0] == "api" or (len(parts) >= 2 and parts[1] == "api"):
+            raise HTTPException(404, "not found")
+        return _serve_spa()
 
     return app

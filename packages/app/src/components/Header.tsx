@@ -6,7 +6,7 @@ import { useSSE } from "../SSEContext";
 export function Header() {
   const { project } = useParams<{ project?: string }>();
   const navigate = useNavigate();
-  const { status } = useSSE();
+  const { status, version } = useSSE();
   const [projects, setProjects] = useState<string[]>([]);
   const [diskFormatted, setDiskFormatted] = useState<string | null>(null);
 
@@ -14,12 +14,15 @@ export function Header() {
     api.projects().then((d) => setProjects(d.available)).catch(() => {});
   }, [project]);
 
+  // version bumps on every SSE event (new entry, notebook change, …); the
+  // backend coalesces the resulting burst of disk-usage walks behind a short
+  // TTL cache, so refetching here keeps the pill fresh without re-walking.
   useEffect(() => {
     if (!project) return;
     api.diskUsage(project)
       .then((d) => setDiskFormatted(d.formatted.total))
       .catch(() => {});
-  }, [project]);
+  }, [project, version]);
 
   const handleSwitch = async (name: string) => {
     if (name === project) return;

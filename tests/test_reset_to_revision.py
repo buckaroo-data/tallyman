@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 from pathlib import Path
+
+import pytest
 
 from pydata_core import catalog_state as cs
 from pydata_core import charts, git_util, notebook, paths
@@ -376,3 +379,141 @@ def test_cross_process_checkpoint(project, isolated_home):
         assert p.wait(timeout=120) == 0
     assert _steps(project) == {"step-000", "step-001"}  # both landed, distinct steps
     assert int(_git(project, "rev-list", "--count", "HEAD")) == 2
+
+
+# ---------------------------------------------------------------------------
+# Hardening — branch pin, run_git timeout, ref/label validation, view-time cache
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_repo_branch_is_main(project, monkeypatch):
+    """xorq's catalog layer hardcodes its branch as `main`; a plain `git init`
+    inherits init.defaultBranch (master on a stock machine and on CI), after
+    which `xorq catalog add` fails forever with "refs/heads/main does not
+    exist" — silently, because registration is best-effort. The repo branch
+    must be pinned, not inherited from host config."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
+    cs.ensure_catalog_repo(project)
+    rc, out, _ = git_util.run_git(["symbolic-ref", "HEAD"], cwd=paths.catalog_dir(project))
+    assert rc == 0
+    assert out == "refs/heads/main"
+
+
+def test_run_git_timeout_kills_hung_git(project):
+    """run_git promises a timeout; a wedged git must come back as a signal
+    death (negative rc), not block the caller — which may hold the project
+    flock — indefinitely."""
+    cs.ensure_catalog_repo(project)
+    t0 = time.monotonic()
+    rc, _, _ = git_util.run_git(["-c", "alias.zzz=!sleep 5", "zzz"], cwd=paths.catalog_dir(project), timeout=0.5)
+    assert rc < 0  # killed, not exited
+    assert time.monotonic() - t0 < 3
+
+
+def test_reset_to_accepts_only_step_tags_and_labels(project):
+    """reset_to's ref is operator input (HTTP payload / CLI arg). Only a plain
+    existing tag may pass to git — option-like strings, revision navigation,
+    and bare refs must be rejected, not silently resolved."""
+    cs.ensure_catalog_repo(project)
+    notebook.append(project, "alias1", markdown="hello")
+    s1 = cs.checkpoint_catalog(project, "step one")
+    notebook.append(project, "alias2", markdown="world")
+    cs.checkpoint_catalog(project, "step two")
+
+    for ref in ("--quiet", ":/step", f"step-{s1:03d}~0", "HEAD"):
+        with pytest.raises(RuntimeError):
+            cs.reset_to(project, ref)
+
+    cs.reset_to(project, s1)  # the sanctioned forms still work
+    assert cs.current_step(project) == s1
+
+
+def test_label_step_rejects_unsafe_names(project):
+    """Labels become git args and live in the tag namespace: option-like names
+    (`-d` deletes tags), step-shaped names (clobber real steps via `tag -f`),
+    and all-digit names (unreachable — digit refs parse as step numbers) must
+    all be rejected before they reach git."""
+    cs.ensure_catalog_repo(project)
+    s = cs.checkpoint_catalog(project, "step")
+    for bad in ("-d", "step-001", "42", "so bad"):
+        with pytest.raises(RuntimeError):
+            cs.label_step(project, s, bad)
+    tags = set(_git(project, "tag", "-l").split())
+    assert tags == {f"step-{s:03d}"}  # nothing created, deleted, or clobbered
+
+
+def test_load_entry_uses_per_project_compute_cache(project, monkeypatch):
+    """#45: caches warm lazily at view time, and view time goes through
+    load_entry — so load_entry must use the per-project compute cache, not the
+    global ~/.cache/xorq. Otherwise the recorded warm-set is vacuous and
+    reset's prune cannot make a re-added expression compute cold."""
+    from pydata_xorq import build as build_mod
+
+    (paths.entry_dir(project, "cafe0001") / "xorq_build").mkdir(parents=True)
+    seen = {}
+
+    def spy(build_dir, project_root, cache_dir=None):
+        seen["cache_dir"] = Path(cache_dir)
+        return "expr"
+
+    monkeypatch.setattr("pydata_xorq.portable.load_expr_portable", spy)
+    assert build_mod.load_entry(project, "cafe0001") == "expr"
+    assert seen["cache_dir"] == paths.compute_cache_dir(project)
+
+
+# ---------------------------------------------------------------------------
+# Cache bullpen — evictions are retired, not destroyed; forward reset restores
+# ---------------------------------------------------------------------------
+
+
+def test_prune_retires_to_bullpen_not_delete(project):
+    """Reset evictions move to the bullpen: the live tree stays honest (a
+    re-add finds nothing and computes cold) while the artifact survives for a
+    forward reset to restore."""
+    cs.ensure_catalog_repo(project)
+    paths.entry_dir(project, "aaaa").mkdir(parents=True)
+    (paths.entry_dir(project, "aaaa") / "result.parquet").write_bytes(b"r")
+    cc = paths.compute_cache_dir(project)
+    cc.mkdir(parents=True)
+    (cc / "warm.parquet").write_bytes(b"w")
+    rcd = paths.result_cache_dir(project)
+    rcd.mkdir(parents=True)
+    (rcd / "res.parquet").write_bytes(b"q")
+
+    cs.write_pydata_state(project, entry_hashes=[], result_cache=[], compute_cache=[])
+    assert cs.prune_entries(project) == 1
+    assert cs.prune_result_cache(project) == 1
+    assert cs.prune_compute_cache(project) == 1
+
+    bp = paths.bullpen_dir(project)
+    assert (bp / "entries" / "aaaa" / "result.parquet").read_bytes() == b"r"
+    assert (bp / "result_cache" / "res.parquet").read_bytes() == b"q"
+    assert (bp / "compute_cache" / "warm.parquet").read_bytes() == b"w"
+    assert not paths.entry_dir(project, "aaaa").exists()  # live tree is cold
+
+
+def test_scrub_back_then_forward_restores_from_bullpen(project):
+    """The rehearsal gesture: reset back (evict to bullpen), reset forward
+    (the step's recorded artifacts come back from the bullpen instead of
+    recomputing), and the bullpen keeps its copies so the loop can repeat."""
+    cs.ensure_catalog_repo(project)
+    notebook.append(project, "alias1", markdown="hello")
+    s1 = cs.checkpoint_catalog(project, "baseline")
+
+    ed = paths.entry_dir(project, "bbbb")
+    ed.mkdir(parents=True)
+    (ed / "result.parquet").write_bytes(b"big")
+    cc = paths.compute_cache_dir(project)
+    cc.mkdir(parents=True)
+    (cc / "later.parquet").write_bytes(b"warm")
+    s2 = cs.checkpoint_catalog(project, "added entry")
+
+    cs.reset_to(project, s1)
+    assert not ed.exists()  # evicted from the live tree...
+    assert (paths.bullpen_dir(project) / "entries" / "bbbb").is_dir()  # ...into the bullpen
+
+    cs.reset_to(project, s2)
+    assert (ed / "result.parquet").read_bytes() == b"big"  # restored, not recomputed
+    assert (cc / "later.parquet").read_bytes() == b"warm"
+    assert (paths.bullpen_dir(project) / "entries" / "bbbb").is_dir()  # bullpen retains its copy

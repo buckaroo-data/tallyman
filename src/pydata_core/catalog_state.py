@@ -114,7 +114,11 @@ def write_pydata_state(project: str, **keys) -> None:
         if v is not None:
             raw[k] = v
     tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(yaml.dump(raw, default_flow_style=False, sort_keys=False))
+    # safe_dump, to mirror _read_raw's safe_load: the full Dumper would write a
+    # stray non-plain value (a Path in a chart spec) as a !!python/object tag,
+    # after which every read fails until the file is hand-repaired. Raising
+    # here — before the tmp replace — keeps the previous file readable.
+    tmp.write_text(yaml.safe_dump(raw, default_flow_style=False, sort_keys=False))
     tmp.replace(p)
 
 
@@ -155,9 +159,8 @@ def capture_pydata_state(project: str) -> dict:
 
 
 def _materialize_scripts(target: Path, entries: list[dict]) -> None:
-    for d in (target, target / "_disabled"):
-        if d.exists():
-            shutil.rmtree(d)
+    if target.exists():
+        shutil.rmtree(target)  # removes _disabled/ with it
     target.mkdir(parents=True, exist_ok=True)
     for e in entries or []:
         dest = (target / "_disabled") if e.get("disabled") else target

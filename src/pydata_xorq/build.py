@@ -83,12 +83,8 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
          it lives on `xorq.vendor.ibis`).
     """
     has_bad_import = _user_imports_bare_ibis(code)
-    has_expr_mismatch = (
-        "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
-    )
-    has_xorq_underscore = (
-        "has no attribute '_'" in exc_msg and "xorq" in exc_msg
-    )
+    has_expr_mismatch = "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
+    has_xorq_underscore = "has no attribute '_'" in exc_msg and "xorq" in exc_msg
     if not (has_bad_import or has_expr_mismatch or has_xorq_underscore):
         return ""
     if has_xorq_underscore and not has_bad_import:
@@ -120,9 +116,7 @@ def _import_script(code: str) -> tuple[object, Path]:
         spec.loader.exec_module(module)
     except Exception as exc:
         hint = _ibis_import_hint(str(exc), code)
-        raise BuildError(
-            f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}"
-        ) from exc
+        raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
     return module, tmp
 
 
@@ -137,9 +131,9 @@ def build_and_persist(
     The user code must bind a variable named `expr_name` (default "expr") to an
     ibis/xorq expression. Imports happen in a fresh module scope.
     """
-    from xorq.common.utils.caching_utils import get_xorq_cache_dir
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
+    from pydata_core.paths import compute_cache_dir
     from pydata_xorq._git_state_guard import install_git_state_guard
 
     # git-provenance capture in xorq's compiler can crash (git SIGSEGV when forked
@@ -162,9 +156,7 @@ def build_and_persist(
             build_path = Path(build_expr(expr_obj, builds_dir=builds_dir))
         except Exception as exc:
             hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(
-                f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}"
-            ) from exc
+            raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
         content_hash = build_path.name
         target = entry_dir(project, content_hash)
@@ -202,13 +194,15 @@ def build_and_persist(
 
         # Load + execute.
         try:
-            cache_dir = get_xorq_cache_dir()
+            # Per-project compute cache (not the global ~/.cache/xorq), so a
+            # reset can prune it to the revision's warm-set and a freshly added
+            # expression computes cold. See plans/adr-reset-to-revision.md.
+            cache_dir = compute_cache_dir(project)
+            cache_dir.mkdir(parents=True, exist_ok=True)
             loaded = load_expr(build_path, cache_dir=cache_dir)
         except Exception as exc:
             hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(
-                f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}"
-            ) from exc
+            raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
         result_path = target / "result.parquet"
         t0 = time.monotonic()
@@ -216,9 +210,7 @@ def build_and_persist(
             loaded.to_parquet(str(result_path))
         except Exception as exc:
             hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(
-                f"to_parquet failed: {exc}{hint}\n{traceback.format_exc()}"
-            ) from exc
+            raise BuildError(f"to_parquet failed: {exc}{hint}\n{traceback.format_exc()}") from exc
         execute_seconds = round(time.monotonic() - t0, 3)
 
     # Schema + row count via pyarrow (no pandas materialize needed).
@@ -287,13 +279,19 @@ def load_entry(project: str, content_hash: str):
     The persisted build is portable (paths use a `${PYDATA_PROJECT_ROOT}`
     placeholder). This expands placeholders against the current machine's
     project root before handing the build to xorq.
-    """
-    from xorq.common.utils.caching_utils import get_xorq_cache_dir
 
+    Loads against the per-project compute cache, like the build-time load:
+    #45 — caches warm lazily at view time, and view time comes through here,
+    so the global ~/.cache/xorq would make the recorded warm-set vacuous and
+    leak warm hits across projects and steps.
+    """
+    from pydata_core.paths import compute_cache_dir
     from pydata_xorq.portable import load_expr_portable
 
     target = entry_dir(project, content_hash)
     build_dir = target / "xorq_build"
     if not build_dir.is_dir():
         raise FileNotFoundError(f"no xorq_build dir for {content_hash} in project {project}")
-    return load_expr_portable(build_dir, project_dir(project), cache_dir=get_xorq_cache_dir())
+    cache_dir = compute_cache_dir(project)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return load_expr_portable(build_dir, project_dir(project), cache_dir=cache_dir)

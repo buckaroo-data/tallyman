@@ -137,6 +137,27 @@ def result_cache_dir(project: str) -> Path:
     return catalog_dir(project) / "result_cache"
 
 
+def compute_cache_dir(project: str) -> Path:
+    """Per-project xorq compute cache, redirected off the global ``~/.cache/xorq``.
+
+    Lives inside the catalog dir so it travels with the project. ``reset-to``
+    prunes it to the revision's recorded warm-set, so a baseline expression
+    stays warm while a freshly added one computes cold — the honest cold add
+    the demo is built to show. Untracked by git (content-addressed parquet).
+    """
+    return catalog_dir(project) / "compute_cache"
+
+
+def bullpen_dir(project: str) -> Path:
+    """Holding area for artifacts a reset evicts (untracked, content-addressed).
+
+    A backward reset moves pruned entries/caches here instead of deleting
+    them; a forward reset copies the step's recorded set back. Live
+    operations never read it, so an evicted entry still re-adds cold.
+    """
+    return catalog_dir(project) / "bullpen"
+
+
 def diff_stat_cache_root(project: str) -> Path:
     """Parent of all per-pair diff stat caches for a project."""
     return catalog_dir(project) / "diff_stat_cache"

@@ -69,16 +69,21 @@ def reset_to_step(ref: str, project_opt: str | None) -> None:
     step = current_step(name)
     where = f"step-{step:03d}" if step is not None else str(target)
     click.echo(f"reset {name} to {where}")
-    _notify_companion_reset()
+    _notify_companion_reset(name)
 
 
-def _notify_companion_reset() -> None:
-    """Best-effort: a running companion reloads buckaroo sessions + browsers."""
+def _notify_companion_reset(project: str) -> None:
+    """Best-effort: a running companion reloads buckaroo sessions + browsers.
+
+    Names the project explicitly: ``--project`` may target a project that is
+    not the companion's active one, and the active-project fallback would
+    reload the wrong sessions.
+    """
     import httpx
 
     url = os.environ.get("PYDATA_COMPANION_URL", "http://127.0.0.1:7860")
     try:
-        httpx.post(f"{url}/internal/notify", json={"kind": "project_reset"}, timeout=2.0)
+        httpx.post(f"{url}/internal/notify", json={"kind": "project_reset", "project": project}, timeout=2.0)
     except Exception:
         pass  # companion may not be running; the reset itself already landed
 

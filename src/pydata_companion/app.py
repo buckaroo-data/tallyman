@@ -57,6 +57,7 @@ _REACT_DIST = Path(__file__).resolve().parents[2] / "packages" / "app" / "dist"
 class NotifyPayload(BaseModel):
     kind: str
     hash: str | None = None
+    project: str | None = None  # explicit target; absent → the active project
     extra: dict | None = None
 
 
@@ -1068,7 +1069,9 @@ def create_app(
 
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
-        project_name = _require_project()
+        # The payload may name its project (CLI `reset-to --project` can target
+        # a non-active project); only fall back to the active one when it doesn't.
+        project_name = payload.project or _require_project()
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
         log.info(

@@ -342,11 +342,16 @@ def _step_tags(project: str) -> list[int]:
     return sorted(nums)
 
 
-def checkpoint_catalog(project: str, message: str, *, step: int | None = None, label: str | None = None) -> int:
+def checkpoint_catalog(project: str, message: str, *, step: int | None = None, label: str | None = None) -> int | None:
     """Capture state, commit catalog.yaml + alias files once, tag the step.
 
     One commit per operation (not per mutator), through the fork-safe primitive,
-    under the per-project lock. Returns the step number.
+    under the per-project lock. Returns the step number, or None when the
+    commit did not land (e.g. index.lock contention with xorq's own catalog
+    add, which commits to this repo outside the flock). The step tag only
+    moves with a landed commit: tagging anyway would stack step-N on
+    step-(N-1)'s commit and hide the earlier step from ``list_revisions``,
+    which keys rows by commit.
     """
     cd = catalog_dir(project)
     with _project_lock(project):
@@ -361,6 +366,7 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
         rc, _, err = run_git([*_GIT_ID, "commit", "-m", message, "--allow-empty"], cwd=cd)
         if rc != 0:
             log.warning("catalog checkpoint commit failed (step %s): %s", step, err)
+            return None
         run_git(["tag", "-f", f"step-{step:03d}"], cwd=cd)
         if label:
             run_git(["tag", "-f", label], cwd=cd)
@@ -408,8 +414,9 @@ def genesis(project: str) -> int | None:
     Called at the project-creation surfaces (CLI ``init``, companion
     ``/api/projects/new``, MCP ``project_new``) so the baseline ``reset-to``
     targets is the true empty start — not a state with the first edit already
-    folded in. No-op (returns None) when the repo already has commits, so a
-    ``--force`` re-init preserves history. Existing projects that predate the
+    folded in. Returns None when there is nothing to record — the repo already
+    has commits (so a ``--force`` re-init preserves history) — or when the
+    genesis commit itself failed to land. Existing projects that predate the
     feature get their step 0 lazily from the first checkpoint instead.
     """
     if not ensure_catalog_repo(project):

@@ -172,6 +172,32 @@ def test_checkpoint_one_commit_and_clean_tree(project):
     assert dirty == "", f"tracked tree not clean after checkpoint: {dirty!r}"
 
 
+def test_checkpoint_commit_failure_does_not_move_step_tag(project):
+    """A failed checkpoint commit must not retag: tagging anyway lands step-N
+    on step-(N-1)'s commit, and list_revisions keys rows by commit, so the
+    earlier step silently vanishes from the timeline. The realistic trigger
+    exists — xorq's own `catalog add` commits to the same repo outside the
+    checkpoint flock, so index.lock contention is a matter of timing."""
+    cs.ensure_catalog_repo(project)
+    notebook.append(project, "alias1", markdown="hello")
+    s1 = cs.checkpoint_catalog(project, "step one")
+    assert s1 is not None
+    before = _steps(project)
+
+    # Wedge the repo the way a concurrent writer does: a stale index.lock.
+    lock = paths.catalog_dir(project) / ".git" / "index.lock"
+    lock.write_bytes(b"")
+    try:
+        notebook.append(project, "alias2", markdown="world")
+        assert cs.checkpoint_catalog(project, "step two") is None  # did not land
+    finally:
+        lock.unlink()
+
+    assert _steps(project) == before  # no tag created, none clobbered
+    revs = cs.list_revisions(project)
+    assert any(r["step"] == s1 and r["current"] for r in revs)  # s1 still on the timeline, at HEAD
+
+
 def test_reset_roundtrip_over_every_kind(project):
     cs.ensure_catalog_repo(project)
     pp.write_post_processing(project, "pp1", PP_SRC)
@@ -357,6 +383,41 @@ def test_cli_genesis_revisions_label_and_reset(isolated_home):
     reset = runner.invoke(cli, ["reset-to", "baseline", "--project", "alpha"])
     assert reset.exit_code == 0, reset.output
     assert pp.list_post_processings("alpha") == []  # back to the empty genesis
+
+
+def test_cli_reset_notify_names_the_reset_project(isolated_home, monkeypatch):
+    """`reset-to --project` must tell the companion *which* project was reset.
+    The notify payload otherwise falls back to the companion's active project,
+    so resetting a non-active project would reload the wrong sessions and
+    leave the reset project's buckaroo sessions stale."""
+    import httpx
+    from click.testing import CliRunner
+
+    from pydata_cli.main import cli
+
+    sent = {}
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: sent.update(url=url, json=json))
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["init", "beta", "--no-fixture"]).exit_code == 0
+    res = runner.invoke(cli, ["reset-to", "0", "--project", "beta"])
+    assert res.exit_code == 0, res.output
+    assert sent["json"] == {"kind": "project_reset", "project": "beta"}
+
+
+def test_notify_honors_explicit_project(fresh_companion_app, project):
+    """/internal/notify reloads sessions for the project named in the payload,
+    falling back to the active project only when none is given."""
+    from fastapi.testclient import TestClient
+
+    c = TestClient(fresh_companion_app)
+    r = c.post("/internal/notify", json={"kind": "project_reset", "project": "beta"})
+    assert r.status_code == 200, r.text
+    assert r.json()["project"] == "beta"
+
+    r2 = c.post("/internal/notify", json={"kind": "project_reset"})  # no project: active
+    assert r2.status_code == 200
+    assert r2.json()["project"] == project
 
 
 def test_genesis_on_companion_project_new(fresh_companion_app, project):

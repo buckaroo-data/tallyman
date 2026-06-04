@@ -606,6 +606,23 @@ def test_capture_seeds_xorq_keys(project):
     assert raw.get("aliases") == []
 
 
+def test_write_pydata_state_rejects_unrepresentable_values(project):
+    """write_pydata_state must never produce a catalog.yaml that safe_load
+    cannot read back. The reader (_read_raw) is yaml.safe_load, while the
+    writer's full Dumper happily emits python-object tags for a stray Path —
+    one such write bricks every later read: checkpoint, materialize, and prune
+    all degrade to log warnings until the file is hand-repaired. The write must
+    fail loudly instead, before the tmp-file replace, leaving the previous
+    catalog.yaml intact."""
+    import yaml as _yaml
+
+    cs.write_pydata_state(project, charts=[])  # a good file exists first
+    bad_spec = {"content_hash": "x", "spec": {"path": Path("/tmp/x")}}
+    with pytest.raises(_yaml.YAMLError):
+        cs.write_pydata_state(project, charts=[bad_spec])
+    assert cs.read_pydata_state(project)["charts"] == []  # previous file untouched
+
+
 @pytest.mark.integration
 def test_xorq_catalog_add_registers_after_genesis(project, orders_parquet):
     """End to end: genesis (branch-pinned, xorq-keyed catalog.yaml) then a

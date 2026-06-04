@@ -523,3 +523,36 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
     assert (ed / "result.parquet").read_bytes() == b"big"  # restored, not recomputed
     assert (cc / "later.parquet").read_bytes() == b"warm"
     assert (paths.bullpen_dir(project) / "entries" / "bbbb").is_dir()  # bullpen retains its copy
+
+
+# ---------------------------------------------------------------------------
+# xorq catalog coexistence — genesis must not break `xorq catalog add`
+# ---------------------------------------------------------------------------
+
+
+def test_capture_seeds_xorq_keys(project):
+    """xorq's CatalogYaml.contents indexes `entries`/`aliases` directly, with
+    no defaulting for dict-shaped files (only the legacy list form gets
+    defaults) — so a catalog.yaml born from genesis/capture must carry both
+    keys, or every `xorq catalog add` fails (Error: 'aliases') and
+    registration silently no-ops. xorq round-trips unknown keys, so seeding
+    its two keys is the whole coexistence contract."""
+    import yaml as _yaml
+
+    cs.capture_pydata_state(project)
+    raw = _yaml.safe_load((paths.catalog_dir(project) / "catalog.yaml").read_text())
+    assert raw.get("entries") == []
+    assert raw.get("aliases") == []
+
+
+@pytest.mark.integration
+def test_xorq_catalog_add_registers_after_genesis(project, orders_parquet):
+    """End to end: genesis (branch-pinned, xorq-keyed catalog.yaml) then a
+    build — the best-effort xorq registration must actually land, leaving the
+    build zip tracked in the catalog repo at entries/<hash>.zip."""
+    assert cs.genesis(project) == 0
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    zip_path = paths.catalog_dir(project) / "entries" / f"{res.content_hash}.zip"
+    assert zip_path.exists(), "xorq catalog add did not register the build"
+    tracked = _git(project, "ls-files", "entries")
+    assert f"entries/{res.content_hash}.zip" in tracked.split()

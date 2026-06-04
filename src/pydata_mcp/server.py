@@ -105,6 +105,80 @@ def _tag_project(fn):
     return wrapped
 
 
+# ---------------------------------------------------------------------------
+# Dispatch-boundary checkpoint (reset-to-revision, plans/adr-reset-to-revision.md)
+# ---------------------------------------------------------------------------
+
+# Read-only and lifecycle tools that must NOT append a revision. Everything
+# else checkpoints by default — opt-out, so a tool added next month is covered
+# automatically and coverage cannot silently regress (pinned by
+# tests/test_reset_to_revision.py).
+_NO_CHECKPOINT = frozenset(
+    {
+        "catalog_list",
+        "catalog_diff",
+        "catalog_list_summary_stats",
+        "catalog_list_post_processings",
+        "catalog_run_post_processing",  # preview, persists nothing
+        "catalog_export_marimo",  # export artifact, not state
+        "project_list",
+        "project_switch",
+        "project_new",  # lifecycle; genesis happens inside the tool itself
+    }
+)
+
+# Names of every tool that registered through the checkpointing decorator —
+# introspection surface for the opt-out coverage test.
+_CHECKPOINTED_TOOLS: set[str] = set()
+
+
+def _with_checkpoint(fn):
+    """Checkpoint the catalog once after a successful mutating tool call.
+
+    Applied to every tool at registration (see ``_checkpointing_tool``). The
+    checkpoint is taken at the dispatch boundary, after the operation returns
+    without error — one revision per operation even when the tool calls several
+    ``pydata_core`` mutators (#33's multi-commit bug). A checkpoint failure is
+    logged, never raised: it must not break the tool response.
+    """
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        result = fn(*args, **kwargs)
+        if fn.__name__ in _NO_CHECKPOINT:
+            return result
+        if isinstance(result, dict) and result.get("error"):
+            return result
+        try:
+            from pydata_core.catalog_state import checkpoint_catalog  # noqa: PLC0415
+
+            project = _resolve_active_project()
+            if project:
+                checkpoint_catalog(project, f"pydata: {fn.__name__}")
+        except Exception as exc:
+            log.warning("checkpoint after %s failed: %s", fn.__name__, exc)
+        return result
+
+    return wrapped
+
+
+_original_tool = mcp.tool
+
+
+def _checkpointing_tool(*dargs, **dkwargs):
+    """``mcp.tool`` wrapped so registration applies the checkpoint hook."""
+    register = _original_tool(*dargs, **dkwargs)
+
+    def _register(fn):
+        _CHECKPOINTED_TOOLS.add(fn.__name__)
+        return register(_with_checkpoint(fn))
+
+    return _register
+
+
+mcp.tool = _checkpointing_tool
+
+
 def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
     """Best-effort POST to the companion's /internal/notify. Never raise."""
     try:
@@ -563,9 +637,16 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     # Diff the two entries' (cache-resolving) expressions — streaming xorq
     # aggregates, and self-healing if a result.parquet was evicted.
     from pydata_xorq.result_cache import cached_result_expr
+
     diff = full_diff(
-        a_dir, b_dir, a_label=f"V{a_idx}", b_label=f"V{b_idx}", backend="xorq",
-        a_expr=cached_result_expr(project, a_hash), b_expr=cached_result_expr(project, b_hash))
+        a_dir,
+        b_dir,
+        a_label=f"V{a_idx}",
+        b_label=f"V{b_idx}",
+        backend="xorq",
+        a_expr=cached_result_expr(project, a_hash),
+        b_expr=cached_result_expr(project, b_hash),
+    )
     return {
         "alias": name,
         "before": {"version": a_idx, "hash": a_hash},

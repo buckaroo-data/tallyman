@@ -312,3 +312,66 @@ def reset_to(project: str, ref: int | str) -> None:
         prune_entries(project)
         prune_result_cache(project)
         prune_compute_cache(project)
+
+
+def genesis(project: str) -> int | None:
+    """Record step-000 from the freshly-created tree, once.
+
+    Called at the project-creation surfaces (CLI ``init``, companion
+    ``/api/projects/new``, MCP ``project_new``) so the baseline ``reset-to``
+    targets is the true empty start — not a state with the first edit already
+    folded in. No-op (returns None) when the repo already has commits, so a
+    ``--force`` re-init preserves history. Existing projects that predate the
+    feature get their step 0 lazily from the first checkpoint instead.
+    """
+    if not ensure_catalog_repo(project):
+        return None
+    rc, _, _ = run_git(["rev-parse", "--verify", "-q", "HEAD"], cwd=catalog_dir(project))
+    if rc == 0:
+        return None
+    return checkpoint_catalog(project, "genesis", step=0)
+
+
+def current_step(project: str) -> int | None:
+    """The step tag at HEAD, or None when the repo has no steps yet."""
+    rc, out, _ = run_git(["tag", "--points-at", "HEAD", "-l", "step-*"], cwd=catalog_dir(project))
+    nums = [int(m.group(1)) for t in out.split() if (m := _STEP_RE.match(t))]
+    return max(nums) if nums else None
+
+
+def label_step(project: str, step: int, name: str) -> None:
+    """Name a step so the operator can ``reset-to <name>``."""
+    rc, _, err = run_git(["tag", "-f", name, f"step-{step:03d}"], cwd=catalog_dir(project))
+    if rc != 0:
+        raise RuntimeError(f"labelling step {step} as {name!r} failed: {err}")
+
+
+def list_revisions(project: str) -> list[dict]:
+    """The timeline: every step tag with its commit, op message, labels, and
+    a marker for the step ``current`` (HEAD) points at."""
+    cd = catalog_dir(project)
+    rc, out, _ = run_git(
+        ["for-each-ref", "refs/tags", "--format=%(refname:short)%09%(objectname:short)%09%(subject)"],
+        cwd=cd,
+    )
+    if rc != 0:
+        return []
+    steps: dict[str, dict] = {}  # commit -> revision row
+    labels: dict[str, list[str]] = {}  # commit -> non-step tag names
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 2:
+            continue
+        ref, commit = parts[0], parts[1]
+        subject = parts[2] if len(parts) > 2 else ""
+        m = _STEP_RE.match(ref)
+        if m:
+            steps[commit] = {"step": int(m.group(1)), "commit": commit, "op": subject}
+        else:
+            labels.setdefault(commit, []).append(ref)
+    cur = current_step(project)
+    revs = sorted(steps.values(), key=lambda r: r["step"])
+    for r in revs:
+        r["labels"] = sorted(labels.get(r["commit"], []))
+        r["current"] = r["step"] == cur
+    return revs

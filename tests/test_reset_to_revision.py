@@ -357,3 +357,22 @@ def test_genesis_on_companion_project_new(fresh_companion_app, project):
     r = c.post("/api/projects/new", json={"name": "fresh"})
     assert r.status_code == 200, r.text
     assert "step-000" in _git("fresh", "tag", "-l", "step-*")
+
+
+def test_cross_process_checkpoint(project, isolated_home):
+    """Two processes checkpoint concurrently; the per-project flock serializes
+    them so both land — no lost revision, no torn `git index.lock` race. Real
+    processes, not threads: flock is held per-process, which is the whole point
+    (the companion and the MCP server are separate processes)."""
+    import os
+    import subprocess as sp
+    import sys
+
+    cs.ensure_catalog_repo(project)
+    code = f"from pydata_core.catalog_state import checkpoint_catalog; checkpoint_catalog({project!r}, 'from child')"
+    env = {**os.environ, "PYDATA_HOME": str(isolated_home)}
+    procs = [sp.Popen([sys.executable, "-c", code], env=env, stdout=sp.DEVNULL, stderr=sp.DEVNULL) for _ in range(2)]
+    for p in procs:
+        assert p.wait(timeout=120) == 0
+    assert _steps(project) == {"step-000", "step-001"}  # both landed, distinct steps
+    assert int(_git(project, "rev-list", "--count", "HEAD")) == 2

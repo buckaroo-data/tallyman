@@ -45,6 +45,82 @@ def init_project(name: str, with_fixture: bool, force: bool) -> None:
     if with_fixture:
         out = write_shoe_orders(data_dir(name) / "orders.parquet")
         click.echo(f"wrote fixture {out} ({out.stat().st_size} bytes)")
+    from pydata_core.catalog_state import genesis
+
+    if genesis(name) is not None:
+        click.echo("recorded step-000 genesis baseline")
+
+
+@cli.command("reset-to")
+@click.argument("ref")
+@click.option("--project", "project_opt", default=None, help="Project name override.")
+def reset_to_step(ref: str, project_opt: str | None) -> None:
+    """Restore the project to a step number or label (e.g. 3 or baseline)."""
+    from pydata_core.catalog_state import current_step, reset_to
+
+    name = resolve_project(project_opt)
+    if name is None:
+        raise click.ClickException("no active project — pass --project")
+    target: int | str = int(ref) if ref.isdigit() else ref
+    try:
+        reset_to(name, target)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    step = current_step(name)
+    where = f"step-{step:03d}" if step is not None else str(target)
+    click.echo(f"reset {name} to {where}")
+    _notify_companion_reset()
+
+
+def _notify_companion_reset() -> None:
+    """Best-effort: a running companion reloads buckaroo sessions + browsers."""
+    import httpx
+
+    url = os.environ.get("PYDATA_COMPANION_URL", "http://127.0.0.1:7860")
+    try:
+        httpx.post(f"{url}/internal/notify", json={"kind": "project_reset"}, timeout=2.0)
+    except Exception:
+        pass  # companion may not be running; the reset itself already landed
+
+
+@cli.group("revisions", invoke_without_command=True)
+@click.option("--project", "project_opt", default=None, help="Project name override.")
+@click.pass_context
+def revisions_group(ctx: click.Context, project_opt: str | None) -> None:
+    """List the revision timeline; `label` names a step for reset-to."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from pydata_core.catalog_state import list_revisions
+
+    name = resolve_project(project_opt)
+    if name is None:
+        raise click.ClickException("no active project — pass --project")
+    revs = list_revisions(name)
+    if not revs:
+        click.echo("no revisions yet")
+        return
+    for r in revs:
+        marker = "*" if r["current"] else " "
+        labels = f"  ({', '.join(r['labels'])})" if r["labels"] else ""
+        click.echo(f"{marker} step-{r['step']:03d}  {r['commit']}  {r['op']}{labels}")
+
+
+@revisions_group.command("label")
+@click.argument("step", type=int)
+@click.argument("name")
+@click.option("--project", "project_opt", default=None, help="Project name override.")
+def revisions_label(step: int, name: str, project_opt: str | None) -> None:
+    """Name a step (e.g. baseline) so the operator can reset-to it."""
+    from pydata_core.catalog_state import label_step
+
+    proj = resolve_project(project_opt)
+    if proj is None:
+        raise click.ClickException("no active project — pass --project")
+    try:
+        label_step(proj, step, name)
+    except RuntimeError as exc:
+        raise click.ClickException(str(exc))
+    click.echo(f"labelled step-{step:03d} as {name!r}")
 
 
 @cli.command("run")

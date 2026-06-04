@@ -233,6 +233,7 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
     # (e.g. both reading their result.parquet on the default xorq backend),
     # which avoids an eager cross-backend transport.
     from buckaroo.compare import _align_backends
+
     a, b = _align_backends(a, b)
 
     # Rename b's non-key columns to avoid ibis collision during outer join.
@@ -250,14 +251,11 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
     # Membership sentinel: null on the b side → a_only; null on the a side → b_only.
     a_sent = a_non_keys[0] if a_non_keys else keys[0]
     b_sent = f"{b_non_keys[0]}_v2" if b_non_keys else keys[0]
-    membership = (
-        ibis.cases(
-            (joined[b_sent].isnull(), ibis.literal(1).cast("int8")),
-            (joined[a_sent].isnull(), ibis.literal(2).cast("int8")),
-            else_=ibis.literal(3).cast("int8"),
-        )
-        .name("membership")
-    )
+    membership = ibis.cases(
+        (joined[b_sent].isnull(), ibis.literal(1).cast("int8")),
+        (joined[a_sent].isnull(), ibis.literal(2).cast("int8")),
+        else_=ibis.literal(3).cast("int8"),
+    ).name("membership")
     sel.append(membership)
 
     # Per-column equality: membership + 4 if equal, membership + 0 if not.
@@ -418,6 +416,51 @@ def create_app(
         event.setdefault("project", _current_project())
         for q in list(subscribers):
             await q.put(event)
+
+    # ------------------------------------------------------------------
+    # Dispatch-boundary checkpoint (reset-to-revision). Opt-out: every
+    # successful non-GET response checkpoints once, unless the route is on
+    # the explicit denylist — so a new authored-state route is covered by
+    # default and coverage cannot silently regress.
+    # ------------------------------------------------------------------
+
+    def _checkpoint_exempt(method: str, path: str) -> bool:
+        if method in ("GET", "HEAD", "OPTIONS"):
+            return True
+        if path.startswith("/internal/") or path.startswith("/api/projects"):
+            return True  # SSE plumbing + project lifecycle (genesis covers new)
+        if "/api/result_cache" in path or path.endswith("/api/errors"):
+            return True  # cache/log clears, not authored state
+        if path.endswith("/api/reset"):
+            return True  # reset moves `current`; it is not a new step
+        return False
+
+    @app.middleware("http")
+    async def _checkpoint_after_mutation(request, call_next):
+        response = await call_next(request)
+        path = request.url.path
+        if read_only or response.status_code >= 400 or _checkpoint_exempt(request.method, path):
+            return response
+        # Mutating project routes all live at /{project}/api/... — take the
+        # first segment and checkpoint only when it names a real project.
+        seg = path.split("/", 2)
+        name = seg[1] if len(seg) > 1 else ""
+        try:
+            validate_project_name(name)
+            known = project_dir(name).is_dir()
+        except ValueError:
+            known = False
+        if not known:
+            return response
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from pydata_core.catalog_state import checkpoint_catalog  # noqa: PLC0415
+
+        try:
+            await run_in_threadpool(checkpoint_catalog, name, f"pydata: {request.method} {path}")
+        except Exception as exc:
+            log.warning("checkpoint after %s %s failed: %s", request.method, path, exc)
+        return response
 
     # ------------------------------------------------------------------
     # Root redirect
@@ -697,16 +740,18 @@ def create_app(
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
             info = version_of_hash(project, latest) if latest else None
-            cells.append({
-                **c,
-                "latest_hash": latest,
-                "version": info[1] if info else None,
-                "entry_meta": entry_meta,
-                "schema": schema,
-                "total_rows": total_rows,
-                "chart_spec": chart_spec,
-                "buckaroo_session": buckaroo_session,
-            })
+            cells.append(
+                {
+                    **c,
+                    "latest_hash": latest,
+                    "version": info[1] if info else None,
+                    "entry_meta": entry_meta,
+                    "schema": schema,
+                    "total_rows": total_rows,
+                    "chart_spec": chart_spec,
+                    "buckaroo_session": buckaroo_session,
+                }
+            )
         return {
             "project": project,
             "cells": cells,
@@ -737,9 +782,14 @@ def create_app(
         b_expr = cached_result_expr(project, b_hash)
         keys = diff_keys(project, a_hash, b_hash) or None
         diff = full_diff(
-            a_dir, b_dir,
-            a_label=f"V{va}", b_label=f"V{vb}",
-            backend="xorq", a_expr=a_expr, b_expr=b_expr, keys=keys,
+            a_dir,
+            b_dir,
+            a_label=f"V{va}",
+            b_label=f"V{vb}",
+            backend="xorq",
+            a_expr=a_expr,
+            b_expr=b_expr,
+            keys=keys,
         )
 
         compare_session = None
@@ -752,6 +802,7 @@ def create_app(
                 try:
                     build_path, overrides = _build_compare_expr(a_expr, b_expr, keys)
                     from pydata_core.paths import diff_stat_cache_dir  # noqa: PLC0415
+
                     stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
                     stat_cache.mkdir(parents=True, exist_ok=True)
                     resp = buckaroo._client.post(
@@ -880,17 +931,19 @@ def create_app(
                         prompt = m.get("prompt")
                     except Exception:
                         pass
-                entries.append({
-                    "hash": content_hash,
-                    "size": size,
-                    "size_formatted": _fmt_bytes(size),
-                    "row_count": row_count,
-                    "created": created,
-                    "alias": alias,
-                    "version": version,
-                    "is_current": is_current,
-                    "prompt": prompt,
-                })
+                entries.append(
+                    {
+                        "hash": content_hash,
+                        "size": size,
+                        "size_formatted": _fmt_bytes(size),
+                        "row_count": row_count,
+                        "created": created,
+                        "alias": alias,
+                        "version": version,
+                        "is_current": is_current,
+                        "prompt": prompt,
+                    }
+                )
         entries.sort(key=lambda e: -e["size"])
         total = sum(e["size"] for e in entries)
         return {
@@ -981,6 +1034,34 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {**cell, "html": _render_markdown(cell["markdown"])}
 
+    @app.post("/{project}/api/reset")
+    async def api_reset(project: str, payload: dict):
+        """Restore the project to a step number or label, then reload sessions.
+
+        Exempt from the checkpoint middleware — a reset moves ``current``, it
+        does not append a new step. (A timeline scrubber in the SPA calls this.)
+        """
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        ref = (payload or {}).get("ref")
+        if ref is None:
+            raise HTTPException(400, "ref required: a step number or a label")
+        if isinstance(ref, str) and ref.isdigit():
+            ref = int(ref)
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from pydata_core.catalog_state import current_step, reset_to  # noqa: PLC0415
+
+        try:
+            await run_in_threadpool(reset_to, project, ref)
+        except RuntimeError as exc:
+            raise HTTPException(404, str(exc))
+        reloaded = buckaroo.reload_project_sessions(project) if buckaroo else 0
+        step = current_step(project)
+        await publish({"kind": "project_reset", "step": step})
+        return {"ok": True, "step": step, "reloaded": reloaded}
+
     # ------------------------------------------------------------------
     # Project-agnostic routes (no project prefix)
     # ------------------------------------------------------------------
@@ -995,7 +1076,7 @@ def create_app(
             payload.kind,
             getattr(payload, "hash", None),
         )
-        if payload.kind in ("post_processing_changed", "summary_stat_changed"):
+        if payload.kind in ("post_processing_changed", "summary_stat_changed", "project_reset"):
             if buckaroo:
                 reloaded = buckaroo.reload_project_sessions(project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)
@@ -1055,6 +1136,13 @@ def create_app(
             from pydata_core import data_dir as _data_dir  # noqa: PLC0415
 
             write_shoe_orders(_data_dir(name) / "orders.parquet")
+        # Record the step-000 genesis baseline so reset-to always has the
+        # true empty start to target (plans/reset-to-revision-v2.md W7).
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from pydata_core.catalog_state import genesis as _genesis  # noqa: PLC0415
+
+        await run_in_threadpool(_genesis, name)
         _sap(name)
         await publish({"kind": "project_switched", "name": name})
         return {"name": name, "active": name}

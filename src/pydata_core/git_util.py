@@ -15,17 +15,38 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import tempfile
+import time
 from pathlib import Path
+
+
+def _wait(pid: int, timeout: float) -> int:
+    """Reap *pid* within *timeout* seconds; SIGKILL it when the clock runs out.
+
+    Callers may hold the per-project flock, so a wedged git (index.lock
+    contention, fs hang) must surface as a signal death, never a stuck thread.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done == pid:
+            return status
+        if time.monotonic() >= deadline:
+            os.kill(pid, signal.SIGKILL)
+            _, status = os.waitpid(pid, 0)
+            return status
+        time.sleep(0.01)
 
 
 def run_git(args: list[str], *, cwd: Path | str | None = None, timeout: float = 10.0) -> tuple[int, str, str]:
     """Run ``git <args>`` fork-free; return ``(returncode, stdout, stderr)``.
 
     *cwd* is passed as ``git -C <cwd>`` (arg-based, so no chdir/fork plumbing).
-    A signal death (e.g. SIGSEGV) is reported as a negative returncode rather
-    than raising, so callers can degrade. ``git`` is resolved on PATH at call
-    time because ``posix_spawn`` does not search PATH.
+    A signal death (e.g. SIGSEGV, or the *timeout* SIGKILL) is reported as a
+    negative returncode rather than raising, so callers can degrade. ``git``
+    is resolved on PATH at call time because ``posix_spawn`` does not search
+    PATH.
     """
     git = shutil.which("git")
     if git is None:
@@ -40,7 +61,7 @@ def run_git(args: list[str], *, cwd: Path | str | None = None, timeout: float = 
             (os.POSIX_SPAWN_DUP2, err.fileno(), 2),
         ]
         pid = os.posix_spawn(git, full, os.environ, file_actions=file_actions)
-        _, status = os.waitpid(pid, 0)
+        status = _wait(pid, timeout)
         out.seek(0)
         err.seek(0)
         stdout = out.read().decode(errors="replace").strip()

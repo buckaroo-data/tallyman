@@ -58,16 +58,20 @@ def test_no_bare_subprocess_git_in_src():
     The macOS fork-from-multithreaded crash won't reproduce on Linux CI, so a
     static check is the only enforcement. All runtime git must go through
     git_util.run_git (os.posix_spawn).
+
+    Matches against the whole file text (``\\s`` spans newlines), so a call
+    ruff wraps across lines is still caught, and any module alias
+    (``import subprocess as sp``) is covered by matching the attribute name,
+    not the literal ``subprocess.``.
     """
     src = Path(__file__).resolve().parent.parent / "src"
-    pattern = re.compile(r"""subprocess\.\w+\(\s*\[\s*["']git["']""")
-    offenders = [
-        f"{p.relative_to(src)}:{i}"
-        for p in src.rglob("*.py")
-        if p.name != "git_util.py"  # the sanctioned primitive; names the pattern in its docs
-        for i, line in enumerate(p.read_text().splitlines(), 1)
-        if pattern.search(line)
-    ]
+    pattern = re.compile(r"""\b\w+\.(?:run|Popen|call|check_call|check_output)\(\s*\[\s*["']git["']""")
+    offenders = []
+    for p in src.rglob("*.py"):
+        if p.name == "git_util.py":  # the sanctioned primitive; names the pattern in its docs
+            continue
+        text = p.read_text()
+        offenders += [f"{p.relative_to(src)}:{text.count('\n', 0, m.start()) + 1}" for m in pattern.finditer(text)]
     assert not offenders, f"bare subprocess git calls: {offenders}"
 
 
@@ -321,10 +325,12 @@ def test_companion_reset_endpoint(fresh_companion_app, project):
     cs.checkpoint_catalog(project, "step two")
 
     c = TestClient(fresh_companion_app)
+    before = _steps(project)
     r = c.post(f"/{project}/api/reset", json={"ref": s1})
     assert r.status_code == 200, r.text
     assert r.json()["step"] == s1
     assert {x["alias"] for x in notebook.load(project)["cells"]} == {"alias1"}
+    assert _steps(project) == before  # /api/reset is middleware-exempt: moves current, appends nothing
 
     assert c.post(f"/{project}/api/reset", json={"ref": 999}).status_code == 404
 

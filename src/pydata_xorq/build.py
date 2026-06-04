@@ -279,13 +279,19 @@ def load_entry(project: str, content_hash: str):
     The persisted build is portable (paths use a `${PYDATA_PROJECT_ROOT}`
     placeholder). This expands placeholders against the current machine's
     project root before handing the build to xorq.
-    """
-    from xorq.common.utils.caching_utils import get_xorq_cache_dir
 
+    Loads against the per-project compute cache, like the build-time load:
+    #45 — caches warm lazily at view time, and view time comes through here,
+    so the global ~/.cache/xorq would make the recorded warm-set vacuous and
+    leak warm hits across projects and steps.
+    """
+    from pydata_core.paths import compute_cache_dir
     from pydata_xorq.portable import load_expr_portable
 
     target = entry_dir(project, content_hash)
     build_dir = target / "xorq_build"
     if not build_dir.is_dir():
         raise FileNotFoundError(f"no xorq_build dir for {content_hash} in project {project}")
-    return load_expr_portable(build_dir, project_dir(project), cache_dir=get_xorq_cache_dir())
+    cache_dir = compute_cache_dir(project)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return load_expr_portable(build_dir, project_dir(project), cache_dir=cache_dir)

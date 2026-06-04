@@ -148,6 +148,16 @@ def compute_cache_dir(project: str) -> Path:
     return catalog_dir(project) / "compute_cache"
 
 
+def bullpen_dir(project: str) -> Path:
+    """Holding area for artifacts a reset evicts (untracked, content-addressed).
+
+    A backward reset moves pruned entries/caches here instead of deleting
+    them; a forward reset copies the step's recorded set back. Live
+    operations never read it, so an evicted entry still re-adds cold.
+    """
+    return catalog_dir(project) / "bullpen"
+
+
 def diff_stat_cache_root(project: str) -> Path:
     """Parent of all per-pair diff stat caches for a project."""
     return catalog_dir(project) / "diff_stat_cache"

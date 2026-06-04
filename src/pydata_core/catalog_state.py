@@ -13,9 +13,13 @@ xorq owns ``entries`` and ``aliases`` in that file; pydata owns:
 
 The catalog git repo tracks only ``catalog.yaml`` + the two alias files. The
 heavy artifacts (entries/, the caches) are content-addressed, additive, and
-untracked — ``git reset`` can't roll them back, so ``reset_to`` prunes them to
-the recorded pointer lists. The derived files (.py scripts, chart specs, the
-notebook) live outside the repo, so they are reconstructed by ``materialize``.
+untracked — ``git reset`` can't roll them back, so ``reset_to`` reconciles them
+to the recorded pointer lists: evictions retire to the bullpen (not deleted),
+and anything the restored step records that is missing comes back from the
+bullpen by copy. Live operations never read the bullpen, so a re-added
+expression still computes cold. The derived files (.py scripts, chart specs,
+the notebook) live outside the repo, so they are reconstructed by
+``materialize``.
 
 A checkpoint captures the live on-disk state into catalog.yaml and commits once,
 through the fork-safe git primitive (git_util) under a per-project lock. This
@@ -40,6 +44,7 @@ from pydata_core import post_processing as pp
 from pydata_core import summary_stats as ss
 from pydata_core.git_util import run_git
 from pydata_core.paths import (
+    bullpen_dir,
     catalog_dir,
     compute_cache_dir,
     entries_dir,
@@ -55,6 +60,10 @@ log = logging.getLogger(__name__)
 _GIT_ID = ["-c", "user.email=pydata@local", "-c", "user.name=pydata"]
 _TRACKED = ("catalog.yaml", "aliases.json", "alias_history.json")
 _STEP_RE = re.compile(r"^step-(\d+)$")
+# Refs and labels are operator input that ends up as git arguments. A plain
+# tag-shaped name only: no leading dash (option injection), no revision
+# navigation (~ ^ : @), nothing git would resolve beyond a tag lookup.
+_TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -187,12 +196,27 @@ def materialize(project: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# prune: reconcile untracked content-addressed artifacts to the pointer lists
+# prune/restore: reconcile untracked artifacts to the pointer lists, via the
+# bullpen — evictions are retired (moved), not destroyed, and a forward reset
+# copies the step's recorded set back instead of recomputing it.
 # ---------------------------------------------------------------------------
 
 
+def _retire(src: Path, dest: Path) -> None:
+    """Move an evicted artifact into the bullpen.
+
+    Content-addressed names mean an existing *dest* is the same content, so
+    the source is simply dropped rather than re-moved.
+    """
+    if dest.exists():
+        shutil.rmtree(src) if src.is_dir() else src.unlink()
+        return
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), str(dest))
+
+
 def prune_entries(project: str) -> int:
-    """Remove entry dirs not named by ``entry_hashes``. No-op when key absent."""
+    """Retire entry dirs not named by ``entry_hashes``. No-op when key absent."""
     raw = _read_raw(project)
     if "entry_hashes" not in raw:
         return 0
@@ -203,7 +227,7 @@ def prune_entries(project: str) -> int:
     removed = 0
     for child in ed.iterdir():
         if child.is_dir() and child.name not in valid:
-            shutil.rmtree(child)
+            _retire(child, bullpen_dir(project) / "entries" / child.name)
             removed += 1
     return removed
 
@@ -217,8 +241,8 @@ def _prune_cache(project: str, root: Path, key: str) -> int:
         return 0
     removed = 0
     for p in root.rglob("*"):
-        if p.is_file() and str(p.relative_to(root)) not in valid:
-            p.unlink()
+        if p.is_file() and (rel := str(p.relative_to(root))) not in valid:
+            _retire(p, bullpen_dir(project) / key / rel)
             removed += 1
     return removed
 
@@ -229,6 +253,35 @@ def prune_result_cache(project: str) -> int:
 
 def prune_compute_cache(project: str) -> int:
     return _prune_cache(project, compute_cache_dir(project), "compute_cache")
+
+
+def restore_from_bullpen(project: str) -> int:
+    """Copy recorded-but-missing artifacts back from the bullpen.
+
+    The inverse of the prunes, for a reset that walks forward: anything the
+    restored catalog.yaml's pointer lists name that is absent from the live
+    tree comes back by *copy*, so the bullpen keeps its set and the
+    back/forward rehearsal loop can repeat. Only ``reset_to`` calls this —
+    live operations never see the bullpen, which is what keeps a re-added
+    expression honest (cold).
+    """
+    raw = _read_raw(project)
+    bp = bullpen_dir(project)
+    restored = 0
+    ed = entries_dir(project)
+    for h in raw.get("entry_hashes") or []:
+        live, parked = ed / h, bp / "entries" / h
+        if not live.exists() and parked.is_dir():
+            shutil.copytree(parked, live)
+            restored += 1
+    for key, root in (("result_cache", result_cache_dir(project)), ("compute_cache", compute_cache_dir(project))):
+        for rel in raw.get(key) or []:
+            live, parked = root / rel, bp / key / rel
+            if not live.exists() and parked.is_file():
+                live.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(parked, live)
+                restored += 1
+    return restored
 
 
 # ---------------------------------------------------------------------------
@@ -252,12 +305,18 @@ def _project_lock(project: str):
 
 
 def ensure_catalog_repo(project: str) -> bool:
-    """Idempotently git-init the catalog repo. Returns True if it exists after."""
+    """Idempotently git-init the catalog repo. Returns True if it exists after.
+
+    The branch is pinned to ``main`` (git ≥ 2.28): xorq's catalog layer
+    hardcodes it, and inheriting the host's ``init.defaultBranch`` (master on
+    stock git) makes every ``xorq catalog add`` fail — silently, because
+    registration is best-effort.
+    """
     cd = catalog_dir(project)
     cd.mkdir(parents=True, exist_ok=True)
     if (cd / ".git").exists():
         return True
-    rc, _, err = run_git(["init", "-q"], cwd=cd)
+    rc, _, err = run_git(["init", "-q", "-b", "main"], cwd=cd)
     if rc != 0:
         log.warning("catalog git init failed in %s: %s", cd, err)
         return False
@@ -299,19 +358,39 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
     return step
 
 
+def _resolve_tag(project: str, tag: str) -> str:
+    """The commit a step/label tag points at.
+
+    Refs arrive from the HTTP payload and the CLI, so anything that is not a
+    plain *existing* tag is rejected here — option-like strings, revision
+    navigation (``step-001~1``, ``:/msg``), and bare refs like ``HEAD`` never
+    reach ``git reset`` as arguments.
+    """
+    if not _TAG_RE.match(tag):
+        raise RuntimeError(f"invalid revision {tag!r}: expected a step number or label")
+    rc, out, _ = run_git(["rev-parse", "--verify", "-q", f"refs/tags/{tag}^{{commit}}"], cwd=catalog_dir(project))
+    if rc != 0:
+        raise RuntimeError(f"unknown revision {tag!r}")
+    return out
+
+
 def reset_to(project: str, ref: int | str) -> None:
     """Restore the catalog to a step/label: git reset --hard, materialize the
-    derived files, prune the untracked artifacts to the recorded pointers."""
+    derived files, then reconcile the untracked artifacts to the recorded
+    pointers — evictions retire to the bullpen, recorded-but-missing files
+    come back from it."""
     cd = catalog_dir(project)
     tag = f"step-{ref:03d}" if isinstance(ref, int) else str(ref)
     with _project_lock(project):
-        rc, _, err = run_git(["reset", "--hard", tag], cwd=cd)
+        commit = _resolve_tag(project, tag)
+        rc, _, err = run_git(["reset", "--hard", commit], cwd=cd)
         if rc != 0:
             raise RuntimeError(f"catalog reset to {tag!r} failed: {err}")
         materialize(project)
         prune_entries(project)
         prune_result_cache(project)
         prune_compute_cache(project)
+        restore_from_bullpen(project)
 
 
 def genesis(project: str) -> int | None:
@@ -340,7 +419,15 @@ def current_step(project: str) -> int | None:
 
 
 def label_step(project: str, step: int, name: str) -> None:
-    """Name a step so the operator can ``reset-to <name>``."""
+    """Name a step so the operator can ``reset-to <name>``.
+
+    The name becomes a git argument and lives in the tag namespace, so three
+    shapes are refused: option-like names (``-d`` would *delete* tags),
+    step-shaped names (``tag -f`` would clobber a real step), and all-digit
+    names (unreachable — digit refs parse as step numbers).
+    """
+    if not _TAG_RE.match(name) or name.isdigit() or _STEP_RE.match(name):
+        raise RuntimeError(f"invalid label {name!r}: use a name that is not a step tag or a bare number")
     rc, _, err = run_git(["tag", "-f", name, f"step-{step:03d}"], cwd=catalog_dir(project))
     if rc != 0:
         raise RuntimeError(f"labelling step {step} as {name!r} failed: {err}")

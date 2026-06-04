@@ -97,10 +97,19 @@ def read_pydata_state(project: str) -> dict:
 
 
 def write_pydata_state(project: str, **keys) -> None:
-    """Merge pydata keys into catalog.yaml atomically, preserving xorq's keys."""
+    """Merge pydata keys into catalog.yaml atomically, preserving xorq's keys.
+
+    xorq's keys are also *seeded* when absent: its ``CatalogYaml.contents``
+    indexes ``entries``/``aliases`` directly (no defaulting for dict-shaped
+    files), so a catalog.yaml born from genesis/capture without them makes
+    every best-effort ``xorq catalog add`` fail — silently. xorq round-trips
+    unknown keys, so the two empty lists are the whole coexistence contract.
+    """
     p = _catalog_yaml(project)
     p.parent.mkdir(parents=True, exist_ok=True)
     raw = _read_raw(project)
+    raw.setdefault("entries", [])
+    raw.setdefault("aliases", [])
     for k, v in keys.items():
         if v is not None:
             raw[k] = v

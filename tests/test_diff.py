@@ -371,3 +371,31 @@ def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parque
     p1, _ = _build_compare_expr(a_expr, b_expr, ["region"])
     p2, _ = _build_compare_expr(a_expr, b_expr, ["region"])
     assert p1 == p2
+
+
+def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Path):
+    # Numeric shared columns use DIVERGING_RED_WHITE_BLUE keyed on {col}_delta;
+    # non-numeric columns keep the categorical membership palette.
+    from pydata_companion.app import _build_compare_expr
+    from pydata_xorq import build_and_persist
+    from pydata_xorq.result_cache import cached_result_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_expr = cached_result_expr(project, a.content_hash)
+    b_expr = cached_result_expr(project, b.content_hash)
+    _, overrides = _build_compare_expr(a_expr, b_expr, ["region"])
+
+    # Numeric shared cols: new value displayed, old value via tooltip, pct coloring.
+    for col in ("total", "n"):
+        assert overrides[col]["merge_rule"] == "hidden"
+        v2 = overrides[f"{col}_v2"]
+        assert v2["header_name"] == col
+        assert v2["tooltip_config"]["val_column"] == col
+        assert v2["color_map_config"]["color_rule"] == "color_map"
+        assert v2["color_map_config"]["map_name"] == "DIVERGING_RED_WHITE_BLUE"
+        assert v2["color_map_config"]["val_column"] == f"{col}_pct_delta"
+        assert overrides[f"{col}_pct_delta"]["merge_rule"] == "hidden"
+
+    # "region" is the join key — must use categorical purple
+    assert overrides["region"]["color_map_config"]["color_rule"] == "color_categorical"

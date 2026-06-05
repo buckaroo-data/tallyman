@@ -270,6 +270,19 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
         ).name(f"{col}_eq")
         sel.append(eq)
 
+    # Percentage change ((new − old) / |old|) for numeric shared columns.
+    # Used as val_column for color_map so the gradient reflects relative magnitude.
+    # Null when the old value is zero (undefined %) or when only one side has a row.
+    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
+    for col in numeric_shared:
+        a_val = joined[col].cast("float64")        # old / before
+        b_val = joined[f"{col}_v2"].cast("float64")  # new / after
+        pct = ibis.cases(
+            (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
+            else_=(b_val - a_val) / a_val.abs(),
+        ).name(f"{col}_pct_delta")
+        sel.append(pct)
+
     expr = joined.select(*sel)
 
     # One session-scoped parent dir, not a fresh mkdtemp per page view: the
@@ -281,23 +294,36 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
     builds_dir.mkdir(parents=True, exist_ok=True)
     build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
 
-    # Color config mirrors col_join_dfs: pink=a_only, teal=b_only, green=both.
     eq_map = ["pink", "#73ae80", "#90b2b3", "#6c83b5"]
     pk_color = "#6c5fc7"
     pk_map = [pk_color] * 4
     overrides: dict = {"membership": {"merge_rule": "hidden"}}
     for col in a_non_keys:
         if col in b_non_keys:
-            overrides[f"{col}_v2"] = {"merge_rule": "hidden"}
+            # Show the new (b) value; hover reveals the old (a) value.
+            overrides[col] = {"merge_rule": "hidden"}
             overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
-            overrides[col] = {
-                "tooltip_config": {"tooltip_type": "simple", "val_column": f"{col}_v2"},
-                "color_map_config": {
-                    "color_rule": "color_categorical",
-                    "map_name": eq_map,
-                    "val_column": f"{col}_eq",
-                },
-            }
+            if col in numeric_shared:
+                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
+                overrides[f"{col}_v2"] = {
+                    "header_name": col,
+                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                    "color_map_config": {
+                        "color_rule": "color_map",
+                        "map_name": "DIVERGING_RED_WHITE_BLUE",
+                        "val_column": f"{col}_pct_delta",
+                    },
+                }
+            else:
+                overrides[f"{col}_v2"] = {
+                    "header_name": col,
+                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                    "color_map_config": {
+                        "color_rule": "color_categorical",
+                        "map_name": eq_map,
+                        "val_column": f"{col}_eq",
+                    },
+                }
     for k in keys:
         overrides[k] = {
             "color_map_config": {

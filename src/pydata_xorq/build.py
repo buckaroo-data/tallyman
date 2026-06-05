@@ -181,8 +181,13 @@ def build_and_persist(
         # Move xorq's build directory contents (expr.yaml + deps) under the entry.
         xorq_build_dir = target / "xorq_build"
         xorq_build_dir.mkdir(exist_ok=True)
-        for item in build_path.iterdir():
-            (xorq_build_dir / item.name).write_bytes(item.read_bytes())
+        for item in build_path.rglob("*"):
+            dest = xorq_build_dir / item.relative_to(build_path)
+            if item.is_dir():
+                dest.mkdir(parents=True, exist_ok=True)
+            else:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(item.read_bytes())
 
         # Rewrite project-root substrings to a portable placeholder so the
         # build is loadable on any machine with the same project laid out.

@@ -20,16 +20,19 @@ export function SSEProvider({ project, children }: { project: string | null; chi
       return;
     }
 
+    console.log(`[pydata-sse] opening EventSource /${project}/api/sse`);
     const es = new EventSource(`/${project}/api/sse`);
 
     const bump = (e: MessageEvent, kind: string) => {
       const data: SSEEvent = JSON.parse(e.data);
+      console.log(`[pydata-sse] event kind=${kind}`, data);
       setState((s) => ({ status: "live", version: s.version + 1, lastEvent: { ...data, kind } }));
     };
 
-    es.addEventListener("hello", () =>
-      setState((s) => ({ ...s, status: "live" }))
-    );
+    es.addEventListener("hello", (e) => {
+      console.log("[pydata-sse] hello", (e as MessageEvent).data);
+      setState((s) => ({ ...s, status: "live" }));
+    });
     es.addEventListener("ping", () => {});
     es.addEventListener("new_entry", (e) => bump(e, "new_entry"));
     es.addEventListener("build_failed", (e) => bump(e, "build_failed"));
@@ -39,11 +42,19 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     es.addEventListener("summary_stat_changed", (e) => bump(e, "summary_stat_changed"));
     es.addEventListener("project_switched", (e) => {
       const data: SSEEvent = JSON.parse(e.data);
+      console.log("[pydata-sse] project_switched", data);
       if (data.name) navigate(`/${data.name}/catalog`);
     });
-    es.onerror = () => setState((s) => ({ ...s, status: "offline" }));
+    es.onopen = () => console.log("[pydata-sse] connection open (readyState=1)");
+    es.onerror = (e) => {
+      console.warn(`[pydata-sse] error/offline (readyState=${es.readyState})`, e);
+      setState((s) => ({ ...s, status: "offline" }));
+    };
 
-    return () => es.close();
+    return () => {
+      console.log(`[pydata-sse] closing EventSource /${project}/api/sse`);
+      es.close();
+    };
   }, [project, navigate]);
 
   return <SSEContext.Provider value={state}>{children}</SSEContext.Provider>;

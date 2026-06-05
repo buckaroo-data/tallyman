@@ -24,6 +24,10 @@ export function NewEntryPill({ project }: { project: string }) {
   useEffect(() => {
     if (version === seen.current) return;
     seen.current = version;
+    console.log(
+      `[pydata-pill] version=${version} kind=${lastEvent?.kind ?? "<none>"}`,
+      lastEvent,
+    );
     if (!lastEvent || lastEvent.kind !== "new_entry") return;
 
     // `document.hasFocus()` is true only when this window/tab is the one the
@@ -34,6 +38,9 @@ export function NewEntryPill({ project }: { project: string }) {
       { hash: lastEvent.hash, alias: lastEvent.alias },
       focused,
     );
+    console.log(
+      `[pydata-pill] new_entry hash=${lastEvent.hash} alias=${lastEvent.alias} focused=${focused} -> navigateTo=${navigateTo} pillCount=${state.count}`,
+    );
     update(state);
     if (navigateTo) navigate(`/${project}/catalog/${navigateTo}`);
     // Keyed on version so one event produces one update; current notice is
@@ -42,6 +49,10 @@ export function NewEntryPill({ project }: { project: string }) {
   }, [version]);
 
   if (notice.count === 0 || !notice.hash) return null;
+
+  console.log(
+    `[pydata-pill] rendering pill count=${notice.count} hash=${notice.hash} alias=${notice.alias}`,
+  );
 
   const label =
     notice.count === 1
@@ -56,6 +67,9 @@ export function NewEntryPill({ project }: { project: string }) {
         type="button"
         className="view"
         onClick={() => {
+          console.log(
+            `[pydata-pill] view clicked -> navigate /${project}/catalog/${notice.hash}`,
+          );
           navigate(`/${project}/catalog/${notice.hash}`);
           update(emptyNotice);
         }}
@@ -67,7 +81,10 @@ export function NewEntryPill({ project }: { project: string }) {
         className="dismiss"
         aria-label="dismiss"
         title="dismiss"
-        onClick={() => update(emptyNotice)}
+        onClick={() => {
+          console.log("[pydata-pill] dismiss clicked");
+          update(emptyNotice);
+        }}
       >
         ×
       </button>

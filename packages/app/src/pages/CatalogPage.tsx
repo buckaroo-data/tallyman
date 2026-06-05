@@ -65,18 +65,20 @@ function ErrorBanner({
 
 // ── Entry detail pane ─────────────────────────────────────────────────────────
 
+type DetailTab = "data" | "code";
+
 function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
   const navigate = useNavigate();
   const [detail, setDetail] = useState<EntryDetail | null>(null);
   const [loading, setLoading] = useState(true);
-  const [showMeta, setShowMeta] = useState(false);
+  const [tab, setTab] = useState<DetailTab>("data");
   const [editingCode, setEditingCode] = useState(false);
   const [codeValue, setCodeValue] = useState("");
   const [codeStatus, setCodeStatus] = useState("");
 
   useEffect(() => {
     setLoading(true);
-    setShowMeta(false);
+    setTab("data");
     setEditingCode(false);
     api
       .entryDetail(project, hash)
@@ -136,9 +138,6 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
             <span className="meta">no prompt recorded</span>
           )}
         </div>
-        <button type="button" className="meta-toggle-btn" onClick={() => setShowMeta((v) => !v)}>
-          {showMeta ? "Hide metadata" : "Show metadata"}
-        </button>
       </div>
 
       {prompt_history.length > 1 && (
@@ -185,8 +184,43 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
         <VegaChart spec={chart_spec} dataHash={manifest.content_hash} project={project} />
       )}
 
-      {showMeta && (
-        <div className="metadata-section">
+      <div className="detail-tabs" role="tablist">
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "data"}
+          className={`detail-tab${tab === "data" ? " active" : ""}`}
+          onClick={() => setTab("data")}
+        >
+          data
+        </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "code"}
+          className={`detail-tab${tab === "code" ? " active" : ""}`}
+          onClick={() => setTab("code")}
+        >
+          code
+        </button>
+      </div>
+
+      {/* Keep the data pane mounted (hidden when inactive) so switching to the
+          code tab doesn't tear down Buckaroo's websocket session. */}
+      <div className="tab-panel" role="tabpanel" hidden={tab !== "data"}>
+        {wsUrl ? (
+          <BuckarooEmbed wsUrl={wsUrl} className="buckaroo-embed" />
+        ) : (
+          <div className="meta">
+            {total_rows > 0
+              ? `${total_rows} rows (Buckaroo not available — run pydata with --buckaroo)`
+              : "no result.parquet"}
+          </div>
+        )}
+      </div>
+
+      {tab === "code" && (
+        <div className="tab-panel metadata-section" role="tabpanel">
           <h3>
             code{" "}
             <Link to={`/${project}/lineage/${manifest.content_hash}`} className="meta">
@@ -237,16 +271,6 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
               ))}
             </details>
           )}
-        </div>
-      )}
-
-      {wsUrl ? (
-        <BuckarooEmbed wsUrl={wsUrl} className="buckaroo-embed" />
-      ) : (
-        <div className="meta">
-          {total_rows > 0
-            ? `${total_rows} rows (Buckaroo not available — run pydata with --buckaroo)`
-            : "no result.parquet"}
         </div>
       )}
     </div>

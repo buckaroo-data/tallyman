@@ -205,6 +205,29 @@ main {
 .metadata-section { margin-bottom: 12px; }
 .metadata-section h3:first-child { margin-top: 0; }
 
+/* ── Entry detail tabs (data / code) ── */
+.detail-tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin: 4px 0 10px; }
+.detail-tab {
+  background: transparent;
+  border: 1px solid transparent;
+  border-bottom: none;
+  color: var(--muted);
+  border-radius: 4px 4px 0 0;
+  padding: 5px 14px;
+  font-size: 12px;
+  font-family: inherit;
+  cursor: pointer;
+  margin-bottom: -1px;
+}
+.detail-tab:hover { color: var(--fg); }
+.detail-tab.active {
+  color: var(--fg);
+  border-color: var(--line);
+  border-bottom: 1px solid var(--panel);
+  background: var(--panel);
+}
+.tab-panel[hidden] { display: none; }
+
 /* ── Typography helpers ── */
 .meta { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
 pre.code {
@@ -448,7 +471,7 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
 .buckaroo-embed.nb-buckaroo { height: auto; }
 
 /* ── Buttons ── */
-.edit-code-btn, .meta-toggle-btn {
+.edit-code-btn {
   background: transparent;
   border: 1px solid var(--line);
   color: var(--muted);
@@ -458,7 +481,7 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
   cursor: pointer;
   font-family: inherit;
 }
-.edit-code-btn:hover, .meta-toggle-btn:hover { color: var(--fg); border-color: var(--accent); }
+.edit-code-btn:hover { color: var(--fg); border-color: var(--accent); }
 
 /* ── Forensic history ── */
 .forensic-history {

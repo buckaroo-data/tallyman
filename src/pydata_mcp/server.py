@@ -384,6 +384,10 @@ def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dic
     return out
 
 
+def _entry_url(project: str, content_hash: str) -> str:
+    return f"{COMPANION_URL}/{project}/catalog/{content_hash}"
+
+
 def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
     """Shared body for tools that compile-and-persist; returns the tool reply dict."""
     try:
@@ -399,6 +403,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
         "execute_seconds": result.execute_seconds,
         "schema": result.schema,
         "entry_path": str(result.entry_path),
+        "url": _entry_url(project, result.content_hash),
     }
 
 
@@ -486,7 +491,7 @@ def catalog_alias(hash: str, name: str) -> dict:
     notebook.append(project, name)
     _notify("alias_changed", content_hash=hash, alias=name, version=info["version"])
     _notify("notebook_changed")
-    return {"hash": hash, "alias": name, "version": info["version"]}
+    return {"hash": hash, "alias": name, "version": info["version"], "url": _entry_url(project, hash)}
 
 
 @mcp.tool()

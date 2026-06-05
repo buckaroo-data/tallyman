@@ -188,6 +188,45 @@ def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# url field — every entry-creating tool must return a viewer URL
+# ---------------------------------------------------------------------------
+
+
+def test_catalog_run_returns_url(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    out = catalog_run(_agg_code(project), prompt="url check")
+    assert "url" in out
+    assert out["url"].endswith(f"/catalog/{out['hash']}")
+    assert project in out["url"]
+
+
+def test_catalog_create_returns_url(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    out = catalog_create("shoe_sales", _agg_code(project), prompt="url check")
+    assert "url" in out
+    assert out["url"].endswith(f"/catalog/{out['hash']}")
+    assert project in out["url"]
+
+
+def test_catalog_revise_returns_url(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    out = catalog_revise("shoe_sales", _filter_code(project), prompt="url check")
+    assert "url" in out
+    assert out["url"].endswith(f"/catalog/{out['hash']}")
+    assert project in out["url"]
+
+
+def test_catalog_alias_returns_url(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("PYDATA_PROJECT", project)
+    scratch = catalog_run(_agg_code(project))
+    out = catalog_alias(scratch["hash"], "shoe_sales")
+    assert "url" in out
+    assert out["url"].endswith(f"/catalog/{scratch['hash']}")
+    assert project in out["url"]
+
+
+# ---------------------------------------------------------------------------
 # companion rendering
 # ---------------------------------------------------------------------------
 

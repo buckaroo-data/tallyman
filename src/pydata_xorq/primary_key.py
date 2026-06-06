@@ -109,15 +109,39 @@ def resolve_primary_key(
     from pydata_xorq.result_cache import cached_result_expr
 
     expr = cached_result_expr(project, content_hash)
-    # _rank_pk_xorq re-sorts candidates by distinctness regardless of the order we
-    # pass, so reordering doesn't help.  Instead: try _pk-named columns in isolation
-    # first (they're likely explicit PKs), then fall back to the full column set.
-    pk_cols = [c for c in cols if "_pk" in c]
-    keys = (pk_cols and _detect_pk_xorq(
-        expr, threshold=threshold, max_group=max_group, columns=pk_cols)) or []
-    if not keys:
-        keys = _detect_pk_xorq(
-            expr, threshold=threshold, max_group=max_group, columns=list(cols)) or []
+    schema = expr.schema()
+
+    # _rank_pk_xorq sorts candidates by distinctness, which lets high-cardinality
+    # float columns (e.g. avg_duration_seconds) beat meaningful composite string keys.
+    # We try candidate pools in semantic priority order so floats are only reached
+    # when no better key exists:
+    #   1. string columns only            (single string, then string composites)
+    #   2. string + integer columns       (cross-type: string+int combos)
+    #   3. integer columns only           (prefer names containing "pk" or "id")
+    #   4. everything (floats included)   (last resort)
+    str_cols = [c for c in cols if schema[c].is_string()]
+    pk_id_int = [c for c in cols if schema[c].is_integer()
+                 and any(w in c.lower() for w in ("pk", "id"))]
+    other_int = [c for c in cols if schema[c].is_integer() and c not in pk_id_int]
+    int_cols = pk_id_int + other_int  # pk/id-named ints first within this group
+
+    candidate_groups: list[list[str]] = []
+    if str_cols:
+        candidate_groups.append(str_cols)
+    if str_cols and int_cols:
+        candidate_groups.append(str_cols + int_cols)
+    if int_cols:
+        candidate_groups.append(int_cols)
+    candidate_groups.append(list(cols))  # floats only reached here
+
+    keys: list[str] = []
+    for group in candidate_groups:
+        found = _detect_pk_xorq(
+            expr, threshold=threshold, max_group=max_group, columns=group) or []
+        if found:
+            keys = found
+            break
+
     _write_cached(project, content_hash, keys)
     return keys
 

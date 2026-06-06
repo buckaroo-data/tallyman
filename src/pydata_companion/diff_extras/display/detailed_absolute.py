@@ -1,7 +1,4 @@
-from buckaroo.customizations.styling import DefaultMainStyling
-
-
-class DiffDetailedAbsoluteStyling(DefaultMainStyling):
+class DiffDetailedAbsoluteStyling(DefaultMainStyling):  # noqa: F821
     """'detailed_absolute' display for diff sessions: show *_abs_delta, hide *_pct_delta.
 
     Exposes absolute-change columns (new − old, same units as the original column)

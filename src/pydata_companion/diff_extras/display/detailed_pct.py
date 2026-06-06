@@ -1,7 +1,4 @@
-from buckaroo.customizations.styling import DefaultMainStyling
-
-
-class DiffDetailedPctStyling(DefaultMainStyling):
+class DiffDetailedPctStyling(DefaultMainStyling):  # noqa: F821
     """'detailed_pct' display for diff sessions: show *_pct_delta, hide *_abs_delta.
 
     Exposes raw percentage-change columns alongside the standard diff columns

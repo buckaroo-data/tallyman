@@ -40,7 +40,8 @@ from pathlib import Path
 
 import yaml
 
-from pydata_core import charts, display_configs as dc, notebook
+from pydata_core import charts, notebook
+from pydata_core import display_configs as dc
 from pydata_core import post_processing as pp
 from pydata_core import summary_stats as ss
 from pydata_core.git_util import run_git
@@ -146,7 +147,10 @@ def capture_pydata_state(project: str) -> dict:
         "post_processing": _scan_scripts(pp.list_post_processings(project)),
         "stats": _scan_scripts(ss.list_stats(project)),
         "charts": [{"content_hash": h, "spec": charts.get_chart(project, h)} for h in charts.list_charts(project)],
-        "display_configs": [{"content_hash": h, "config": dc.get_display_config(project, h)} for h in dc.list_display_configs(project)],
+        "display_configs": [
+            {"content_hash": h, "config": dc.get_display_config(project, h)}
+            for h in dc.list_display_configs(project)
+        ],
         "notebook": notebook.load(project),
         "entry_hashes": sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else [],
         "result_cache": _list_cache_files(result_cache_dir(project)),

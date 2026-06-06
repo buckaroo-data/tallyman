@@ -765,6 +765,7 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     """
     import textwrap
 
+    from pydata_companion.diff import compute_column_config_overrides
     from pydata_core.aliases import AliasExists, set_alias
     from pydata_core.catalog_state import checkpoint_catalog
     from pydata_core.display_configs import set_display_config
@@ -772,8 +773,6 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     from pydata_xorq.build import BuildError
     from pydata_xorq.primary_key import diff_keys
     from pydata_xorq.result_cache import cached_result_expr
-
-    from pydata_companion.diff import compute_column_config_overrides
 
     project = _resolve_active_project()
     hashes = history_for(project, name)

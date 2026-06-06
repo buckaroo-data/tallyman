@@ -794,6 +794,7 @@ def create_app(
 
         import textwrap  # noqa: PLC0415
 
+        from pydata_companion.diff import compute_column_config_overrides  # noqa: PLC0415
         from pydata_core.aliases import AliasExists, set_alias  # noqa: PLC0415
         from pydata_core.catalog_state import checkpoint_catalog  # noqa: PLC0415
         from pydata_core.display_configs import set_display_config  # noqa: PLC0415
@@ -801,8 +802,6 @@ def create_app(
         from pydata_xorq.build import BuildError  # noqa: PLC0415
         from pydata_xorq.primary_key import diff_keys  # noqa: PLC0415
         from pydata_xorq.result_cache import cached_result_expr  # noqa: PLC0415
-
-        from pydata_companion.diff import compute_column_config_overrides  # noqa: PLC0415
 
         hashes = history_for(project, alias)
         if not hashes:

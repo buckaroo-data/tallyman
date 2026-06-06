@@ -239,7 +239,9 @@ def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, o
     assert r.status_code == 400
 
 
-def test_http_entry_detail_diff_has_display_config(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_http_entry_detail_diff_has_display_config(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
     monkeypatch.setenv("PYDATA_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -306,7 +308,10 @@ def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parque
     diff_hash = out["hash"]
 
     set_display_config(project, diff_hash, {
-        "column_config_overrides": {"membership": {"merge_rule": "hidden"}, "region": {"color_map_config": {"color_rule": "color_categorical"}}},
+        "column_config_overrides": {
+            "membership": {"merge_rule": "hidden"},
+            "region": {"color_map_config": {"color_rule": "color_categorical"}},
+        },
         "diff_provenance": {
             "source_alias": "shoe_sales",
             "va": 1,

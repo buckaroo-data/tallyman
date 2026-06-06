@@ -10,7 +10,10 @@ from pydata_core.display_configs import (
 )
 from pydata_xorq import build_and_persist
 
-SAMPLE_OVERRIDES = {"membership": {"merge_rule": "hidden"}, "region": {"color_map_config": {"color_rule": "color_categorical"}}}
+SAMPLE_OVERRIDES = {
+    "membership": {"merge_rule": "hidden"},
+    "region": {"color_map_config": {"color_rule": "color_categorical"}},
+}
 SAMPLE_CONFIG = {
     "column_config_overrides": SAMPLE_OVERRIDES,
     "diff_provenance": {
@@ -90,7 +93,7 @@ def test_display_configs_materialize_round_trip(project: str):
 
 
 def test_display_configs_materialize_removes_unrecorded(project: str):
-    from pydata_core.catalog_state import capture_pydata_state, materialize, write_pydata_state
+    from pydata_core.catalog_state import materialize, write_pydata_state
 
     set_display_config(project, "orphan", SAMPLE_CONFIG)
     write_pydata_state(project, display_configs=[])

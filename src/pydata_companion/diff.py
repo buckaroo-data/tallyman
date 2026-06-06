@@ -18,6 +18,60 @@ from __future__ import annotations
 from typing import Any
 
 
+def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str]) -> dict:
+    """Compute Buckaroo column_config_overrides from two ibis schemas and join keys.
+
+    Pure schema analysis — no expression building.  Called by both build_compare_expr
+    and the promote paths so the expression is only constructed once (during build).
+    """
+    a_non_keys = [c for c in a_schema if c not in keys]
+    b_non_keys = [c for c in b_schema if c not in keys]
+    shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
+    numeric_shared = {
+        c for c, dtype in a_schema.items()
+        if c in shared_non_keys and dtype.is_numeric()
+    }
+
+    eq_map = ["#e8b4b8", "#73ae80", "#90b2b3", "#6c83b5"]
+    pk_color = "#6c5fc7"
+    pk_map = [pk_color] * 4
+    overrides: dict = {"membership": {"merge_rule": "hidden"}}
+    for col in a_non_keys:
+        if col in b_non_keys:
+            overrides[col] = {"merge_rule": "hidden"}
+            overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
+            if col in numeric_shared:
+                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
+                overrides[f"{col}_v2"] = {
+                    "header_name": col,
+                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                    "color_map_config": {
+                        "color_rule": "color_map",
+                        "map_name": "DIVERGING_RED_WHITE_BLUE",
+                        "val_column": f"{col}_pct_delta",
+                    },
+                }
+            else:
+                overrides[f"{col}_v2"] = {
+                    "header_name": col,
+                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                    "color_map_config": {
+                        "color_rule": "color_categorical",
+                        "map_name": eq_map,
+                        "val_column": f"{col}_eq",
+                    },
+                }
+    for k in keys:
+        overrides[k] = {
+            "color_map_config": {
+                "color_rule": "color_categorical",
+                "map_name": pk_map,
+                "val_column": "membership",
+            }
+        }
+    return overrides
+
+
 def build_compare_expr(
     a_expr: Any, b_expr: Any, keys: list[str]
 ) -> tuple[Any, dict]:
@@ -83,45 +137,7 @@ def build_compare_expr(
         sel.append(pct)
 
     expr = joined.select(*sel)
-
-    eq_map = ["pink", "#73ae80", "#90b2b3", "#6c83b5"]
-    pk_color = "#6c5fc7"
-    pk_map = [pk_color] * 4
-    overrides: dict = {"membership": {"merge_rule": "hidden"}}
-    for col in a_non_keys:
-        if col in b_non_keys:
-            overrides[col] = {"merge_rule": "hidden"}
-            overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
-            if col in numeric_shared:
-                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_map",
-                        "map_name": "DIVERGING_RED_WHITE_BLUE",
-                        "val_column": f"{col}_pct_delta",
-                    },
-                }
-            else:
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_categorical",
-                        "map_name": eq_map,
-                        "val_column": f"{col}_eq",
-                    },
-                }
-    for k in keys:
-        overrides[k] = {
-            "color_map_config": {
-                "color_rule": "color_categorical",
-                "map_name": pk_map,
-                "val_column": "membership",
-            }
-        }
-
+    overrides = compute_column_config_overrides(a_schema, b_schema, keys)
     return expr, overrides
 
 

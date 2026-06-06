@@ -802,7 +802,7 @@ def create_app(
         from pydata_xorq.primary_key import diff_keys  # noqa: PLC0415
         from pydata_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
-        from pydata_companion.diff import build_compare_expr  # noqa: PLC0415
+        from pydata_companion.diff import compute_column_config_overrides  # noqa: PLC0415
 
         hashes = history_for(project, alias)
         if not hashes:
@@ -828,7 +828,7 @@ def create_app(
 
         a_expr = cached_result_expr(project, a_hash)
         b_expr = cached_result_expr(project, b_hash)
-        _, column_config_overrides = build_compare_expr(a_expr, b_expr, keys)
+        column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
         target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
         keys_repr = repr(keys)

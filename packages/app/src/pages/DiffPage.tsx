@@ -43,6 +43,7 @@ export function DiffPage() {
     setPromoteError("");
     try {
       const res = await api.promoteDiff(project, alias, data.va, data.vb);
+      setPromoting(false);
       navigate(`/${project}/catalog/${res.hash}`);
     } catch (e) {
       setPromoteError(e instanceof Error ? e.message : String(e));

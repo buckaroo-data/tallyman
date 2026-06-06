@@ -766,13 +766,14 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     import textwrap
 
     from pydata_core.aliases import AliasExists, set_alias
+    from pydata_core.catalog_state import checkpoint_catalog
     from pydata_core.display_configs import set_display_config
     from pydata_xorq import build_and_persist as _build_and_persist
     from pydata_xorq.build import BuildError
     from pydata_xorq.primary_key import diff_keys
     from pydata_xorq.result_cache import cached_result_expr
 
-    from pydata_companion.diff import build_compare_expr
+    from pydata_companion.diff import compute_column_config_overrides
 
     project = _resolve_active_project()
     hashes = history_for(project, name)
@@ -799,7 +800,7 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
 
     a_expr = cached_result_expr(project, a_hash)
     b_expr = cached_result_expr(project, b_hash)
-    _, column_config_overrides = build_compare_expr(a_expr, b_expr, keys)
+    column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
     target_alias = alias or f"diff_{name}_v{a_idx}_v{b_idx}"
     keys_repr = repr(keys)
@@ -837,6 +838,7 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         },
     })
 
+    checkpoint_catalog(project, f"pydata: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
     _notify("entry_added", content_hash=result.content_hash)
     return {
         "alias": target_alias,

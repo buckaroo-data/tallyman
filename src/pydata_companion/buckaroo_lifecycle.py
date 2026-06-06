@@ -483,7 +483,7 @@ class BuckarooManager:
                 # recomputation on next /load_expr.
                 "cache_storage_path": str(stat_cache),
             }
-            if column_config_overrides:
+            if column_config_overrides is not None:
                 payload["column_config_overrides"] = column_config_overrides
             try:
                 resp = self._client.post(

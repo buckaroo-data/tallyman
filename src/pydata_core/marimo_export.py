@@ -64,11 +64,14 @@ def _diff_cell_lines(
     keys = diff_provenance["keys"]
     column_config_overrides = display_config.get("column_config_overrides", {})
 
-    a_expr_py = (entry_dir(project, a_hash) / "expr.py").read_text().strip()
-    b_expr_py = (entry_dir(project, b_hash) / "expr.py").read_text().strip()
-
-    def _ind(text: str) -> list[str]:
-        return [f"    {line}" if line.strip() else "" for line in text.splitlines()]
+    a_expr_path = entry_dir(project, a_hash) / "expr.py"
+    b_expr_path = entry_dir(project, b_hash) / "expr.py"
+    if not a_expr_path.exists():
+        raise FileNotFoundError(f"source expr.py missing for diff entry: a_hash={a_hash}")
+    if not b_expr_path.exists():
+        raise FileNotFoundError(f"source expr.py missing for diff entry: b_hash={b_hash}")
+    a_expr_py = a_expr_path.read_text().strip()
+    b_expr_py = b_expr_path.read_text().strip()
 
     overrides_repr = repr(column_config_overrides)
     keys_repr = repr(keys)
@@ -79,13 +82,13 @@ def _diff_cell_lines(
         "",
         f"    # {source_alias} V{va} (catalog entry {a_hash})",
     ]
-    lines += _ind(a_expr_py)
+    lines += _indent(a_expr_py).splitlines()
     lines += [
         "    a_expr = expr",
         "",
         f"    # {source_alias} V{vb} (catalog entry {b_hash})",
     ]
-    lines += _ind(b_expr_py)
+    lines += _indent(b_expr_py).splitlines()
     lines += [
         "    b_expr = expr",
         "",

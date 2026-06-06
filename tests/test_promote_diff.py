@@ -7,6 +7,7 @@ Covers:
   - POST /api/promote_diff HTTP endpoint
   - marimo export inlines source expressions for diff entries
 """
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -274,17 +275,21 @@ def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_parqu
     out = catalog_promote_diff("shoe_sales")
     diff_hash = out["hash"]
 
-    set_display_config(project, diff_hash, {
-        "column_config_overrides": {"membership": {"merge_rule": "hidden"}},
-        "diff_provenance": {
-            "source_alias": "shoe_sales",
-            "va": 1,
-            "vb": 2,
-            "a_hash": out["a_hash"],
-            "b_hash": out["b_hash"],
-            "keys": out["keys"],
+    set_display_config(
+        project,
+        diff_hash,
+        {
+            "column_config_overrides": {"membership": {"merge_rule": "hidden"}},
+            "diff_provenance": {
+                "source_alias": "shoe_sales",
+                "va": 1,
+                "vb": 2,
+                "a_hash": out["a_hash"],
+                "b_hash": out["b_hash"],
+                "keys": out["keys"],
+            },
         },
-    })
+    )
 
     nb_mod.append(project, "diff_shoe_sales_v1_v2")
     nb_source = notebook_to_marimo(project)
@@ -307,20 +312,24 @@ def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parque
     out = catalog_promote_diff("shoe_sales")
     diff_hash = out["hash"]
 
-    set_display_config(project, diff_hash, {
-        "column_config_overrides": {
-            "membership": {"merge_rule": "hidden"},
-            "region": {"color_map_config": {"color_rule": "color_categorical"}},
+    set_display_config(
+        project,
+        diff_hash,
+        {
+            "column_config_overrides": {
+                "membership": {"merge_rule": "hidden"},
+                "region": {"color_map_config": {"color_rule": "color_categorical"}},
+            },
+            "diff_provenance": {
+                "source_alias": "shoe_sales",
+                "va": 1,
+                "vb": 2,
+                "a_hash": out["a_hash"],
+                "b_hash": out["b_hash"],
+                "keys": out["keys"],
+            },
         },
-        "diff_provenance": {
-            "source_alias": "shoe_sales",
-            "va": 1,
-            "vb": 2,
-            "a_hash": out["a_hash"],
-            "b_hash": out["b_hash"],
-            "keys": out["keys"],
-        },
-    })
+    )
 
     nb_mod.append(project, "diff_shoe_sales_v1_v2")
     nb_source = notebook_to_marimo(project)

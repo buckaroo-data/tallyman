@@ -27,10 +27,7 @@ def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str
     a_non_keys = [c for c in a_schema if c not in keys]
     b_non_keys = [c for c in b_schema if c not in keys]
     shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
-    numeric_shared = {
-        c for c, dtype in a_schema.items()
-        if c in shared_non_keys and dtype.is_numeric()
-    }
+    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
 
     eq_map = ["#e8b4b8", "#73ae80", "#90b2b3", "#6c83b5"]
     pk_color = "#6c5fc7"
@@ -72,9 +69,7 @@ def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str
     return overrides
 
 
-def build_compare_expr(
-    a_expr: Any, b_expr: Any, keys: list[str]
-) -> tuple[Any, dict]:
+def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, dict]:
     """Build an outer-join comparison expression from two ibis expressions.
 
     Returns (joined_expr, column_config_overrides).  Column layout:
@@ -93,10 +88,7 @@ def build_compare_expr(
     a_non_keys = [c for c in a_schema if c not in keys]
     b_non_keys = [c for c in b_schema if c not in keys]
     shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
-    numeric_shared = {
-        c for c, dtype in a_schema.items()
-        if c in shared_non_keys and dtype.is_numeric()
-    }
+    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
 
     a_expr, b_expr = _align_backends(a_expr, b_expr)
     b_renamed = b_expr.rename({f"{c}_v2": c for c in b_non_keys})

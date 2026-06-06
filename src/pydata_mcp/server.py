@@ -825,17 +825,21 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     except AliasExists:
         set_alias(project, target_alias, result.content_hash)
 
-    set_display_config(project, result.content_hash, {
-        "column_config_overrides": column_config_overrides,
-        "diff_provenance": {
-            "source_alias": name,
-            "va": a_idx,
-            "vb": b_idx,
-            "a_hash": a_hash,
-            "b_hash": b_hash,
-            "keys": keys,
+    set_display_config(
+        project,
+        result.content_hash,
+        {
+            "column_config_overrides": column_config_overrides,
+            "diff_provenance": {
+                "source_alias": name,
+                "va": a_idx,
+                "vb": b_idx,
+                "a_hash": a_hash,
+                "b_hash": b_hash,
+                "keys": keys,
+            },
         },
-    })
+    )
 
     checkpoint_catalog(project, f"pydata: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
     _notify("entry_added", content_hash=result.content_hash)

@@ -751,6 +751,108 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
 
 @mcp.tool()
 @_tag_project
+def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | None = None) -> dict:
+    """Promote a diff between two versions to a first-class catalog entry.
+
+    Creates a named catalog entry whose expression is the full outer-join
+    comparison of the two versions, with Buckaroo coloring preserved. The
+    entry can be post-processed, charted, and exported to a marimo notebook.
+
+    Args:
+        name: An existing alias.
+        va, vb: 1-based version indices, or negative for from-end (-1 = latest).
+        alias: Name for the new entry. Defaults to diff_{name}_v{va}_{vb}.
+    """
+    import textwrap
+
+    from pydata_core.aliases import AliasExists, set_alias
+    from pydata_core.display_configs import set_display_config
+    from pydata_xorq import build_and_persist as _build_and_persist
+    from pydata_xorq.build import BuildError
+    from pydata_xorq.primary_key import diff_keys
+    from pydata_xorq.result_cache import cached_result_expr
+
+    from pydata_companion.diff import build_compare_expr
+
+    project = _resolve_active_project()
+    hashes = history_for(project, name)
+    if not hashes:
+        return {"error": f"alias {name!r} has no history"}
+
+    def _resolve(v):
+        if v < 0:
+            v = len(hashes) + v + 1
+        if v < 1 or v > len(hashes):
+            return None
+        return v, hashes[v - 1]
+
+    a = _resolve(va)
+    b = _resolve(vb)
+    if a is None or b is None:
+        return {"error": f"version out of range; alias has {len(hashes)} versions"}
+    a_idx, a_hash = a
+    b_idx, b_hash = b
+
+    keys = diff_keys(project, a_hash, b_hash) or []
+    if not keys:
+        return {"error": "no stable join key detected between the two versions; cannot build keyed diff"}
+
+    a_expr = cached_result_expr(project, a_hash)
+    b_expr = cached_result_expr(project, b_hash)
+    _, column_config_overrides = build_compare_expr(a_expr, b_expr, keys)
+
+    target_alias = alias or f"diff_{name}_v{a_idx}_v{b_idx}"
+    keys_repr = repr(keys)
+    code = textwrap.dedent(f"""\
+        # auto-generated — diff of {name} V{a_idx} → V{b_idx}
+        # a_hash: {a_hash}
+        # b_hash: {b_hash}
+        from pydata_companion.diff import build_diff_expr
+        expr = build_diff_expr(
+            a_hash={a_hash!r},
+            b_hash={b_hash!r},
+            keys={keys_repr},
+        )
+    """)
+
+    try:
+        result = _build_and_persist(project, code, prompt=f"promote diff {name} V{a_idx}→V{b_idx}")
+    except BuildError as exc:
+        return {"error": str(exc)}
+
+    try:
+        set_alias(project, target_alias, result.content_hash, expect_exists=False)
+    except AliasExists:
+        set_alias(project, target_alias, result.content_hash)
+
+    set_display_config(project, result.content_hash, {
+        "column_config_overrides": column_config_overrides,
+        "diff_provenance": {
+            "source_alias": name,
+            "va": a_idx,
+            "vb": b_idx,
+            "a_hash": a_hash,
+            "b_hash": b_hash,
+            "keys": keys,
+        },
+    })
+
+    _notify("entry_added", content_hash=result.content_hash)
+    return {
+        "alias": target_alias,
+        "hash": result.content_hash,
+        "source_alias": name,
+        "va": a_idx,
+        "vb": b_idx,
+        "a_hash": a_hash,
+        "b_hash": b_hash,
+        "keys": keys,
+        "row_count": result.row_count,
+    }
+
+
+@mcp.tool()
+@_tag_project
 def catalog_add_summary_stat(name: str, source: str) -> dict:
     """Register a project-authored column summary stat.
 

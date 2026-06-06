@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
 import type { DiffData } from "../types";
@@ -11,9 +11,12 @@ export function DiffPage() {
     va?: string;
     vb?: string;
   }>();
+  const navigate = useNavigate();
   const [data, setData] = useState<DiffData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [promoting, setPromoting] = useState(false);
+  const [promoteError, setPromoteError] = useState("");
 
   useEffect(() => {
     if (!project || !alias) return;
@@ -33,6 +36,19 @@ export function DiffPage() {
       .then((d) => { setData(d); setLoading(false); })
       .catch((e) => { setError(String(e)); setLoading(false); });
   }, [project, alias, va, vb]);
+
+  const handlePromote = async () => {
+    if (!project || !alias || !data) return;
+    setPromoting(true);
+    setPromoteError("");
+    try {
+      const res = await api.promoteDiff(project, alias, data.va, data.vb);
+      navigate(`/${project}/catalog/${res.hash}`);
+    } catch (e) {
+      setPromoteError(e instanceof Error ? e.message : String(e));
+      setPromoting(false);
+    }
+  };
 
   if (!project || !alias) return null;
 
@@ -69,25 +85,34 @@ export function DiffPage() {
             diff · {alias} <span className="vchip">V{data.va}</span> →{" "}
             <span className="vchip">V{data.vb}</span>
           </h2>
-          <p className="meta" style={{ margin: 0 }}>
-            {data.a_hash} → {data.b_hash}.{" "}
-            {n > 2 && (
-              <>
-                Other pairs:{" "}
-                {Array.from({ length: n - 1 }, (_, i) => i + 1).map((i) => (
-                  <span key={i}>
-                    <Link to={`/${project}/diff/${alias}/${i}/${i + 1}`}>
-                      V{i}→V{i + 1}
-                    </Link>{" "}
-                    ·{" "}
-                  </span>
-                ))}
-                {n > 3 && (
-                  <Link to={`/${project}/diff/${alias}/1/${n}`}>V1→V{n}</Link>
-                )}
-              </>
-            )}
+          <p className="meta" style={{ margin: "4px 0 0 0", display: "flex", alignItems: "center", gap: 12 }}>
+            <span>{data.a_hash} → {data.b_hash}</span>
+            <button
+              type="button"
+              onClick={handlePromote}
+              disabled={promoting}
+              style={{ fontSize: 12, padding: "2px 8px" }}
+            >
+              {promoting ? "promoting…" : "promote to catalog"}
+            </button>
+            {promoteError && <span style={{ color: "#ffb4b4", fontSize: 12 }}>{promoteError}</span>}
           </p>
+          {n > 2 && (
+            <p className="meta" style={{ margin: 0 }}>
+              Other pairs:{" "}
+              {Array.from({ length: n - 1 }, (_, i) => i + 1).map((i) => (
+                <span key={i}>
+                  <Link to={`/${project}/diff/${alias}/${i}/${i + 1}`}>
+                    V{i}→V{i + 1}
+                  </Link>{" "}
+                  ·{" "}
+                </span>
+              ))}
+              {n > 3 && (
+                <Link to={`/${project}/diff/${alias}/1/${n}`}>V1→V{n}</Link>
+              )}
+            </p>
+          )}
         </div>
 
         {/* Keyed-diff zero-match warning */}

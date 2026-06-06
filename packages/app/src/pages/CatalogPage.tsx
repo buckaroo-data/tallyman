@@ -94,7 +94,8 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
   if (!detail) return <div className="meta">entry not found</div>;
 
   const { manifest, alias, version, forensic_history, prompt_history, chart_spec,
-    build_artifacts, total_rows, buckaroo_session, buckaroo_ws_base, code } = detail;
+    display_config, build_artifacts, total_rows, buckaroo_session, buckaroo_ws_base, code } = detail;
+  const diffProvenance = display_config?.diff_provenance;
 
   const handleSaveCode = async () => {
     if (!alias) return;
@@ -208,6 +209,21 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
       {/* Keep the data pane mounted (hidden when inactive) so switching to the
           code tab doesn't tear down Buckaroo's websocket session. */}
       <div className="tab-panel" role="tabpanel" hidden={tab !== "data"}>
+        {diffProvenance && (
+          <div className="meta" style={{ marginBottom: 6, fontSize: 12 }}>
+            diff ·{" "}
+            <Link to={`/${project}/diff/${diffProvenance.source_alias}/${diffProvenance.va}/${diffProvenance.vb}`}>
+              {diffProvenance.source_alias} V{diffProvenance.va}→V{diffProvenance.vb}
+            </Link>
+            {"  "}
+            <span style={{ display: "inline-block", width: 10, height: 10, background: "#e8b4b8", borderRadius: 2, margin: "0 2px" }} />
+            {" "}only in V{diffProvenance.va} ·{" "}
+            <span style={{ display: "inline-block", width: 10, height: 10, background: "#90b2b3", borderRadius: 2, margin: "0 2px" }} />
+            {" "}only in V{diffProvenance.vb} ·{" "}
+            <span style={{ display: "inline-block", width: 10, height: 10, background: "#73ae80", borderRadius: 2, margin: "0 2px" }} />
+            {" "}matched
+          </div>
+        )}
         {wsUrl ? (
           <BuckarooEmbed wsUrl={wsUrl} className="buckaroo-embed" />
         ) : (

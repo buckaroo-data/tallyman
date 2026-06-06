@@ -304,7 +304,6 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
             overrides[col] = {"merge_rule": "hidden"}
             overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
             if col in numeric_shared:
-                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
                 overrides[f"{col}_v2"] = {
                     "header_name": col,
                     "tooltip_config": {"tooltip_type": "simple", "val_column": col},
@@ -846,6 +845,7 @@ def create_app(
 
                     stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
                     stat_cache.mkdir(parents=True, exist_ok=True)
+                    _diff_extras = Path(__file__).parent / "diff_extras"
                     resp = buckaroo._client.post(
                         f"{buckaroo.base_url}/load_expr",
                         json={
@@ -855,6 +855,7 @@ def create_app(
                             "column_config_overrides": overrides,
                             "cache_storage_path": str(stat_cache),
                             "extra_grid_config": {"searchDebounceMs": 3000},
+                            "project_root": str(_diff_extras),
                         },
                         timeout=30.0,
                     )

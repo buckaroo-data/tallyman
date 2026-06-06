@@ -395,7 +395,8 @@ def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Pat
         assert v2["color_map_config"]["color_rule"] == "color_map"
         assert v2["color_map_config"]["map_name"] == "DIVERGING_RED_WHITE_BLUE"
         assert v2["color_map_config"]["val_column"] == f"{col}_pct_delta"
-        assert overrides[f"{col}_pct_delta"]["merge_rule"] == "hidden"
+        # _pct_delta hiding is handled by DiffMainStyling display klass, not global overrides
+        assert f"{col}_pct_delta" not in overrides
 
     # "region" is the join key — must use categorical purple
     assert overrides["region"]["color_map_config"]["color_rule"] == "color_categorical"

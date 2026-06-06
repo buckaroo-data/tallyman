@@ -15,7 +15,4 @@ class DiffMainStyling(DefaultMainStyling):
     @classmethod
     def style_columns(cls, sd, df):
         result = super().style_columns(sd, df)
-        return [
-            c for c in result
-            if not c.get("col_name", "").endswith(("_pct_delta", "_abs_delta"))
-        ]
+        return [c for c in result if not c.get("col_name", "").endswith(("_pct_delta", "_abs_delta"))]

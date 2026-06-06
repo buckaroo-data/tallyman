@@ -20,7 +20,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo==0.14.11",
+    "buckaroo==0.14.13",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
     "ibis-framework[duckdb]>=12.0.0",

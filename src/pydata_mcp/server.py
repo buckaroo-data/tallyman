@@ -261,6 +261,36 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         t = ibis.memtable({"d": ["2024-01-01"]})
         expr = t.mutate(d=t.d.cast("date"))
 
+    LOADING RAW CSV FILES — always inspect first:
+
+        Before writing a schema for deferred_read_csv, run `head -5 <file>` to
+        verify the actual column names and order. Do NOT guess — yfinance and
+        similar sources produce non-obvious layouts:
+
+        - yfinance multi-download CSVs have two extra header rows (a "Price"
+          label row and a ticker row) before the real headers. Detect this with
+          head; use skip_rows=2 only when those rows are actually present.
+        - yfinance column order is alphabetical: Close, High, Low, Open, Volume
+          (NOT the conventional Open, High, Low, Close, Volume order).
+        - The first column is often literally named "Price" in raw yfinance output,
+          not "Date".
+
+        ALWAYS use an explicit schema with deferred_read_csv — without one, type
+        inference silently misassigns types (e.g. date columns become timestamps).
+
+        DATE-ONLY COLUMNS — use 'date', never 'timestamp':
+
+        # BAD: 'timestamp' stores midnight UTC; Western-timezone display shifts
+        #      the date back by one day (2026-05-19 → shows as 2026-05-18).
+        import xorq.vendor.ibis as ibis
+        schema = ibis.schema({'Date': 'timestamp', ...})   # off-by-one in viewer
+
+        # CORRECT: 'date' has no time component, no timezone conversion.
+        schema = ibis.schema({'Date': 'date', ...})        # import xorq.vendor.ibis as ibis
+
+        This applies to any date-only column: OHLCV Date, trading calendars,
+        event dates, anything that looks like YYYY-MM-DD in the CSV.
+
     GOTCHAS — pandas reflexes that silently fail:
 
         t.x.describe()        # No describe() — decompose into explicit aggregates.
@@ -272,6 +302,49 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         t.mutate(h=t.ts.hour())
         t.select("col_a", "col_b")                                   # explicit columns
         t.mutate(new_col=t.x + 1)                                    # not select(ibis._, ...)
+
+    GOTCHAS — group_by / aggregate patterns:
+
+        # WRONG: .agg() is a pandas shorthand — ibis/xorq uses .aggregate()
+        t.group_by("k").agg(n=t.x.count())           # AttributeError: 'agg' not found
+        # CORRECT:
+        t.group_by("k").aggregate(n=t.x.count())
+
+        # WRONG: .sort() is pandas/polars — ibis uses .sort_by() or .order_by()
+        agg.sort("n", descending=True)                # AttributeError: 'sort' not found
+        # CORRECT:
+        agg.sort_by("n", descending=True)
+        agg.order_by(ibis.desc("n"))
+
+        # WRONG: .alias() to rename a computed column expression
+        distance_col.alias("distance_km")             # AttributeError: 'alias' not found
+        # CORRECT:
+        distance_col.name("distance_km")
+
+        # WRONG: referencing the *source* table in post-aggregate operations
+        agg = t.group_by(["a", "b"]).aggregate(n=t.x.count())
+        agg.order_by(t.n.desc())                      # t has no column 'n'; fails or silently wrong
+        agg.select(t.a, t.b, agg.n)                  # mixes references across different relations
+        # CORRECT: always reference the *result* table; use bracket form for safety
+        agg.order_by(ibis.desc("n"))
+        agg.select(agg["a"], agg["b"], agg["n"])
+
+        # CANONICAL multi-step pattern (mutate → group_by → aggregate → sort → select):
+        with_dur = t.mutate(dur_s=(t.ended_at - t.started_at).cast("int64"))
+        agg = (
+            with_dur
+            .group_by(["start_col", "end_col"])
+            .aggregate(
+                n=with_dur.dur_s.count(),
+                avg_dur=with_dur.dur_s.mean(),
+                lat=with_dur.start_lat.first(),
+            )
+        )
+        result = agg.order_by(ibis.desc("n")).limit(500)
+        expr = result.select(
+            result["start_col"], result["end_col"],
+            result["n"], result["avg_dur"], result["lat"],
+        )
 
     GOTCHAS — referencing aggregate columns:
 

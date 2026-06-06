@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
+from pydata_companion.diff_color_maps import DIVERGING_BLUE_WHITE_RED
 from pydata_core import (
     alias_for_hash,
     clear_errors,
@@ -270,9 +271,8 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
         ).name(f"{col}_eq")
         sel.append(eq)
 
-    # Percentage change ((new − old) / |old|) for numeric shared columns.
-    # Used as val_column for color_map so the gradient reflects relative magnitude.
-    # Null when the old value is zero (undefined %) or when only one side has a row.
+    # Percentage and absolute change for numeric shared columns.
+    # Null when only one side has a row (membership != 3); pct_delta also null when old=0.
     numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
     for col in numeric_shared:
         a_val = joined[col].cast("float64")        # old / before
@@ -281,7 +281,9 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
             (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
             else_=(b_val - a_val) / a_val.abs(),
         ).name(f"{col}_pct_delta")
+        abs_delta = (b_val - a_val).name(f"{col}_abs_delta")
         sel.append(pct)
+        sel.append(abs_delta)
 
     expr = joined.select(*sel)
 
@@ -304,13 +306,12 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
             overrides[col] = {"merge_rule": "hidden"}
             overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
             if col in numeric_shared:
-                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
                 overrides[f"{col}_v2"] = {
                     "header_name": col,
                     "tooltip_config": {"tooltip_type": "simple", "val_column": col},
                     "color_map_config": {
                         "color_rule": "color_map",
-                        "map_name": "DIVERGING_RED_WHITE_BLUE",
+                        "map_name": DIVERGING_BLUE_WHITE_RED,
                         "val_column": f"{col}_pct_delta",
                     },
                 }
@@ -786,6 +787,20 @@ def create_app(
             "buckaroo_available": buckaroo_available,
         }
 
+    @app.get("/{project}/diff/{alias}", include_in_schema=False)
+    def diff_default_versions(project: str, alias: str):
+        """Redirect /diff/{alias} to /diff/{alias}/{n-1}/{n} (latest two versions)."""
+        project = _validate_project(project)
+        hashes = history_for(project, alias)
+        if not hashes:
+            raise HTTPException(404, f"alias {alias!r} not found or has no history")
+        n = len(hashes)
+        va = max(1, n - 1)
+        vb = n
+        if va == vb:
+            va = 1
+        return RedirectResponse(f"/{project}/diff/{alias}/{va}/{vb}")
+
     @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
@@ -832,6 +847,7 @@ def create_app(
 
                     stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
                     stat_cache.mkdir(parents=True, exist_ok=True)
+                    _diff_extras = Path(__file__).parent / "diff_extras"
                     resp = buckaroo._client.post(
                         f"{buckaroo.base_url}/load_expr",
                         json={
@@ -840,6 +856,8 @@ def create_app(
                             "no_browser": True,
                             "column_config_overrides": overrides,
                             "cache_storage_path": str(stat_cache),
+                            "extra_grid_config": {"searchDebounceMs": 3000},
+                            "project_root": str(_diff_extras),
                         },
                         timeout=30.0,
                     )

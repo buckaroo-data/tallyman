@@ -5,7 +5,7 @@ Two entry points:
   build_compare_expr(a_expr, b_expr, keys)
       Pure ibis expression construction: returns (expr, column_config_overrides).
       The expr is the full outer-join with membership / per-column equality /
-      pct-delta sentinel columns that drive Buckaroo coloring.
+      pct-delta / abs-delta sentinel columns that drive Buckaroo coloring.
 
   build_diff_expr(a_hash, b_hash, keys)
       Convenience wrapper used as the internal expr.py rebuild path for
@@ -38,7 +38,9 @@ def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str
             overrides[col] = {"merge_rule": "hidden"}
             overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
             if col in numeric_shared:
-                overrides[f"{col}_pct_delta"] = {"merge_rule": "hidden"}
+                # _pct_delta and _abs_delta are not hidden here so that
+                # DiffDetailedPctStyling / DiffDetailedAbsoluteStyling can
+                # display them.  DiffMainStyling filters them by name.
                 overrides[f"{col}_v2"] = {
                     "header_name": col,
                     "tooltip_config": {"tooltip_type": "simple", "val_column": col},
@@ -74,11 +76,13 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
 
     Returns (joined_expr, column_config_overrides).  Column layout:
       - key columns: coalesced from both sides
-      - non-key a columns: the "before" value (hidden in the Buckaroo view)
-      - {col}_v2 columns: the "after" value shown in the Buckaroo view
+      - for each non-key column:
+          {col}           the "before" value (hidden)
+          {col}_v2        the "after" value shown with color
+          {col}_pct_delta (b-a)/|a|, numeric cols only; null when a=0
+          {col}_abs_delta b-a, numeric cols only
       - membership (int8): 1=a_only, 2=b_only, 3=both
       - {col}_eq (int8): membership+4 if equal, membership+0 if different
-      - {col}_pct_delta (float64): (b-a)/|a| for numeric shared columns
     """
     import xorq.vendor.ibis as ibis
     from buckaroo.compare import _align_backends
@@ -99,6 +103,15 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
         sel.append(joined[col])
         if col in b_non_keys:
             sel.append(joined[f"{col}_v2"])
+            if col in numeric_shared:
+                a_val = joined[col].cast("float64")
+                b_val = joined[f"{col}_v2"].cast("float64")
+                pct = ibis.cases(
+                    (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
+                    else_=(b_val - a_val) / a_val.abs(),
+                ).name(f"{col}_pct_delta")
+                sel.append(pct)
+                sel.append((b_val - a_val).name(f"{col}_abs_delta"))
 
     a_sent = a_non_keys[0] if a_non_keys else keys[0]
     b_sent = f"{b_non_keys[0]}_v2" if b_non_keys else keys[0]
@@ -118,15 +131,6 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
             )
         ).name(f"{col}_eq")
         sel.append(eq)
-
-    for col in numeric_shared:
-        a_val = joined[col].cast("float64")
-        b_val = joined[f"{col}_v2"].cast("float64")
-        pct = ibis.cases(
-            (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
-            else_=(b_val - a_val) / a_val.abs(),
-        ).name(f"{col}_pct_delta")
-        sel.append(pct)
 
     expr = joined.select(*sel)
     overrides = compute_column_config_overrides(a_schema, b_schema, keys)

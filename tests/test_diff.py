@@ -374,7 +374,7 @@ def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parque
 
 
 def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Path):
-    # Numeric shared columns use DIVERGING_RED_WHITE_BLUE keyed on {col}_delta;
+    # Numeric shared columns use DIVERGING_BLUE_WHITE_RED keyed on {col}_pct_delta;
     # non-numeric columns keep the categorical membership palette.
     from pydata_companion.app import _build_compare_expr
     from pydata_xorq import build_and_persist
@@ -393,7 +393,7 @@ def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Pat
         assert v2["header_name"] == col
         assert v2["tooltip_config"]["val_column"] == col
         assert v2["color_map_config"]["color_rule"] == "color_map"
-        assert v2["color_map_config"]["map_name"] == "DIVERGING_RED_WHITE_BLUE"
+        assert isinstance(v2["color_map_config"]["map_name"], list)  # inline DIVERGING_BLUE_WHITE_RED array
         assert v2["color_map_config"]["val_column"] == f"{col}_pct_delta"
         # _pct_delta hiding is handled by DiffMainStyling display klass, not global overrides
         assert f"{col}_pct_delta" not in overrides

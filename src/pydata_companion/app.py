@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
+from pydata_companion.diff_color_maps import DIVERGING_BLUE_WHITE_RED
 from pydata_core import (
     alias_for_hash,
     clear_errors,
@@ -309,7 +310,7 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
                     "tooltip_config": {"tooltip_type": "simple", "val_column": col},
                     "color_map_config": {
                         "color_rule": "color_map",
-                        "map_name": "DIVERGING_RED_WHITE_BLUE",
+                        "map_name": DIVERGING_BLUE_WHITE_RED,
                         "val_column": f"{col}_pct_delta",
                     },
                 }

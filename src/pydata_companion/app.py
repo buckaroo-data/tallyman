@@ -840,6 +840,7 @@ def create_app(
                             "no_browser": True,
                             "column_config_overrides": overrides,
                             "cache_storage_path": str(stat_cache),
+                            "extra_grid_config": {"searchDebounceMs": 3000},
                         },
                         timeout=30.0,
                     )

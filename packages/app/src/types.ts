@@ -46,6 +46,17 @@ export interface EntryDetail {
   forensic_history: Array<{ hash: string; version: number; is_current: boolean }>;
   prompt_history: Array<{ at: string; prompt: string }>;
   chart_spec: Record<string, unknown> | null;
+  display_config: {
+    column_config_overrides: Record<string, unknown>;
+    diff_provenance?: {
+      source_alias: string;
+      va: number;
+      vb: number;
+      a_hash: string;
+      b_hash: string;
+      keys: string[];
+    };
+  } | null;
   build_artifacts: Array<{ name: string; text: string }>;
   total_rows: number;
   buckaroo_session: string | null;

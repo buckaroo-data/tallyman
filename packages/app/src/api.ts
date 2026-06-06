@@ -109,6 +109,14 @@ export const api = {
   diffData: (project: string, alias: string, va: number, vb: number): Promise<DiffData> =>
     get(`/${project}/api/diff_data/${alias}/${va}/${vb}`),
 
+  promoteDiff: (
+    project: string,
+    alias: string,
+    va: number,
+    vb: number,
+  ): Promise<{ alias: string; hash: string; source_alias: string; va: number; vb: number; keys: string[]; row_count: number }> =>
+    post(`/${project}/api/promote_diff/${alias}/${va}/${vb}`, {}),
+
   errorDetail: (project: string, errorId: string): Promise<{ project: string; error: AppError }> =>
     get(`/${project}/api/error/${errorId}`),
 

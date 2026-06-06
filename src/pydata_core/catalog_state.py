@@ -6,6 +6,7 @@ xorq owns ``entries`` and ``aliases`` in that file; pydata owns:
     post_processing: [{name, source, disabled}]
     stats:           [{name, source, disabled}]
     charts:          [{content_hash, spec}]
+    display_configs: [{content_hash, config}]
     notebook:        {cells: [{cell_id, alias, markdown}]}
     entry_hashes:    [content_hash, ...]      # pointer to untracked entries/<hash>/
     result_cache:    [relpath, ...]           # pointer to untracked result cache
@@ -40,6 +41,7 @@ from pathlib import Path
 import yaml
 
 from pydata_core import charts, notebook
+from pydata_core import display_configs as dc
 from pydata_core import post_processing as pp
 from pydata_core import summary_stats as ss
 from pydata_core.git_util import run_git
@@ -89,6 +91,7 @@ def read_pydata_state(project: str) -> dict:
         "post_processing": raw.get("post_processing", []),
         "stats": raw.get("stats", []),
         "charts": raw.get("charts", []),
+        "display_configs": raw.get("display_configs", []),
         "notebook": raw.get("notebook", {"cells": []}),
         "entry_hashes": raw.get("entry_hashes", []),
         "result_cache": raw.get("result_cache", []),
@@ -144,6 +147,10 @@ def capture_pydata_state(project: str) -> dict:
         "post_processing": _scan_scripts(pp.list_post_processings(project)),
         "stats": _scan_scripts(ss.list_stats(project)),
         "charts": [{"content_hash": h, "spec": charts.get_chart(project, h)} for h in charts.list_charts(project)],
+        "display_configs": [
+            {"content_hash": h, "config": dc.get_display_config(project, h)}
+            for h in dc.list_display_configs(project)
+        ],
         "notebook": notebook.load(project),
         "entry_hashes": sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else [],
         "result_cache": _list_cache_files(result_cache_dir(project)),
@@ -178,6 +185,16 @@ def _materialize_charts(project: str, entries: list[dict]) -> None:
         charts.set_chart(project, h, spec)
 
 
+def _materialize_display_configs(project: str, entries: list[dict]) -> None:
+    recorded = {c["content_hash"]: c["config"] for c in entries or []}
+    for h in list(dc.list_display_configs(project)):
+        if h not in recorded:
+            dc.remove_display_config(project, h)
+    for h, config in recorded.items():
+        if config is not None:
+            dc.set_display_config(project, h, config)
+
+
 def _materialize_notebook(project: str, nb: dict) -> None:
     nbfile = notebooks_dir(project) / "default.json"
     cells = (nb or {}).get("cells") or []
@@ -203,6 +220,8 @@ def materialize(project: str) -> None:
         _materialize_scripts(stats_dir(project), raw["stats"])
     if "charts" in raw:
         _materialize_charts(project, raw["charts"])
+    if "display_configs" in raw:
+        _materialize_display_configs(project, raw["display_configs"])
     if "notebook" in raw:
         _materialize_notebook(project, raw["notebook"] or {"cells": []})
 

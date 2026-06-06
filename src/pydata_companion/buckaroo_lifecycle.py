@@ -418,7 +418,12 @@ class BuckarooManager:
         except BuckarooUnavailable as exc:
             log.warning("buckaroo restart failed: %s (will retry after cooldown)", exc)
 
-    def ensure_session(self, content_hash: str, project: str) -> str | None:
+    def ensure_session(
+        self,
+        content_hash: str,
+        project: str,
+        column_config_overrides: dict | None = None,
+    ) -> str | None:
         """Return a Buckaroo session_id for ``content_hash``, creating it if needed.
 
         Posts the entry's ``xorq_build/`` dir to Buckaroo's ``/load_expr``
@@ -430,6 +435,9 @@ class BuckarooManager:
         across projects via content hash (globally unique), so a second call
         for the same hash from a different project returns the existing
         session — the bytes are the same by definition.
+
+        ``column_config_overrides`` is passed to ``/load_expr`` when provided
+        (e.g. for promoted diff entries that carry Buckaroo coloring state).
 
         Returns None (instead of raising) if Buckaroo isn't running or the load
         fails — the companion falls back to the pandas.to_html preview in that
@@ -461,23 +469,26 @@ class BuckarooManager:
                 self._expanded_dirs[content_hash] = expanded
             stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
             stat_cache.mkdir(parents=True, exist_ok=True)
+            payload: dict = {
+                "build_dir": str(expanded),
+                "no_browser": True,
+                # Buckaroo scans <project_root>/stats/*.py and
+                # <project_root>/post_processing/*.py for project-authored
+                # klasses. pydata stores both under artifacts/, so pass
+                # artifacts_dir, not project_dir. Older buckaroo builds
+                # ignore this field, so it's safe to always send.
+                "project_root": str(artifacts_dir(project)),
+                # Buckaroo 0.14.9+: persist computed summary stats to
+                # disk so they survive a Buckaroo restart without full
+                # recomputation on next /load_expr.
+                "cache_storage_path": str(stat_cache),
+            }
+            if column_config_overrides is not None:
+                payload["column_config_overrides"] = column_config_overrides
             try:
                 resp = self._client.post(
                     f"{self.base_url}/load_expr",
-                    json={
-                        "build_dir": str(expanded),
-                        "no_browser": True,
-                        # Buckaroo scans <project_root>/stats/*.py and
-                        # <project_root>/post_processing/*.py for project-authored
-                        # klasses. pydata stores both under artifacts/, so pass
-                        # artifacts_dir, not project_dir. Older buckaroo builds
-                        # ignore this field, so it's safe to always send.
-                        "project_root": str(artifacts_dir(project)),
-                        # Buckaroo 0.14.9+: persist computed summary stats to
-                        # disk so they survive a Buckaroo restart without full
-                        # recomputation on next /load_expr.
-                        "cache_storage_path": str(stat_cache),
-                    },
+                    json=payload,
                     timeout=10.0,
                 )
                 resp.raise_for_status()

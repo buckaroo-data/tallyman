@@ -17,6 +17,7 @@ import textwrap
 from pathlib import Path
 
 from pydata_core.aliases import load_aliases, version_of_hash
+from pydata_core.display_configs import get_display_config
 from pydata_core.manifest import read_manifest
 from pydata_core.notebook import load as load_notebook
 from pydata_core.paths import entry_dir
@@ -41,6 +42,66 @@ def _marimo_version() -> str:
         return marimo.__version__
     except ImportError:
         return "0.10.0"
+
+
+def _diff_cell_lines(
+    project: str,
+    content_hash: str,
+    diff_provenance: dict,
+    display_config: dict,
+) -> list[str]:
+    """Generate fully-inlined marimo cell lines for a promoted diff entry.
+
+    Both source expressions are inlined verbatim (with their hashes as
+    comments) so the exported notebook is self-contained.  The outer join
+    is reconstructed via build_compare_expr with the pinned keys.
+    """
+    source_alias = diff_provenance["source_alias"]
+    va = diff_provenance["va"]
+    vb = diff_provenance["vb"]
+    a_hash = diff_provenance["a_hash"]
+    b_hash = diff_provenance["b_hash"]
+    keys = diff_provenance["keys"]
+    column_config_overrides = display_config.get("column_config_overrides", {})
+
+    a_expr_path = entry_dir(project, a_hash) / "expr.py"
+    b_expr_path = entry_dir(project, b_hash) / "expr.py"
+    if not a_expr_path.exists():
+        raise FileNotFoundError(f"source expr.py missing for diff entry: a_hash={a_hash}")
+    if not b_expr_path.exists():
+        raise FileNotFoundError(f"source expr.py missing for diff entry: b_hash={b_hash}")
+    a_expr_py = a_expr_path.read_text().strip()
+    b_expr_py = b_expr_path.read_text().strip()
+
+    overrides_repr = repr(column_config_overrides)
+    keys_repr = repr(keys)
+
+    lines = [
+        "    import os",
+        f'    os.environ.setdefault("PYDATA_PROJECT", {project!r})',
+        "",
+        f"    # {source_alias} V{va} (catalog entry {a_hash})",
+    ]
+    lines += _indent(a_expr_py).splitlines()
+    lines += [
+        "    a_expr = expr",
+        "",
+        f"    # {source_alias} V{vb} (catalog entry {b_hash})",
+    ]
+    lines += _indent(b_expr_py).splitlines()
+    lines += [
+        "    b_expr = expr",
+        "",
+        f"    # outer-join diff — keys: {keys_repr}  (catalog diff entry {content_hash})",
+        "    from pydata_companion.diff import build_compare_expr",
+        f"    _expr, _overrides = build_compare_expr(a_expr, b_expr, keys={keys_repr})",
+        f"    _overrides = {overrides_repr}",
+        "",
+        "    from buckaroo.xorq_buckaroo import XorqBuckarooInfiniteWidget",
+        "    _widget = XorqBuckarooInfiniteWidget(_expr, column_config_overrides=_overrides)",
+        "    return (_widget,)",
+    ]
+    return lines
 
 
 def notebook_to_marimo(project: str) -> str:
@@ -138,19 +199,23 @@ def notebook_to_marimo(project: str) -> str:
         ]
 
         # -- code cell -------------------------------------------------------
-        # Wrap code in a function, append execute() for display.
-        code_lines = [
-            "    import os",
-            f'    os.environ.setdefault("PYDATA_PROJECT", {project!r})',
-            "",
-        ]
-        code_lines += [f"    {line}" if line.strip() else "" for line in code.splitlines()]
-        # Last meaningful line: display execute() result
-        code_lines += [
-            "",
-            "    _df = expr.execute()",
-            "    return (_df,)",
-        ]
+        display_config = get_display_config(project, content_hash)
+        diff_provenance = (display_config or {}).get("diff_provenance")
+
+        if diff_provenance:
+            code_lines = _diff_cell_lines(project, content_hash, diff_provenance, display_config)
+        else:
+            code_lines = [
+                "    import os",
+                f'    os.environ.setdefault("PYDATA_PROJECT", {project!r})',
+                "",
+            ]
+            code_lines += [f"    {line}" if line.strip() else "" for line in code.splitlines()]
+            code_lines += [
+                "",
+                "    _df = expr.execute()",
+                "    return (_df,)",
+            ]
 
         parts += [
             "",

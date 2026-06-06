@@ -18,7 +18,6 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
-from pydata_companion.diff_color_maps import DIVERGING_BLUE_WHITE_RED
 from pydata_core import (
     alias_for_hash,
     clear_errors,
@@ -210,129 +209,25 @@ def _compute_disk_usage(project: str) -> dict:
 def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
     """Build an xorq outer-join comparison expression for two entry exprs.
 
-    ``a`` / ``b`` are the two entries' (cache-wrapped) xorq expressions, so the
-    comparison composes ``expr1`` ⋈ ``expr2`` and each side resolves its own
-    cache when Buckaroo streams rows — nothing depends on a result.parquet.
+    Delegates expression construction to ``pydata_companion.diff.build_compare_expr``
+    and then calls ``xo.build_expr`` to produce the build_dir Buckaroo needs for
+    its ``/load_expr`` endpoint.
 
-    Returns (build_path, column_config_overrides).  Column naming mirrors
-    col_join_dfs: non-key b-columns get a ``_v2`` suffix; ``membership``
-    (1=a_only, 2=b_only, 3=both) and per-column ``{col}_eq`` columns drive the
-    Buckaroo color mapping.
+    Returns (build_path, column_config_overrides).
     """
     import tempfile
 
     import xorq.api as xo
-    import xorq.vendor.ibis as ibis
 
-    a_schema = a.schema()
-    b_schema = b.schema()
-    a_non_keys = [c for c in a_schema if c not in keys]
-    b_non_keys = [c for c in b_schema if c not in keys]
-    shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
+    from pydata_companion.diff import build_compare_expr
 
-    # Land both on one backend so the outer join (and the build Buckaroo
-    # streams from) is single-engine — a no-op when they already share one
-    # (e.g. both reading their result.parquet on the default xorq backend),
-    # which avoids an eager cross-backend transport.
-    from buckaroo.compare import _align_backends
+    expr, overrides = build_compare_expr(a, b, keys)
 
-    a, b = _align_backends(a, b)
-
-    # Rename b's non-key columns to avoid ibis collision during outer join.
-    # ibis rename convention: {new_name: old_name}
-    b_renamed = b.rename({f"{c}_v2": c for c in b_non_keys})
-    joined = a.outer_join(b_renamed, [a[k] == b_renamed[k] for k in keys])
-
-    # Coalesced key columns + all data columns.
-    sel: list = [ibis.coalesce(a[k], b_renamed[k]).name(k) for k in keys]
-    for col in a_non_keys:
-        sel.append(joined[col])
-        if col in b_non_keys:
-            sel.append(joined[f"{col}_v2"])
-
-    # Membership sentinel: null on the b side → a_only; null on the a side → b_only.
-    a_sent = a_non_keys[0] if a_non_keys else keys[0]
-    b_sent = f"{b_non_keys[0]}_v2" if b_non_keys else keys[0]
-    membership = ibis.cases(
-        (joined[b_sent].isnull(), ibis.literal(1).cast("int8")),
-        (joined[a_sent].isnull(), ibis.literal(2).cast("int8")),
-        else_=ibis.literal(3).cast("int8"),
-    ).name("membership")
-    sel.append(membership)
-
-    # Per-column equality: membership + 4 if equal, membership + 0 if not.
-    for col in shared_non_keys:
-        eq = (
-            membership
-            + ibis.cases(
-                (joined[col] == joined[f"{col}_v2"], ibis.literal(4).cast("int8")),
-                else_=ibis.literal(0).cast("int8"),
-            )
-        ).name(f"{col}_eq")
-        sel.append(eq)
-
-    # Percentage and absolute change for numeric shared columns.
-    # Null when only one side has a row (membership != 3); pct_delta also null when old=0.
-    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
-    for col in numeric_shared:
-        a_val = joined[col].cast("float64")        # old / before
-        b_val = joined[f"{col}_v2"].cast("float64")  # new / after
-        pct = ibis.cases(
-            (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
-            else_=(b_val - a_val) / a_val.abs(),
-        ).name(f"{col}_pct_delta")
-        abs_delta = (b_val - a_val).name(f"{col}_abs_delta")
-        sel.append(pct)
-        sel.append(abs_delta)
-
-    expr = joined.select(*sel)
-
-    # One session-scoped parent dir, not a fresh mkdtemp per page view: the
-    # comparison expr is deterministic, so build_expr lands it in a stable
-    # content-hash subdir here. Re-rendering the same diff reuses that subdir
-    # instead of leaking a new /tmp dir on every load. (Disk reclamation of
-    # this tree is handled separately.)
+    # One session-scoped parent dir so build_expr lands the comparison in a
+    # stable content-hash subdir — re-rendering the same diff reuses it.
     builds_dir = Path(tempfile.gettempdir()) / "pydata_diff_builds"
     builds_dir.mkdir(parents=True, exist_ok=True)
     build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
-
-    eq_map = ["pink", "#73ae80", "#90b2b3", "#6c83b5"]
-    pk_color = "#6c5fc7"
-    pk_map = [pk_color] * 4
-    overrides: dict = {"membership": {"merge_rule": "hidden"}}
-    for col in a_non_keys:
-        if col in b_non_keys:
-            # Show the new (b) value; hover reveals the old (a) value.
-            overrides[col] = {"merge_rule": "hidden"}
-            overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
-            if col in numeric_shared:
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_map",
-                        "map_name": DIVERGING_BLUE_WHITE_RED,
-                        "val_column": f"{col}_pct_delta",
-                    },
-                }
-            else:
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_categorical",
-                        "map_name": eq_map,
-                        "val_column": f"{col}_eq",
-                    },
-                }
-    for k in keys:
-        overrides[k] = {
-            "color_map_config": {
-                "color_rule": "color_categorical",
-                "map_name": pk_map,
-                "val_column": "membership",
-            }
-        }
 
     return build_path, overrides
 
@@ -633,7 +528,16 @@ def create_app(
                     text = f"(binary, {f.stat().st_size} bytes)"
                 build_artifacts.append({"name": f.name, "text": text})
 
-        buckaroo_session = buckaroo.ensure_session(content_hash, project) if buckaroo else None
+        from pydata_core.display_configs import get_display_config  # noqa: PLC0415
+
+        display_config = get_display_config(project, content_hash)
+        column_config_overrides = (display_config or {}).get("column_config_overrides")
+
+        buckaroo_session = (
+            buckaroo.ensure_session(content_hash, project, column_config_overrides=column_config_overrides)
+            if buckaroo
+            else None
+        )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
         result_path = entry / "result.parquet"
@@ -650,6 +554,7 @@ def create_app(
             "forensic_history": forensic_history,
             "prompt_history": prompt_history,
             "chart_spec": chart_spec,
+            "display_config": display_config,
             "build_artifacts": build_artifacts,
             "total_rows": total_rows,
             "buckaroo_session": buckaroo_session,
@@ -878,6 +783,105 @@ def create_app(
             "diff": diff,
             "compare_session": compare_session,
             "buckaroo_ws_base": buckaroo_ws_base_url,
+        }
+
+    @app.post("/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}")
+    async def api_promote_diff(project: str, alias: str, va: int, vb: int):
+        """Promote a diff between two versions to a first-class catalog entry."""
+        if read_only:
+            raise HTTPException(403, "companion is in read-only (serve) mode")
+        project = _validate_project(project)
+
+        import textwrap  # noqa: PLC0415
+
+        from pydata_companion.diff import compute_column_config_overrides  # noqa: PLC0415
+        from pydata_core.aliases import AliasExists, set_alias  # noqa: PLC0415
+        from pydata_core.catalog_state import checkpoint_catalog  # noqa: PLC0415
+        from pydata_core.display_configs import set_display_config  # noqa: PLC0415
+        from pydata_xorq import build_and_persist as _build_and_persist  # noqa: PLC0415
+        from pydata_xorq.build import BuildError  # noqa: PLC0415
+        from pydata_xorq.primary_key import diff_keys  # noqa: PLC0415
+        from pydata_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+        hashes = history_for(project, alias)
+        if not hashes:
+            raise HTTPException(404, f"alias {alias!r} has no history")
+
+        def _resolve(v: int):
+            if v < 0:
+                v = len(hashes) + v + 1
+            if v < 1 or v > len(hashes):
+                return None
+            return v, hashes[v - 1]
+
+        a = _resolve(va)
+        b = _resolve(vb)
+        if a is None or b is None:
+            raise HTTPException(400, f"version out of range; alias has {len(hashes)} versions")
+        a_idx, a_hash = a
+        b_idx, b_hash = b
+
+        keys = diff_keys(project, a_hash, b_hash) or []
+        if not keys:
+            raise HTTPException(400, "no stable join key detected; cannot build keyed diff")
+
+        a_expr = cached_result_expr(project, a_hash)
+        b_expr = cached_result_expr(project, b_hash)
+        column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
+
+        target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
+        keys_repr = repr(keys)
+        code = textwrap.dedent(f"""\
+            # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
+            # a_hash: {a_hash}
+            # b_hash: {b_hash}
+            from pydata_companion.diff import build_diff_expr
+            expr = build_diff_expr(
+                a_hash={a_hash!r},
+                b_hash={b_hash!r},
+                keys={keys_repr},
+            )
+        """)
+
+        try:
+            result = _build_and_persist(project, code, prompt=f"promote diff {alias} V{a_idx}→V{b_idx}")
+        except BuildError as exc:
+            raise HTTPException(500, str(exc)) from exc
+
+        try:
+            set_alias(project, target_alias, result.content_hash, expect_exists=False)
+        except AliasExists:
+            set_alias(project, target_alias, result.content_hash)
+
+        set_display_config(
+            project,
+            result.content_hash,
+            {
+                "column_config_overrides": column_config_overrides,
+                "diff_provenance": {
+                    "source_alias": alias,
+                    "va": a_idx,
+                    "vb": b_idx,
+                    "a_hash": a_hash,
+                    "b_hash": b_hash,
+                    "keys": keys,
+                },
+            },
+        )
+
+        checkpoint_catalog(project, f"pydata: catalog_promote_diff {alias} V{a_idx}→V{b_idx}")
+        await publish({"kind": "entry_added", "hash": result.content_hash})
+
+        return {
+            "alias": target_alias,
+            "hash": result.content_hash,
+            "source_alias": alias,
+            "va": a_idx,
+            "vb": b_idx,
+            "a_hash": a_hash,
+            "b_hash": b_hash,
+            "keys": keys,
+            "row_count": result.row_count,
         }
 
     @app.get("/{project}/api/error/{error_id}")

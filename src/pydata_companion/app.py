@@ -18,7 +18,6 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from pydata_companion.buckaroo_lifecycle import BuckarooManager
-from pydata_companion.diff_color_maps import DIVERGING_BLUE_WHITE_RED
 from pydata_core import (
     alias_for_hash,
     clear_errors,
@@ -536,7 +535,8 @@ def create_app(
 
         buckaroo_session = (
             buckaroo.ensure_session(content_hash, project, column_config_overrides=column_config_overrides)
-            if buckaroo else None
+            if buckaroo
+            else None
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
@@ -853,17 +853,21 @@ def create_app(
         except AliasExists:
             set_alias(project, target_alias, result.content_hash)
 
-        set_display_config(project, result.content_hash, {
-            "column_config_overrides": column_config_overrides,
-            "diff_provenance": {
-                "source_alias": alias,
-                "va": a_idx,
-                "vb": b_idx,
-                "a_hash": a_hash,
-                "b_hash": b_hash,
-                "keys": keys,
+        set_display_config(
+            project,
+            result.content_hash,
+            {
+                "column_config_overrides": column_config_overrides,
+                "diff_provenance": {
+                    "source_alias": alias,
+                    "va": a_idx,
+                    "vb": b_idx,
+                    "a_hash": a_hash,
+                    "b_hash": b_hash,
+                    "keys": keys,
+                },
             },
-        })
+        )
 
         checkpoint_catalog(project, f"pydata: catalog_promote_diff {alias} V{a_idx}→V{b_idx}")
         await publish({"kind": "entry_added", "hash": result.content_hash})

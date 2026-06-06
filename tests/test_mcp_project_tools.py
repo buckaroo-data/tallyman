@@ -202,6 +202,21 @@ def test_list_returning_tool_wrapped_with_project_and_items(project: str, orders
     assert len(out["items"]) >= 1
 
 
+def test_catalog_list_includes_compact_columns(project: str, orders_parquet: Path):
+    # The model should be able to look up an entry's columns before writing an
+    # expression against it, without a build. catalog_list carries a compact
+    # "name:type, name:type" summary the LLM can scan at a glance.
+    from pydata_mcp.server import catalog_list, catalog_load_parquet
+
+    catalog_load_parquet("orders.parquet", prompt="raw")
+    entry = catalog_list()["items"][0]
+    cols = entry["columns"]
+    assert isinstance(cols, str)
+    assert "region" in cols  # a real column name
+    assert ":" in cols  # name:type form
+    assert ", " in cols  # multiple columns, comma-separated
+
+
 def test_project_list_includes_project_field(isolated_home: Path):
     from pydata_mcp.server import project_list
 

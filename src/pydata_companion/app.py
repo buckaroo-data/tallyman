@@ -786,6 +786,20 @@ def create_app(
             "buckaroo_available": buckaroo_available,
         }
 
+    @app.get("/{project}/diff/{alias}", include_in_schema=False)
+    def diff_default_versions(project: str, alias: str):
+        """Redirect /diff/{alias} to /diff/{alias}/{n-1}/{n} (latest two versions)."""
+        project = _validate_project(project)
+        hashes = history_for(project, alias)
+        if not hashes:
+            raise HTTPException(404, f"alias {alias!r} not found or has no history")
+        n = len(hashes)
+        va = max(1, n - 1)
+        vb = n
+        if va == vb:
+            va = 1
+        return RedirectResponse(f"/{project}/diff/{alias}/{va}/{vb}")
+
     @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""

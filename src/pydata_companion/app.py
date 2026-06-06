@@ -271,9 +271,8 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
         ).name(f"{col}_eq")
         sel.append(eq)
 
-    # Percentage change ((new − old) / |old|) for numeric shared columns.
-    # Used as val_column for color_map so the gradient reflects relative magnitude.
-    # Null when the old value is zero (undefined %) or when only one side has a row.
+    # Percentage and absolute change for numeric shared columns.
+    # Null when only one side has a row (membership != 3); pct_delta also null when old=0.
     numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
     for col in numeric_shared:
         a_val = joined[col].cast("float64")        # old / before
@@ -282,7 +281,9 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
             (a_val == ibis.literal(0.0), ibis.null().cast("float64")),
             else_=(b_val - a_val) / a_val.abs(),
         ).name(f"{col}_pct_delta")
+        abs_delta = (b_val - a_val).name(f"{col}_abs_delta")
         sel.append(pct)
+        sel.append(abs_delta)
 
     expr = joined.select(*sel)
 

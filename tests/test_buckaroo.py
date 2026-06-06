@@ -540,7 +540,7 @@ class _StubBuckaroo:
     def ws_base_url(self) -> str:
         return f"ws://127.0.0.1:{self.bound_port}"
 
-    def ensure_session(self, content_hash: str, project: str) -> str | None:
+    def ensure_session(self, content_hash: str, project: str, column_config_overrides=None) -> str | None:
         return self.session
 
 
@@ -570,7 +570,7 @@ def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_p
         is_running = False
         base_url = "http://127.0.0.1:8700"
 
-        def ensure_session(self, content_hash, project):
+        def ensure_session(self, content_hash, project, column_config_overrides=None):
             return None
 
     app = create_app(project, buckaroo=_DownBuckaroo())  # type: ignore[arg-type]

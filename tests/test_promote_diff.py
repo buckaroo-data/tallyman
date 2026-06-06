@@ -55,9 +55,28 @@ def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: P
     assert "total_v2" in schema
     assert "total_eq" in schema
     assert "total_pct_delta" in schema
+    assert "total_abs_delta" in schema
     assert "n_v2" in schema
     assert "n_eq" in schema
     assert "n_pct_delta" in schema
+    assert "n_abs_delta" in schema
+
+
+def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet: Path):
+    from pydata_companion.diff import build_compare_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_expr = cached_result_expr(project, a.content_hash)
+    b_expr = cached_result_expr(project, b.content_hash)
+
+    expr, _ = build_compare_expr(a_expr, b_expr, ["region"])
+    cols = list(expr.schema().keys())
+    # _pct_delta and _abs_delta must appear right after their _v2 column
+    for prefix in ("total", "n"):
+        v2_idx = cols.index(f"{prefix}_v2")
+        assert cols[v2_idx + 1] == f"{prefix}_pct_delta"
+        assert cols[v2_idx + 2] == f"{prefix}_abs_delta"
 
 
 def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet: Path):
@@ -71,7 +90,9 @@ def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet
     _, overrides = build_compare_expr(a_expr, b_expr, ["region"])
     assert overrides["membership"]["merge_rule"] == "hidden"
     assert overrides["total"]["merge_rule"] == "hidden"
-    assert overrides["total_pct_delta"]["merge_rule"] == "hidden"
+    # _pct_delta and _abs_delta are not hidden; DiffMainStyling filters them
+    assert "total_pct_delta" not in overrides
+    assert "total_abs_delta" not in overrides
 
 
 def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, orders_parquet: Path):

@@ -1,3 +1,6 @@
+from buckaroo.customizations.styling import DefaultMainStyling
+
+
 class DiffDetailedPctStyling(DefaultMainStyling):
     """'detailed_pct' display for diff sessions: show *_pct_delta, hide *_abs_delta.
 

@@ -1,3 +1,6 @@
+from buckaroo.customizations.styling import DefaultMainStyling
+
+
 class DiffMainStyling(DefaultMainStyling):
     """Override the 'main' display for diff sessions: hide *_pct_delta and *_abs_delta columns.
 

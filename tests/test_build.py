@@ -95,3 +95,58 @@ expr = t.nonexistent_column.sum()
     with pytest.raises(BuildError) as excinfo:
         build_and_persist(project, code)
     assert "import xorq.vendor.ibis as ibis" not in str(excinfo.value).split("Traceback")[0]
+
+
+# ---------------------------------------------------------------------------
+# Namespace / column-name hints. The session scan showed the model repeatedly
+# reaching for `xorq.<fn>` (the api lives on `xorq.api`/`xo`), `ibis.<fn>` for
+# things that are column methods or live elsewhere, inventing `pydata_xorq.io`
+# helpers, guessing column names, and reaching for a duckdb backend. The old
+# hint only caught bare `import ibis`, the Expr class mismatch, and `xorq._`.
+# ---------------------------------------------------------------------------
+
+from pydata_xorq.build import _ibis_import_hint  # noqa: E402
+
+
+def test_hint_bare_xorq_attribute_points_to_api():
+    h = _ibis_import_hint("module 'xorq' has no attribute 'memtable'")
+    assert "xorq.api" in h
+
+
+def test_hint_ibis_read_parquet_points_to_loaders():
+    h = _ibis_import_hint("module 'ibis' has no attribute 'read_parquet'")
+    assert "from_project" in h
+
+
+def test_hint_ibis_math_func_is_column_method():
+    h = _ibis_import_hint("module 'ibis' has no attribute 'sin'")
+    assert ".sin()" in h
+
+
+def test_hint_io_import_typo_lists_real_exports():
+    h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'pydata_xorq.io'")
+    assert "from_project" in h and "from_catalog" in h
+
+
+def test_hint_missing_table_column():
+    h = _ibis_import_hint("'Table' object has no attribute 'trip_duration'")
+    assert "not a column" in h.lower()
+    assert "trip_duration" in h
+
+
+def test_hint_duckdb_reach_points_to_datafusion():
+    h = _ibis_import_hint("No module named 'duckdb'")
+    assert "datafusion" in h.lower()
+
+
+def test_build_hints_bare_xorq_namespace(project: str, orders_parquet: Path):
+    # End-to-end: a bare `import xorq` + `xorq.deferred_read_parquet(...)` must
+    # steer the model to `xorq.api` through the real build path, not just the
+    # unit-tested helper.
+    code = f"""
+import xorq
+t = xorq.deferred_read_parquet({str(orders_parquet)!r})
+expr = t.group_by("region").aggregate(n=t.count())
+"""
+    with pytest.raises(BuildError, match="xorq.api"):
+        build_and_persist(project, code)

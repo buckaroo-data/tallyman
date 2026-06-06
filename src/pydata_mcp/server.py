@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import sys
@@ -208,6 +209,26 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         t = from_project("file.parquet")          # raw file under <project>/data/
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
 
+    THREE NAMESPACES — mixing these up is the #1 build failure:
+
+        import xorq.api as xo            # backends + deferred reads:
+                                         # xo.memtable, xo.deferred_read_parquet, xo.connect
+        import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
+                                         # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
+        from pydata_xorq.io import from_project, from_catalog   # reading data
+
+        t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
+        # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
+        #   xorq._ all raise AttributeError. The api module is `xo` (xorq.api).
+        # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
+        #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
+        # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
+        # Read data only via from_project / from_catalog (no xo.read_parquet / ibis.read_parquet).
+
+    ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
+    `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
+    everything with the ibis expression API over from_project/from_catalog.
+
     DATA SOURCING — choose between `from_catalog` and `from_project`:
       - `from_catalog("name")` resolves catalog aliases AND bare content hashes.
         Use this when the source appears in `catalog_list` output.
@@ -216,6 +237,13 @@ def catalog_run(code: str, prompt: str = "") -> dict:
       - When in doubt, call `catalog_list` first. A name that looks like a file
         is often actually an alias — `from_project` on an alias raises
         `ProjectDataNotFound`.
+
+    COLUMN NAMES — do not guess. The source step returns a `schema`, and
+    `catalog_list` shows each entry's columns as a compact `name:type, ...`
+    summary. Reference the exact names you see there (`tripduration`, not
+    `trip_duration`). When unsure, index with `t["col"]` rather than `t.col`:
+    the bracket form's error lists the real columns, whereas attribute access
+    on a missing column raises an opaque AttributeError.
 
     GOTCHAS — types and casts:
 
@@ -245,13 +273,6 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         t.select("col_a", "col_b")                                   # explicit columns
         t.mutate(new_col=t.x + 1)                                    # not select(ibis._, ...)
 
-    GOTCHAS — xorq vs ibis deferred accessor:
-
-        xo._.column_name       # AttributeError: module 'xorq' has no attribute '_'
-        # xorq has no `_` deferred proxy. Use ibis._:
-        ibis._.column_name     # correct — `ibis` from `import xorq.vendor.ibis as ibis`
-        t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat
-
     GOTCHAS — referencing aggregate columns:
 
         # BAD: when an aggregate alias collides with an ibis method name
@@ -278,13 +299,6 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # Or equivalently with mutate + relocation:
         expr = t.mutate(tripduration=(t.ended_at - t.started_at).cast("int64"))
         expr = expr.select("tripduration", *[c for c in t.columns])
-
-    GOTCHAS — imports:
-
-        # FORBIDDEN: even one `import ibis` makes the expression unsavable.
-        # The expression constructs fine but explodes at catalog-save time with
-        # a TypeError about ibis vs xorq.vendor.ibis Expr classes. Always use:
-        import xorq.vendor.ibis as ibis
 
     GOTCHAS — APIs that DON'T exist (do not invent these):
 
@@ -887,6 +901,23 @@ def catalog_export_marimo() -> dict:
     return {"path": str(path), "cells": n}
 
 
+def _compact_columns(project: str, content_hash: str) -> str | None:
+    """Compact ``"name:type, name:type"`` column summary for an entry.
+
+    Read straight from the entry's ``schema.json`` so the model can see an
+    entry's columns before writing an expression against it — no build, one
+    short line to scan. Returns ``None`` when the schema isn't on disk.
+    """
+    schema_path = entry_dir(project, content_hash) / "schema.json"
+    if not schema_path.exists():
+        return None
+    try:
+        fields = json.loads(schema_path.read_text()).get("fields", [])
+    except Exception:
+        return None
+    return ", ".join(f"{f['name']}:{f['type']}" for f in fields) or None
+
+
 @mcp.tool()
 @_tag_project
 def catalog_list() -> list[dict]:
@@ -895,6 +926,12 @@ def catalog_list() -> list[dict]:
     Each entry is annotated with `alias` and `version` if it currently
     corresponds to a named version. Scratch entries (no alias) are also
     included.
+
+    Each entry also carries `columns`: a compact `"name:type, name:type"`
+    summary read from the entry's schema. Call this BEFORE writing an
+    expression against an entry you did not just build — reference the exact
+    column names shown here rather than guessing (`tripduration` is not
+    `trip_duration`).
     """
     project = _resolve_active_project()
     entries = list_entries(project)
@@ -909,6 +946,7 @@ def catalog_list() -> list[dict]:
         else:
             e["alias"] = None
             e["version"] = None
+        e["columns"] = _compact_columns(project, e["content_hash"])
     return entries
 
 
@@ -1057,7 +1095,9 @@ def ds_modeling_workflow(dataset: str, target: str = "") -> str:
         "4. Score in PURE IBIS on the prediction column (e.g. accuracy=(t.y==t.pred).mean(), or "
         "rmse=((t.y-t.pred)**2).mean().sqrt()) — deferred_sklearn_metric does NOT survive catalog "
         "build (see the same MODELING section). Attach a predicted-vs-actual chart.\n"
-        "Reminders: import xorq.vendor.ibis as ibis (never bare import ibis); no project= kwargs; "
+        "Reminders: import xorq.vendor.ibis as ibis (never bare import ibis); the api module is "
+        "import xorq.api as xo (never bare xorq.<fn>); the only backend is xorq's built-in datafusion "
+        "(no duckdb); check columns with catalog_list before referencing them; no project= kwargs; "
         "do not fabricate placeholder results."
     )
 

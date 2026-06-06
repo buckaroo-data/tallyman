@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import sys
 import tempfile
 import time
@@ -72,32 +73,121 @@ def _user_imports_bare_ibis(code: str) -> bool:
     return False
 
 
-def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
-    """Actionable hint for the three most common ibis/xorq import mistakes.
+# Read helpers the model reaches for on the wrong namespace. The project-aware
+# way is from_project/from_catalog; xo.deferred_read_parquet handles a raw path.
+_READ_FNS = frozenset(
+    {"read_parquet", "read_csv", "read_in_memory", "read_delta", "deferred_read_parquet", "deferred_read_csv"}
+)
+# Elementwise math the model reaches for as `ibis.fn(col)`; they are column methods.
+_IBIS_MATH = frozenset(
+    {
+        "sin", "cos", "tan", "asin", "acos", "atan", "atan2", "cot",
+        "exp", "ln", "log", "log2", "log10", "sqrt", "abs", "ceil",
+        "floor", "round", "sign", "power", "pow", "degrees", "radians",
+    }
+)
 
-    Signals:
-      1. User code contains a bare `import ibis` / `from ibis ...`.
-      2. The exception message names xorq's vendored Expr class (expression
-         built against the wrong ibis instance).
-      3. `xorq._` used instead of `ibis._` (xorq has no `_` deferred proxy;
-         it lives on `xorq.vendor.ibis`).
+
+def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
+    """Actionable hints for the namespace / column mistakes seen in the wild.
+
+    Reactive backstop to the proactive guidance in the MCP tool docstrings:
+    fired only after user code (or build_expr) raises, and shown to the model
+    in the tool's error response. Each branch maps a recurring failure
+    signature from the session scan to a one-line correction. Multiple signals
+    can co-fire; their hints are concatenated.
+
+    Signatures handled:
+      - bare `import ibis` / `from ibis ...`, or the vendored-Expr class
+        mismatch (expression built against the wrong ibis instance);
+      - `module 'xorq' has no attribute 'X'` — xorq is not the API entrypoint
+        (`import xorq.api as xo`); `_` lives on `xorq.vendor.ibis`;
+      - `module 'ibis' has no attribute 'X'` — math is a column method, reads
+        go through from_project/from_catalog, `ibis.case` is now `ibis.cases`;
+      - `cannot import name 'X' from 'pydata_xorq.io'` — invented loader;
+      - any duckdb reach — there is no duckdb backend, only datafusion;
+      - `'Table' object has no attribute 'X'` — guessed a column name.
     """
+    hints: list[str] = []
+
     has_bad_import = _user_imports_bare_ibis(code)
     has_expr_mismatch = "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
-    has_xorq_underscore = "has no attribute '_'" in exc_msg and "xorq" in exc_msg
-    if not (has_bad_import or has_expr_mismatch or has_xorq_underscore):
-        return ""
-    if has_xorq_underscore and not has_bad_import:
-        return (
-            "\n\nHint: `xorq` has no `_` deferred accessor. Use `ibis._` "
-            "where `ibis` comes from `import xorq.vendor.ibis as ibis`."
+    if has_bad_import or has_expr_mismatch:
+        hints.append(
+            "this usually means the expression was built using `import ibis` "
+            "instead of `import xorq.vendor.ibis as ibis`. Replace any "
+            "`import ibis` (or `from ibis import ...`) with "
+            "`import xorq.vendor.ibis as ibis` and rebuild."
         )
-    return (
-        "\n\nHint: this usually means the expression was built using "
-        "`import ibis` instead of `import xorq.vendor.ibis as ibis`. "
-        "Replace any `import ibis` (or `from ibis import ...`) with "
-        "`import xorq.vendor.ibis as ibis` and rebuild."
-    )
+
+    m = re.search(r"module 'xorq' has no attribute '(\w+)'", exc_msg)
+    if m:
+        name = m.group(1)
+        if name == "_":
+            if not has_bad_import:
+                hints.append(
+                    "`xorq` has no `_` deferred accessor. Use `ibis._` where "
+                    "`ibis` comes from `import xorq.vendor.ibis as ibis`."
+                )
+        elif name in _READ_FNS:
+            hints.append(
+                f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint "
+                "(`import xorq.api as xo`). Read data with `from pydata_xorq.io "
+                "import from_project, from_catalog`, or `xo.deferred_read_parquet"
+                "(abs_path)` for a raw path."
+            )
+        else:
+            hints.append(
+                f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint. "
+                f"`import xorq.api as xo` and call `xo.{name}` "
+                "(e.g. xo.memtable, xo.deferred_read_parquet, xo.connect)."
+            )
+
+    m = re.search(r"module 'ibis' has no attribute '(\w+)'", exc_msg)
+    if m:
+        name = m.group(1)
+        if name in _IBIS_MATH:
+            hints.append(f"math/elementwise functions are column methods: `col.{name}()`, not `ibis.{name}(col)`.")
+        elif name in {"read_parquet", "read_csv", "read_table"}:
+            hints.append(
+                f"`ibis.{name}` does not exist — read data with "
+                "`from pydata_xorq.io import from_project, from_catalog`."
+            )
+        elif name == "case":
+            hints.append("`ibis.case` is gone — use `ibis.cases((cond, val), ..., else_=default)`.")
+        else:
+            hints.append(
+                f"`ibis.{name}` does not exist on `xorq.vendor.ibis`. Many operations are column methods "
+                "(`col.method()`), and data is read via from_project/from_catalog."
+            )
+
+    m = re.search(r"cannot import name '(\w+)' from 'pydata_xorq\.io'", exc_msg)
+    if m:
+        hints.append(
+            f"`pydata_xorq.io` has no `{m.group(1)}` — it exports only `from_project` "
+            "(raw files under <project>/data/) and `from_catalog` (named entries / content hashes)."
+        )
+
+    if "duckdb" in exc_msg.lower():
+        hints.append(
+            "there is no duckdb backend here — the only backend is xorq's built-in datafusion. "
+            "Build with the ibis expression API over from_project/from_catalog sources; "
+            "do not use duckdb, `.sql()`, or `con.register()`."
+        )
+
+    m = re.search(r"'Table' object has no attribute '(\w+)'", exc_msg)
+    if m:
+        name = m.group(1)
+        hints.append(
+            f"`{name}` is not a column on this table — attribute access on a missing column raises this "
+            "opaque error. List the entry's columns first (catalog_list shows a compact columns summary "
+            "per entry, or use the source step's returned `schema`) and reference exact names; "
+            f"when unsure use `t['{name}']`, whose error lists the real columns."
+        )
+
+    if not hints:
+        return ""
+    return "\n\nHint: " + " ".join(hints)
 
 
 def _import_script(code: str) -> tuple[object, Path]:

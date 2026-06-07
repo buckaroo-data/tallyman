@@ -55,9 +55,28 @@ def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: P
     assert "total_v2" in schema
     assert "total_eq" in schema
     assert "total_pct_delta" in schema
+    assert "total_abs_delta" in schema
     assert "n_v2" in schema
     assert "n_eq" in schema
     assert "n_pct_delta" in schema
+    assert "n_abs_delta" in schema
+
+
+def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet: Path):
+    from pydata_companion.diff import build_compare_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_expr = cached_result_expr(project, a.content_hash)
+    b_expr = cached_result_expr(project, b.content_hash)
+
+    expr, _ = build_compare_expr(a_expr, b_expr, ["region"])
+    cols = list(expr.schema().keys())
+    # _pct_delta and _abs_delta must appear right after their _v2 column
+    for prefix in ("total", "n"):
+        v2_idx = cols.index(f"{prefix}_v2")
+        assert cols[v2_idx + 1] == f"{prefix}_pct_delta"
+        assert cols[v2_idx + 2] == f"{prefix}_abs_delta"
 
 
 def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet: Path):
@@ -71,10 +90,16 @@ def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet
     _, overrides = build_compare_expr(a_expr, b_expr, ["region"])
     assert overrides["membership"]["merge_rule"] == "hidden"
     assert overrides["total"]["merge_rule"] == "hidden"
-    assert overrides["total_pct_delta"]["merge_rule"] == "hidden"
+    # _pct_delta and _abs_delta are not hidden; DiffMainStyling filters them
+    assert "total_pct_delta" not in overrides
+    assert "total_abs_delta" not in overrides
 
 
 def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, orders_parquet: Path):
+    # The base overrides (used by promoted diff entries, which render without
+    # the diff display klasses) color numeric value columns by pct_delta. The
+    # live /diff route strips this via strip_live_diff_color so the per-view
+    # klass coloring wins — see test_strip_live_diff_color below.
     from pydata_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -87,6 +112,37 @@ def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, or
     assert v2_cfg["color_map_config"]["color_rule"] == "color_map"
     assert v2_cfg["color_map_config"]["map_name"] == "DIVERGING_RED_WHITE_BLUE"
     assert v2_cfg["color_map_config"]["val_column"] == "total_pct_delta"
+
+
+def test_strip_live_diff_color_drops_numeric_keeps_categorical():
+    # The live /diff route strips numeric (color_map) value-column coloring so
+    # the display klasses own it, but keeps categorical key/equality colors.
+    from pydata_companion.diff import strip_live_diff_color
+
+    overrides = {
+        "total_v2": {
+            "header_name": "total",
+            "tooltip_config": {"tooltip_type": "simple", "val_column": "total"},
+            "color_map_config": {
+                "color_rule": "color_map",
+                "map_name": "DIVERGING_RED_WHITE_BLUE",
+                "val_column": "total_pct_delta",
+            },
+        },
+        "region_v2": {
+            "header_name": "region",
+            "color_map_config": {"color_rule": "color_categorical", "val_column": "region_eq"},
+        },
+        "region": {"color_map_config": {"color_rule": "color_categorical", "val_column": "membership"}},
+    }
+    stripped = strip_live_diff_color(overrides)
+    # numeric color dropped, rename + tooltip kept
+    assert "color_map_config" not in stripped["total_v2"]
+    assert stripped["total_v2"]["header_name"] == "total"
+    assert stripped["total_v2"]["tooltip_config"]["val_column"] == "total"
+    # categorical colors preserved
+    assert stripped["region_v2"]["color_map_config"]["color_rule"] == "color_categorical"
+    assert stripped["region"]["color_map_config"]["color_rule"] == "color_categorical"
 
 
 def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orders_parquet: Path):

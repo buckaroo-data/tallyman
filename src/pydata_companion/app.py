@@ -219,9 +219,14 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
 
     import xorq.api as xo
 
-    from pydata_companion.diff import build_compare_expr
+    from pydata_companion.diff import build_compare_expr, strip_live_diff_color
 
     expr, overrides = build_compare_expr(a, b, keys)
+    # The live /diff route loads the diff display klasses, which own per-view
+    # numeric coloring. Drop the shared numeric color from the overrides so it
+    # doesn't clobber the klass-set color in merge_column_config. (Promoted
+    # entries keep the colored overrides — they render without the klasses.)
+    overrides = strip_live_diff_color(overrides)
 
     # One session-scoped parent dir so build_expr lands the comparison in a
     # stable content-hash subdir — re-rendering the same diff reuses it.

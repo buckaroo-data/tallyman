@@ -391,3 +391,46 @@ def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parque
     nb_source = notebook_to_marimo(project)
     assert "_overrides = " in nb_source
     assert "membership" in nb_source
+
+
+def test_marimo_export_loads_in_marimo_without_collisions(
+    project: str, orders_parquet: Path, monkeypatch, tmp_path: Path
+):
+    """The exported notebook must load in marimo without a MultipleDefinitionError.
+
+    Each code cell inlines an ``expr.py`` that binds ``expr`` and imports
+    ``os`` / ``xo`` / ``from_project``. With more than one entry those names
+    used to leak into marimo's global dataflow graph and collide; the closure
+    wrapper in ``marimo_export`` keeps them cell-local. String assertions
+    alone never caught this — we have to actually build the marimo graph.
+    """
+    import importlib.util
+    import sys
+
+    from marimo._ast.app import InternalApp
+
+    from tallyman_core.marimo_export import notebook_to_marimo
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_create("shoe_boots", _filter_code(project))
+
+    src = notebook_to_marimo(project)
+
+    # marimo's @app.cell decorator reads source via inspect.getsourcelines,
+    # so the module must exist as a real file on disk, not exec'd in memory.
+    nb_path = tmp_path / "nb_marimo_regression.py"
+    nb_path.write_text(src)
+    spec = importlib.util.spec_from_file_location("nb_marimo_regression", nb_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["nb_marimo_regression"] = mod
+    try:
+        spec.loader.exec_module(mod)
+        # Building the graph raises MultipleDefinitionError if any
+        # non-underscore name is defined by more than one cell.
+        graph = InternalApp(mod.app).graph
+    finally:
+        sys.modules.pop("nb_marimo_regression", None)
+
+    # bootstrap + title + (markdown + code) per entry
+    assert len(graph.cells) >= 6

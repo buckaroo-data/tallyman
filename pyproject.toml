@@ -43,6 +43,9 @@ tallyman = "tallyman_cli.main:cli"
 dev = [
     "pytest>=8",
     "ruff>=0.15.15",
+    # marimo is only needed to run the exported notebooks and to validate the
+    # marimo export in tests; the package generates marimo source without it.
+    "marimo>=0.23.9",
 ]
 
 [build-system]

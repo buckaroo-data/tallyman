@@ -41,6 +41,14 @@ def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str
                 # _pct_delta and _abs_delta are not hidden here so that
                 # DiffDetailedPctStyling / DiffDetailedAbsoluteStyling can
                 # display them.  DiffMainStyling filters them by name.
+                #
+                # This pct_delta coloring is what a *promoted* diff entry
+                # renders with: it's persisted into display_configs and applied
+                # without the diff display klasses (which only load on the live
+                # /diff route).  The live diff route strips this numeric color
+                # via strip_live_diff_color() so the per-view klass coloring
+                # (pct_delta for main/detailed_pct, abs_delta for
+                # detailed_absolute) isn't clobbered by merge_column_config.
                 overrides[f"{col}_v2"] = {
                     "header_name": col,
                     "tooltip_config": {"tooltip_type": "simple", "val_column": col},
@@ -69,6 +77,27 @@ def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str
             }
         }
     return overrides
+
+
+def strip_live_diff_color(overrides: dict) -> dict:
+    """Return a copy of overrides with the numeric value-column coloring removed.
+
+    The live /diff route loads the diff display klasses, which color each value
+    column per view (pct_delta for main/detailed_pct, abs_delta for
+    detailed_absolute). Because merge_column_config applies these overrides
+    *after* the klasses run and ``row.update()`` would clobber the klass-set
+    color, the shared 'color_map' (numeric pct_delta) entries must be dropped on
+    the live path. The categorical key/equality colors are left intact, and the
+    original overrides (with color) are kept for promoted entries, which render
+    without the klasses.
+    """
+    out: dict = {}
+    for col, cfg in overrides.items():
+        cmc = cfg.get("color_map_config") if isinstance(cfg, dict) else None
+        if cmc and cmc.get("color_rule") == "color_map":
+            cfg = {k: v for k, v in cfg.items() if k != "color_map_config"}
+        out[col] = cfg
+    return out
 
 
 def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, dict]:

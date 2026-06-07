@@ -2,11 +2,11 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // Dev: Vite runs on :5173 and proxies API calls to the FastAPI companion.
-// The companion's port is `pydata run --port` (default 7860); when you run it
-// on another port, point the proxy at it with PYDATA_API_PORT, e.g.
-// `PYDATA_API_PORT=7861 pnpm dev`.
+// The companion's port is `tallyman run --port` (default 7860); when you run it
+// on another port, point the proxy at it with TALLYMAN_API_PORT, e.g.
+// `TALLYMAN_API_PORT=7861 pnpm dev`.
 // Prod: build lands in dist/, FastAPI serves index.html as the SPA catch-all.
-const apiTarget = `http://localhost:${process.env.PYDATA_API_PORT || "7860"}`;
+const apiTarget = `http://localhost:${process.env.TALLYMAN_API_PORT || "7860"}`;
 
 export default defineConfig({
   plugins: [react()],

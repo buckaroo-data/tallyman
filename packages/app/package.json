@@ -1,5 +1,5 @@
 {
-  "name": "@pydata-app/app",
+  "name": "@tallyman/app",
   "version": "0.0.1",
   "private": true,
   "type": "module",

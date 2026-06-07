@@ -1,6 +1,6 @@
-# pydata-app — plan
+# tallyman-notebooks — plan
 
-The xorq MCP app that backs the PyData London 2026 talk *"The Future of Notebooks in a Claude Code World"* (see `proposal.md`). This document is the result of a grilling pass; it supersedes earlier drafts. Decisions baked in from the grilling are stated; remaining open questions are listed at the end.
+The xorq MCP app that backs the Tallyman London 2026 talk *"The Future of Notebooks in a Claude Code World"* (see `proposal.md`). This document is the result of a grilling pass; it supersedes earlier drafts. Decisions baked in from the grilling are stated; remaining open questions are listed at the end.
 
 > **V0.6 implementation status (2026-05-24).** Working end-to-end on branch
 > `spike/catalog-run-loop`:
@@ -29,11 +29,11 @@ The xorq MCP app that backs the PyData London 2026 talk *"The Future of Notebook
 >   `buckaroo==0.14.6` and `xorq==0.3.26` pinned from PyPI (no editable
 >   sources). Search regression in 0.14.4/0.14.5 reported as
 >   buckaroo-data/buckaroo#838, fixed in 0.14.6.
-> - **`pydata serve <project_dir>`** read-only artifact mode and
->   **`pydata pack [<project>]`** tar-up command (portable `.tgz`,
->   `${PYDATA_PROJECT_ROOT}` placeholders preserved, optional
+> - **`tallyman serve <project_dir>`** read-only artifact mode and
+>   **`tallyman pack [<project>]`** tar-up command (portable `.tgz`,
+>   `${TALLYMAN_PROJECT_ROOT}` placeholders preserved, optional
 >   `--exclude-cache`).
-> - **`pydata replay <storyboard.json>`** rehearsal mode that drives the
+> - **`tallyman replay <storyboard.json>`** rehearsal mode that drives the
 >   MCP tool surface deterministically (the open question #10 fallback).
 > - MCP-over-stdio proven by `tests/test_mcp_stdio.py` (spawns the CLI as a
 >   subprocess and round-trips real tool calls).
@@ -74,7 +74,7 @@ Identity is by **content hash**, never by timestamp. Aliases are mutable handles
 
 ```
 ┌────────────────────────┐    MCP stdio    ┌──────────────────────────┐
-│  Claude Code terminal  │ ──────────────► │  pydata_mcp server       │
+│  Claude Code terminal  │ ──────────────► │  tallyman_mcp server       │
 │  (left half of screen) │                 │  (FastMCP, ~14 tools)    │
 └────────────────────────┘                 └────────┬─────────────────┘
                                                     │ writes catalog
@@ -82,13 +82,13 @@ Identity is by **content hash**, never by timestamp. Aliases are mutable handles
                                                     ▼
                                          ┌──────────────────────────┐
                                          │  catalog store on disk   │
-                                         │  ~/.pydata-app/projects/ │
+                                         │  ~/.tallyman/projects/ │
                                          │  <name>/catalog/...      │
                                          └────────┬─────────────────┘
                                                   │ reads
                                                   ▼
 ┌────────────────────────┐  HTTP + SSE  ┌─────────────────────────┐
-│  Browser               │ ◄──────────  │  pydata_companion       │
+│  Browser               │ ◄──────────  │  tallyman_companion       │
 │  (right half of        │              │  (FastAPI + Jinja2)     │
 │   screen, full-height) │ ── click ──► │  port 7860              │
 │                        │              └────────┬────────────────┘
@@ -100,7 +100,7 @@ Identity is by **content hash**, never by timestamp. Aliases are mutable handles
 └────────────────────────┘                       └─────────────────────┘
 ```
 
-Three processes on one machine — `pydata_mcp` (spawned by Claude Code), `pydata_companion` (the FastAPI app you start manually with `pydata run`), and a `buckaroo` server subprocess managed by the companion.
+Three processes on one machine — `tallyman_mcp` (spawned by Claude Code), `tallyman_companion` (the FastAPI app you start manually with `tallyman run`), and a `buckaroo` server subprocess managed by the companion.
 
 The companion notifies the browser of changes via SSE. The MCP server notifies the companion via `POST /internal/notify` after each tool call that mutates the catalog.
 
@@ -111,7 +111,7 @@ The companion notifies the browser of changes via SSE. The MCP server notifies t
 A "project" is a directory that owns one catalog and one or more notebooks. V1 has a single default notebook per project.
 
 ```
-~/.pydata-app/projects/<project_name>/
+~/.tallyman/projects/<project_name>/
 ├── catalog/
 │   ├── entries/<content_hash>/
 │   │   ├── manifest.json       # name?, version?, parent_hash?, prompt, code_path, created_at, parent_alias?
@@ -127,7 +127,7 @@ A "project" is a directory that owns one catalog and one or more notebooks. V1 h
 │   └── buckaroo_sessions.json  # {hash: buckaroo_session_id}  (regenerated on startup)
 ├── notebooks/
 │   └── default.json            # cell list, markdown blocks, ordering
-└── pydata.toml                 # project config (name, default notebook, settings)
+└── tallyman.toml                 # project config (name, default notebook, settings)
 ```
 
 Append-only-ish: catalog entries are immutable (content-hashed), but `aliases.json`, `alias_history.json`, and `notebooks/*.json` are mutable indexes maintained by the system. Pruning a catalog entry deletes its directory and removes references; the catalog reflects what you want to keep.
@@ -140,13 +140,13 @@ Seven Python packages in one monorepo. Boundary discipline matters because the t
 
 | Package | Owns | Depends on |
 |---|---|---|
-| `pydata_core` | Disk layout, manifest schema, alias bookkeeping, notebook JSON model. No HTTP, no MCP, no compute. | (stdlib + pydantic) |
-| `pydata_xorq` | Compute layer. Wraps xorq's `xo.build_expr`, expr.yaml decompile, lineage extraction. Takes Python code → catalog entry on disk. | `xorq`, `pydata_core` |
-| `pydata_mcp` | The MCP server. Exposes ~13 tools. Calls into `pydata_xorq` and `pydata_core`. Posts notifications to companion's `/internal/notify`. | `fastmcp`, `pydata_xorq`, `pydata_core` |
-| `pydata_companion` | FastAPI app. Reads catalog from disk. Manages buckaroo subprocess. Serves Jinja2 templates + SSE. Accepts notebook edits from browser. | `fastapi`, `pydata_core`, `buckaroo` |
-| `pydata_companion/static/` | Static assets: Buckaroo bundles (copied from `~/buckaroo` build output), Vega-Lite, Cytoscape, custom JS for notebook drag/edit. | (build artifact) |
-| `pydata_companion/templates/` | Jinja2 templates: `base.html`, `catalog.html`, `notebook.html`, `lineage.html`, `diff.html`, fragments for SSE updates. | (templates) |
-| `pydata_cli` | The `pydata` console script. `pydata init <name>` / `pydata run` / `pydata mcp` (the latter is what Claude Code spawns) / `pydata serve <project_dir>` (read-only companion against a handed-off project) / `pydata pack [<project>]` (portable `.tgz`) / `pydata replay <storyboard.json>` (deterministic rehearsal). | `click`, `pydata_companion`, `pydata_mcp` |
+| `tallyman_core` | Disk layout, manifest schema, alias bookkeeping, notebook JSON model. No HTTP, no MCP, no compute. | (stdlib + pydantic) |
+| `tallyman_xorq` | Compute layer. Wraps xorq's `xo.build_expr`, expr.yaml decompile, lineage extraction. Takes Python code → catalog entry on disk. | `xorq`, `tallyman_core` |
+| `tallyman_mcp` | The MCP server. Exposes ~13 tools. Calls into `tallyman_xorq` and `tallyman_core`. Posts notifications to companion's `/internal/notify`. | `fastmcp`, `tallyman_xorq`, `tallyman_core` |
+| `tallyman_companion` | FastAPI app. Reads catalog from disk. Manages buckaroo subprocess. Serves Jinja2 templates + SSE. Accepts notebook edits from browser. | `fastapi`, `tallyman_core`, `buckaroo` |
+| `tallyman_companion/static/` | Static assets: Buckaroo bundles (copied from `~/buckaroo` build output), Vega-Lite, Cytoscape, custom JS for notebook drag/edit. | (build artifact) |
+| `tallyman_companion/templates/` | Jinja2 templates: `base.html`, `catalog.html`, `notebook.html`, `lineage.html`, `diff.html`, fragments for SSE updates. | (templates) |
+| `tallyman_cli` | The `tallyman` console script. `tallyman init <name>` / `tallyman run` / `tallyman mcp` (the latter is what Claude Code spawns) / `tallyman serve <project_dir>` (read-only companion against a handed-off project) / `tallyman pack [<project>]` (portable `.tgz`) / `tallyman replay <storyboard.json>` (deterministic rehearsal). | `click`, `tallyman_companion`, `tallyman_mcp` |
 
 Single `pyproject.toml` at the repo root, src-layout, uv-managed. Python 3.13.
 
@@ -197,7 +197,7 @@ The agent's choice between `catalog_run`, `catalog_create`, and `catalog_revise`
 
 FastAPI app, Jinja2 templates, vanilla JS for interactions. Server-Sent Events for live updates. No SPA framework — keep moving parts low.
 
-The companion has two modes. **Edit mode** (`pydata run`) is the authoring surface used during a session: full routes, drag-and-drop, markdown editing, MCP notifications. **Serve mode** (`pydata serve <project_dir>`) is the read-only artifact view: a colleague (or future-you) runs it against a handed-off project directory and sees exactly the catalog and notebook the author last saved. Serve mode hides drag handles, ×, and contenteditable affordances; rejects `PATCH /api/notebook`, `PUT /api/markdown/<cell_id>`, and `POST /internal/notify` with 403; and does not start the MCP server. The project directory plus a `pydata` install is the artifact — there is no `.ipynb`, no static export, no other deliverable.
+The companion has two modes. **Edit mode** (`tallyman run`) is the authoring surface used during a session: full routes, drag-and-drop, markdown editing, MCP notifications. **Serve mode** (`tallyman serve <project_dir>`) is the read-only artifact view: a colleague (or future-you) runs it against a handed-off project directory and sees exactly the catalog and notebook the author last saved. Serve mode hides drag handles, ×, and contenteditable affordances; rejects `PATCH /api/notebook`, `PUT /api/markdown/<cell_id>`, and `POST /internal/notify` with 403; and does not start the MCP server. The project directory plus a `tallyman` install is the artifact — there is no `.ipynb`, no static export, no other deliverable.
 
 | Route | Purpose |
 |---|---|
@@ -210,7 +210,7 @@ The companion has two modes. **Edit mode** (`pydata run`) is the authoring surfa
 | `/api/sse` | EventSource stream of `{kind, ...}` events. |
 | `/api/notebook` | `PATCH` for reorder/remove/markdown edits from the browser. |
 | `/api/markdown/<cell_id>` | `PUT` for markdown edits. |
-| `/internal/notify` | Internal POST endpoint. Only `pydata_mcp` calls this. Fans out to SSE clients. |
+| `/internal/notify` | Internal POST endpoint. Only `tallyman_mcp` calls this. Fans out to SSE clients. |
 
 **Tab semantics:** clicking a notebook cell in the `/notebook` tab auto-syncs `/catalog` to that cell's entry, so when you switch back to catalog the entry is already focused.
 
@@ -223,8 +223,8 @@ The companion has two modes. **Edit mode** (`pydata run`) is the authoring surfa
 Buckaroo runs as a **live Tornado server** managed by the companion subprocess group. This enables search, sort, filter, and column-level recon (null counts, distributions) directly in the table widget — the in-line recon tier of the three-tier model.
 
 **Lifecycle:**
-1. `pydata run` starts: companion spawns `python -m buckaroo.server --port 8700 --no-browser --stdio-control` as a subprocess. Companion holds the subprocess handle; cleans up on shutdown.
-2. When a new catalog entry lands (companion is notified via `/internal/notify`), the companion expands the entry's `xorq_build/` dir into a tmp copy with `${PYDATA_PROJECT_ROOT}` placeholders resolved, then POSTs that path to buckaroo's `/load_expr` endpoint (added in upstream PR 776). Buckaroo loads the xorq expression and returns a `session_id`. Stored in `buckaroo_sessions.json` keyed by content hash.
+1. `tallyman run` starts: companion spawns `python -m buckaroo.server --port 8700 --no-browser --stdio-control` as a subprocess. Companion holds the subprocess handle; cleans up on shutdown.
+2. When a new catalog entry lands (companion is notified via `/internal/notify`), the companion expands the entry's `xorq_build/` dir into a tmp copy with `${TALLYMAN_PROJECT_ROOT}` placeholders resolved, then POSTs that path to buckaroo's `/load_expr` endpoint (added in upstream PR 776). Buckaroo loads the xorq expression and returns a `session_id`. Stored in `buckaroo_sessions.json` keyed by content hash.
 3. The entry-detail page renders a `<div data-ws-url="ws://localhost:8700/ws/<session_id>">` placeholder; the React embed (`static/buckaroo-embed.js`, built from `packages/embed/`) mounts `BuckarooServerView` into it and pages rows over the WS. Sort/search push-down lands on the underlying backend rather than re-materialising the parquet.
 4. On companion startup, `buckaroo_sessions.json` is loaded but treated as a *naming hint* — buckaroo itself is fresh, so sessions are lazily re-created on first view (and the cache is invalidated when buckaroo's reported `started` timestamp doesn't match what was last persisted).
 
@@ -237,7 +237,7 @@ Buckaroo runs as a **live Tornado server** managed by the companion subprocess g
 
 **Why React embed and not iframe?** The original design used `<iframe src="/s/<session>">`. The iframe model carried a FOUC (full bundle re-bootstrap per nav) and a per-cell isolation tax (separate browser contexts). The React embed mounts directly into the host page, sharing the document, and connects over WS. T-31/T-32 documented the iframe-era follow-ups; both are now moot. T-33 is the new memory baseline ticket for the embed model.
 
-**Build prerequisites:** `packages/embed/` builds a tiny ~1.4MB ESM bundle that mounts `BuckarooServerView` from `buckaroo-js-core`. Bundle is committed at `src/pydata_companion/static/buckaroo-embed.js` so fresh clones run without Node. The Python `buckaroo` server is a normal PyPI dep — `buckaroo==0.14.6` pinned in `pyproject.toml` (PR 776 has landed; no editable source override).
+**Build prerequisites:** `packages/embed/` builds a tiny ~1.4MB ESM bundle that mounts `BuckarooServerView` from `buckaroo-js-core`. Bundle is committed at `src/tallyman_companion/static/buckaroo-embed.js` so fresh clones run without Node. The Python `buckaroo` server is a normal PyPI dep — `buckaroo==0.14.6` pinned in `pyproject.toml` (PR 776 has landed; no editable source override).
 
 ---
 
@@ -245,15 +245,15 @@ Buckaroo runs as a **live Tornado server** managed by the companion subprocess g
 
 | Source | What | Destination |
 |---|---|---|
-| `~/code/xorq-mcp/xorq_web/metadata.py` | Lineage extraction from xorq DAG; expression decompile helper | `pydata_xorq/lineage.py`, `pydata_xorq/decompile.py` |
-| `~/code/xorq-mcp/xorq_mcp_tool.py` | Patterns for `xo.build_expr` invocation, hash → cache path conventions, Buckaroo session bootstrap. **Caveat:** xorq-mcp pins `xorq>=0.3.8`; xorq 0.3.23 renamed `xo.read_parquet` → `xo.deferred_read_parquet` and made the former resolve through ibis backend loading (which errors). Use the deferred names. | `pydata_xorq/build.py`, `pydata_companion/buckaroo_lifecycle.py` |
-| `~/code/xorq-cloud-planning/packages/app/templates/entry_detail.html` | Tab structure, prompt block layout, build-metadata grid, Pygments highlighting setup | `pydata_companion/templates/_entry_detail.html` (adapted; not literal copy) |
-| `~/code/xorq-cloud-planning/packages/app/templates/base.html` | Base template scaffolding (head, nav, includes) | `pydata_companion/templates/base.html` |
-| `~/code/xorq-cloud-planning/packages/app/static/` (if present) | Pygments CSS, base CSS | `pydata_companion/static/` |
+| `~/code/xorq-mcp/xorq_web/metadata.py` | Lineage extraction from xorq DAG; expression decompile helper | `tallyman_xorq/lineage.py`, `tallyman_xorq/decompile.py` |
+| `~/code/xorq-mcp/xorq_mcp_tool.py` | Patterns for `xo.build_expr` invocation, hash → cache path conventions, Buckaroo session bootstrap. **Caveat:** xorq-mcp pins `xorq>=0.3.8`; xorq 0.3.23 renamed `xo.read_parquet` → `xo.deferred_read_parquet` and made the former resolve through ibis backend loading (which errors). Use the deferred names. | `tallyman_xorq/build.py`, `tallyman_companion/buckaroo_lifecycle.py` |
+| `~/code/xorq-cloud-planning/packages/app/templates/entry_detail.html` | Tab structure, prompt block layout, build-metadata grid, Pygments highlighting setup | `tallyman_companion/templates/_entry_detail.html` (adapted; not literal copy) |
+| `~/code/xorq-cloud-planning/packages/app/templates/base.html` | Base template scaffolding (head, nav, includes) | `tallyman_companion/templates/base.html` |
+| `~/code/xorq-cloud-planning/packages/app/static/` (if present) | Pygments CSS, base CSS | `tallyman_companion/static/` |
 | `~/code/xorq-desktop-plan/catalog-viewer-plan.md` | Conceptual reference for V_n revision chips, lineage-derived parent association | (read for design; nothing to copy directly) |
-| `~/buckaroo/buckaroo/static/` (after `full_build.sh`) | Buckaroo JS bundles | `pydata_companion/static/buckaroo/` (or shipped via `buckaroo` PyPI dep) |
+| `~/buckaroo/buckaroo/static/` (after `full_build.sh`) | Buckaroo JS bundles | `tallyman_companion/static/buckaroo/` (or shipped via `buckaroo` PyPI dep) |
 
-`~/code/xorq-mcp` is **referenced, not extended**. We build pydata-app fresh; we cherry-pick code we need.
+`~/code/xorq-mcp` is **referenced, not extended**. We build tallyman-notebooks fresh; we cherry-pick code we need.
 
 ---
 
@@ -274,7 +274,7 @@ Twelve beats. Dataset: TBD (Citibike or NYC orders/sales — see open questions)
 | 9 | (Switch to the Notebook tab.) | The narrative so far: 3 cells. Markdown above each (initially the prompts). |
 | 10 | (Click on the markdown above `shoe_sales`; rewrite it for the audience.) | Markdown updates live. SSE pushes to any other connected clients. |
 | 11 | (Drag `shoe_size_model` cell above `shoe_sales`.) | Reorder. Notebook narrative now leads with the model, drills into the data underneath. |
-| 12 | (Hand the project off.) Open a second terminal, run `pydata serve ~/.pydata-app/projects/pydata-london-2026` against the same directory. | Second browser tab opens to the read-only companion: same catalog, same notebook, same Buckaroo. No drag handles, no edit affordances. The point: the project directory *is* the artifact. A colleague with `pydata` installed sees exactly what you see. Every cell's `expr.py` is re-runnable from upstream parquet — content-hashed, deterministic, no kernel state to lose. |
+| 12 | (Hand the project off.) Open a second terminal, run `tallyman serve ~/.tallyman/projects/tallyman-london-2026` against the same directory. | Second browser tab opens to the read-only companion: same catalog, same notebook, same Buckaroo. No drag handles, no edit affordances. The point: the project directory *is* the artifact. A colleague with `tallyman` installed sees exactly what you see. Every cell's `expr.py` is re-runnable from upstream parquet — content-hashed, deterministic, no kernel state to lose. |
 
 Closing line on stage: *"The notebook is the story. The catalog is what did the work. The project directory is the artifact — and it's reproducible because xorq cached every step by content hash, not by whatever happened to be in memory."*
 
@@ -295,7 +295,7 @@ Closing line on stage: *"The notebook is the story. The catalog is what did the 
 | 9 | Catalog itself is curated (prune wrong explanations); not append-only-forever | Honesty over completeness |
 | 10 | Identity by content hash; aliases are mutable handles | Standard xorq model |
 | 11 | Live Buckaroo Tornado server (port 8700), React-embedded into entry detail; sessions backed by `XorqBuckarooInfiniteWidget` via `/load_expr` | Search/sort push-down lands on the xorq backend; no parquet re-materialisation |
-| 12 | Build pydata-app fresh; vendor/copy from xorq-mcp; don't extend it | Different data model; talk hardening easier in a fresh repo |
+| 12 | Build tallyman-notebooks fresh; vendor/copy from xorq-mcp; don't extend it | Different data model; talk hardening easier in a fresh repo |
 
 ---
 
@@ -313,15 +313,15 @@ Smaller, mostly tactical:
 
 5. **Reordering UX.** ✅ Resolved — SortableJS shipped in `notebook.html`, ↑/↓ button fallback retained for accessibility.
 
-6. **Buckaroo build/dependency.** ✅ Resolved — `buckaroo==0.14.6` from PyPI. The embed bundle is committed at `src/pydata_companion/static/buckaroo-embed.js`; the Python server is a normal PyPI dep with no editable override.
+6. **Buckaroo build/dependency.** ✅ Resolved — `buckaroo==0.14.6` from PyPI. The embed bundle is committed at `src/tallyman_companion/static/buckaroo-embed.js`; the Python server is a normal PyPI dep with no editable override.
 
-7. **Project lifecycle.** `pydata init <name>` writes `~/.pydata-app/projects/<name>/`. `pydata run` from that dir, or `pydata run --project <name>` from anywhere. Question: is the project rooted in `~/.pydata-app/...` or in CWD? My lean: **`~/.pydata-app/projects/`** — keeps state separate from code. Conference dataset committed to the repo as a fixture, copied into project on `init`.
+7. **Project lifecycle.** `tallyman init <name>` writes `~/.tallyman/projects/<name>/`. `tallyman run` from that dir, or `tallyman run --project <name>` from anywhere. Question: is the project rooted in `~/.tallyman/...` or in CWD? My lean: **`~/.tallyman/projects/`** — keeps state separate from code. Conference dataset committed to the repo as a fixture, copied into project on `init`.
 
 8. **Dataset.** Citibike vs orders/sales. My lean: **synthetic orders/sales** matching the storyboard's `shoe_sales` naming. Easier to curate the demo to land on shoe-specific moments.
 
 9. **Active-cell context for "refine that".** Agent uses recent context. If unreliable in rehearsal, add `viewer_active_alias()` tool that returns whatever the user last clicked in the catalog tab.
 
-10. **Pre-talk rehearsal mode.** ✅ Resolved — `pydata replay <storyboard.json>` ships in `pydata_cli.main:replay_storyboard`; calls MCP tools in order with optional `--delay` for stage pacing.
+10. **Pre-talk rehearsal mode.** ✅ Resolved — `tallyman replay <storyboard.json>` ships in `tallyman_cli.main:replay_storyboard`; calls MCP tools in order with optional `--delay` for stage pacing.
 
 ---
 
@@ -329,7 +329,7 @@ Smaller, mostly tactical:
 
 | Risk | Mitigation |
 |---|---|
-| **Project-as-artifact is not yet portable** — xorq embeds absolute filesystem paths in build artifacts; `pydata serve` on a colleague's machine would fail unless paths are rewritten. Surfaced by the V0 spike. | Build-time path rewriting: replace `$PYDATA_HOME/projects/<name>/...` with a `${PYDATA_PROJECT_ROOT}` placeholder when writing the build to disk; expand at load time. Verify with a portability test that swaps PYDATA_HOME and re-runs the entry. |
+| **Project-as-artifact is not yet portable** — xorq embeds absolute filesystem paths in build artifacts; `tallyman serve` on a colleague's machine would fail unless paths are rewritten. Surfaced by the V0 spike. | Build-time path rewriting: replace `$TALLYMAN_HOME/projects/<name>/...` with a `${TALLYMAN_PROJECT_ROOT}` placeholder when writing the build to disk; expand at load time. Verify with a portability test that swaps TALLYMAN_HOME and re-runs the entry. |
 | Buckaroo build environment breaks on demo machine | Pin buckaroo version; commit a working build of static assets; smoke test the full stack on the actual demo laptop two weeks out |
 | Agent picks wrong tool (e.g. `catalog_create` when you wanted scratch, or vice versa) | Tool descriptions written carefully; prompts in the rehearsal use unambiguous phrasing ("name this X" → create; no name in prompt → run) |
 | MCP reconnect loses session state | All state on disk, never in MCP process memory. Reconnect re-reads. (Avoids xorq-mcp's known bug.) |
@@ -337,4 +337,4 @@ Smaller, mostly tactical:
 | Live demo crashes mid-talk | Recorded fallback video, switchable in 5 seconds |
 | Vega-Lite or Cytoscape fails to load | Both have CDN fallback URLs in addition to local copies |
 | SSE drops silently | Heartbeat every 10s; browser auto-reconnects |
-| Serve mode diverges from edit mode (different rendering, missing assets) | Same FastAPI app, same templates, same Buckaroo subprocess; mode is a single flag that gates mutation routes and hides edit affordances. Smoke test: end every rehearsal by running `pydata serve` against the project and clicking through the notebook. |
+| Serve mode diverges from edit mode (different rendering, missing assets) | Same FastAPI app, same templates, same Buckaroo subprocess; mode is a single flag that gates mutation routes and hides edit affordances. Smoke test: end every rehearsal by running `tallyman serve` against the project and clicking through the notebook. |

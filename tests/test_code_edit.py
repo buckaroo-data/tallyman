@@ -6,13 +6,13 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_core import get_alias, history_for
-from pydata_mcp.server import catalog_create
+from tallyman_core import get_alias, history_for
+from tallyman_mcp.server import catalog_create
 
 
 def _agg(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -20,7 +20,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 
 def _filter(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(n=f.count())
@@ -28,7 +28,7 @@ expr = f.group_by("region").aggregate(n=f.count())
 
 
 def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     v1_hash = get_alias(project, "shoe_sales")
 
@@ -52,7 +52,7 @@ def test_put_code_missing_alias_404(fresh_companion_app, project: str):
 
 
 def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
     r = c.put(f"/{project}/api/code/shoe_sales", json={"code": "   "})
@@ -60,23 +60,23 @@ def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: P
 
 
 def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
     r = c.put(f"/{project}/api/code/shoe_sales", json={"code": "expr = undefined_thing"})
     assert r.status_code == 400
 
     # The error was recorded via record_error with tool="api_code".
-    from pydata_core import list_errors
+    from tallyman_core import list_errors
 
     rec = list_errors(project)[0]
     assert rec["tool"] == "api_code"
 
 
 def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
@@ -84,11 +84,9 @@ def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch
     assert r.status_code == 403
 
 
-def test_entry_detail_has_alias_for_named(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_entry_detail_has_alias_for_named(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Named entries include alias and code in the JSON API response."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{out['hash']}")
@@ -98,12 +96,10 @@ def test_entry_detail_has_alias_for_named(
     assert body["code"].strip() != ""
 
 
-def test_entry_detail_no_alias_for_scratch(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
-):
+def test_entry_detail_no_alias_for_scratch(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Scratch entries have no alias in the JSON API response."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_run
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_run
 
     out = catalog_run(_agg(project), prompt="exploratory")
     c = TestClient(fresh_companion_app)
@@ -114,9 +110,9 @@ def test_entry_detail_no_alias_for_scratch(
 
 def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_parquet: Path, monkeypatch):
     """read_only mode returns 403 on PUT /api/code/."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     app = create_app(project, read_only=True)
     c = TestClient(app)

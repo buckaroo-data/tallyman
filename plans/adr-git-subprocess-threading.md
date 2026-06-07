@@ -1,12 +1,12 @@
-# ADR: Calling git from the multithreaded pydata server
+# ADR: Calling git from the multithreaded tallyman server
 
 - **Status:** Accepted (2026-06-03)
 - **Context ticket:** buckaroo-data/nokernel-notebooks#25
-- **Affected code:** `src/pydata_xorq/_git_state_guard.py`, the `run_git()` primitive in `tests/git_multithread_reliable.py`, `xorq.common.utils.logging_utils.get_git_state`
+- **Affected code:** `src/tallyman_xorq/_git_state_guard.py`, the `run_git()` primitive in `tests/git_multithread_reliable.py`, `xorq.common.utils.logging_utils.get_git_state`
 
 ## Problem
 
-xorq records git provenance by shelling out to `git rev-parse HEAD`, `git diff`, and `git diff --cached` from `logging_utils.get_git_state`, called inline on the catalog-write/compile path. The pydata companion server is long-lived and multithreaded, so these calls run while other threads are active.
+xorq records git provenance by shelling out to `git rev-parse HEAD`, `git diff`, and `git diff --cached` from `logging_utils.get_git_state`, called inline on the catalog-write/compile path. The tallyman companion server is long-lived and multithreaded, so these calls run while other threads are active.
 
 On macOS, `fork()` from a multithreaded process is unsafe: the child inherits locks (malloc, dyld, CoreFoundation) held by threads that do not exist in the child, and can die with SIGSEGV/SIGABRT before reaching `exec`. `subprocess` reports that as the spawned command dying with a negative returncode (e.g. -11). xorq's `get_git_state` had no error containment, so that propagated out of `build_expr` and failed every catalog write — a best-effort logging detail became a hard blocker.
 

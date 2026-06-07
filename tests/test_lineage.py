@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydata_xorq import (
+from tallyman_xorq import (
     build_and_persist,
     catalog_dag,
     catalog_parents,
@@ -13,7 +13,7 @@ from pydata_xorq import (
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -21,7 +21,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 
 def _from_catalog_code(project: str, parent_alias_or_hash: str) -> str:
     return f"""
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog({parent_alias_or_hash!r}, project={project!r})
 expr = t.order_by("total")
 """
@@ -46,7 +46,7 @@ def test_read_data_sources_lists_input_paths(project: str, orders_parquet: Path)
     sources = read_data_sources(project, res.content_hash)
     assert sources, "expected at least one source"
     # Persisted form is the portable placeholder, not the absolute path.
-    assert all("${PYDATA_PROJECT_ROOT}" in s for s in sources)
+    assert all("${TALLYMAN_PROJECT_ROOT}" in s for s in sources)
     assert any(s.endswith("data/orders.parquet") for s in sources)
 
 
@@ -76,7 +76,7 @@ def test_catalog_dag_handles_alias_referenced_child(project: str, orders_parquet
     """When the child references a parent via its alias name, lineage still
     resolves to the parent's content hash (because from_catalog dereferences
     the alias at build time)."""
-    from pydata_core import set_alias
+    from tallyman_core import set_alias
 
     parent = build_and_persist(project, _agg_code(project), prompt="parent")
     set_alias(project, "by_region", parent.content_hash)
@@ -86,7 +86,7 @@ def test_catalog_dag_handles_alias_referenced_child(project: str, orders_parquet
 
 
 def test_column_lineage_returns_per_column_trees(project: str, orders_parquet: Path):
-    from pydata_xorq import column_lineage
+    from tallyman_xorq import column_lineage
 
     res = build_and_persist(project, _agg_code(project))
     cols = column_lineage(project, res.content_hash)
@@ -99,10 +99,10 @@ def test_column_lineage_returns_per_column_trees(project: str, orders_parquet: P
 
 
 def test_column_lineage_traces_through_filter(project: str, orders_parquet: Path):
-    from pydata_xorq import column_lineage
+    from tallyman_xorq import column_lineage
 
     code = f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(total=f.price.sum())
@@ -116,6 +116,6 @@ expr = f.group_by("region").aggregate(total=f.price.sum())
 
 
 def test_column_lineage_missing_hash_returns_empty(project: str):
-    from pydata_xorq import column_lineage
+    from tallyman_xorq import column_lineage
 
     assert column_lineage(project, "deadbeef") == {}

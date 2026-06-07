@@ -1,6 +1,6 @@
 # The Future of Notebooks in a Claude Code World
 
-PyData London 2026 — proposal
+Tallyman London 2026 — proposal
 
 ## Abstract
 
@@ -8,7 +8,7 @@ AI coding agents are changing how data professionals work. But an AI agent chat 
 
 We'll trace the historical reasons why the programming notebook style developed, what problems it solves, and what problems it creates. Notebooks intermingle three valuable concepts: a live execution environment, a long-running process that caches state in memory, and a narrative log of exploration steps. The long-running process is the key. It's why data scientists use notebooks instead of Python scripts. But this coupling is also why notebooks are fragile, unreproducible, and impossible to productionize. And the kernel's implicit mutable state is a poor fit for AI agents. Unlike databases (explicit state, declarative interface, introspectable), a notebook kernel degrades as implicit state accumulates across cells.
 
-This talk introduces the Deconstructed Notebook: a system that gives AI-agent-driven data work the structure and visualization of a notebook without the notebook's baggage. Claude writes the instructions in the terminal. The PyData Arrow stack, driven by Ibis and xorq, handles the compute. A browser companion renders tables, charts, diffs, and lineage live as the work iterates, organized into distinct steps, not a scrolling chat log. The key architectural insight is that automatic caching of expression results to disk replaces the notebook kernel's in-memory state, letting each step execute as a self-contained script while preserving the interactive, incremental workflow data scientists depend on. The system is built on xorq, an open-source library built on Ibis and Apache Arrow, but the design principles generalize. We'll demo the full workflow live and share what we learned about building post-notebook tooling for the age of AI agents.
+This talk introduces the Deconstructed Notebook: a system that gives AI-agent-driven data work the structure and visualization of a notebook without the notebook's baggage. Claude writes the instructions in the terminal. The Tallyman Arrow stack, driven by Ibis and xorq, handles the compute. A browser companion renders tables, charts, diffs, and lineage live as the work iterates, organized into distinct steps, not a scrolling chat log. The key architectural insight is that automatic caching of expression results to disk replaces the notebook kernel's in-memory state, letting each step execute as a self-contained script while preserving the interactive, incremental workflow data scientists depend on. The system is built on xorq, an open-source library built on Ibis and Apache Arrow, but the design principles generalize. We'll demo the full workflow live and share what we learned about building post-notebook tooling for the age of AI agents.
 
 ## Description
 
@@ -18,7 +18,7 @@ This talk introduces the Deconstructed Notebook: a system that gives AI-agent-dr
 
 3. **Prior art and adjacent solutions** — MCP Apps (renders UI inside Claude Desktop's chat window), chart-canvas (browser dashboard for Claude Desktop), Data Formulator (Microsoft's standalone viz tool). What each gets right, and why none of them solve the CLI agent case.
 
-4. **The deconstructed notebook (live demo)** — Separate the three concerns. Terminal for intent. The PyData Arrow stack driven by Ibis/xorq for compute, with instructions written by Claude. Browser for display. Live walkthrough of the working system: the audience sees the browser update in real time as Claude iterates, with tables, charts, and diffs appearing in structured blocks, not a scrolling chat log. The default view shows the current result at each step — preserving the notebook's narrative quality — with iteration history available but not in your face.
+4. **The deconstructed notebook (live demo)** — Separate the three concerns. Terminal for intent. The Tallyman Arrow stack driven by Ibis/xorq for compute, with instructions written by Claude. Browser for display. Live walkthrough of the working system: the audience sees the browser update in real time as Claude iterates, with tables, charts, and diffs appearing in structured blocks, not a scrolling chat log. The default view shows the current result at each step — preserving the notebook's narrative quality — with iteration history available but not in your face.
 
 5. **Iteration and diffing (live demo)** — Exploratory data analysis through model evaluation, driven by conversation. The audience watches the full loop live: prompt, compute, result, diff, refine. Interactive tables with sort/filter, Vega-Lite charts, side-by-side diffs showing exactly what changed between iterations, and expression lineage tracing the full dependency graph from raw data to final result.
 

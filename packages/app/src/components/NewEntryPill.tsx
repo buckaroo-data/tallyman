@@ -25,7 +25,7 @@ export function NewEntryPill({ project }: { project: string }) {
     if (version === seen.current) return;
     seen.current = version;
     console.log(
-      `[pydata-pill] version=${version} kind=${lastEvent?.kind ?? "<none>"}`,
+      `[tallyman-pill] version=${version} kind=${lastEvent?.kind ?? "<none>"}`,
       lastEvent,
     );
     if (!lastEvent || lastEvent.kind !== "new_entry") return;
@@ -39,7 +39,7 @@ export function NewEntryPill({ project }: { project: string }) {
       focused,
     );
     console.log(
-      `[pydata-pill] new_entry hash=${lastEvent.hash} alias=${lastEvent.alias} focused=${focused} -> navigateTo=${navigateTo} pillCount=${state.count}`,
+      `[tallyman-pill] new_entry hash=${lastEvent.hash} alias=${lastEvent.alias} focused=${focused} -> navigateTo=${navigateTo} pillCount=${state.count}`,
     );
     update(state);
     if (navigateTo) navigate(`/${project}/catalog/${navigateTo}`);
@@ -51,7 +51,7 @@ export function NewEntryPill({ project }: { project: string }) {
   if (notice.count === 0 || !notice.hash) return null;
 
   console.log(
-    `[pydata-pill] rendering pill count=${notice.count} hash=${notice.hash} alias=${notice.alias}`,
+    `[tallyman-pill] rendering pill count=${notice.count} hash=${notice.hash} alias=${notice.alias}`,
   );
 
   const label =
@@ -68,7 +68,7 @@ export function NewEntryPill({ project }: { project: string }) {
         className="view"
         onClick={() => {
           console.log(
-            `[pydata-pill] view clicked -> navigate /${project}/catalog/${notice.hash}`,
+            `[tallyman-pill] view clicked -> navigate /${project}/catalog/${notice.hash}`,
           );
           navigate(`/${project}/catalog/${notice.hash}`);
           update(emptyNotice);
@@ -82,7 +82,7 @@ export function NewEntryPill({ project }: { project: string }) {
         aria-label="dismiss"
         title="dismiss"
         onClick={() => {
-          console.log("[pydata-pill] dismiss clicked");
+          console.log("[tallyman-pill] dismiss clicked");
           update(emptyNotice);
         }}
       >

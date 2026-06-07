@@ -2,7 +2,7 @@
 
 **Date:** 2026-05-29
 **Dataset:** citibike_large (2.5M rows, Sep 2020), artifact hash `29a208d050d1`
-**Parquet path used:** `/Users/paddy/.pydata-app/projects/test-1/artifacts/catalog/entries/29a208d050d1/result.parquet`
+**Parquet path used:** `/Users/paddy/.tallyman-notebooks/projects/test-1/artifacts/catalog/entries/29a208d050d1/result.parquet`
 
 ---
 

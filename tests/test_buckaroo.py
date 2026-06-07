@@ -22,13 +22,13 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from pydata_companion.buckaroo_lifecycle import BuckarooManager
-from pydata_xorq import build_and_persist
+from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_xorq import build_and_persist
 
 
 def _code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -131,7 +131,7 @@ def test_unit_ensure_session_restart_throttled(project: str, orders_parquet: Pat
     mgr.proc = _DeadProc()  # type: ignore[assignment]
     mgr.bound_port = None
 
-    from pydata_companion.buckaroo_lifecycle import BuckarooUnavailable
+    from tallyman_companion.buckaroo_lifecycle import BuckarooUnavailable
 
     restart_calls = {"n": 0}
 
@@ -172,10 +172,12 @@ def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatc
 
     reloaded = mgr.reload_project_sessions(project)
     assert reloaded == 2
-    assert sorted(posted_urls) == sorted([
-        f"{mgr.base_url}/reload_expr/sess-aaa",
-        f"{mgr.base_url}/reload_expr/sess-bbb",
-    ])
+    assert sorted(posted_urls) == sorted(
+        [
+            f"{mgr.base_url}/reload_expr/sess-aaa",
+            f"{mgr.base_url}/reload_expr/sess-bbb",
+        ]
+    )
     # Sessions are NOT evicted — they remain cached for fast reconnect.
     assert len(mgr._sessions) == 3
 
@@ -236,7 +238,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     ensure_session posts to /load_expr so Buckaroo serves it via the
     xorq backend with push-down sort/search rather than paging over a
     materialised parquet."""
-    from pydata_xorq import build_and_persist
+    from tallyman_xorq import build_and_persist
 
     res = build_and_persist(project, _code(project))
 
@@ -265,7 +267,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     assert session == "abc123def456"
     assert captured["url"].endswith("/load_expr"), captured["url"]
     assert captured["json"]["no_browser"] is True
-    # The build_dir we POST must already have ${PYDATA_PROJECT_ROOT}
+    # The build_dir we POST must already have ${TALLYMAN_PROJECT_ROOT}
     # expanded — buckaroo's xorq_loading.load_expr_build_dir calls
     # xorq.api.load_expr directly and does no placeholder handling, so
     # an unexpanded build_dir produces a session whose paged reads return
@@ -273,7 +275,7 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     posted_dir = Path(captured["json"]["build_dir"])
     assert posted_dir.is_dir(), posted_dir
     expr_yaml = (posted_dir / "expr.yaml").read_text()
-    assert "${PYDATA_PROJECT_ROOT}" not in expr_yaml
+    assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
 
 # ---------------------------------------------------------------------------
@@ -285,7 +287,7 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
     """The tmp dir created by ensure_session must be deleted by stop().
 
     Without this, a long-lived companion accumulates per-content-hash
-    tmp dirs in /var/folders/.../pydata_load_*.
+    tmp dirs in /var/folders/.../tallyman_load_*.
     """
     res = build_and_persist(project, _code(project))
 
@@ -324,7 +326,7 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
     mgr = BuckarooManager()
     tmp_paths = []
     for i in range(N):
-        d = Path(tempfile.mkdtemp(prefix="pydata_load_test_"))
+        d = Path(tempfile.mkdtemp(prefix="tallyman_load_test_"))
         mgr._expanded_dirs[f"hash_{i:02d}"] = d
         tmp_paths.append(d)
 
@@ -464,7 +466,7 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet
 
     Without expansion, /load_expr loads the schema fine (it reads YAML
     metadata) but its `rows` field is 0 — buckaroo's xorq.api.load_expr
-    call can't resolve ``${PYDATA_PROJECT_ROOT}`` paths so the underlying
+    call can't resolve ``${TALLYMAN_PROJECT_ROOT}`` paths so the underlying
     parquet read returns empty. The original
     ``test_integration_spawn_and_load`` test passed even with that bug
     in place because it only asserted a session id came back. This
@@ -482,7 +484,7 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet
         # placeholder-free so xorq can read the upstream parquet.
         tmp = mgr._expanded_dirs[res.content_hash]
         expr_yaml = (tmp / "expr.yaml").read_text()
-        assert "${PYDATA_PROJECT_ROOT}" not in expr_yaml
+        assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
         # /load_expr's response surfaces rows — POST a probe directly to
         # inspect it. With unexpanded paths this comes back rows=0.
@@ -546,7 +548,7 @@ class _StubBuckaroo:
 
 def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, orders_parquet: Path):
     """API returns buckaroo_session and buckaroo_ws_base when Buckaroo is running."""
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     res = build_and_persist(project, _code(project))
     bk: Any = _StubBuckaroo(session="abc123", port=8700)
@@ -561,7 +563,7 @@ def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, or
 
 def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_parquet: Path):
     """When ensure_session returns None, API returns null for buckaroo fields."""
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     res = build_and_persist(project, _code(project))
 

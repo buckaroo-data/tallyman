@@ -21,7 +21,7 @@ level; no hot-reload inside an existing session in V1.
 Example a Claude Code session might produce:
 
 ```python
-# ~/.pydata-app/projects/<name>/stats/percent_emails.py
+# ~/.tallyman/projects/<name>/stats/percent_emails.py
 def compute(col):
     return (col.cast("string").contains("@").sum() / col.count()).name("percent_emails")
 ```
@@ -40,7 +40,7 @@ preserved end-to-end.
 |---|---|
 | Stats are pure Python functions, not a DSL | The agent knows xorq. Inventing a parallel grammar would only restrict it. The function signature `(col) -> Value` is the contract. |
 | One file per stat | Trivial CRUD: write/replace/delete by filename. Mirrors how `catalog/entries/<hash>/` is organised. |
-| Stats live under the project directory | The project is the artifact. A handed-off project carries its stats. `pydata serve` shows them unchanged. |
+| Stats live under the project directory | The project is the artifact. A handed-off project carries its stats. `tallyman serve` shows them unchanged. |
 | Buckaroo picks them up at `/load_expr` time, not via a new WS message | One scan per session-load is enough — every relevant render path goes through that. No new wire shape, no need to coordinate with running sessions. |
 | Restricted exec namespace (no `__builtins__`, only `ibis` / `xorq`) | Not a real sandbox, but closes the function's reachable surface — no `__import__`, no `open`, no filesystem. Return-type checked. |
 | Scalar OR struct return is fine; framework derives `provides_defaults` from the schema | Matches what built-in `ColAnalysis` classes already do. |
@@ -50,17 +50,17 @@ preserved end-to-end.
 ## Files and wires
 
 ```
-~/.pydata-app/projects/<name>/
+~/.tallyman/projects/<name>/
 ├── catalog/                          # unchanged
 ├── stats/                            # NEW
 │   ├── percent_emails.py             # one function per file, def compute(col): ...
 │   ├── n_distinct_log10.py
 │   └── _disabled/                    # (optional) parked stats kept around for history
 │       └── pct_negatives.py
-└── pydata.toml                       # (optional) list of enabled stats, or "all"
+└── tallyman.toml                       # (optional) list of enabled stats, or "all"
 ```
 
-Three new MCP tools on the pydata-app side:
+Three new MCP tools on the tallyman-notebooks side:
 
 | Tool | Behaviour |
 |---|---|
@@ -88,7 +88,7 @@ def load_project_stat_klasses(build_dir: str) -> list[type[ColAnalysis]]:
 ```
 
 The handler reads the project root from a new field in the `/load_expr`
-request body (`project_root: str`) — pydata-app passes it, headless
+request body (`project_root: str`) — tallyman-notebooks passes it, headless
 callers omit it and get the existing built-in stats only. Each generated
 class is a thin shim:
 
@@ -134,7 +134,7 @@ are inspectable Python files, not opaque blobs).
 ## Lifecycle
 
 ```
-Claude Code terminal                pydata-app MCP                buckaroo subprocess
+Claude Code terminal                tallyman-notebooks MCP                buckaroo subprocess
         │                                   │                              │
         │  catalog_add_summary_stat(        │                              │
         │      "percent_emails",            │                              │
@@ -229,15 +229,15 @@ talk.
 
 6. **Editing a stat without an explicit MCP call.** A user opens
    `stats/percent_emails.py` in an editor and saves changes. Should
-   `pydata run` watch the directory and re-emit `stats_changed`?
+   `tallyman run` watch the directory and re-emit `stats_changed`?
    Probably yes for ergonomics, but V1 can require the agent to
    re-call `catalog_add_summary_stat` to pick up changes. Watcher is a
    V2 hardening item.
 
 7. **MCP tool boundary.** Does `catalog_add_summary_stat` go in
-   `pydata_mcp` or buckaroo's own MCP surface (`pip install
-   buckaroo[mcp]`)? Lean: pydata-app side. The stats live under
-   pydata-app's project directory; buckaroo just consumes a directory
+   `tallyman_mcp` or buckaroo's own MCP surface (`pip install
+   buckaroo[mcp]`)? Lean: tallyman-notebooks side. The stats live under
+   tallyman-notebooks's project directory; buckaroo just consumes a directory
    path. If a future buckaroo-mcp wants to mirror this, it can.
 
 ---
@@ -265,10 +265,10 @@ talk.
    - `buckaroo/server/xorq_loading.py:XorqServerDataflow`: thread `extra_klasses` into `analysis_klasses`.
    - Test: a project dir with one `stats/foo.py` produces a session whose stats include `foo`.
 
-2. **pydata-app side**:
-   - `pydata_mcp/server.py`: add `catalog_add_summary_stat`, `catalog_remove_summary_stat`, `catalog_list_summary_stats`.
-   - `pydata_core/`: a tiny `summary_stats.py` module — write/read/list/dry-run.
-   - `pydata_companion/buckaroo_lifecycle.py:ensure_session`: pass `project_root` in the `/load_expr` body.
+2. **tallyman-notebooks side**:
+   - `tallyman_mcp/server.py`: add `catalog_add_summary_stat`, `catalog_remove_summary_stat`, `catalog_list_summary_stats`.
+   - `tallyman_core/`: a tiny `summary_stats.py` module — write/read/list/dry-run.
+   - `tallyman_companion/buckaroo_lifecycle.py:ensure_session`: pass `project_root` in the `/load_expr` body.
    - Tests: dry-run rejects bad source; `/load_expr` carries `project_root`; integration test that an added stat shows up in the `/api/data/<hash>` response (or wherever stats land in the companion's view).
 
 About a day's work end-to-end, mostly tests.

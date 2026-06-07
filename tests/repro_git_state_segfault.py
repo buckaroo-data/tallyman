@@ -12,7 +12,7 @@ compiler (``xorq/ibis_yaml/compiler.py:507``) on the catalog-write path
 (``build_and_persist`` -> ``build_expr``).
 
 That function has no error containment. When git is forked from the long-lived,
-multithreaded pydata server it can die with SIGSEGV (a macOS
+multithreaded tallyman server it can die with SIGSEGV (a macOS
 fork-from-a-multithreaded-process hazard); ``subprocess.check_output`` then
 raises ``CalledProcessError`` (returncode -11). Because the call sits *inline*
 in the build path, that exception propagates out of ``build_expr`` and fails
@@ -27,7 +27,7 @@ WHAT THIS FILE DOES
    itself with SIGSEGV, exactly like the observed crash — no flaky macOS repro
    needed.
 3. Patches the function with the crash-safe guard (mirrors
-   ``src/pydata_xorq/_git_state_guard.py``) and proves the build now succeeds.
+   ``src/tallyman_xorq/_git_state_guard.py``) and proves the build now succeeds.
 4. If xorq is importable, repeats the proof against the **real** xorq module +
    the **real** in-repo ``install_git_state_guard`` for an end-to-end check.
 
@@ -90,7 +90,7 @@ def simulate_catalog_write(expr):
 
 
 # ---------------------------------------------------------------------------
-# 3. THE FIX — crash-safe replacement (mirrors src/pydata_xorq/_git_state_guard.py):
+# 3. THE FIX — crash-safe replacement (mirrors src/tallyman_xorq/_git_state_guard.py):
 #    capture once + cache, and degrade to placeholders on ANY failure.
 # ---------------------------------------------------------------------------
 _UNSET = object()
@@ -113,14 +113,12 @@ def _format(triple, hash_diffs):
 
 def safe_get_git_state(hash_diffs=False):
     global _raw_state
-    if os.environ.get("PYDATA_DISABLE_GIT_STATE"):
+    if os.environ.get("TALLYMAN_DISABLE_GIT_STATE"):
         return _format(("unknown", "", ""), hash_diffs)
     if _raw_state is _UNSET:
         try:
             out = [
-                subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10)
-                .decode()
-                .strip()
+                subprocess.check_output(cmd, stderr=subprocess.DEVNULL, timeout=10).decode().strip()
                 for cmd in _GIT_COMMANDS
             ]
             _raw_state = (out[0], out[1], out[2])
@@ -230,7 +228,7 @@ def healthy_git_still_works():
 
 def real_xorq_proof():
     """If xorq is importable, prove it against the REAL module + the in-repo guard."""
-    _banner("PHASE 4 — REAL STACK: against actual xorq + src/pydata_xorq guard")
+    _banner("PHASE 4 — REAL STACK: against actual xorq + src/tallyman_xorq guard")
     try:
         from xorq.common.utils import logging_utils as lu
     except Exception as exc:  # noqa: BLE001
@@ -248,7 +246,7 @@ def real_xorq_proof():
 
         # Install the real in-repo guard and prove it.
         try:
-            from pydata_xorq._git_state_guard import install_git_state_guard
+            from tallyman_xorq._git_state_guard import install_git_state_guard
         except Exception as exc:  # noqa: BLE001
             print(f"  (could not import in-repo guard: {type(exc).__name__}: {exc})")
             return False

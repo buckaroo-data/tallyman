@@ -7,8 +7,8 @@ import polars as pl
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
-from pydata_mcp.server import catalog_create, catalog_diff, catalog_revise
-from pydata_xorq import (
+from tallyman_mcp.server import catalog_create, catalog_diff, catalog_revise
+from tallyman_xorq import (
     code_diff,
     full_diff,
     head_diff,
@@ -26,7 +26,7 @@ from pydata_xorq import (
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -34,7 +34,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 
 def _filter_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
@@ -117,11 +117,11 @@ def test_key_diff_detects_unique_numeric_key():
 
 
 def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
-    from pydata_xorq import build_and_persist
+    from tallyman_xorq import build_and_persist
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    from pydata_core import entry_dir
+    from tallyman_core import entry_dir
 
     diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash))
     assert "highlight" in diff["code"]
@@ -136,7 +136,7 @@ def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
 
 
 def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_diff("shoe_sales")
@@ -146,7 +146,7 @@ def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_par
 
 
 def test_catalog_diff_explicit_versions(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_diff("shoe_sales", 1, 2)
@@ -154,13 +154,13 @@ def test_catalog_diff_explicit_versions(project: str, orders_parquet: Path, monk
 
 
 def test_catalog_diff_no_history(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_diff("nonexistent")
     assert "error" in out
 
 
 def test_catalog_diff_out_of_range(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_diff("shoe_sales", 1, 5)
     assert "error" in out
@@ -172,7 +172,7 @@ def test_catalog_diff_out_of_range(project: str, orders_parquet: Path, monkeypat
 
 
 def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
@@ -187,7 +187,7 @@ def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: P
 
 
 def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
@@ -199,7 +199,7 @@ def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: 
 
 def test_diff_route_single_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     # Only 1 version: requesting vb=2 is out of range → 404.
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/diff_data/shoe_sales/1/2")
@@ -213,7 +213,7 @@ def test_diff_route_no_alias_404(fresh_companion_app, project: str):
 
 def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     # Diffing a version against itself is rejected.
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
@@ -272,9 +272,11 @@ def test_key_diff_polars_detects_unique_numeric_key():
 
 
 def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):
-    from pydata_xorq import build_and_persist
+    from tallyman_xorq import build_and_persist
+
     res = build_and_persist(project, _agg_code(project))
-    from pydata_core import entry_dir
+    from tallyman_core import entry_dir
+
     pq_path = entry_dir(project, res.content_hash) / "result.parquet"
     d = head_diff_polars(pq_path, pq_path, n=2)
     assert d["n"] == 2
@@ -283,8 +285,9 @@ def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):
 
 
 def test_full_diff_polars_backend(project: str, orders_parquet: Path):
-    from pydata_core import entry_dir
-    from pydata_xorq import build_and_persist
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
     diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="polars")
@@ -298,28 +301,31 @@ def test_full_diff_polars_backend(project: str, orders_parquet: Path):
 
 
 def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
-    from pydata_core import entry_dir
-    from pydata_xorq import build_and_persist
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
     res = build_and_persist(project, _agg_code(project))
     pq_path = entry_dir(project, res.content_hash) / "result.parquet"
-    pd_result = {r["name"]: r for r in stats_diff(
-        pq.read_table(pq_path).to_pandas(),
-        pq.read_table(pq_path).to_pandas(),
-    )}
+    pd_result = {
+        r["name"]: r
+        for r in stats_diff(
+            pq.read_table(pq_path).to_pandas(),
+            pq.read_table(pq_path).to_pandas(),
+        )
+    }
     xq_result = {r["name"]: r for r in stats_diff_xorq(pq_path, pq_path)}
     assert set(pd_result) == set(xq_result)
     for col in pd_result:
         assert pd_result[col]["before"]["distinct"] == xq_result[col]["before"]["distinct"]
         assert pd_result[col]["before"]["nulls"] == xq_result[col]["before"]["nulls"]
         if pd_result[col]["before"]["numeric"] and xq_result[col]["before"]["numeric"]:
-            assert abs(
-                pd_result[col]["before"]["numeric"]["sum"] - xq_result[col]["before"]["numeric"]["sum"]
-            ) < 1e-6
+            assert abs(pd_result[col]["before"]["numeric"]["sum"] - xq_result[col]["before"]["numeric"]["sum"]) < 1e-6
 
 
 def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path):
-    from pydata_core import entry_dir
-    from pydata_xorq import build_and_persist
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
     res = build_and_persist(project, _agg_code(project))
     pq_path = entry_dir(project, res.content_hash) / "result.parquet"
     d = head_diff_xorq(pq_path, pq_path, n=3)
@@ -328,8 +334,9 @@ def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path):
 
 
 def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
-    from pydata_core import entry_dir
-    from pydata_xorq import build_and_persist
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
     a_pq = entry_dir(project, a.content_hash) / "result.parquet"
@@ -346,8 +353,9 @@ def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
 
 
 def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
-    from pydata_core import entry_dir
-    from pydata_xorq import build_and_persist
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
     diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="xorq")
@@ -360,9 +368,9 @@ def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parque
     # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
     # Re-rendering the same diff must reuse one session-scoped build dir, not
     # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
-    from pydata_companion.app import _build_compare_expr
-    from pydata_xorq import build_and_persist
-    from pydata_xorq.result_cache import cached_result_expr
+    from tallyman_companion.app import _build_compare_expr
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -380,9 +388,9 @@ def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Pat
     # per-view color via merge_column_config. The global override only renames
     # the _v2 column, attaches the old-value tooltip, and hides the a-side.
     # Non-numeric columns keep the categorical membership palette.
-    from pydata_companion.app import _build_compare_expr
-    from pydata_xorq import build_and_persist
-    from pydata_xorq.result_cache import cached_result_expr
+    from tallyman_companion.app import _build_compare_expr
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -416,15 +424,24 @@ def test_diff_display_klasses_per_view():
     """
     from buckaroo.server.xorq_loading import load_project_display_klasses
 
-    import pydata_companion
+    import tallyman_companion
 
-    root = str(Path(pydata_companion.__file__).parent / "diff_extras")
+    root = str(Path(tallyman_companion.__file__).parent / "diff_extras")
     klasses = {k.df_display_name: k for k in load_project_display_klasses(root)}
     assert {"main", "detailed_pct", "detailed_absolute"} <= set(klasses)
 
-    cols = ["station", "price_v2", "price_pct_delta", "price_abs_delta",
-            "vol_v2", "vol_pct_delta", "vol_abs_delta",
-            "lat_v2", "lat_pct_delta", "lat_abs_delta"]
+    cols = [
+        "station",
+        "price_v2",
+        "price_pct_delta",
+        "price_abs_delta",
+        "vol_v2",
+        "vol_pct_delta",
+        "vol_abs_delta",
+        "lat_v2",
+        "lat_pct_delta",
+        "lat_abs_delta",
+    ]
     df = pd.DataFrame({c: [0, 0] for c in cols})
 
     def meta(t, orig, mn, mx):
@@ -466,8 +483,8 @@ def test_diff_display_klasses_per_view():
     pct = klasses["detailed_pct"].style_columns(sd, df)
     hp = headers(pct)
     assert not any(h.endswith("_abs_delta") for h in hp)
-    assert "vol_pct_delta" not in hp                       # exactly-zero dropped
-    assert "lat_pct_delta" not in hp                       # ~1e-8 noise dropped
+    assert "vol_pct_delta" not in hp  # exactly-zero dropped
+    assert "lat_pct_delta" not in hp  # ~1e-8 noise dropped
     assert hp.index("price_pct_delta") == hp.index("price_v2") + 1
     assert color(pct, "price_v2") == "c"
     assert color(pct, "price_pct_delta") == "c"
@@ -477,8 +494,8 @@ def test_diff_display_klasses_per_view():
     ab = klasses["detailed_absolute"].style_columns(sd, df)
     ha = headers(ab)
     assert not any(h.endswith("_pct_delta") for h in ha)
-    assert "vol_abs_delta" not in ha                       # exactly-zero dropped
-    assert "lat_abs_delta" not in ha                       # ~1e-6 noise dropped
+    assert "vol_abs_delta" not in ha  # exactly-zero dropped
+    assert "lat_abs_delta" not in ha  # ~1e-6 noise dropped
     assert ha.index("price_abs_delta") == ha.index("price_v2") + 1
     assert color(ab, "price_v2") == "d"
     assert color(ab, "price_abs_delta") == "d"

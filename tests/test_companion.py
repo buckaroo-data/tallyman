@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_xorq import build_and_persist
+from tallyman_xorq import build_and_persist
 
 
 def _build_one(project: str, parquet: Path) -> str:
@@ -35,8 +35,8 @@ def test_unknown_project_404s(fresh_companion_app, project: str):
     """Project validation happens at the API layer; UI routes serve the SPA."""
     c = TestClient(fresh_companion_app)
     assert c.get(f"/{project}/api/entries").status_code == 200  # valid project
-    assert c.get("/nope/api/entries").status_code == 404         # unknown project
-    assert c.get("/Bad-NAME/api/entries").status_code == 404     # invalid name
+    assert c.get("/nope/api/entries").status_code == 404  # unknown project
+    assert c.get("/Bad-NAME/api/entries").status_code == 404  # invalid name
 
 
 def test_api_entries_empty(fresh_companion_app, project: str):
@@ -78,20 +78,20 @@ def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):
     """Entries API returns named/forensic/scratch entries with correct flags."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create, catalog_run
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create, catalog_run
 
     catalog_create(
         "shoe_sales",
         f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
     )
     scratch = catalog_run(
         f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.order_by("region")
 """,
@@ -117,9 +117,9 @@ def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, o
     body = r.json()
     artifact_names = [a["name"] for a in body["build_artifacts"]]
     assert any("yaml" in n for n in artifact_names)
-    # Portable build references ${PYDATA_PROJECT_ROOT}, not absolute paths.
+    # Portable build references ${TALLYMAN_PROJECT_ROOT}, not absolute paths.
     artifact_texts = " ".join(a["text"] for a in body["build_artifacts"])
-    assert "${PYDATA_PROJECT_ROOT}" in artifact_texts
+    assert "${TALLYMAN_PROJECT_ROOT}" in artifact_texts
 
 
 def test_entry_detail_missing_returns_404(fresh_companion_app, project: str):
@@ -141,7 +141,7 @@ def test_read_endpoints_reject_malformed_content_hash(fresh_companion_app, proje
     c = TestClient(fresh_companion_app)
     for path in [
         f"/{project}/api/data/NOPE",
-        f"/{project}/api/entry/Deadbeef",          # uppercase: not lowercase hex
+        f"/{project}/api/entry/Deadbeef",  # uppercase: not lowercase hex
         f"/{project}/api/lineage/not-a-hash",
         f"/{project}/api/lineage_layout/not-a-hash",
     ]:

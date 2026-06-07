@@ -94,7 +94,7 @@ df['tip_pct'] = (df['tip_amount'] / df['fare_amount'].replace(0, float('nan')))
 
 ## MCP prompts for the demo
 
-Type these into Claude Code with the pydata MCP server running:
+Type these into Claude Code with the tallyman MCP server running:
 
 ```
 Use catalog_load_parquet to load /tmp/nyc_taxi/yellow_tripdata_2024-01.parquet,
@@ -321,7 +321,7 @@ Machine: macOS, M-series. Input: 119.1 M taxi rows (36 parquet files, 2022–202
 - The xorq cold query (Phase 8) uses **+2,512 MB** above its entry RSS to execute the join+agg on 587 MB + 562 MB parquets. Warm query (Phase 9) uses **+691 MB** — DataFusion reuses cached file metadata.
 - **Practical implication for 16 GB laptops**: Phase 3 alone requires ~18 GB of total RSS. This pipeline cannot run on a 16 GB machine without spilling or chunking the H3 encoding step.
 
-Script: `/Users/paddy/code/pydata-app/scripts/h3_pipeline_bench.py`
+Script: `/Users/paddy/code/tallyman-notebooks/scripts/h3_pipeline_bench.py`
 
 ---
 

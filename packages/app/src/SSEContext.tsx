@@ -20,17 +20,17 @@ export function SSEProvider({ project, children }: { project: string | null; chi
       return;
     }
 
-    console.log(`[pydata-sse] opening EventSource /${project}/api/sse`);
+    console.log(`[tallyman-sse] opening EventSource /${project}/api/sse`);
     const es = new EventSource(`/${project}/api/sse`);
 
     const bump = (e: MessageEvent, kind: string) => {
       const data: SSEEvent = JSON.parse(e.data);
-      console.log(`[pydata-sse] event kind=${kind}`, data);
+      console.log(`[tallyman-sse] event kind=${kind}`, data);
       setState((s) => ({ status: "live", version: s.version + 1, lastEvent: { ...data, kind } }));
     };
 
     es.addEventListener("hello", (e) => {
-      console.log("[pydata-sse] hello", (e as MessageEvent).data);
+      console.log("[tallyman-sse] hello", (e as MessageEvent).data);
       setState((s) => ({ ...s, status: "live" }));
     });
     es.addEventListener("ping", () => {});
@@ -42,17 +42,17 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     es.addEventListener("summary_stat_changed", (e) => bump(e, "summary_stat_changed"));
     es.addEventListener("project_switched", (e) => {
       const data: SSEEvent = JSON.parse(e.data);
-      console.log("[pydata-sse] project_switched", data);
+      console.log("[tallyman-sse] project_switched", data);
       if (data.name) navigate(`/${data.name}/catalog`);
     });
-    es.onopen = () => console.log("[pydata-sse] connection open (readyState=1)");
+    es.onopen = () => console.log("[tallyman-sse] connection open (readyState=1)");
     es.onerror = (e) => {
-      console.warn(`[pydata-sse] error/offline (readyState=${es.readyState})`, e);
+      console.warn(`[tallyman-sse] error/offline (readyState=${es.readyState})`, e);
       setState((s) => ({ ...s, status: "offline" }));
     };
 
     return () => {
-      console.log(`[pydata-sse] closing EventSource /${project}/api/sse`);
+      console.log(`[tallyman-sse] closing EventSource /${project}/api/sse`);
       es.close();
     };
   }, [project, navigate]);

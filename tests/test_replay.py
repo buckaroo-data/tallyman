@@ -1,4 +1,4 @@
-"""T-19: `pydata replay` against a JSON storyboard."""
+"""T-19: `tallyman replay` against a JSON storyboard."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from pydata_cli.main import cli
-from pydata_core import get_alias, history_for, notebook
+from tallyman_cli.main import cli
+from tallyman_core import get_alias, history_for, notebook
 
 
 def _storyboard(project: str, parquet: Path) -> dict:
@@ -24,7 +24,7 @@ def _storyboard(project: str, parquet: Path) -> dict:
                 "tool": "catalog_create",
                 "args": {
                     "name": "by_region",
-                    "code": "from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nexpr = t.group_by('region').aggregate(n=t.count())\n",  # noqa: E501
+                    "code": "from tallyman_xorq.io import from_project\nt = from_project('orders.parquet')\nexpr = t.group_by('region').aggregate(n=t.count())\n",  # noqa: E501
                     "prompt": "by region",
                 },
             },
@@ -32,7 +32,7 @@ def _storyboard(project: str, parquet: Path) -> dict:
                 "tool": "catalog_revise",
                 "args": {
                     "name": "by_region",
-                    "code": "from pydata_xorq.io import from_project\nt = from_project('orders.parquet')\nf = t.filter(t.category == 'boots')\nexpr = f.group_by('region').aggregate(n=f.count())\n",  # noqa: E501
+                    "code": "from tallyman_xorq.io import from_project\nt = from_project('orders.parquet')\nf = t.filter(t.category == 'boots')\nexpr = f.group_by('region').aggregate(n=f.count())\n",  # noqa: E501
                     "prompt": "boots only",
                 },
             },

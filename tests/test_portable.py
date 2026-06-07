@@ -3,15 +3,15 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
-from pydata_core import entry_dir, project_dir
-from pydata_xorq import build_and_persist, load_entry
-from pydata_xorq.portable import PLACEHOLDER
+from tallyman_core import entry_dir, project_dir
+from tallyman_xorq import build_and_persist, load_entry
+from tallyman_xorq.portable import PLACEHOLDER
 
 
 def _agg_code(project_name: str) -> str:
     # Use from_project so the recorded code uses the conventional path.
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project_name!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -49,8 +49,8 @@ def test_load_entry_on_current_machine(project: str, orders_parquet: Path):
 def test_load_entry_under_relocated_home(
     project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
 ):
-    """The strongest portability check: build under one PYDATA_HOME, then move
-    the entire project tree to a fresh PYDATA_HOME and load from there.
+    """The strongest portability check: build under one TALLYMAN_HOME, then move
+    the entire project tree to a fresh TALLYMAN_HOME and load from there.
 
     This simulates handing the project directory to a colleague whose
     home directory is at a different absolute path.
@@ -62,14 +62,14 @@ def test_load_entry_under_relocated_home(
     new_project_root.parent.mkdir(parents=True)
     shutil.copytree(project_dir(project), new_project_root)
 
-    monkeypatch.setenv("PYDATA_HOME", str(new_home))
+    monkeypatch.setenv("TALLYMAN_HOME", str(new_home))
     # Sanity: the build artifacts still reference the placeholder, not the old home.
     relocated_build = entry_dir(project, res.content_hash) / "xorq_build" / "expr.yaml"
     assert PLACEHOLDER in relocated_build.read_text()
     assert str(isolated_home) not in relocated_build.read_text()
 
     # The fixture's parquet is at new_project_root/data/orders.parquet because
-    # we copied the whole tree; load_entry should resolve via the new PYDATA_HOME.
+    # we copied the whole tree; load_entry should resolve via the new TALLYMAN_HOME.
     expr = load_entry(project, res.content_hash)
     df = expr.execute()
     assert len(df) == 4
@@ -89,7 +89,7 @@ def test_load_entry_fails_clean_if_data_missing(
         new_project_root / "artifacts" / "catalog" / "entries" / res.content_hash,
     )
     # NOTE: we deliberately do NOT copy data/ into the new tree.
-    monkeypatch.setenv("PYDATA_HOME", str(new_home))
+    monkeypatch.setenv("TALLYMAN_HOME", str(new_home))
 
     try:
         expr = load_entry(project, res.content_hash)

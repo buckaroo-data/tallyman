@@ -2,13 +2,13 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from pydata_core.display_configs import (
+from tallyman_core.display_configs import (
     get_display_config,
     list_display_configs,
     remove_display_config,
     set_display_config,
 )
-from pydata_xorq import build_and_persist
+from tallyman_xorq import build_and_persist
 
 SAMPLE_OVERRIDES = {
     "membership": {"merge_rule": "hidden"},
@@ -29,7 +29,7 @@ SAMPLE_CONFIG = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -70,20 +70,20 @@ def test_remove_display_config(project: str):
 
 
 def test_display_configs_captured_in_catalog_state(project: str):
-    from pydata_core.catalog_state import capture_pydata_state, read_pydata_state
+    from tallyman_core.catalog_state import capture_tallyman_state, read_tallyman_state
 
     set_display_config(project, "abc123", SAMPLE_CONFIG)
-    capture_pydata_state(project)
-    state = read_pydata_state(project)
+    capture_tallyman_state(project)
+    state = read_tallyman_state(project)
     hashes = [c["content_hash"] for c in state["display_configs"]]
     assert "abc123" in hashes
 
 
 def test_display_configs_materialize_round_trip(project: str):
-    from pydata_core.catalog_state import capture_pydata_state, materialize
+    from tallyman_core.catalog_state import capture_tallyman_state, materialize
 
     set_display_config(project, "abc123", SAMPLE_CONFIG)
-    capture_pydata_state(project)
+    capture_tallyman_state(project)
     remove_display_config(project, "abc123")
     assert get_display_config(project, "abc123") is None
     materialize(project)
@@ -93,10 +93,10 @@ def test_display_configs_materialize_round_trip(project: str):
 
 
 def test_display_configs_materialize_removes_unrecorded(project: str):
-    from pydata_core.catalog_state import materialize, write_pydata_state
+    from tallyman_core.catalog_state import materialize, write_tallyman_state
 
     set_display_config(project, "orphan", SAMPLE_CONFIG)
-    write_pydata_state(project, display_configs=[])
+    write_tallyman_state(project, display_configs=[])
     materialize(project)
     assert get_display_config(project, "orphan") is None
 

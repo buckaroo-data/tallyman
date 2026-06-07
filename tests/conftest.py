@@ -9,23 +9,23 @@ from pathlib import Path
 # "modifying env var XORQ_CACHE_DIR won't have any impact after first import"),
 # so this has to happen here at conftest module level — before any test or
 # helper imports xorq. Without this, tests pollute the user's ~/.cache/xorq/.
-_TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="pydata_xorq_cache_"))
+_TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="tallyman_xorq_cache_"))
 os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 
 import pytest  # noqa: E402
 
-from pydata_cli.fixtures import write_shoe_orders  # noqa: E402
-from pydata_core import data_dir, ensure_project, set_active_project  # noqa: E402
+from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402
+from tallyman_core import data_dir, ensure_project, set_active_project  # noqa: E402
 
 
 @pytest.fixture
 def isolated_home(tmp_path: Path, monkeypatch) -> Path:
-    """Point PYDATA_HOME at a tmp dir for the duration of the test.
+    """Point TALLYMAN_HOME at a tmp dir for the duration of the test.
 
     xorq's cache is redirected at conftest module load (see top of file)
     because XORQ_CACHE_DIR is frozen at first xorq import.
     """
-    monkeypatch.setenv("PYDATA_HOME", str(tmp_path))
+    monkeypatch.setenv("TALLYMAN_HOME", str(tmp_path))
     return tmp_path
 
 
@@ -53,7 +53,7 @@ def orders_parquet(project: str) -> Path:
 @pytest.fixture
 def fresh_companion_app(project: str):
     """Create a companion app bound to the current isolated project."""
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     return create_app(project)
 
@@ -69,7 +69,7 @@ def built_spa():
     fail with the 503 "React app not built" response. Tests that assert on
     served SPA HTML depend on this fixture so they skip cleanly instead.
     """
-    from pydata_companion.app import _REACT_DIST
+    from tallyman_companion.app import _REACT_DIST
 
     if not (_REACT_DIST / "index.html").exists():
         pytest.skip("React SPA not built — run `pnpm -C packages/app build`")

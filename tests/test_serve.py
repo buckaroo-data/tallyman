@@ -5,14 +5,14 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_companion import create_app
-from pydata_core import entry_dir, project_dir, set_alias
-from pydata_xorq import build_and_persist
+from tallyman_companion import create_app
+from tallyman_core import entry_dir, project_dir, set_alias
+from tallyman_xorq import build_and_persist
 
 
 def _code(project_name: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project_name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -100,22 +100,22 @@ def test_project_path_override_relocates_project(
     project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
 ):
     """The full hand-off scenario: copy the project to a random location,
-    point PYDATA_PROJECT_PATH at it, and verify the catalog still loads
+    point TALLYMAN_PROJECT_PATH at it, and verify the catalog still loads
     and entries still execute through the portability layer.
     """
     res = build_and_persist(project, _code(project), prompt="region totals")
     set_alias(project, "shoe_sales", res.content_hash)
 
-    # Simulate untarring the project dir somewhere arbitrary (NOT under PYDATA_HOME).
+    # Simulate untarring the project dir somewhere arbitrary (NOT under TALLYMAN_HOME).
     handoff = tmp_path / "handoff" / project
     handoff.parent.mkdir()
     shutil.copytree(project_dir(project), handoff)
 
-    # Now reconfigure env to point at the handoff dir, and use a different PYDATA_HOME
+    # Now reconfigure env to point at the handoff dir, and use a different TALLYMAN_HOME
     # (so we know we're NOT secretly reading from the original location).
-    monkeypatch.setenv("PYDATA_HOME", str(tmp_path / "fresh-home"))
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    monkeypatch.setenv("PYDATA_PROJECT_PATH", str(handoff))
+    monkeypatch.setenv("TALLYMAN_HOME", str(tmp_path / "fresh-home"))
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT_PATH", str(handoff))
 
     # Sanity: project_dir() now returns the handoff path.
     assert project_dir(project) == handoff

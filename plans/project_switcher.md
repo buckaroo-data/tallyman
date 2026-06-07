@@ -22,7 +22,7 @@ A user-visible project switcher in the companion chrome:
 ## Architecture in one paragraph
 
 The companion is multi-project-aware: it resolves the active project
-per-request by reading `~/.pydata-app/active_project` (a one-line plain-text
+per-request by reading `~/.tallyman/active_project` (a one-line plain-text
 file). The companion is the *only* writer of that file; MCP write-tools
 (`project_switch`, `project_new`) POST to the companion over HTTP rather
 than touching the file directly, which keeps the SSE story honest. Read-side,
@@ -41,7 +41,7 @@ disk, content-addressed. So "switch project" is functionally as cheap as
 
 1. **MCP write-tools go through the companion's HTTP API.** Single
    writer of the active-project file → SSE story works cleanly. MCP
-   discovers the companion via `PYDATA_COMPANION_URL` env (set by whatever
+   discovers the companion via `TALLYMAN_COMPANION_URL` env (set by whatever
    launches the MCP process). Read-tools read the file directly and work
    when the companion is down.
 
@@ -64,7 +64,7 @@ disk, content-addressed. So "switch project" is functionally as cheap as
    back-compat reader. Users re-init. (This is a spike branch; "build
    it, don't sweat continuity" was the explicit instruction.)
 
-6. **The file is the sole source of truth at runtime.** `PYDATA_PROJECT`
+6. **The file is the sole source of truth at runtime.** `TALLYMAN_PROJECT`
    env is read *only* to seed the file on first run when no file exists.
    `resolve_project()` no longer reads env after that. CLI `--project foo`
    writes the file.
@@ -77,7 +77,7 @@ disk, content-addressed. So "switch project" is functionally as cheap as
 
 8. **`project_new(name, with_fixture=False)` everywhere.** Dropdown
    `+ new` calls with `with_fixture=False`; MCP `project_new` defaults
-   to `False`. CLI `pydata init <name>` keeps its existing
+   to `False`. CLI `tallyman init <name>` keeps its existing
    `--with-fixture/--no-fixture` default-on flag for back-compat with
    demo workflows.
 
@@ -88,10 +88,10 @@ disk, content-addressed. So "switch project" is functionally as cheap as
 
 10. **Active-project file format: plain text, one line, project name.**
     Nothing else. Recency, timestamps, companion URL live elsewhere or
-    not at all. `cat ~/.pydata-app/active_project` debugs trivially.
+    not at all. `cat ~/.tallyman/active_project` debugs trivially.
 
 11. **Buckaroo sessions persisted to one global file** at
-    `~/.pydata-app/buckaroo_sessions.json`, schema
+    `~/.tallyman/buckaroo_sessions.json`, schema
     `{<hash>: {session_id, project, buckaroo_started_at}}`. Migrate
     to a Buckaroo-side enumeration endpoint when
     [buckaroo#860](https://github.com/buckaroo-data/buckaroo/issues/860)
@@ -104,7 +104,7 @@ disk, content-addressed. So "switch project" is functionally as cheap as
     events. `project_switched` is the one untagged event — every tab
     listens.
 
-13. **Switcher hidden in `pydata serve` / read-only mode.** Header
+13. **Switcher hidden in `tallyman serve` / read-only mode.** Header
     shows static `project: <served-name> · serve mode`. No dropdown,
     no `+ new`. Matches the existing pattern of stripping interactive
     chrome in read-only mode.
@@ -121,11 +121,11 @@ disk, content-addressed. So "switch project" is functionally as cheap as
 15. **Tests monkeypatch `resolve_project()` itself, not the file.**
     The `project` fixture in `conftest.py` does:
     ```python
-    monkeypatch.setattr("pydata_core.paths.resolve_project",
+    monkeypatch.setattr("tallyman_core.paths.resolve_project",
                         lambda explicit=None: explicit or name)
-    # plus re-export sites: pydata_core.resolve_project, pydata_mcp.server.resolve_project
+    # plus re-export sites: tallyman_core.resolve_project, tallyman_mcp.server.resolve_project
     ```
-    The 90 `monkeypatch.setenv("PYDATA_PROJECT", project)` calls in the
+    The 90 `monkeypatch.setenv("TALLYMAN_PROJECT", project)` calls in the
     suite become no-op removals in a cleanup pass. Integration tests
     (subprocess-based) write the file directly via a `set_active_project`
     helper — those are the tests that genuinely exercise the storage
@@ -134,7 +134,7 @@ disk, content-addressed. So "switch project" is functionally as cheap as
 ## Per-project layout
 
 ```
-~/.pydata-app/
+~/.tallyman/
 ├── active_project                       # one-line plain text
 ├── buckaroo_sessions.json               # global session table
 └── projects/
@@ -173,7 +173,7 @@ If `project` argument was passed to `create_app`, it seeds the
 active-project file on startup *if and only if* the file doesn't already
 exist. After that, the file is canonical.
 
-If no project at all exists at startup (`~/.pydata-app/projects/` empty
+If no project at all exists at startup (`~/.tallyman/projects/` empty
 or absent), the companion serves the **empty-state landing page** for
 every route, rendering a single form that posts to `/api/projects/new`.
 Once one project exists, normal routing resumes.
@@ -191,7 +191,7 @@ POST /api/projects/new    → {"name": "baz", "with_fixture": false}
 
 All three return 409 on name collision (for /new) or 404 on unknown
 project (for /switch). Name validation lives in
-`pydata_core.paths.validate_project_name(name) -> None | raises ValueError`.
+`tallyman_core.paths.validate_project_name(name) -> None | raises ValueError`.
 
 ### SSE event tagging
 
@@ -223,7 +223,7 @@ sse.addEventListener('project_switched', () => window.location.reload());
 
 `BuckarooManager.__init__` no longer takes `project`. `ensure_session`
 gains a `project: str` parameter. The session persistence file moves to
-`~/.pydata-app/buckaroo_sessions.json` with the schema noted in decision
+`~/.tallyman/buckaroo_sessions.json` with the schema noted in decision
 11. On startup, the manager reads the file and prunes entries for which
 `project_dir(entry.project) / "artifacts" / "catalog" / "entries" / hash` no
 longer exists.
@@ -235,9 +235,9 @@ on companion startup, build the map in-memory from the response.
 
 ### `resolve_project()` reads the file every call
 
-`pydata_core.paths.resolve_project()` returns the contents of
-`~/.pydata-app/active_project`, falling back to `os.environ.get(
-"PYDATA_PROJECT")` (one-shot seed) on first use when the file is absent.
+`tallyman_core.paths.resolve_project()` returns the contents of
+`~/.tallyman/active_project`, falling back to `os.environ.get(
+"TALLYMAN_PROJECT")` (one-shot seed) on first use when the file is absent.
 After the first successful resolve, the env is ignored.
 
 ### New MCP tools
@@ -250,10 +250,10 @@ project_new(name: str, with_fixture: bool = False)
 ```
 
 `project_switch` and `project_new` implementation: POST to
-`os.environ['PYDATA_COMPANION_URL'] + '/api/projects/...'`. If the env is
+`os.environ['TALLYMAN_COMPANION_URL'] + '/api/projects/...'`. If the env is
 unset or the request times out, return
 `{"error": "companion not reachable; project lifecycle tools require
-pydata run to be active"}`. Read tools (`project_list`) read the file
+tallyman run to be active"}`. Read tools (`project_list`) read the file
 directly and work without the companion.
 
 ### Per-response project tag + switch warning
@@ -293,7 +293,7 @@ worth doing once and documenting.
 
 ```html
 <header>
-  <span class="brand">pydata</span>
+  <span class="brand">tallyman</span>
   {% if read_only %}
     <span class="project">project: {{ project }}</span>
   {% else %}
@@ -327,10 +327,10 @@ Two paths:
 
 - **Unit tests (vast majority).** `project` fixture monkeypatches
   `resolve_project()` to return the test's project name. Tests
-  drop their `monkeypatch.setenv("PYDATA_PROJECT", ...)` lines in a
+  drop their `monkeypatch.setenv("TALLYMAN_PROJECT", ...)` lines in a
   cleanup commit (no-op once env is dropped from runtime resolution).
-  The fixture patches at every re-export site (`pydata_core.paths`,
-  `pydata_core`, `pydata_mcp.server`) because `from … import resolve_project`
+  The fixture patches at every re-export site (`tallyman_core.paths`,
+  `tallyman_core`, `tallyman_mcp.server`) because `from … import resolve_project`
   binds at import time.
 - **Integration tests (~5 sites).** Subprocess-based tests genuinely
   exercise the file mechanism; they call a new `set_active_project(name)`
@@ -346,7 +346,7 @@ New tests:
 - `test_companion.py` — `/api/projects` shape; switch updates file;
   new creates dir tree; SSE `project_switched` fires on switch.
 - `test_companion.py` — empty-state landing page renders when
-  `~/.pydata-app/projects/` is empty.
+  `~/.tallyman/projects/` is empty.
 - `test_mcp.py` — `project_switch` POSTs to companion URL; returns
   error when companion unreachable; `_tag_project` decorator adds
   `project` to every response and emits `warning` on switch.
@@ -357,9 +357,9 @@ New tests:
 ## First-launch flow
 
 ```
-1. pydata run --project=??? (no arg)
+1. tallyman run --project=??? (no arg)
 2. companion boots
-3. checks: any ~/.pydata-app/projects/<name>/ exist?
+3. checks: any ~/.tallyman/projects/<name>/ exist?
    → no:  serves empty-state landing page for every route
    → yes: checks active-project file
           → file exists & names a real project: use it
@@ -368,7 +368,7 @@ New tests:
 4. companion serves normally
 ```
 
-`pydata init <name>` continues to exist as a CLI shortcut for the
+`tallyman init <name>` continues to exist as a CLI shortcut for the
 fixture-on path (since the dropdown / MCP path now default to no
 fixture).
 
@@ -401,16 +401,16 @@ per repo TDD rule), bundled per the test-vs-fix axis.
 ## Out of scope for v1
 
 - Renaming or deleting projects from the UI. CLI workaround:
-  `rm -rf ~/.pydata-app/projects/<name>`, then choose another via the
+  `rm -rf ~/.tallyman/projects/<name>`, then choose another via the
   dropdown.
 - Cross-project search (catalog index spanning projects).
 - URL-prefix routing (`/p/<project>/…`) for true side-by-side tabs.
 - A real modal for new-project name (using `prompt()` in v1).
 - A recently-used list for dropdown ordering (sort alphabetical for
-  now; add `~/.pydata-app/recent_projects.json` later if needed).
+  now; add `~/.tallyman/recent_projects.json` later if needed).
 - Per-project Buckaroo config (memory limits, theme).
-- Symlinking external project trees into the dropdown. `PYDATA_PROJECT_PATH`
-  / `pydata serve` stays as the escape hatch.
+- Symlinking external project trees into the dropdown. `TALLYMAN_PROJECT_PATH`
+  / `tallyman serve` stays as the escape hatch.
 
 ## Open follow-ups
 

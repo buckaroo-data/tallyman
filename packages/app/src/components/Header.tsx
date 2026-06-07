@@ -49,7 +49,7 @@ export function Header() {
 
   return (
     <header>
-      <span className="brand">pydata</span>
+      <span className="brand">tallyman</span>
 
       {project ? (
         <span className="project-switcher">

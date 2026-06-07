@@ -229,7 +229,7 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
         ) : (
           <div className="meta">
             {total_rows > 0
-              ? `${total_rows} rows (Buckaroo not available — run pydata with --buckaroo)`
+              ? `${total_rows} rows (Buckaroo not available — run tallyman with --buckaroo)`
               : "no result.parquet"}
           </div>
         )}

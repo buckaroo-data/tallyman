@@ -26,7 +26,7 @@ export default defineConfig({
       formats: ["es"],
       fileName: () => "buckaroo-embed.js",
     },
-    outDir: resolve(__dirname, "../../src/pydata_companion/static"),
+    outDir: resolve(__dirname, "../../src/tallyman_companion/static"),
     emptyOutDir: false,
     cssCodeSplit: false,
     minify: true,

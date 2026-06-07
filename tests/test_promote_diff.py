@@ -1,7 +1,7 @@
 """Tests for the promote-diff feature.
 
 Covers:
-  - build_compare_expr columns and overrides (pydata_companion.diff)
+  - build_compare_expr columns and overrides (tallyman_companion.diff)
   - build_diff_expr round-trip (active-project path)
   - catalog_promote_diff MCP tool
   - POST /api/promote_diff HTTP endpoint
@@ -14,14 +14,14 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_mcp.server import catalog_create, catalog_promote_diff, catalog_revise
-from pydata_xorq import build_and_persist
-from pydata_xorq.result_cache import cached_result_expr
+from tallyman_mcp.server import catalog_create, catalog_promote_diff, catalog_revise
+from tallyman_xorq import build_and_persist
+from tallyman_xorq.result_cache import cached_result_expr
 
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -29,7 +29,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 
 def _filter_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
@@ -42,7 +42,7 @@ expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filte
 
 
 def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: Path):
-    from pydata_companion.diff import build_compare_expr
+    from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -63,7 +63,7 @@ def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: P
 
 
 def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet: Path):
-    from pydata_companion.diff import build_compare_expr
+    from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -80,7 +80,7 @@ def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet
 
 
 def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet: Path):
-    from pydata_companion.diff import build_compare_expr
+    from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -100,7 +100,7 @@ def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, or
     # the diff display klasses) color numeric value columns by pct_delta. The
     # live /diff route strips this via strip_live_diff_color so the per-view
     # klass coloring wins — see test_strip_live_diff_color below.
-    from pydata_companion.diff import build_compare_expr
+    from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -117,7 +117,7 @@ def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, or
 def test_strip_live_diff_color_drops_numeric_keeps_categorical():
     # The live /diff route strips numeric (color_map) value-column coloring so
     # the display klasses own it, but keeps categorical key/equality colors.
-    from pydata_companion.diff import strip_live_diff_color
+    from tallyman_companion.diff import strip_live_diff_color
 
     overrides = {
         "total_v2": {
@@ -146,7 +146,7 @@ def test_strip_live_diff_color_drops_numeric_keeps_categorical():
 
 
 def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orders_parquet: Path):
-    from pydata_companion.diff import build_compare_expr
+    from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -164,7 +164,7 @@ def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orde
 
 
 def test_build_diff_expr_returns_ibis_expr(project: str, orders_parquet: Path):
-    from pydata_companion.diff import build_diff_expr
+    from tallyman_companion.diff import build_diff_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
@@ -178,7 +178,7 @@ def test_build_diff_expr_returns_ibis_expr(project: str, orders_parquet: Path):
 
 
 def test_catalog_promote_diff_creates_entry(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales")
@@ -190,7 +190,7 @@ def test_catalog_promote_diff_creates_entry(project: str, orders_parquet: Path, 
 
 
 def test_catalog_promote_diff_auto_alias(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales")
@@ -198,7 +198,7 @@ def test_catalog_promote_diff_auto_alias(project: str, orders_parquet: Path, mon
 
 
 def test_catalog_promote_diff_custom_alias(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales", alias="my_diff")
@@ -206,9 +206,9 @@ def test_catalog_promote_diff_custom_alias(project: str, orders_parquet: Path, m
 
 
 def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet: Path, monkeypatch):
-    from pydata_core.display_configs import get_display_config
+    from tallyman_core.display_configs import get_display_config
 
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales")
@@ -223,20 +223,20 @@ def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet
 
 
 def test_catalog_promote_diff_no_history_returns_error(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_promote_diff("nonexistent")
     assert "error" in out
 
 
 def test_catalog_promote_diff_out_of_range_returns_error(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_promote_diff("shoe_sales", va=1, vb=5)
     assert "error" in out
 
 
 def test_catalog_promote_diff_negative_indices(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales", va=-2, vb=-1)
@@ -250,7 +250,7 @@ def test_catalog_promote_diff_negative_indices(project: str, orders_parquet: Pat
 
 
 def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
 
@@ -266,9 +266,9 @@ def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orde
 
 
 def test_http_promote_diff_sets_display_config(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    from pydata_core.display_configs import get_display_config
+    from tallyman_core.display_configs import get_display_config
 
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
 
@@ -288,7 +288,7 @@ def test_http_promote_diff_unknown_alias_404(fresh_companion_app, project: str):
 
 
 def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
 
     c = TestClient(fresh_companion_app)
@@ -299,7 +299,7 @@ def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, o
 def test_http_entry_detail_diff_has_display_config(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
 
@@ -321,11 +321,11 @@ def test_http_entry_detail_diff_has_display_config(
 
 
 def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_parquet: Path, monkeypatch):
-    from pydata_core import notebook as nb_mod
-    from pydata_core.display_configs import set_display_config
-    from pydata_core.marimo_export import notebook_to_marimo
+    from tallyman_core import notebook as nb_mod
+    from tallyman_core.display_configs import set_display_config
+    from tallyman_core.marimo_export import notebook_to_marimo
 
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales")
@@ -358,11 +358,11 @@ def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_parqu
 
 
 def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parquet: Path, monkeypatch):
-    from pydata_core import notebook as nb_mod
-    from pydata_core.display_configs import set_display_config
-    from pydata_core.marimo_export import notebook_to_marimo
+    from tallyman_core import notebook as nb_mod
+    from tallyman_core.display_configs import set_display_config
+    from tallyman_core.marimo_export import notebook_to_marimo
 
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_promote_diff("shoe_sales")

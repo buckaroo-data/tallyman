@@ -6,9 +6,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from pydata_core import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
-from pydata_mcp.server import catalog_chart, catalog_create
-from pydata_xorq import build_and_persist
+from tallyman_core import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
+from tallyman_mcp.server import catalog_chart, catalog_create
+from tallyman_xorq import build_and_persist
 
 SAMPLE_SPEC = {
     "mark": "bar",
@@ -21,7 +21,7 @@ SAMPLE_SPEC = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -76,7 +76,7 @@ def test_remove_chart(project: str):
 
 
 def test_catalog_chart_by_hash(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     out = catalog_chart(res.content_hash, SAMPLE_SPEC)
     assert "error" not in out
@@ -85,24 +85,24 @@ def test_catalog_chart_by_hash(project: str, orders_parquet: Path, monkeypatch):
 
 
 def test_catalog_chart_by_alias(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_chart("shoe_sales", SAMPLE_SPEC)
     assert "error" not in out
     # The chart is stored against the latest hash for this alias.
-    from pydata_core import get_alias
+    from tallyman_core import get_alias
 
     assert get_chart(project, get_alias(project, "shoe_sales")) is not None
 
 
 def test_catalog_chart_rejects_missing(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_chart("nonexistent_alias", SAMPLE_SPEC)
     assert "error" in out
 
 
 def test_catalog_chart_invalid_spec(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     out = catalog_chart(res.content_hash, "{not json}")
     assert "error" in out
@@ -183,10 +183,10 @@ def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orde
 
 def test_api_data_default_limit_is_200(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Defaults are demo-safe: aggregate fits, raw 2k-row loads cap at 200."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     # Use a passthrough expression (raw orders, 200 rows in the fixture).
     code = """
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 expr = from_project("orders.parquet")
 """
     res = build_and_persist(project, code)

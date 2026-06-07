@@ -20,7 +20,7 @@ Severity legend:
 Fixed: the SSE handler now branches on `window.location.pathname`. On
 `/catalog` (no hash) it reloads to refresh the entry list; on
 `/catalog/<hash>` it focuses the new entry; on other tabs it does
-nothing. See `src/pydata_companion/templates/base.html`.
+nothing. See `src/tallyman_companion/templates/base.html`.
 
 ### ~~T-02 — Catalog index page doesn't auto-refresh~~ ✅ 2026-05-11
 
@@ -42,9 +42,9 @@ so the edit-toggle textarea gets the unrendered source.
 
 Listener added in `base.html`; reloads only when on the affected entry.
 
-### ~~T-06 — No `pydata pack` command~~ ✅ 2026-05-11
+### ~~T-06 — No `tallyman pack` command~~ ✅ 2026-05-11
 
-`pydata pack <project>` produces `./<project>-<YYYY-MM-DD>.tgz`,
+`tallyman pack <project>` produces `./<project>-<YYYY-MM-DD>.tgz`,
 skipping `__pycache__`, `.DS_Store`, and the stale
 `buckaroo_sessions.json`. Round-trip serve verified by
 `tests/test_pack.py::test_pack_round_trip_serves`. See also T-24
@@ -78,12 +78,12 @@ implemented as
 (`feat/load-expr-server`). Adds `POST /load_expr` + a `backend="xorq"`
 discriminator on the existing `mode="buckaroo"` dispatch arm.
 
-**pydata-app side:** `BuckarooManager.ensure_session` POSTs to
+**tallyman-notebooks side:** `BuckarooManager.ensure_session` POSTs to
 `/load_expr` with the entry's `xorq_build/` directory; the dead
 `mode` parameter is gone. One subtlety surfaced during integration:
 buckaroo's `xorq_loading.load_expr_build_dir` calls
-`xorq.api.load_expr` directly, so it does **not** resolve pydata's
-`${PYDATA_PROJECT_ROOT}` placeholders. Without expansion the session
+`xorq.api.load_expr` directly, so it does **not** resolve tallyman's
+`${TALLYMAN_PROJECT_ROOT}` placeholders. Without expansion the session
 loads fine (schema flows from YAML) but every paged read returns
 zero rows. ensure_session now `expand_to_tmp`s the build dir before
 POSTing and rmtree's the tmp on `stop()`. Tracked per content_hash
@@ -92,14 +92,14 @@ so concurrent hits don't double-expand.
 Verified end-to-end: `GET /catalog/shoe_sales` →
 `buckaroo.server.handlers: load_expr ... rows=4 backend=xorq`.
 
-Files touched: `src/pydata_companion/buckaroo_lifecycle.py`,
+Files touched: `src/tallyman_companion/buckaroo_lifecycle.py`,
 `tests/test_buckaroo.py` (+5 tests: 4 stress, 1 row-count smoke
 integration). pyproject + uv.lock pin buckaroo to the local PR 776
 editable; switch to a git ref or published version once PR 776 lands.
 
 ### ~~T-07 — Buckaroo server is not integrated~~ ✅ done 2026-05-11
 
-`pydata run` now manages a Buckaroo subprocess (default `:8700`, falls
+`tallyman run` now manages a Buckaroo subprocess (default `:8700`, falls
 back to a random port if busy). Per-entry sessions are lazily created
 on first view via `POST /load`, persisted under
 `catalog/buckaroo_sessions.json` with an envelope shape that records
@@ -108,9 +108,9 @@ Buckaroo's `started` timestamp for restart detection. Iframe in
 close (Buckaroo's `--stdio-control` flag) with SIGTERM fallback.
 Disable with `--no-buckaroo` if Buckaroo's runtime deps are missing.
 
-Files added/touched: `src/pydata_companion/buckaroo_lifecycle.py`,
-`src/pydata_companion/app.py`, `src/pydata_companion/templates/entry_detail.html`,
-`src/pydata_cli/main.py`, `pyproject.toml`. 8 new tests
+Files added/touched: `src/tallyman_companion/buckaroo_lifecycle.py`,
+`src/tallyman_companion/app.py`, `src/tallyman_companion/templates/entry_detail.html`,
+`src/tallyman_cli/main.py`, `pyproject.toml`. 8 new tests
 (3 unit, 2 integration, 3 companion-level).
 
 Known follow-ups not in scope of this ticket:
@@ -170,7 +170,7 @@ each with a header showing the count. Item rendering factored into
 
 Entry detail now has a "build artifacts" disclosure that lists every
 file under the entry's `xorq_build/` (expr.yaml, expr_metadata.json,
-build_metadata.json, profiles.yaml). The `${PYDATA_PROJECT_ROOT}`
+build_metadata.json, profiles.yaml). The `${TALLYMAN_PROJECT_ROOT}`
 placeholder is visible in the displayed text — useful for showing the
 portability story to an audience. Test asserts the placeholder is
 present in the rendered page.
@@ -200,7 +200,7 @@ toolbar; save redirects to the new V_{n+1} on success.
 
 ### ~~T-17 — Column-level lineage~~ ✅ 2026-05-11
 
-`pydata_xorq.column_lineage(project, hash)` loads the entry via the
+`tallyman_xorq.column_lineage(project, hash)` loads the entry via the
 portable load path, runs `xorq.common.utils.lineage_utils.build_column_trees`,
 renders each column's tree via `build_tree(...).__str__` (the ASCII
 art form). The `/lineage/<hash>` page now surfaces per-column trees
@@ -218,14 +218,14 @@ instead"). xorq has `xorq.ml` helpers — haven't explored.
   model="logistic")` or expect Claude to write the xorq.ml call.
 - **Verify:** beats 7–8 of the storyboard execute end-to-end.
 
-### ~~T-19 — `pydata replay <storyboard.json>`~~ ✅ 2026-05-11
+### ~~T-19 — `tallyman replay <storyboard.json>`~~ ✅ 2026-05-11
 
-`pydata replay <file.json>` reads `{project, steps: [{tool, args,
+`tallyman replay <file.json>` reads `{project, steps: [{tool, args,
 narration?, skip?}]}` and drives the MCP tools in order. `--delay N`
 paces between steps; `--continue-on-error` pushes through failures
 for stage fallback. `demo/storyboard.json` exercises beats 1, 3, 4,
 5, plus a chart attach — a regression test asserts it replays to a
-known state under an isolated PYDATA_HOME.
+known state under an isolated TALLYMAN_HOME.
 
 ### ~~T-20 — `/api/data/<hash>` pagination~~ ✅ 2026-05-11
 
@@ -276,7 +276,7 @@ N-cell notebook = N WS connections + N AG-Grid instances.
   files and gate with `@pytest.mark.integration`).
 - Fixture: a project with N synthetic catalog entries, one notebook
   cell per entry. Parametrise N over `[1, 5, 10, 25]`.
-- For each N: launch `pydata run`, load `/notebook`, wait for all
+- For each N: launch `tallyman run`, load `/notebook`, wait for all
   embeds to reach `initial_state`, sample both metrics, then close the
   page and re-sample server RSS to catch sessions that don't release.
 - Assert: server RSS growth per cell is sub-linear (i.e. shared
@@ -311,19 +311,19 @@ new embed surface.
 ### ~~T-34 — `/internal/notify` should log the event `kind`~~ ✅ 2026-05-20
 
 `@app.post("/internal/notify")` now `log.info`s `kind` and `hash`
-before publishing to subscribers. Logger is `pydata.companion`; INFO
+before publishing to subscribers. Logger is `tallyman.companion`; INFO
 level is on by default under uvicorn's `log_level="info"`.
 
 ### ~~T-35 — Companion startup banner should print buckaroo PID~~ ✅ 2026-05-20
 
-`pydata run` banner now includes `pid=<n>` next to the URL. After an
+`tallyman run` banner now includes `pid=<n>` next to the URL. After an
 auto-restart in `BuckarooManager._maybe_restart`, the success log
 includes both the new pid and the bound port (which can change if the
 original port was reclaimed by something else).
 
-### ~~T-23 — `pydata init` silently re-runs~~ ✅ 2026-05-11
+### ~~T-23 — `tallyman init` silently re-runs~~ ✅ 2026-05-11
 
-`pydata init` now errors if the project already exists. `--force`
+`tallyman init` now errors if the project already exists. `--force`
 proceeds (re-initialises dirs that may already be there; preserves
 catalog entries and aliases). Tests cover both paths.
 
@@ -351,7 +351,7 @@ URL, never load it.
 
 ### T-36 — `/api/data/<hash>` leaf goes Arrow → pandas → records
 
-`api_data` in `src/pydata_companion/app.py` currently ends with
+`api_data` in `src/tallyman_companion/app.py` currently ends with
 `df.to_dict(orient="records")` after the parquet `iter_batches` →
 arrow `slice()` → `to_pandas()` chain. The pandas step exists only to
 re-emit records that FastAPI then re-serialises to JSON.
@@ -376,7 +376,7 @@ build time, causing `ReferenceError: process is not defined` at
 runtime. Fixed via `define: { "process.env.NODE_ENV":
 JSON.stringify("production") }` in `vite.config.ts`.
 
-Output: `src/pydata_companion/static/buckaroo-embed.{js,css}` (both
+Output: `src/tallyman_companion/static/buckaroo-embed.{js,css}` (both
 in `.gitignore`; built locally before deploy / before demo). Build
 command: `pnpm -C packages/embed build`.
 
@@ -397,7 +397,7 @@ Three new MCP tools mirror the summary-stats pattern:
 `catalog_add_post_processing(name, source)`,
 `catalog_remove_post_processing(name)`,
 `catalog_list_post_processings()`. Source is validated by
-`pydata_core.post_processing.validate_post_processing_source` (exec in
+`tallyman_core.post_processing.validate_post_processing_source` (exec in
 restricted globals, dry-run against a 3-row memtable; accepts ibis
 expr or pandas DataFrame). Scripts land in
 `<project>/post_processing/<name>.py`; removal soft-deletes to

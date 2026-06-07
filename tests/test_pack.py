@@ -1,4 +1,4 @@
-"""Tests for `pydata pack`: tar a project dir into a portable .tgz."""
+"""Tests for `tallyman pack`: tar a project dir into a portable .tgz."""
 
 from __future__ import annotations
 
@@ -8,15 +8,15 @@ from pathlib import Path
 from click.testing import CliRunner
 from fastapi.testclient import TestClient
 
-from pydata_cli.main import cli
-from pydata_companion import create_app
-from pydata_core import set_alias
-from pydata_xorq import build_and_persist
+from tallyman_cli.main import cli
+from tallyman_companion import create_app
+from tallyman_core import set_alias
+from tallyman_xorq import build_and_persist
 
 
 def _build_one(project: str, orders_parquet: Path) -> str:
     code = f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -43,7 +43,7 @@ def test_pack_creates_tgz(project: str, orders_parquet: Path, isolated_home: Pat
 
 def test_pack_skips_buckaroo_sessions(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path):
     # Write a stale sessions file that mustn't ship.
-    from pydata_core import catalog_dir
+    from tallyman_core import catalog_dir
 
     _build_one(project, orders_parquet)
     sessions_file = catalog_dir(project) / "buckaroo_sessions.json"
@@ -69,7 +69,7 @@ def test_pack_unknown_project(isolated_home: Path, tmp_path: Path):
 
 def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch):
     """The full handoff loop: pack → extract to a random location →
-    point PYDATA_PROJECT_PATH at the extract → serve read-only and verify
+    point TALLYMAN_PROJECT_PATH at the extract → serve read-only and verify
     every alias resolves."""
     h = _build_one(project, orders_parquet)
     set_alias(project, "by_region", h)
@@ -85,10 +85,10 @@ def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_hom
     extracted_project = handoff / project
     assert extracted_project.is_dir()
 
-    # Point the companion at the extracted dir, NOT the original PYDATA_HOME.
-    monkeypatch.setenv("PYDATA_HOME", str(tmp_path / "empty-home"))
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    monkeypatch.setenv("PYDATA_PROJECT_PATH", str(extracted_project))
+    # Point the companion at the extracted dir, NOT the original TALLYMAN_HOME.
+    monkeypatch.setenv("TALLYMAN_HOME", str(tmp_path / "empty-home"))
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT_PATH", str(extracted_project))
 
     app = create_app(project, read_only=True)
     c = TestClient(app)

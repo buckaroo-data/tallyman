@@ -19,9 +19,9 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_companion import create_app
-from pydata_core import ensure_project, resolve_project, set_active_project
-from pydata_core.paths import active_project_file_path, project_dir
+from tallyman_companion import create_app
+from tallyman_core import ensure_project, resolve_project, set_active_project
+from tallyman_core.paths import active_project_file_path, project_dir
 
 # ---------------------------------------------------------------------------
 # GET /api/projects
@@ -42,7 +42,7 @@ def test_api_projects_returns_active_and_available(isolated_home: Path):
 
 
 def test_api_projects_active_null_when_no_active(isolated_home: Path, monkeypatch):
-    monkeypatch.delenv("PYDATA_PROJECT", raising=False)
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
     ensure_project("alpha")
     # No set_active_project — file absent.
     app = create_app()
@@ -252,7 +252,7 @@ def test_companion_picks_up_switch_without_restart(isolated_home: Path, orders_p
 
 def test_empty_state_landing_when_no_projects(built_spa, isolated_home: Path, monkeypatch):
     """No projects → root serves the React SPA (empty state rendered client-side)."""
-    monkeypatch.delenv("PYDATA_PROJECT", raising=False)
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
     assert not active_project_file_path().exists()
     app = create_app()
     c = TestClient(app, follow_redirects=False)
@@ -265,7 +265,7 @@ def test_empty_state_landing_when_no_projects(built_spa, isolated_home: Path, mo
 
 
 def test_empty_state_landing_creates_first_project(isolated_home: Path, monkeypatch):
-    monkeypatch.delenv("PYDATA_PROJECT", raising=False)
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
     app = create_app()
     c = TestClient(app, follow_redirects=False)
     r = c.post("/api/projects/new", json={"name": "first", "with_fixture": False})
@@ -332,7 +332,7 @@ def test_chrome_renders_dropdown_in_writable_mode(isolated_home: Path):
 
 
 def test_chrome_hides_switcher_in_read_only_mode(isolated_home: Path, orders_parquet: Path):
-    """pydata serve mode: project switching is rejected (403)."""
+    """tallyman serve mode: project switching is rejected (403)."""
     ensure_project("alpha")
     set_active_project("alpha")
     app = create_app(read_only=True)

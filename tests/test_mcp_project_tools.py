@@ -20,11 +20,11 @@ from pathlib import Path
 import httpx
 import pytest
 
-from pydata_core import ensure_project, set_active_project
+from tallyman_core import ensure_project, set_active_project
 
 
 def _mock_transport(handler):
-    """Wrap ``httpx`` so the module-level client used by pydata_mcp.server
+    """Wrap ``httpx`` so the module-level client used by tallyman_mcp.server
     routes its requests through ``handler`` instead of the network."""
     transport = httpx.MockTransport(handler)
     real_client = httpx.Client
@@ -42,7 +42,7 @@ def _mock_transport(handler):
 
 
 def test_project_list_returns_active_and_available(isolated_home: Path):
-    from pydata_mcp.server import project_list
+    from tallyman_mcp.server import project_list
 
     ensure_project("alpha")
     ensure_project("beta")
@@ -53,7 +53,7 @@ def test_project_list_returns_active_and_available(isolated_home: Path):
 
 
 def test_project_list_active_none_when_no_active(isolated_home: Path):
-    from pydata_mcp.server import project_list
+    from tallyman_mcp.server import project_list
 
     ensure_project("alpha")
     # No set_active_project — file absent.
@@ -68,7 +68,7 @@ def test_project_list_active_none_when_no_active(isolated_home: Path):
 
 
 def test_project_switch_happy_path(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     ensure_project("beta")
@@ -89,7 +89,7 @@ def test_project_switch_happy_path(isolated_home: Path, monkeypatch):
 
 
 def test_project_switch_returns_error_when_unreachable(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -106,7 +106,7 @@ def test_project_switch_returns_error_when_unreachable(isolated_home: Path, monk
 
 
 def test_project_switch_returns_error_on_http_error(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -125,7 +125,7 @@ def test_project_switch_returns_error_on_http_error(isolated_home: Path, monkeyp
 
 
 def test_project_new_happy_path_default_no_fixture(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -146,7 +146,7 @@ def test_project_new_happy_path_default_no_fixture(isolated_home: Path, monkeypa
 
 
 def test_project_new_with_fixture_true(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -164,7 +164,7 @@ def test_project_new_with_fixture_true(isolated_home: Path, monkeypatch):
 
 
 def test_project_new_returns_error_on_409(isolated_home: Path, monkeypatch):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -184,14 +184,14 @@ def test_project_new_returns_error_on_409(isolated_home: Path, monkeypatch):
 
 
 def test_existing_tool_response_includes_project(project: str, orders_parquet: Path):
-    from pydata_mcp.server import catalog_load_parquet
+    from tallyman_mcp.server import catalog_load_parquet
 
     out = catalog_load_parquet("orders.parquet", prompt="raw")
     assert out.get("project") == project
 
 
 def test_list_returning_tool_wrapped_with_project_and_items(project: str, orders_parquet: Path):
-    from pydata_mcp.server import catalog_list, catalog_load_parquet
+    from tallyman_mcp.server import catalog_list, catalog_load_parquet
 
     catalog_load_parquet("orders.parquet", prompt="raw")
     out = catalog_list()
@@ -206,7 +206,7 @@ def test_catalog_list_includes_compact_columns(project: str, orders_parquet: Pat
     # The model should be able to look up an entry's columns before writing an
     # expression against it, without a build. catalog_list carries a compact
     # "name:type, name:type" summary the LLM can scan at a glance.
-    from pydata_mcp.server import catalog_list, catalog_load_parquet
+    from tallyman_mcp.server import catalog_list, catalog_load_parquet
 
     catalog_load_parquet("orders.parquet", prompt="raw")
     entry = catalog_list()["items"][0]
@@ -218,7 +218,7 @@ def test_catalog_list_includes_compact_columns(project: str, orders_parquet: Pat
 
 
 def test_project_list_includes_project_field(isolated_home: Path):
-    from pydata_mcp.server import project_list
+    from tallyman_mcp.server import project_list
 
     ensure_project("alpha")
     set_active_project("alpha")
@@ -238,7 +238,7 @@ def test_external_disk_change_does_not_override_in_process_project(
     external writes to the active-project file have no effect — the session is
     sticky to whatever project was active on the first call (or was set via
     project_switch)."""
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     ensure_project("beta")
@@ -251,16 +251,14 @@ def test_external_disk_change_does_not_override_in_process_project(
     set_active_project("beta")
     second = srv.project_list()
     assert second["project"] == "alpha"  # sticky to first-call value
-    assert second["active"] == "alpha"   # active field must match, not read disk
+    assert second["active"] == "alpha"  # active field must match, not read disk
     assert "warning" not in second
 
 
-def test_switch_warning_emitted_when_project_switch_called(
-    isolated_home: Path, monkeypatch
-):
+def test_switch_warning_emitted_when_project_switch_called(isolated_home: Path, monkeypatch):
     """project_switch() updates _mcp_active_project so subsequent calls see
     the new project; the switch response itself carries the change warning."""
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     ensure_project("alpha")
     ensure_project("beta")
@@ -287,7 +285,7 @@ def test_switch_warning_emitted_when_project_switch_called(
 
 
 def test_no_warning_when_project_unchanged(isolated_home: Path):
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     srv._last_project = None
     ensure_project("alpha")
@@ -300,7 +298,7 @@ def test_no_warning_when_project_unchanged(isolated_home: Path):
 @pytest.fixture(autouse=True)
 def _reset_mcp_server_state():
     """Each test starts with clean module-level MCP server state."""
-    from pydata_mcp import server as srv
+    from tallyman_mcp import server as srv
 
     srv._last_project = None
     srv._mcp_active_project = None

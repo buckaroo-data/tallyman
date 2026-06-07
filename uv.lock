@@ -1762,77 +1762,6 @@ wheels = [
 ]
 
 [[package]]
-name = "pydata-app"
-version = "0.0.1"
-source = { editable = "." }
-dependencies = [
-    { name = "buckaroo" },
-    { name = "click" },
-    { name = "fastapi" },
-    { name = "fastmcp" },
-    { name = "geopandas" },
-    { name = "h3" },
-    { name = "httpx" },
-    { name = "ibis-framework" },
-    { name = "markdown" },
-    { name = "pandas" },
-    { name = "pillow" },
-    { name = "polars" },
-    { name = "pyarrow" },
-    { name = "pydantic" },
-    { name = "pygments" },
-    { name = "scikit-learn" },
-    { name = "scipy" },
-    { name = "seaborn" },
-    { name = "sse-starlette" },
-    { name = "tomli-w" },
-    { name = "tornado" },
-    { name = "uvicorn", extra = ["standard"] },
-    { name = "vl-convert-python" },
-    { name = "xorq" },
-]
-
-[package.dev-dependencies]
-dev = [
-    { name = "pytest" },
-    { name = "ruff" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "buckaroo", specifier = "==0.14.15" },
-    { name = "click", specifier = ">=8.1" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "fastmcp", specifier = ">=2.0" },
-    { name = "geopandas", specifier = ">=1.1.3" },
-    { name = "h3", specifier = ">=4.4.2" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "ibis-framework", specifier = ">=12.0.0" },
-    { name = "markdown", specifier = ">=3.10.2" },
-    { name = "pandas", specifier = ">=2.2" },
-    { name = "pillow", specifier = ">=12.2.0" },
-    { name = "polars" },
-    { name = "pyarrow", specifier = ">=16" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "pygments", specifier = ">=2.20.0" },
-    { name = "scikit-learn", specifier = ">=1.4,<2.0" },
-    { name = "scipy", specifier = ">=1.17.1" },
-    { name = "seaborn", specifier = ">=0.13.2" },
-    { name = "sse-starlette", specifier = ">=2.1" },
-    { name = "tomli-w", specifier = ">=1.0" },
-    { name = "tornado", specifier = ">=6.0" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
-    { name = "vl-convert-python", specifier = ">=1.9.0.post1" },
-    { name = "xorq", specifier = "==0.3.26" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "pytest", specifier = ">=8" },
-    { name = "ruff", specifier = ">=0.15.15" },
-]
-
-[[package]]
 name = "pygments"
 version = "2.20.0"
 source = { registry = "https://pypi.org/simple" }
@@ -2344,6 +2273,77 @@ source = { registry = "https://pypi.org/simple" }
 sdist = { url = "https://files.pythonhosted.org/packages/ef/52/9ba0f43b686e7f3ddfeaa78ac3af750292662284b3661e91ad5494f21dbc/structlog-25.5.0.tar.gz", hash = "sha256:098522a3bebed9153d4570c6d0288abf80a031dfdb2048d59a49e9dc2190fc98", size = 1460830, upload-time = "2025-10-27T08:28:23.028Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/a8/45/a132b9074aa18e799b891b91ad72133c98d8042c70f6240e4c5f9dabee2f/structlog-25.5.0-py3-none-any.whl", hash = "sha256:a8453e9b9e636ec59bd9e79bbd4a72f025981b3ba0f5837aebf48f02f37a7f9f", size = 72510, upload-time = "2025-10-27T08:28:21.535Z" },
+]
+
+[[package]]
+name = "tallyman-notebooks"
+version = "0.0.1"
+source = { editable = "." }
+dependencies = [
+    { name = "buckaroo" },
+    { name = "click" },
+    { name = "fastapi" },
+    { name = "fastmcp" },
+    { name = "geopandas" },
+    { name = "h3" },
+    { name = "httpx" },
+    { name = "ibis-framework" },
+    { name = "markdown" },
+    { name = "pandas" },
+    { name = "pillow" },
+    { name = "polars" },
+    { name = "pyarrow" },
+    { name = "pydantic" },
+    { name = "pygments" },
+    { name = "scikit-learn" },
+    { name = "scipy" },
+    { name = "seaborn" },
+    { name = "sse-starlette" },
+    { name = "tomli-w" },
+    { name = "tornado" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "vl-convert-python" },
+    { name = "xorq" },
+]
+
+[package.dev-dependencies]
+dev = [
+    { name = "pytest" },
+    { name = "ruff" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "buckaroo", specifier = "==0.14.15" },
+    { name = "click", specifier = ">=8.1" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "fastmcp", specifier = ">=2.0" },
+    { name = "geopandas", specifier = ">=1.1.3" },
+    { name = "h3", specifier = ">=4.4.2" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "ibis-framework", specifier = ">=12.0.0" },
+    { name = "markdown", specifier = ">=3.10.2" },
+    { name = "pandas", specifier = ">=2.2" },
+    { name = "pillow", specifier = ">=12.2.0" },
+    { name = "polars" },
+    { name = "pyarrow", specifier = ">=16" },
+    { name = "pydantic", specifier = ">=2.7" },
+    { name = "pygments", specifier = ">=2.20.0" },
+    { name = "scikit-learn", specifier = ">=1.4,<2.0" },
+    { name = "scipy", specifier = ">=1.17.1" },
+    { name = "seaborn", specifier = ">=0.13.2" },
+    { name = "sse-starlette", specifier = ">=2.1" },
+    { name = "tomli-w", specifier = ">=1.0" },
+    { name = "tornado", specifier = ">=6.0" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "vl-convert-python", specifier = ">=1.9.0.post1" },
+    { name = "xorq", specifier = "==0.3.26" },
+]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "pytest", specifier = ">=8" },
+    { name = "ruff", specifier = ">=0.15.15" },
 ]
 
 [[package]]

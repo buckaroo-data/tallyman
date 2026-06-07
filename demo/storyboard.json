@@ -10,7 +10,7 @@
       "tool": "catalog_create",
       "args": {
         "name": "shoe_sales",
-        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category == 'boots')\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
+        "code": "from tallyman_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category == 'boots')\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
         "prompt": "shoe sales (boots only) by region"
       },
       "narration": "beat 3: filter to shoes, name it"
@@ -18,7 +18,7 @@
     {
       "tool": "catalog_run",
       "args": {
-        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('shoe_sales')\nexpr = t.order_by('total')\n",
+        "code": "from tallyman_xorq.io import from_catalog\nt = from_catalog('shoe_sales')\nexpr = t.order_by('total')\n",
         "prompt": "verify shoe_sales totals are reasonable"
       },
       "narration": "beat 4: scratch verification — sort the result"
@@ -27,7 +27,7 @@
       "tool": "catalog_revise",
       "args": {
         "name": "shoe_sales",
-        "code": "from pydata_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category.isin(['boots', 'sneakers', 'sandals']))\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
+        "code": "from tallyman_xorq.io import from_catalog\nt = from_catalog('orders')\nfiltered = t.filter(t.category.isin(['boots', 'sneakers', 'sandals']))\nexpr = filtered.group_by('region').aggregate(total=filtered.price.sum(), n=filtered.count())\n",
         "prompt": "include sneakers and sandals too"
       },
       "narration": "beat 5: revise to a broader shoes filter (V1 becomes forensic)"

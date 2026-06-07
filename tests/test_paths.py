@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from pydata_core import (
+from tallyman_core import (
     catalog_dir,
     data_dir,
     ensure_project,
@@ -13,7 +13,7 @@ from pydata_core import (
     project_dir,
     resolve_project,
 )
-from pydata_core.paths import (
+from tallyman_core.paths import (
     active_project_file_path,
     delete_project,
     errors_path,
@@ -32,12 +32,12 @@ from pydata_core.paths import (
 
 def test_resolve_project_returns_none_when_nothing_set(isolated_home: Path, monkeypatch):
     """No file, no env → None. No zombie 'spike' default."""
-    monkeypatch.delenv("PYDATA_PROJECT", raising=False)
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
     assert resolve_project() is None
 
 
 def test_resolve_project_reads_file(isolated_home: Path, monkeypatch):
-    monkeypatch.delenv("PYDATA_PROJECT", raising=False)
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
     ensure_project("alpha")
     set_active_project("alpha")
     assert resolve_project() == "alpha"
@@ -45,7 +45,7 @@ def test_resolve_project_reads_file(isolated_home: Path, monkeypatch):
 
 def test_resolve_project_seeds_from_env_once(isolated_home: Path, monkeypatch):
     """File absent + env set → write env value to file, return it."""
-    monkeypatch.setenv("PYDATA_PROJECT", "demo")
+    monkeypatch.setenv("TALLYMAN_PROJECT", "demo")
     ensure_project("demo")
     assert resolve_project() == "demo"
     assert active_project_file_path().read_text().strip() == "demo"
@@ -55,12 +55,12 @@ def test_resolve_project_ignores_env_after_seed(isolated_home: Path, monkeypatch
     """Once file exists, env is ignored even if set to a different value."""
     ensure_project("alpha")
     set_active_project("alpha")
-    monkeypatch.setenv("PYDATA_PROJECT", "demo")
+    monkeypatch.setenv("TALLYMAN_PROJECT", "demo")
     assert resolve_project() == "alpha"
 
 
 def test_resolve_project_explicit_wins(isolated_home: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", "demo")
+    monkeypatch.setenv("TALLYMAN_PROJECT", "demo")
     ensure_project("alpha")
     set_active_project("alpha")
     # Explicit wins over both env and file.
@@ -185,12 +185,12 @@ def test_path_helpers_under_artifacts(isolated_home: Path):
     assert data_dir("alpha") == p / "data"
 
 
-def test_active_project_file_path_under_pydata_home(isolated_home: Path):
-    """File lives at $PYDATA_HOME/active_project; no per-project location."""
+def test_active_project_file_path_under_tallyman_home(isolated_home: Path):
+    """File lives at $TALLYMAN_HOME/active_project; no per-project location."""
     assert active_project_file_path() == isolated_home / "active_project"
 
 
-def test_projects_root_under_pydata_home(isolated_home: Path):
+def test_projects_root_under_tallyman_home(isolated_home: Path):
     assert projects_root() == isolated_home / "projects"
 
 

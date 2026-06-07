@@ -6,8 +6,8 @@ from pathlib import Path
 
 from click.testing import CliRunner
 
-from pydata_cli.main import cli
-from pydata_core import project_dir
+from tallyman_cli.main import cli
+from tallyman_core import project_dir
 
 
 def test_init_creates_project(isolated_home: Path):

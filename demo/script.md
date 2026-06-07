@@ -1,12 +1,12 @@
-# pydata-app demo script
+# tallyman-notebooks demo script
 
-**Talk:** *The Future of Notebooks in a Claude Code World* — PyData London 2026, 2026-06-08.
+**Talk:** *The Future of Notebooks in a Claude Code World* — Tallyman London 2026, 2026-06-08.
 
 **Stage time:** ~12 minutes live + 1 min hand-off + 1 min closing.
 
 **Thesis to land:** the notebook is the *story*; the catalog is what *did the work*; the project directory is the *artifact* — content-hashed, reproducible, hand-off-able.
 
-**Pairing**: this script is the human-readable companion to `demo/storyboard.json`, which `pydata replay` will execute deterministically if the live demo collapses (see Fallback).
+**Pairing**: this script is the human-readable companion to `demo/storyboard.json`, which `tallyman replay` will execute deterministically if the live demo collapses (see Fallback).
 
 ---
 
@@ -30,12 +30,12 @@ That's what this demo shows.
 
 ```sh
 # Terminal A — companion + buckaroo subprocess
-cd ~/code/pydata-app
-uv run pydata init spike --force          # fresh fixture; idempotent on catalog
-uv run pydata run --project spike         # http://127.0.0.1:7860
+cd ~/code/tallyman-notebooks
+uv run tallyman init spike --force          # fresh fixture; idempotent on catalog
+uv run tallyman run --project spike         # http://127.0.0.1:7860
 
-# Terminal B — Claude Code, .mcp.json auto-wires the pydata MCP server
-cd ~/code/pydata-app
+# Terminal B — Claude Code, .mcp.json auto-wires the tallyman MCP server
+cd ~/code/tallyman-notebooks
 claude .
 ```
 
@@ -44,7 +44,7 @@ Visual: terminal B (left half of screen, Claude Code), browser at http://127.0.0
 Sanity checks before walking on stage:
 - `lsof -iTCP:7860 -sTCP:LISTEN` — companion responding.
 - `lsof -iTCP:8700 -sTCP:LISTEN` — buckaroo subprocess up.
-- Browser shows empty catalog with the dataset fixture visible under `~/.pydata-app/projects/spike/data/orders.parquet`.
+- Browser shows empty catalog with the dataset fixture visible under `~/.tallyman/projects/spike/data/orders.parquet`.
 
 ---
 
@@ -72,7 +72,7 @@ Each beat = one prompt typed into Claude Code. Watch the browser update live. Pr
 
 > Add a summary stat called `boots_pct` that computes the percentage of rows in a column where the value is "boots". Use `catalog_add_summary_stat`.
 
-*Expected:* the tool writes `~/.pydata-app/projects/spike/stats/boots_pct.py`, validates it against a 1-row ibis memtable, returns success. The next time a session is loaded (next beat), the new stat appears in the summary-stats bar above the `category` column.
+*Expected:* the tool writes `~/.tallyman/projects/spike/stats/boots_pct.py`, validates it against a 1-row ibis memtable, returns success. The next time a session is loaded (next beat), the new stat appears in the summary-stats bar above the `category` column.
 
 *Presenter:* "The stats bar above the Buckaroo table is project-scoped and authored by Claude. The agent writes a `compute(col)` function in a restricted-globals namespace. No real sandbox — this is single-user local — but the validator catches arity / import / non-ibis-return mistakes before the file lands."
 
@@ -86,7 +86,7 @@ Each beat = one prompt typed into Claude Code. Watch the browser update live. Pr
 
 > We want to spot regions with too few transactions. Add a post-processing function `low_volume` that filters to rows where `n < 100`. Use `catalog_add_post_processing`.
 
-*Expected:* the tool writes `~/.pydata-app/projects/spike/post_processing/low_volume.py`, validates it against a small in-memory table (must define `process(expr) -> ibis expression | DataFrame`), returns success. The file appears as a new option in the Buckaroo embed's **post processing** dropdown on the next session load.
+*Expected:* the tool writes `~/.tallyman/projects/spike/post_processing/low_volume.py`, validates it against a small in-memory table (must define `process(expr) -> ibis expression | DataFrame`), returns success. The file appears as a new option in the Buckaroo embed's **post processing** dropdown on the next session load.
 
 *Click the post-processing dropdown on the `shoe_sales` embed; pick `low_volume`.* Table re-renders to only the low-volume regions.
 
@@ -137,16 +137,16 @@ Each beat = one prompt typed into Claude Code. Watch the browser update live. Pr
 *New terminal, in front of the audience:*
 
 ```sh
-uv run pydata pack spike -o /tmp/demo.tgz
+uv run tallyman pack spike -o /tmp/demo.tgz
 mkdir /tmp/demo-handoff && tar -xzf /tmp/demo.tgz -C /tmp/demo-handoff
-uv run pydata serve /tmp/demo-handoff/spike --port 7861
+uv run tallyman serve /tmp/demo-handoff/spike --port 7861
 ```
 
 *Open http://127.0.0.1:7861/ in a second browser window alongside the first.*
 
 *Expected:* same catalog, same notebook, same Buckaroo embed, same forensic history. **No drag handles. No × buttons. No contenteditable.** The serve mode hides edit affordances and rejects `PATCH /api/notebook`, `PUT /api/markdown/<cell_id>`, and `POST /internal/notify` with 403. No MCP server.
 
-*Presenter:* "The project directory *is* the artifact. A colleague with `pydata` installed sees exactly what I see. Every cell's expression is re-runnable from upstream parquet — content-hashed, deterministic, no kernel state to lose."
+*Presenter:* "The project directory *is* the artifact. A colleague with `tallyman` installed sees exactly what I see. Every cell's expression is re-runnable from upstream parquet — content-hashed, deterministic, no kernel state to lose."
 
 ---
 
@@ -159,7 +159,7 @@ uv run pydata serve /tmp/demo-handoff/spike --port 7861
 ## Fallback (if the agent goes off-script or the network drops)
 
 ```sh
-uv run pydata replay demo/storyboard.json --delay 2
+uv run tallyman replay demo/storyboard.json --delay 2
 ```
 
 Runs the same beats deterministically against the MCP tool surface. Pair it with the running companion on :7860 — the browser updates the same way as the live demo. Use `--delay 2` for stage pacing.
@@ -167,8 +167,8 @@ Runs the same beats deterministically against the MCP tool surface. Pair it with
 Also rehearse a clean reset in case you need to restart mid-talk:
 
 ```sh
-rm -rf ~/.pydata-app/projects/spike
-uv run pydata init spike            # fresh fixture, fresh catalog
+rm -rf ~/.tallyman/projects/spike
+uv run tallyman init spike            # fresh fixture, fresh catalog
 ```
 
 ---
@@ -201,7 +201,7 @@ This hurts notebook reproducability, because I'm specifically not re-executing a
 I have done a limited amount of AI assisted notebook coding, but I have found that it is like collaborating with another human on the same notebook.  I don't trust the state of the kernel and cells to change beneath me in a coherent way.  
 
 
-I joined xorq 3 months ago because I was excited about their core framework that regularlizes and unifies a lot of data engineering tasks into a declarative DSL that addresses cachability, reproducability, verifiable lineage into a coherent dsl.  This talk builds heavily on the xorq cache system to build a system for interactive data analysis that bridges the gap between what the pydata arrow stack is good at, claude does well, and what notebooks are good at.
+I joined xorq 3 months ago because I was excited about their core framework that regularlizes and unifies a lot of data engineering tasks into a declarative DSL that addresses cachability, reproducability, verifiable lineage into a coherent dsl.  This talk builds heavily on the xorq cache system to build a system for interactive data analysis that bridges the gap between what the tallyman arrow stack is good at, claude does well, and what notebooks are good at.
 
 
 when working in a notebook on a data problem (before buckaroo) I generally start by loading the dataframe and typing `df.head()`  then I poke around a bit to get a feel for the data.  Buckaroo makes this manual inspection much quicker (it's still very relevant in the claude code world).  next I try to perform some operations on the dataframe, some types of transformations to expose a particular aspect or pattern in the data.  Claude is very helpful for these parts for writing the python code.

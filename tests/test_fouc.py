@@ -11,12 +11,12 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_mcp.server import catalog_create
+from tallyman_mcp.server import catalog_create
 
 
 def _agg(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -80,7 +80,7 @@ def test_unknown_api_path_404s(fresh_companion_app, project: str):
 
 def test_entry_detail_api_returns_entry_data(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Entry detail data is served via JSON API, not server-rendered HTML."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{out['hash']}")
@@ -94,7 +94,7 @@ def test_entry_detail_api_returns_entry_data(fresh_companion_app, project: str, 
 
 def test_lineage_api_returns_layout_data(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     """Lineage layout is served via JSON API for the React SPA DAG renderer."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/lineage_layout/{out['hash']}")

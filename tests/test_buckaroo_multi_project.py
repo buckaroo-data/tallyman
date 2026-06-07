@@ -4,7 +4,7 @@ Content hashes are globally unique by definition (content-addressed), so one
 Buckaroo subprocess can serve sessions backed by xorq builds from any project.
 The manager no longer captures a single project at construction time; the
 project travels with each ``ensure_session(hash, project)`` call. Session
-state lives in a single global file at ``~/.pydata-app/buckaroo_sessions.json``
+state lives in a single global file at ``~/.tallyman/buckaroo_sessions.json``
 keyed by hash, with the project recorded so a restart can find the parquet
 again.
 """
@@ -14,9 +14,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydata_companion.buckaroo_lifecycle import BuckarooManager
-from pydata_core import ensure_project
-from pydata_core.paths import buckaroo_sessions_path
+from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_core import ensure_project
+from tallyman_core.paths import buckaroo_sessions_path
 
 # ---------------------------------------------------------------------------
 # Constructor shape
@@ -54,7 +54,7 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResp())
 
     # An xorq_build dir must exist for ensure_session not to short-circuit.
-    from pydata_core.paths import entry_dir
+    from tallyman_core.paths import entry_dir
 
     for proj, h in (("alpha", "hash_a"), ("beta", "hash_b")):
         d = entry_dir(proj, h) / "xorq_build"
@@ -76,10 +76,10 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
 
 
 def test_session_file_lives_at_global_location(isolated_home: Path):
-    """The on-disk session map is one file under ``~/.pydata-app/``, not under
+    """The on-disk session map is one file under ``~/.tallyman/``, not under
     any specific project's catalog. Schema includes the project per hash so
     a restart-reload knows which parquet to find."""
-    from pydata_core.paths import entry_dir
+    from tallyman_core.paths import entry_dir
 
     ensure_project("alpha")
     # Minimal entry so the prune check on _load_session_file lets the
@@ -112,7 +112,7 @@ def test_startup_prunes_entries_for_missing_parquets(isolated_home: Path):
     ensure_project("alpha")
     # Write a session file with one valid entry (parquet exists) and one stale
     # entry (no such project at all).
-    from pydata_core.paths import entry_dir
+    from tallyman_core.paths import entry_dir
 
     valid_dir = entry_dir("alpha", "valid_hash")
     valid_dir.mkdir(parents=True, exist_ok=True)
@@ -140,7 +140,7 @@ def test_startup_prunes_entries_for_missing_parquets(isolated_home: Path):
 def test_persist_only_writes_global_file_not_per_project(isolated_home: Path):
     """Negative assertion: nothing gets written under
     ``<project>/artifacts/catalog/buckaroo_sessions.json`` anymore."""
-    from pydata_core.paths import catalog_dir
+    from tallyman_core.paths import catalog_dir
 
     ensure_project("alpha")
     mgr = BuckarooManager()

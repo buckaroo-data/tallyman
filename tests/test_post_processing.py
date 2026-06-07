@@ -4,7 +4,7 @@ Mirror of ``test_summary_stats.py`` for the parallel channel that backs
 buckaroo's "post processing" dropdown via
 ``xorq_loading.load_project_post_processing_klasses``. Two layers:
 
-- ``pydata_core.post_processing``: write/list/remove + the dry-run
+- ``tallyman_core.post_processing``: write/list/remove + the dry-run
   validator that gates ``write_post_processing``.
 - MCP tools: the three ``catalog_*_post_processing`` wrappers around
   the core module, exposing the same surface to an agent.
@@ -18,13 +18,13 @@ from __future__ import annotations
 
 import pytest
 
-from pydata_core import (
+from tallyman_core import (
     PostProcessingSourceError,
     list_post_processings,
     remove_post_processing,
     write_post_processing,
 )
-from pydata_core.post_processing import (
+from tallyman_core.post_processing import (
     post_processing_dir,
     validate_post_processing_source,
 )
@@ -34,7 +34,7 @@ NOOP = "def process(expr):\n    return expr\n"
 
 
 # ---------------------------------------------------------------------------
-# pydata_core.post_processing — write/list/remove + dry-run
+# tallyman_core.post_processing — write/list/remove + dry-run
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +118,7 @@ def test_listing_with_no_directory_is_empty(project: str):
 
 
 def test_mcp_add_remove_list_smoke(project: str):
-    from pydata_mcp.server import (
+    from tallyman_mcp.server import (
         catalog_add_post_processing,
         catalog_list_post_processings,
         catalog_remove_post_processing,
@@ -140,7 +140,7 @@ def test_mcp_add_remove_list_smoke(project: str):
 
 
 def test_mcp_add_rejects_bad_source(project: str):
-    from pydata_mcp.server import catalog_add_post_processing
+    from tallyman_mcp.server import catalog_add_post_processing
 
     resp = catalog_add_post_processing("evil", "import os\ndef process(expr): return expr\n")
     assert "error" in resp
@@ -148,7 +148,7 @@ def test_mcp_add_rejects_bad_source(project: str):
 
 
 def test_mcp_remove_nonexistent_returns_error(project: str):
-    from pydata_mcp.server import catalog_remove_post_processing
+    from tallyman_mcp.server import catalog_remove_post_processing
 
     resp = catalog_remove_post_processing("never_existed")
     assert resp["error"] == "no post-processing named 'never_existed'"
@@ -161,7 +161,7 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
 
 def _agg_code(project: str) -> str:
     return (
-        "from pydata_xorq.io import from_project\n"
+        "from tallyman_xorq.io import from_project\n"
         f"t = from_project('orders.parquet', project={project!r})\n"
         "expr = t.group_by('region').aggregate(n=t.count())\n"
     )
@@ -169,8 +169,8 @@ def _agg_code(project: str) -> str:
 
 def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch):
     """run_post_processing resolves an alias and returns filtered rows."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
     catalog_create("agg", _agg_code(project))
     resp = catalog_run_post_processing(
@@ -185,8 +185,8 @@ def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch)
 
 def test_run_post_processing_by_hash(project: str, orders_parquet, monkeypatch):
     """run_post_processing accepts a raw content hash."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
     out = catalog_create("agg2", _agg_code(project))
     resp = catalog_run_post_processing(
@@ -199,8 +199,8 @@ def test_run_post_processing_by_hash(project: str, orders_parquet, monkeypatch):
 
 def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, monkeypatch):
     """A filter in process() produces fewer rows than the original."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
     catalog_create("agg3", _agg_code(project))
     all_rows = catalog_run_post_processing("def process(expr):\n    return expr\n", "agg3")
@@ -212,8 +212,8 @@ def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, m
 
 def test_run_post_processing_bad_code_returns_error(project: str, orders_parquet, monkeypatch):
     """Syntax errors in the process function surface as error dict."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create, catalog_run_post_processing
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
     catalog_create("agg4", _agg_code(project))
     resp = catalog_run_post_processing("def process(expr):\n    return 42\n", "agg4")
@@ -222,8 +222,8 @@ def test_run_post_processing_bad_code_returns_error(project: str, orders_parquet
 
 def test_run_post_processing_unknown_entry_returns_error(project: str, monkeypatch):
     """Unknown alias or hash returns error dict, does not raise."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_run_post_processing
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_run_post_processing
 
     resp = catalog_run_post_processing("def process(expr):\n    return expr\n", "no_such_entry")
     assert "error" in resp

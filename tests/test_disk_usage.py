@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-import pydata_companion.app as app_mod
-from pydata_core.paths import catalog_dir, result_cache_dir
+import tallyman_companion.app as app_mod
+from tallyman_core.paths import catalog_dir, result_cache_dir
 
 
 def _write(path, blob: bytes) -> None:

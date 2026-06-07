@@ -1,7 +1,7 @@
 [project]
-name = "pydata-app"
+name = "tallyman-notebooks"
 version = "0.0.1"
-description = "Deconstructed notebook for the PyData London 2026 talk"
+description = "tallyman — deconstructed notebook platform"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
 dependencies = [
@@ -37,7 +37,7 @@ dependencies = [
 ]
 
 [project.scripts]
-pydata = "pydata_cli.main:cli"
+tallyman = "tallyman_cli.main:cli"
 
 [dependency-groups]
 dev = [
@@ -51,11 +51,11 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = [
-    "src/pydata_core",
-    "src/pydata_xorq",
-    "src/pydata_mcp",
-    "src/pydata_companion",
-    "src/pydata_cli",
+    "src/tallyman_core",
+    "src/tallyman_xorq",
+    "src/tallyman_mcp",
+    "src/tallyman_companion",
+    "src/tallyman_cli",
 ]
 
 [tool.ruff]

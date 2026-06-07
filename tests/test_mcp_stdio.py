@@ -1,4 +1,4 @@
-"""Real wire-protocol test: spawn `pydata mcp` and drive it over stdio.
+"""Real wire-protocol test: spawn `tallyman mcp` and drive it over stdio.
 
 This is the test that proves a fresh Claude Code session pointed at our
 `.mcp.json` will round-trip tool calls. It spawns the CLI as a subprocess
@@ -30,15 +30,15 @@ def _has_uv() -> bool:
 needs_uv = pytest.mark.skipif(not _has_uv(), reason="uv not on PATH")
 
 
-def _client(project_name: str, pydata_home: Path) -> Client:
+def _client(project_name: str, tallyman_home: Path) -> Client:
     env = {
         **os.environ,
-        "PYDATA_PROJECT": project_name,
-        "PYDATA_HOME": str(pydata_home),
+        "TALLYMAN_PROJECT": project_name,
+        "TALLYMAN_HOME": str(tallyman_home),
     }
     transport = StdioTransport(
         command="uv",
-        args=["run", "pydata", "mcp"],
+        args=["run", "tallyman", "mcp"],
         env=env,
         cwd=str(REPO_ROOT),
     )
@@ -94,12 +94,12 @@ def test_stdio_create_revise_diff_round_trip(isolated_home: Path, project: str, 
     async def go():
         async with _client(project, isolated_home) as client:
             code1 = f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
             code2 = f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())

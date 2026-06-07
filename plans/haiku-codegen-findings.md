@@ -12,12 +12,12 @@ Generated 2026-05-30. The 5 DS demo-script step-intents were fed to a Haiku mode
 - ✗ **step 2** `catalog_create` — BUILD_ERROR
   - `executing user code raised: module 'ibis' has no attribute 'to_date'. 
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", line 112, in _import_script`
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", line 112, in _import_script`
 - · **step 3** `catalog_chart` — 
 - ✗ **step 4** `catalog_revise` — BUILD_ERROR
   - `executing user code raised: catalog entry 'stock_returns' not found in project 'haiku-ts'
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", line 112, i`
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", line 112, i`
 - · **step 5** `catalog_chart` — 
 - · **step 6** `catalog_diff` — 
 - ✗ **step 7** `catalog_run_post_processing` — PP_RUN_ERROR  ⚠ imports `pandas` in process() (sandbox blocks __import__), imports `scipy` in process() (sandbox blocks __import__)
@@ -33,9 +33,9 @@ Traceback (most recent call last):
 - ✗ **step 4** `catalog_create` — BUILD_ERROR
   - `executing user code raised: struct() got an unexpected keyword argument 'mean'
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", line 112, in _import_s`
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", line 112, in _import_s`
 - ✗ **step 5** `catalog_create` — OTHER_ERROR
-  - `IsADirectoryError: [Errno 21] Is a directory: '/tmp/claude-501/pydata_build_78hd_37o/8d7ab266d947/memtables'`
+  - `IsADirectoryError: [Errno 21] Is a directory: '/tmp/claude-501/tallyman_build_78hd_37o/8d7ab266d947/memtables'`
 - ✗ **step 6** `catalog_run_post_processing` — PP_RUN_ERROR  ⚠ imports `pandas` in process() (sandbox blocks __import__), imports `scipy` in process() (sandbox blocks __import__)
   - `source raised at exec time: ImportError('__import__ not found')`
 - ✗ **step 7** `catalog_add_post_processing` — PP_VALIDATE_ERROR  ⚠ imports `pandas` in process() (sandbox blocks __import__), imports `scipy` in process() (sandbox blocks __import__)
@@ -45,7 +45,7 @@ Traceback (most recent call last):
 - ✗ **step 9** `catalog_revise` — BUILD_ERROR
   - `executing user code raised: struct() got an unexpected keyword argument 'mean'
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", line 112, in _import_s`
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", line 112, in _import_s`
 
 ## survival-cohort-analysis  (project `haiku-titanic`)
 
@@ -87,12 +87,12 @@ Traceback (most recent call last):
 - ✗ **step 6** `catalog_create` — BUILD_ERROR
   - `executing user code raised: No module named 'sklearn'
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", line 112, in _import_script
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", line 112, in _import_script
     spec.loader.exe`
 - ✗ **step 7** `catalog_create` — BUILD_ERROR
   - `executing user code raised: catalog entry 'penguins_labeled' not found in project 'haiku-penguins'
 Traceback (most recent call last):
-  File "/Users/paddy/code/pydata-app/src/pydata_xorq/build.py", li`
+  File "/Users/paddy/code/tallyman-notebooks/src/tallyman_xorq/build.py", li`
 - · **step 8** `catalog_chart` — 
 - ✗ **step 9** `catalog_add_summary_stat` — STAT_ERROR
   - `source raised at exec time: ImportError('__import__ not found')`

@@ -18,11 +18,11 @@ from pathlib import Path
 
 import pytest
 
-from pydata_core import catalog_state as cs
-from pydata_core import charts, git_util, notebook, paths
-from pydata_core import post_processing as pp
-from pydata_core import summary_stats as ss
-from pydata_xorq import build_and_persist
+from tallyman_core import catalog_state as cs
+from tallyman_core import charts, git_util, notebook, paths
+from tallyman_core import post_processing as pp
+from tallyman_core import summary_stats as ss
+from tallyman_xorq import build_and_persist
 
 PP_SRC = "def process(expr):\n    return expr\n"
 ST_SRC = "def compute(col):\n    return col.count()\n"
@@ -93,7 +93,7 @@ def test_capture_materialize_roundtrip(project):
     charts.set_chart(project, "deadbeef", SPEC)
     notebook.append(project, "alias1", markdown="hello")
 
-    state = cs.capture_pydata_state(project)
+    state = cs.capture_tallyman_state(project)
     assert any(e["name"] == "pp1" for e in state["post_processing"])
     assert any(e["name"] == "st1" for e in state["stats"])
     assert any(c["content_hash"] == "deadbeef" for c in state["charts"])
@@ -121,7 +121,7 @@ def test_materialize_absent_key_preserves_files(project):
 def test_materialize_present_empty_clears(project):
     """A present-but-empty list is a deliberate 'none at this step'."""
     pp.write_post_processing(project, "doomed", PP_SRC)
-    cs.write_pydata_state(project, post_processing=[])
+    cs.write_tallyman_state(project, post_processing=[])
     cs.materialize(project)
     assert pp.list_post_processings(project) == []
 
@@ -134,7 +134,7 @@ def test_materialize_present_empty_clears(project):
 def test_prune_entries_to_recorded(project):
     for h in ("aaaa", "bbbb"):
         paths.entry_dir(project, h).mkdir(parents=True)
-    cs.write_pydata_state(project, entry_hashes=["aaaa"])
+    cs.write_tallyman_state(project, entry_hashes=["aaaa"])
     assert cs.prune_entries(project) == 1
     assert paths.entry_dir(project, "aaaa").exists()
     assert not paths.entry_dir(project, "bbbb").exists()
@@ -151,7 +151,7 @@ def test_prune_compute_cache_to_recorded(project):
     cdir.mkdir(parents=True)
     (cdir / "keep.parquet").write_bytes(b"x")
     (cdir / "drop.parquet").write_bytes(b"y")
-    cs.write_pydata_state(project, compute_cache=["keep.parquet"])
+    cs.write_tallyman_state(project, compute_cache=["keep.parquet"])
     assert cs.prune_compute_cache(project) == 1
     assert {p.name for p in cdir.iterdir()} == {"keep.parquet"}
 
@@ -166,7 +166,7 @@ def test_checkpoint_one_commit_and_clean_tree(project):
     base = _commit_count(project)
     pp.write_post_processing(project, "pp1", PP_SRC)
     notebook.append(project, "alias1", markdown="note")
-    cs.checkpoint_catalog(project, "pydata: add pp1")
+    cs.checkpoint_catalog(project, "tallyman: add pp1")
     assert _commit_count(project) == base + 1  # exactly one, not three
     dirty = _git(project, "status", "--porcelain", "--untracked-files=no")
     assert dirty == "", f"tracked tree not clean after checkpoint: {dirty!r}"
@@ -242,7 +242,7 @@ def test_reset_prunes_compute_cache_to_warm_set(project):
     cc.mkdir(parents=True)
     (cc / "baseline.parquet").write_bytes(b"a")
     s1 = cs.checkpoint_catalog(project, "baseline")
-    assert set(cs.read_pydata_state(project)["compute_cache"]) == {"baseline.parquet"}
+    assert set(cs.read_tallyman_state(project)["compute_cache"]) == {"baseline.parquet"}
 
     (cc / "added.parquet").write_bytes(b"b")
     cs.checkpoint_catalog(project, "added later")
@@ -265,7 +265,7 @@ def test_every_mcp_tool_is_checkpoint_wrapped():
     """Opt-out, structurally: every @mcp.tool() registration passes through the
     checkpoint wrapper, so a tool added next month is covered by default and
     only the explicit read-only/lifecycle denylist suppresses the checkpoint."""
-    from pydata_mcp import server
+    from tallyman_mcp import server
 
     assert server.mcp.tool.__name__ == "_checkpointing_tool"  # registration is wrapped
     mutating = {
@@ -290,7 +290,7 @@ def test_every_mcp_tool_is_checkpoint_wrapped():
 
 
 def test_mcp_mutating_tool_checkpoints_once(project):
-    from pydata_mcp.server import catalog_add_post_processing, catalog_list
+    from tallyman_mcp.server import catalog_add_post_processing, catalog_list
 
     base = _steps(project)
     res = catalog_add_post_processing(name="pp_hook", source=PP_SRC)
@@ -303,7 +303,7 @@ def test_mcp_mutating_tool_checkpoints_once(project):
 
 
 def test_mcp_multi_mutator_tool_is_one_step(project, orders_parquet):
-    from pydata_mcp.server import catalog_create
+    from tallyman_mcp.server import catalog_create
 
     base = _steps(project)
     res = catalog_create(name="agg", code=_agg_code(orders_parquet))
@@ -312,7 +312,7 @@ def test_mcp_multi_mutator_tool_is_one_step(project, orders_parquet):
 
 
 def test_mcp_failing_tool_does_not_checkpoint(project):
-    from pydata_mcp.server import catalog_add_post_processing
+    from tallyman_mcp.server import catalog_add_post_processing
 
     base = _steps(project)
     res = catalog_add_post_processing(name="bad", source="not python ((")
@@ -364,14 +364,14 @@ def test_companion_reset_endpoint(fresh_companion_app, project):
 def test_cli_genesis_revisions_label_and_reset(isolated_home):
     from click.testing import CliRunner
 
-    from pydata_cli.main import cli
+    from tallyman_cli.main import cli
 
     runner = CliRunner()
     assert runner.invoke(cli, ["init", "alpha", "--no-fixture"]).exit_code == 0
     assert "step-000" in _git("alpha", "tag", "-l", "step-*")  # genesis baseline
 
     pp.write_post_processing("alpha", "pp1", PP_SRC)
-    cs.checkpoint_catalog("alpha", "pydata: add pp1")
+    cs.checkpoint_catalog("alpha", "tallyman: add pp1")
 
     listed = runner.invoke(cli, ["revisions", "--project", "alpha"])
     assert listed.exit_code == 0, listed.output
@@ -393,7 +393,7 @@ def test_cli_reset_notify_names_the_reset_project(isolated_home, monkeypatch):
     import httpx
     from click.testing import CliRunner
 
-    from pydata_cli.main import cli
+    from tallyman_cli.main import cli
 
     sent = {}
     monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: sent.update(url=url, json=json))
@@ -439,8 +439,8 @@ def test_cross_process_checkpoint(project, isolated_home):
     import sys
 
     cs.ensure_catalog_repo(project)
-    code = f"from pydata_core.catalog_state import checkpoint_catalog; checkpoint_catalog({project!r}, 'from child')"
-    env = {**os.environ, "PYDATA_HOME": str(isolated_home)}
+    code = f"from tallyman_core.catalog_state import checkpoint_catalog; checkpoint_catalog({project!r}, 'from child')"
+    env = {**os.environ, "TALLYMAN_HOME": str(isolated_home)}
     procs = [sp.Popen([sys.executable, "-c", code], env=env, stdout=sp.DEVNULL, stderr=sp.DEVNULL) for _ in range(2)]
     for p in procs:
         assert p.wait(timeout=120) == 0
@@ -515,7 +515,7 @@ def test_load_entry_uses_per_project_compute_cache(project, monkeypatch):
     load_entry — so load_entry must use the per-project compute cache, not the
     global ~/.cache/xorq. Otherwise the recorded warm-set is vacuous and
     reset's prune cannot make a re-added expression compute cold."""
-    from pydata_xorq import build as build_mod
+    from tallyman_xorq import build as build_mod
 
     (paths.entry_dir(project, "cafe0001") / "xorq_build").mkdir(parents=True)
     seen = {}
@@ -524,7 +524,7 @@ def test_load_entry_uses_per_project_compute_cache(project, monkeypatch):
         seen["cache_dir"] = Path(cache_dir)
         return "expr"
 
-    monkeypatch.setattr("pydata_xorq.portable.load_expr_portable", spy)
+    monkeypatch.setattr("tallyman_xorq.portable.load_expr_portable", spy)
     assert build_mod.load_entry(project, "cafe0001") == "expr"
     assert seen["cache_dir"] == paths.compute_cache_dir(project)
 
@@ -548,7 +548,7 @@ def test_prune_retires_to_bullpen_not_delete(project):
     rcd.mkdir(parents=True)
     (rcd / "res.parquet").write_bytes(b"q")
 
-    cs.write_pydata_state(project, entry_hashes=[], result_cache=[], compute_cache=[])
+    cs.write_tallyman_state(project, entry_hashes=[], result_cache=[], compute_cache=[])
     assert cs.prune_entries(project) == 1
     assert cs.prune_result_cache(project) == 1
     assert cs.prune_compute_cache(project) == 1
@@ -600,14 +600,14 @@ def test_capture_seeds_xorq_keys(project):
     its two keys is the whole coexistence contract."""
     import yaml as _yaml
 
-    cs.capture_pydata_state(project)
+    cs.capture_tallyman_state(project)
     raw = _yaml.safe_load((paths.catalog_dir(project) / "catalog.yaml").read_text())
     assert raw.get("entries") == []
     assert raw.get("aliases") == []
 
 
-def test_write_pydata_state_rejects_unrepresentable_values(project):
-    """write_pydata_state must never produce a catalog.yaml that safe_load
+def test_write_tallyman_state_rejects_unrepresentable_values(project):
+    """write_tallyman_state must never produce a catalog.yaml that safe_load
     cannot read back. The reader (_read_raw) is yaml.safe_load, while the
     writer's full Dumper happily emits python-object tags for a stray Path —
     one such write bricks every later read: checkpoint, materialize, and prune
@@ -616,11 +616,11 @@ def test_write_pydata_state_rejects_unrepresentable_values(project):
     catalog.yaml intact."""
     import yaml as _yaml
 
-    cs.write_pydata_state(project, charts=[])  # a good file exists first
+    cs.write_tallyman_state(project, charts=[])  # a good file exists first
     bad_spec = {"content_hash": "x", "spec": {"path": Path("/tmp/x")}}
     with pytest.raises(_yaml.YAMLError):
-        cs.write_pydata_state(project, charts=[bad_spec])
-    assert cs.read_pydata_state(project)["charts"] == []  # previous file untouched
+        cs.write_tallyman_state(project, charts=[bad_spec])
+    assert cs.read_tallyman_state(project)["charts"] == []  # previous file untouched
 
 
 @pytest.mark.integration

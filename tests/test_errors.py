@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from pydata_core import clear_errors, get_error, list_errors, record_error
-from pydata_mcp.server import catalog_run
+from tallyman_core import clear_errors, get_error, list_errors, record_error
+from tallyman_mcp.server import catalog_run
 
 
 def test_record_error_writes_jsonl(project: str):
@@ -32,7 +32,7 @@ def test_get_error_by_id(project: str):
 
 
 def test_catalog_run_failure_records_error(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run("expr = nope", prompt="broken thing")
     assert "error" in out
     assert "error_id" in out
@@ -86,7 +86,7 @@ def test_record_error_persists_tool_field(project: str):
 
 
 def test_catalog_run_records_tool_name(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run("expr = nope", prompt="broken")
     assert "error" in out
     rec = list_errors(project)[0]
@@ -94,8 +94,8 @@ def test_catalog_run_records_tool_name(project: str, monkeypatch):
 
 
 def test_catalog_create_failure_records_tool_name(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create
 
     out = catalog_create("x", "expr = oops", prompt="bad")
     assert "error" in out
@@ -122,13 +122,13 @@ def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
 
 def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """Entries and error APIs return independent data for the React sidebar."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create
 
     catalog_create(
         "shoe_sales",
         f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
@@ -174,7 +174,7 @@ def test_companion_clear_errors_route(fresh_companion_app, project: str):
 
 def test_companion_clear_errors_serve_mode_403(project: str):
     record_error(project, code="x", message="boom")
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     app = create_app(project, read_only=True)
     c = TestClient(app)

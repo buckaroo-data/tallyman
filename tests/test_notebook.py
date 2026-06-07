@@ -5,9 +5,9 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from pydata_core import notebook
-from pydata_core.notebook import CellNotFound
-from pydata_mcp.server import (
+from tallyman_core import notebook
+from tallyman_core.notebook import CellNotFound
+from tallyman_mcp.server import (
     catalog_alias,
     catalog_create,
     catalog_rename,
@@ -22,7 +22,7 @@ from pydata_mcp.server import (
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -30,7 +30,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 
 def _filter_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
@@ -38,7 +38,7 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
 
 
 # ---------------------------------------------------------------------------
-# pydata_core.notebook storage
+# tallyman_core.notebook storage
 # ---------------------------------------------------------------------------
 
 
@@ -118,7 +118,7 @@ def test_remove_alias_from_cells(project: str):
 
 
 def test_catalog_create_appends_cell(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="seed text")
     cells = notebook.load(project)["cells"]
     assert len(cells) == 1
@@ -127,7 +127,7 @@ def test_catalog_create_appends_cell(project: str, orders_parquet: Path, monkeyp
 
 
 def test_catalog_revise_does_not_duplicate_cell(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="seed")
     catalog_revise("shoe_sales", _filter_code(project), prompt="revised")
     cells = notebook.load(project)["cells"]
@@ -137,7 +137,7 @@ def test_catalog_revise_does_not_duplicate_cell(project: str, orders_parquet: Pa
 
 
 def test_catalog_alias_appends_cell(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project), prompt="exploratory")
     catalog_alias(scratch["hash"], "shoe_sales")
     cells = notebook.load(project)["cells"]
@@ -146,7 +146,7 @@ def test_catalog_alias_appends_cell(project: str, orders_parquet: Path, monkeypa
 
 
 def test_catalog_rename_renames_cell_in_place(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("old", _agg_code(project))
     catalog_rename("old", "new")
     cells = notebook.load(project)["cells"]
@@ -155,7 +155,7 @@ def test_catalog_rename_renames_cell_in_place(project: str, orders_parquet: Path
 
 
 def test_catalog_unalias_drops_cell(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("dropme", _agg_code(project))
     out = catalog_unalias("dropme")
     assert out["notebook_cells_removed"] == 1
@@ -163,7 +163,7 @@ def test_catalog_unalias_drops_cell(project: str, orders_parquet: Path, monkeypa
 
 
 def test_notebook_reorder_tool(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     catalog_create("b", _filter_code(project))
     cells = notebook.load(project)["cells"]
@@ -173,7 +173,7 @@ def test_notebook_reorder_tool(project: str, orders_parquet: Path, monkeypatch):
 
 
 def test_notebook_remove_tool(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     cells = notebook.load(project)["cells"]
     notebook_remove(cells[0]["cell_id"])
@@ -181,7 +181,7 @@ def test_notebook_remove_tool(project: str, orders_parquet: Path, monkeypatch):
 
 
 def test_notebook_edit_markdown_tool(project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project), prompt="original")
     cell = notebook.load(project)["cells"][0]
     notebook_edit_markdown(cell["cell_id"], "agent-written narrative")
@@ -189,7 +189,7 @@ def test_notebook_edit_markdown_tool(project: str, orders_parquet: Path, monkeyp
 
 
 def test_notebook_tool_errors_on_missing(project: str, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     for fn in (notebook_remove, notebook_edit_markdown):
         if fn is notebook_edit_markdown:
             out = fn("missing", "x")
@@ -211,7 +211,7 @@ def test_notebook_route_empty(fresh_companion_app, project: str):
 
 
 def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="region totals")
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/notebook_full")
@@ -223,7 +223,7 @@ def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_
 
 
 def test_api_notebook_reorder(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     catalog_create("b", _filter_code(project))
     cells = notebook.load(project)["cells"]
@@ -237,7 +237,7 @@ def test_api_notebook_reorder(fresh_companion_app, project: str, orders_parquet:
 
 
 def test_api_notebook_remove(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     cells = notebook.load(project)["cells"]
     c = TestClient(fresh_companion_app)
@@ -250,7 +250,7 @@ def test_api_notebook_remove(fresh_companion_app, project: str, orders_parquet: 
 
 
 def test_api_markdown_put(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
     c = TestClient(fresh_companion_app)
@@ -260,7 +260,7 @@ def test_api_markdown_put(fresh_companion_app, project: str, orders_parquet: Pat
 
 
 def test_serve_mode_rejects_notebook_mutations(project: str):
-    from pydata_companion import create_app
+    from tallyman_companion import create_app
 
     app = create_app(project, read_only=True)
     c = TestClient(app)
@@ -275,9 +275,9 @@ def test_api_notebook_unknown_action(fresh_companion_app, project: str):
 
 
 def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc
-    from pydata_mcp.server import notebook_edit_markdown as _em
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create as _cc
+    from tallyman_mcp.server import notebook_edit_markdown as _em
 
     _cc("shoe_sales", _agg_code(project))
     cell = notebook.load(project)["cells"][0]
@@ -294,8 +294,8 @@ def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, or
 def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
     fresh_companion_app, project: str, orders_parquet, monkeypatch
 ):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project), prompt="")
     c = TestClient(fresh_companion_app)
@@ -309,8 +309,8 @@ def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
 def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """T-10: in-place updates need the server to send back rendered HTML
     so the client can swap it in without a reload."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
@@ -324,8 +324,8 @@ def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, o
 
 def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """T-09: drag-reorder is handled by dnd-kit in the React SPA; API must accept reorder."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)
@@ -336,9 +336,9 @@ def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, o
 
 
 def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_companion import create_app
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_companion import create_app
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project))
     app = create_app(project, read_only=True)
@@ -351,9 +351,9 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
 
 def test_notebook_uses_buckaroo_embed_when_session_available(project: str, orders_parquet, monkeypatch):
     """notebook_full API returns buckaroo_session when Buckaroo is running."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_companion import create_app
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_companion import create_app
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project))
 
@@ -384,7 +384,7 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
     assert cell["buckaroo_session"].startswith("sess-")
 
     # /api/session/<hash> returns the WS URL on demand.
-    from pydata_core import get_alias
+    from tallyman_core import get_alias
 
     content_hash = get_alias(project, "shoe_sales")
     sr = c.get(f"/{project}/api/session/{content_hash}")
@@ -394,8 +394,8 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
 
 def test_notebook_falls_back_to_html_when_no_buckaroo(fresh_companion_app, project: str, orders_parquet, monkeypatch):
     """notebook_full API signals buckaroo unavailable when no manager is configured."""
-    monkeypatch.setenv("PYDATA_PROJECT", project)
-    from pydata_mcp.server import catalog_create as _cc
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_mcp.server import catalog_create as _cc
 
     _cc("shoe_sales", _agg_code(project))
     c = TestClient(fresh_companion_app)

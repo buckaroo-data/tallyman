@@ -4,14 +4,14 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_core import set_alias
-from pydata_xorq import build_and_persist
-from pydata_xorq.layout import layered_positions
+from tallyman_core import set_alias
+from tallyman_xorq import build_and_persist
+from tallyman_xorq.layout import layered_positions
 
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -19,7 +19,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 
 def _from_catalog_code(project: str, parent: str) -> str:
     return f"""
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog({parent!r}, project={project!r})
 expr = t.order_by("total")
 """

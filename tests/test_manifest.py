@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydata_core import Manifest, read_manifest, write_manifest
+from tallyman_core import Manifest, read_manifest, write_manifest
 
 
 def test_manifest_round_trip(tmp_path: Path):

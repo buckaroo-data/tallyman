@@ -61,7 +61,7 @@ def run_git(args, cwd=None) -> str:
         with tempfile.TemporaryFile() as out:
             file_actions = [
                 (os.POSIX_SPAWN_DUP2, out.fileno(), 1),  # stdout -> temp file
-                (os.POSIX_SPAWN_DUP2, devnull, 2),       # stderr -> /dev/null
+                (os.POSIX_SPAWN_DUP2, devnull, 2),  # stderr -> /dev/null
             ]
             pid = os.posix_spawn(GIT, argv, os.environ, file_actions=file_actions)
             _, status = os.waitpid(pid, 0)
@@ -150,10 +150,7 @@ def stress(fn, label, n_threads=24, iters=40):
         t.join()
     stop.set()
     total = n_threads * iters
-    print(
-        f"  {label}: {len(oks)}/{total} succeeded, {len(errors)} errors, "
-        f"{sum(oks)} correct, {time.time() - t0:.2f}s"
-    )
+    print(f"  {label}: {len(oks)}/{total} succeeded, {len(errors)} errors, {sum(oks)} correct, {time.time() - t0:.2f}s")
     if errors:
         print(f"    first error: {errors[0]}")
     return len(errors) == 0 and sum(oks) == total, expected
@@ -220,9 +217,7 @@ def main():
     )
     mechanism(
         "subprocess([ABS_GIT, ...], close_fds=False)",
-        lambda: subprocess.check_output(
-            [GIT, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, close_fds=False
-        ),
+        lambda: subprocess.check_output([GIT, "rev-parse", "HEAD"], stderr=subprocess.DEVNULL, close_fds=False),
     )
 
     print("\n" + "=" * 72)

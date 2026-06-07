@@ -2,11 +2,11 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from pydata_companion import create_app
-from pydata_core.aliases import history_for
-from pydata_core.paths import entry_dir
-from pydata_mcp.server import catalog_create, catalog_revise
-from pydata_xorq.build import list_entries
+from tallyman_companion import create_app
+from tallyman_core.aliases import history_for
+from tallyman_core.paths import entry_dir
+from tallyman_mcp.server import catalog_create, catalog_revise
+from tallyman_xorq.build import list_entries
 
 # The cache pane is a React page (CachePage) backed by JSON: GET
 # /{project}/api/result_cache lists materialised parquets, DELETE
@@ -16,7 +16,7 @@ from pydata_xorq.build import list_entries
 
 def _agg_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
@@ -24,7 +24,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 
 def _filter_code(project: str) -> str:
     return f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
@@ -32,7 +32,7 @@ expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 
 
 def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     c = TestClient(fresh_companion_app)
@@ -51,7 +51,7 @@ def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, 
 
 
 def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
     edir = entry_dir(project, h)
@@ -76,7 +76,7 @@ def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_
 
 
 def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
     c = TestClient(fresh_companion_app)
@@ -86,7 +86,7 @@ def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_p
 
 
 def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
     pq_path = entry_dir(project, h) / "result.parquet"
@@ -99,7 +99,7 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
 
 
 def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("PYDATA_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     c = TestClient(fresh_companion_app)
     # A content hash is lowercase hex (it names an entry dir). A junk value can
     # only ever resolve outside the entries tree, so reject it as a bad request

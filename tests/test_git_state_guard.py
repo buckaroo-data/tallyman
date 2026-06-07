@@ -3,7 +3,7 @@
 Background: xorq records git provenance by shelling out to `git rev-parse HEAD`
 / `git diff` / `git diff --cached` from `logging_utils.get_git_state`, called
 inline on the catalog-write/compile path. From the long-lived, multithreaded
-pydata server those bare-name `subprocess` calls fork, and `fork()` from a
+tallyman server those bare-name `subprocess` calls fork, and `fork()` from a
 multithreaded process on macOS can die with SIGSEGV/SIGABRT (a child inherits
 locks held by threads that don't exist in it). See
 `plans/adr-git-subprocess-threading.md` and buckaroo-data/nokernel-notebooks#25.
@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from pydata_xorq import build_and_persist
+from tallyman_xorq import build_and_persist
 
 
 # ---------------------------------------------------------------------------
@@ -36,8 +36,11 @@ from pydata_xorq import build_and_persist
 # ---------------------------------------------------------------------------
 def _git(*args: str, cwd: Path) -> None:
     subprocess.run(
-        ["git", *args], cwd=cwd, check=True,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ["git", *args],
+        cwd=cwd,
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
 
 
@@ -73,14 +76,14 @@ def guard_env(monkeypatch):
     """
     from xorq.common.utils import logging_utils as lu
 
-    import pydata_xorq._git_state_guard as g
+    import tallyman_xorq._git_state_guard as g
 
     original = lu.get_git_state
     had_cache = hasattr(g, "_raw_state")
     saved_raw = getattr(g, "_raw_state", None)
     if had_cache:
         g._raw_state = g._UNSET
-    monkeypatch.delenv("PYDATA_DISABLE_GIT_STATE", raising=False)
+    monkeypatch.delenv("TALLYMAN_DISABLE_GIT_STATE", raising=False)
     try:
         yield lu, g
     finally:

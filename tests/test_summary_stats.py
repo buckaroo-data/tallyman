@@ -2,7 +2,7 @@
 
 Three layers:
 
-- ``pydata_core.summary_stats``: write/list/remove + the dry-run
+- ``tallyman_core.summary_stats``: write/list/remove + the dry-run
   validator that gates ``write_stat``.
 - ``BuckarooManager.ensure_session``: must include ``project_root`` in
   the ``/load_expr`` POST body so buckaroo's project-stats scanner
@@ -18,15 +18,15 @@ from typing import Any
 
 import pytest
 
-from pydata_core import StatSourceError, list_stats, remove_stat, write_stat
-from pydata_core.summary_stats import stats_dir, validate_stat_source
+from tallyman_core import StatSourceError, list_stats, remove_stat, write_stat
+from tallyman_core.summary_stats import stats_dir, validate_stat_source
 
 PERCENT_AT_SIGN = "def compute(col):\n    return col.cast('string').contains('@').sum() / col.count()\n"
 N_ROWS = "def compute(col):\n    return col.count()\n"
 
 
 # ---------------------------------------------------------------------------
-# pydata_core.summary_stats — write/list/remove + dry-run
+# tallyman_core.summary_stats — write/list/remove + dry-run
 # ---------------------------------------------------------------------------
 
 
@@ -105,11 +105,11 @@ def test_ensure_session_includes_project_root_in_load_expr_body(project: str, or
     """The /load_expr POST must carry the project's absolute path so
     buckaroo's load_project_stat_klasses (PR #784) can scan its stats/
     directory."""
-    from pydata_companion.buckaroo_lifecycle import BuckarooManager
-    from pydata_xorq import build_and_persist
+    from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+    from tallyman_xorq import build_and_persist
 
     code = f"""
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 t = from_project("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
@@ -139,7 +139,8 @@ expr = t.group_by("region").aggregate(n=t.count())
     assert posted_project_root is not None
     # project_root must point to artifacts_dir so buckaroo finds
     # stats/ and post_processing/ under it.
-    from pydata_core.paths import artifacts_dir
+    from tallyman_core.paths import artifacts_dir
+
     assert Path(posted_project_root) == artifacts_dir(project)
 
 
@@ -150,9 +151,9 @@ expr = t.group_by("region").aggregate(n=t.count())
 
 def test_mcp_add_remove_list_smoke(project: str):
     """Drive the three tools directly (no MCP transport) — they should
-    just forward to pydata_core.summary_stats and the companion-notify
+    just forward to tallyman_core.summary_stats and the companion-notify
     layer (which is best-effort and silent here)."""
-    from pydata_mcp.server import (
+    from tallyman_mcp.server import (
         catalog_add_summary_stat,
         catalog_list_summary_stats,
         catalog_remove_summary_stat,
@@ -176,7 +177,7 @@ def test_mcp_add_remove_list_smoke(project: str):
 def test_mcp_add_rejects_bad_source(project: str):
     """A bad source returns ``{"error": <msg>}`` rather than raising —
     matches the convention every catalog_* tool follows."""
-    from pydata_mcp.server import catalog_add_summary_stat
+    from tallyman_mcp.server import catalog_add_summary_stat
 
     resp = catalog_add_summary_stat("evil", "import os\ndef compute(c): return c.count()\n")
     assert "error" in resp
@@ -184,7 +185,7 @@ def test_mcp_add_rejects_bad_source(project: str):
 
 
 def test_mcp_remove_nonexistent_returns_error(project: str):
-    from pydata_mcp.server import catalog_remove_summary_stat
+    from tallyman_mcp.server import catalog_remove_summary_stat
 
     resp = catalog_remove_summary_stat("never_existed")
     assert resp["error"] == "no stat named 'never_existed'"

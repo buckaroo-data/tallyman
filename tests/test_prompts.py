@@ -4,7 +4,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
-from pydata_xorq import build_and_persist, read_prompts
+from tallyman_xorq import build_and_persist, read_prompts
 
 
 def _code(parquet: Path) -> str:

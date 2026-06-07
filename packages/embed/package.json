@@ -1,5 +1,5 @@
 {
-  "name": "@pydata-app/embed",
+  "name": "@tallyman/embed",
   "version": "0.0.1",
   "private": true,
   "description": "Vite library that mounts BuckarooServerView into [data-ws-url] divs on companion pages.",

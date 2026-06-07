@@ -1,12 +1,12 @@
 {
   "mcpServers": {
-    "pydata": {
+    "tallyman": {
       "command": "uv",
-      "args": ["run", "pydata", "mcp"],
-      "cwd": "/Users/paddy/code/pydata-app",
+      "args": ["run", "tallyman", "mcp"],
+      "cwd": "/Users/paddy/code/tallyman-notebooks",
       "env": {
-        "PYDATA_PROJECT": "spike",
-        "PYDATA_COMPANION_URL": "http://127.0.0.1:7860"
+        "TALLYMAN_PROJECT": "spike",
+        "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860"
       }
     }
   }

@@ -5,8 +5,8 @@ from pathlib import Path
 
 import pytest
 
-from pydata_core import entry_dir
-from pydata_xorq import BuildError, build_and_persist, list_entries
+from tallyman_core import entry_dir
+from tallyman_xorq import BuildError, build_and_persist, list_entries
 
 
 def _agg_code(parquet_path: Path) -> str:
@@ -100,12 +100,12 @@ expr = t.nonexistent_column.sum()
 # ---------------------------------------------------------------------------
 # Namespace / column-name hints. The session scan showed the model repeatedly
 # reaching for `xorq.<fn>` (the api lives on `xorq.api`/`xo`), `ibis.<fn>` for
-# things that are column methods or live elsewhere, inventing `pydata_xorq.io`
+# things that are column methods or live elsewhere, inventing `tallyman_xorq.io`
 # helpers, guessing column names, and reaching for a duckdb backend. The old
 # hint only caught bare `import ibis`, the Expr class mismatch, and `xorq._`.
 # ---------------------------------------------------------------------------
 
-from pydata_xorq.build import _ibis_import_hint  # noqa: E402
+from tallyman_xorq.build import _ibis_import_hint  # noqa: E402
 
 
 def test_hint_bare_xorq_attribute_points_to_api():
@@ -124,7 +124,7 @@ def test_hint_ibis_math_func_is_column_method():
 
 
 def test_hint_io_import_typo_lists_real_exports():
-    h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'pydata_xorq.io'")
+    h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'tallyman_xorq.io'")
     assert "from_project" in h and "from_catalog" in h
 
 

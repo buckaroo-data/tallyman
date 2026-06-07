@@ -1,8 +1,8 @@
-# Data-science demo scripts — synthetic workflows to exercise pydata-app and surface bugs
+# Data-science demo scripts — synthetic workflows to exercise tallyman-notebooks and surface bugs
 
 Generated 2026-05-30. Five DS-oriented demo scripts on freshly-downloaded public datasets, chosen by a fan-out design pass + critic for distinct DS techniques, plotting variety, and coverage of the recently-changed code (diff backends, result cache, primary-key inference, post-processing live-reload).
 
-**Datasets** are staged at `/tmp/pydata_demo_data/`. Before running a script, copy its parquet(s) into the target project: `cp /tmp/pydata_demo_data/<file> ~/.pydata-app/projects/<project>/data/`.
+**Datasets** are staged at `/tmp/tallyman_demo_data/`. Before running a script, copy its parquet(s) into the target project: `cp /tmp/tallyman_demo_data/<file> ~/.tallyman/projects/<project>/data/`.
 
 **Verified blocker (post_processing.py:35-61,110-119):** the `process(expr)` sandbox builds `__builtins__` from a fixed allowlist with no `__import__`, so `import numpy/scipy/sklearn/pandas` fails inside any post-processing function. The pandas-DataFrame return path only works via `expr.execute()` + DataFrame methods; third-party stats/ML is unreachable. Scripts 2 and 5 are designed to hit this wall.
 
@@ -30,7 +30,7 @@ catalog_load_parquet(rel_path="stocks.parquet", name="stocks_raw", prompt="Raw m
 **2. Parse the string date with an explicit strptime format, sort per symbol, and derive the lagged monthly return; put the new return column first.**  _(`catalog_create`)_
 
 ```python
-catalog_create(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom pydata_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nw = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nt = t.mutate(prev_price=t.price.lag(1).over(w))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1)\nexpr = t.select(\"monthly_return\", *[c for c in t.columns if c != \"monthly_return\"])\n", prompt="Parse 'Jan 1 2000' dates, order by symbol+date, compute lagged monthly return; return column leftmost.")
+catalog_create(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nw = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nt = t.mutate(prev_price=t.price.lag(1).over(w))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1)\nexpr = t.select(\"monthly_return\", *[c for c in t.columns if c != \"monthly_return\"])\n", prompt="Parse 'Jan 1 2000' dates, order by symbol+date, compute lagged monthly return; return column leftmost.")
 ```
 > _Probes:_ The string-date parse trap: as_timestamp('%b %d %Y') must build AND execute (bare .to_timestamp() with no format silently mis-parses). lag(1).over(window) over a partitioned+ordered series. New-column-first reselect. CRITICAL: as_timestamp yields a UTC-tz timestamp (+00:00) — a downstream trap if any later step compares it to a tz-naive literal. This entry has a WindowFunction op so it is cache_worthy=True (result lives in the snapshot cache, result.parquet may later be evicted).
 
@@ -44,7 +44,7 @@ catalog_chart(hash_or_alias="stock_returns", vega_spec={"$schema": "https://vega
 **4. Revise the alias to add a rolling 3-month and 12-month moving average plus a cumulative running-max drawdown reference, keeping the prior version in history.**  _(`catalog_revise`)_
 
 ```python
-catalog_revise(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom pydata_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nbase = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nroll3 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=2, following=0)\nroll12 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=11, following=0)\ncumw = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=None, following=0)\nt = t.mutate(prev_price=t.price.lag(1).over(base))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1, ma3=t.price.mean().over(roll3), ma12=t.price.mean().over(roll12), running_max=t.price.max().over(cumw))\nt = t.mutate(drawdown=(t.price / t.running_max) - 1)\nexpr = t.select(\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\", *[c for c in t.columns if c not in (\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\")])\n", prompt="Add rolling 3/12-month MA, running-max, and drawdown windows; keep returns. New cols leftmost.")
+catalog_revise(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nbase = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nroll3 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=2, following=0)\nroll12 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=11, following=0)\ncumw = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=None, following=0)\nt = t.mutate(prev_price=t.price.lag(1).over(base))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1, ma3=t.price.mean().over(roll3), ma12=t.price.mean().over(roll12), running_max=t.price.max().over(cumw))\nt = t.mutate(drawdown=(t.price / t.running_max) - 1)\nexpr = t.select(\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\", *[c for c in t.columns if c not in (\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\")])\n", prompt="Add rolling 3/12-month MA, running-max, and drawdown windows; keep returns. New cols leftmost.")
 ```
 > _Probes:_ Three distinct window frames in one expr: bounded rolling (preceding=2/11, following=0) AND an unbounded cumulative frame (preceding=None). Multiple WindowFunction ops stress the build's op-classification regex in classify_build. V1 vs V2 now differ by 4 added columns over the SAME (symbol, date) grain — sets up the keyed diff in step 6. Confirms revise keeps V1's hash in forensic history.
 
@@ -219,7 +219,7 @@ catalog_load_parquet(rel_path="wine_white.parquet", name="wine_white", prompt="U
 
 ```python
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_project
+from tallyman_xorq.io import from_project
 
 red = from_project("wine_red.parquet").mutate(wine_type=ibis.literal("red"))
 white = from_project("wine_white.parquet").mutate(wine_type=ibis.literal("white"))
@@ -237,7 +237,7 @@ catalog_create(name="wine_all", code=code, prompt="red+white unioned with a wine
 
 ```python
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 
 t = from_catalog("wine_all")
 props = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "free sulfur dioxide", "total sulfur dioxide", "density", "pH", "sulphates", "alcohol"]
@@ -256,7 +256,7 @@ catalog_create(name="wine_group_stats", code=code, prompt="per-wine_type mean/st
 
 ```python
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 
 g = from_catalog("wine_group_stats")
 red = g.filter(g.wine_type == "red")
@@ -341,7 +341,7 @@ catalog_add_post_processing(name="welch_ttest", source=safe_code)  # re-add -> r
 
 # (b) revise the grouped-stats entry (drop the two sulfur columns) and diff
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog("wine_all")
 props = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "density", "pH", "sulphates", "alcohol"]
 aggs = {"n": t.count()}
@@ -511,17 +511,17 @@ catalog_diff(name="wine_group_stats", va=-2, vb=-1)
 
 ### Steps
 
-**1. Drop the raw titanic parquet into the project as a named catalog entry so it gets a notebook cell and an alias we can revise later.**  _(`mcp__pydata__catalog_load_parquet`)_
+**1. Drop the raw titanic parquet into the project as a named catalog entry so it gets a notebook cell and an alias we can revise later.**  _(`mcp__tallyman__catalog_load_parquet`)_
 
 ```python
 catalog_load_parquet(rel_path="titanic.parquet", name="titanic_raw", prompt="Raw seaborn titanic: 891 passengers, survived 0/1 target, heavy nulls in age/deck, bool adult_male/alone.")
 ```
 > _Probes:_ First-contact load + alias creation. Probes that a name= load registers an alias AND a notebook cell in one shot, and that a bool-heavy / null-heavy schema round-trips through the parquet registration without coercing adult_male/alone to int or dropping the all-but-203-null deck column.
 
-**2. Compute survival rate by sex and by class as a long-format cohort table — the headline target-rate-by-segment view. Average the int 0/1 survived column to get a rate, count cohort size, and put the new computed columns first.**  _(`mcp__pydata__catalog_create`)_
+**2. Compute survival rate by sex and by class as a long-format cohort table — the headline target-rate-by-segment view. Average the int 0/1 survived column to get a rate, count cohort size, and put the new computed columns first.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("titanic_raw")
 by_sex = t.group_by("sex").aggregate(survival_rate=t.survived.mean(), n=t.survived.count()).mutate(cohort_kind=ibis.literal("sex")).rename(cohort_value="sex")
@@ -531,20 +531,20 @@ expr = unioned.select("cohort_kind", "cohort_value", "survival_rate", "n").order
 ```
 > _Probes:_ survived.mean() on an int 0/1 column must yield a fractional rate (not int truncation to 0). UNION of two aggregates with different group keys forces column-order/type alignment (pclass int cast to string vs sex string) — the documented union trap. Aggregate alias n= avoids shadowing the count method. Aggregate op makes this entry cache_worthy=True in the result cache.
 
-**3. Build the sex x pclass survival crosstab by grouping on two columns at once, then attach it as a named entry. This is the wide cohort grid behind the heatmap.**  _(`mcp__pydata__catalog_create`)_
+**3. Build the sex x pclass survival crosstab by grouping on two columns at once, then attach it as a named entry. This is the wide cohort grid behind the heatmap.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("titanic_raw")
 expr = (t.group_by(["sex", "pclass"]).aggregate(survival_rate=t.survived.mean(), n=t.survived.count(), avg_fare=t.fare.mean()).order_by(["sex", "pclass"]))
 ```
 > _Probes:_ group_by([two cols]) crosstab grain. Companion must render a 6-row long table that the heatmap (step 9) re-pivots client-side via Vega-Lite encoding — long->wide happens in the chart, not the query. Probes that catalog_chart's auto-served parquet exposes sex+pclass+survival_rate columns by exact name for the heatmap x/y/color channels.
 
-**4. Audit the null landscape before imputing: per-column null counts and null fractions for the columns we care about (age, deck, embarked), computed as explicit aggregates since .describe() is unavailable.**  _(`mcp__pydata__catalog_run`)_
+**4. Audit the null landscape before imputing: per-column null counts and null fractions for the columns we care about (age, deck, embarked), computed as explicit aggregates since .describe() is unavailable.**  _(`mcp__tallyman__catalog_run`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("titanic_raw")
 n = t.count()
@@ -559,20 +559,20 @@ expr = t.aggregate(
 ```
 > _Probes:_ isnull().sum() over a column with 177 (age) / 688 (deck) nulls — boolean-to-int summation. Division by a scalar t.count() inside aggregate (scalar broadcast). Scratch entry via catalog_run (no alias). deck is ~77% null, a candidate for the 'should we even keep this column' decision the narrative makes.
 
-**5. Create the imputation alias as V1 = the raw passenger rows passed through unchanged (select all columns), establishing a baseline version to diff against. This is deliberately row-preserving and cheap.**  _(`mcp__pydata__catalog_create`)_
+**5. Create the imputation alias as V1 = the raw passenger rows passed through unchanged (select all columns), establishing a baseline version to diff against. This is deliberately row-preserving and cheap.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog("titanic_raw")
 cols = ["survived", "pclass", "sex", "age", "sibsp", "parch", "fare", "embarked", "class", "who", "adult_male", "deck", "embark_town", "alive", "alone"]
 expr = t.select(*cols)
 ```
 > _Probes:_ Establishes a lineage root for PK inference. Pure projection -> cache_worthy=False -> resolve_primary_key runs full _detect_pk_xorq cardinality scan. titanic has NO single unique column at threshold 0.98 (closest is fare ~0.27 unique, age fractional) so this caches keys=[] in primary_key.json. Probes that the system gracefully records 'no usable key' rather than erroring.
 
-**6. Revise the impute alias to V2: median-impute age within each (sex, pclass) cohort using a partitioned window — the .transform trap done in ibis. Fill nulls with the group median, keep all other rows identical. New/changed column goes first.**  _(`mcp__pydata__catalog_revise`)_
+**6. Revise the impute alias to V2: median-impute age within each (sex, pclass) cohort using a partitioned window — the .transform trap done in ibis. Fill nulls with the group median, keep all other rows identical. New/changed column goes first.**  _(`mcp__tallyman__catalog_revise`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("impute_age")
 w = ibis.window(group_by=["sex", "pclass"])
@@ -584,17 +584,17 @@ expr = t.mutate(age=filled).select(
 ```
 > _Probes:_ THE central stress. approx_median().over(window) is the group-transform trap (median not mean). fill_null with a windowed scalar must broadcast per partition, not collapse rows. Critically: the WindowFunction op makes this revision cache_worthy=True, so resolve_primary_key SKIPS the parent-inherit branch (which only fires when cache_worthy=False) and re-detects on V2 — even though it is genuinely row-preserving. Cross-check: does V2 still report keys=[] consistently with V1, or does the classifier-vs-reality mismatch produce a different/absent key?
 
-**7. Diff V1 vs V2 of the impute alias to prove the age impute changed exactly the 177 null rows and nothing else: row count identical, only age column stats shifted, keyed-row diff shows only modified (not added/removed) rows.**  _(`mcp__pydata__catalog_diff`)_
+**7. Diff V1 vs V2 of the impute alias to prove the age impute changed exactly the 177 null rows and nothing else: row count identical, only age column stats shifted, keyed-row diff shows only modified (not added/removed) rows.**  _(`mcp__tallyman__catalog_diff`)_
 
 ```python
 catalog_diff(name="impute_age", va=1, vb=2)
 ```
 > _Probes:_ Highest-value bug hunter. diff_keys asks both V1/V2 for a resolved PK; both are []/composite-less, so key_diff_xorq falls back to LIVE detection on a keyless 891-row frame — does it crash, pick a spurious key, or duplicate-explode the join? stats_diff_xorq must show age.null_count 177->0 and age.mean shifting while n stays 891. The xorq diff backend composes V1 (cheap, deferred_read_parquet) JOIN V2 (expensive, cache-wrapped WindowFunction) — mixing a cached and uncached side through cached_result_expr is the live-reload/result-cache integration point most likely to mis-resolve.
 
-**8. Add an age-band cohort as a third impute version (V3) so a second diff exercises schema-add diffing on a keyless frame, then audit survival rate by band.**  _(`mcp__pydata__catalog_revise`)_
+**8. Add an age-band cohort as a third impute version (V3) so a second diff exercises schema-add diffing on a keyless frame, then audit survival rate by band.**  _(`mcp__tallyman__catalog_revise`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("impute_age")
 band = (ibis.case().when(t.age < 13, "child").when(t.age < 20, "teen").when(t.age < 40, "adult").when(t.age < 60, "middle").else_("senior").end())
@@ -602,7 +602,7 @@ expr = t.mutate(age_band=band).select("age_band", *t.columns)
 ```
 > _Probes:_ select(newcol, *t.columns) leftmost-placement convention. ibis.case() ladder on a now-fully-imputed age (no nulls reach else_). schema_diff between V2 and V3 must report added=['age_band'] with row_count unchanged. A SECOND catalog_diff(impute_age, va=2, vb=3) re-exercises keyless PK fallback on a frame whose schema grew — the diff_keys 'key present in BOTH schemas' guard with mismatched columns.
 
-**9. Attach a grouped bar chart of survival rate by class, split by sex, to the crosstab entry — the headline cohort comparison.**  _(`mcp__pydata__catalog_chart`)_
+**9. Attach a grouped bar chart of survival rate by class, split by sex, to the crosstab entry — the headline cohort comparison.**  _(`mcp__tallyman__catalog_chart`)_
 
 ```python
 catalog_chart(hash_or_alias="surv_by_sex_class", vega_spec={
@@ -620,7 +620,7 @@ catalog_chart(hash_or_alias="surv_by_sex_class", vega_spec={
 ```
 > _Probes:_ Vega-Lite xOffset grouped-bar (v5-only feature) over the auto-served crosstab parquet. Probes that the companion serves the entry's 6-row parquet as named-column chart data with NO inlined rows, and that pclass (int) maps to ordinal and survival_rate to a %-formatted quantitative axis.
 
-**10. Attach a heatmap of survival rate over the sex x pclass grid to the same crosstab entry — long-format data re-pivoted by the chart's x/y/color channels.**  _(`mcp__pydata__catalog_chart`)_
+**10. Attach a heatmap of survival rate over the sex x pclass grid to the same crosstab entry — long-format data re-pivoted by the chart's x/y/color channels.**  _(`mcp__tallyman__catalog_chart`)_
 
 ```python
 catalog_chart(hash_or_alias="surv_by_sex_class", vega_spec={
@@ -637,21 +637,21 @@ catalog_chart(hash_or_alias="surv_by_sex_class", vega_spec={
 ```
 > _Probes:_ SECOND chart on the SAME entry — probes that catalog_chart appends/stacks specs rather than overwriting the step-9 bar (multiple chart_specs per hash). rect heatmap with a fixed color domain [0,1]. Whether the companion renders two charts above one table cleanly.
 
-**11. Preview a two-proportion z-test (female vs male survival) as a post-processing function that imports scipy and returns a pandas DataFrame, run against the crosstab entry to confirm it produces a clean stat table before committing.**  _(`mcp__pydata__catalog_run_post_processing`)_
+**11. Preview a two-proportion z-test (female vs male survival) as a post-processing function that imports scipy and returns a pandas DataFrame, run against the crosstab entry to confirm it produces a clean stat table before committing.**  _(`mcp__tallyman__catalog_run_post_processing`)_
 
 ```python
 catalog_run_post_processing(entry="surv_by_sex_class", code="def process(expr):\n    import pandas as pd\n    from scipy.stats import norm\n    import numpy as np\n    df = expr.execute()\n    g = df.groupby('sex').apply(lambda d: pd.Series({'survived': (d['survival_rate'] * d['n']).sum(), 'total': d['n'].sum()}))\n    f, m = g.loc['female'], g.loc['male']\n    p1, p2 = f['survived']/f['total'], m['survived']/m['total']\n    p = (f['survived']+m['survived'])/(f['total']+m['total'])\n    se = np.sqrt(p*(1-p)*(1/f['total']+1/m['total']))\n    z = (p1-p2)/se\n    pval = 2*(1-norm.cdf(abs(z)))\n    return pd.DataFrame([{'female_rate': p1, 'male_rate': m, 'z_stat': z, 'p_value': pval}])")
 ```
 > _Probes:_ THE data-science escape hatch + live-reload-post-processing hot path. expr.execute() pulls the cached aggregate to pandas; scipy import inside process(); returning a 1-row pandas.DataFrame (not ibis). Probes run_post_processing executing against result.parquet of a cache_worthy entry — does it self-heal if result.parquet was evicted? Note the intentional bug bait: 'male_rate' is assigned m (the whole Series) instead of p2 — does the previewer surface the malformed column or silently mangle it? Iterating to fix this is the realistic loop.
 
-**12. Commit the corrected two-proportion z-test as a permanent post-processing option so it appears in the embed dropdown on next session load.**  _(`mcp__pydata__catalog_add_post_processing`)_
+**12. Commit the corrected two-proportion z-test as a permanent post-processing option so it appears in the embed dropdown on next session load.**  _(`mcp__tallyman__catalog_add_post_processing`)_
 
 ```python
 catalog_add_post_processing(name="sex_survival_ztest", source="def process(expr):\n    import pandas as pd\n    from scipy.stats import norm\n    import numpy as np\n    df = expr.execute()\n    g = df.groupby('sex').apply(lambda d: pd.Series({'survived': (d['survival_rate'] * d['n']).sum(), 'total': d['n'].sum()}))\n    f, m = g.loc['female'], g.loc['male']\n    p1, p2 = f['survived']/f['total'], m['survived']/m['total']\n    p = (f['survived']+m['survived'])/(f['total']+m['total'])\n    se = np.sqrt(p*(1-p)*(1/f['total']+1/m['total']))\n    z = (p1-p2)/se\n    pval = 2*(1-norm.cdf(abs(z)))\n    return pd.DataFrame([{'female_rate': p1, 'male_rate': p2, 'z_stat': z, 'p_value': pval}])")
 ```
 > _Probes:_ add_post_processing dry-runs process() against a tiny in-memory memtable BEFORE landing on disk — but this process() does df.groupby('sex').loc['female'], which will KeyError on the validation memtable (no 'female'/'male' rows, likely no 'sex'/'n' columns). Probes whether the validator's synthetic table is shaped enough to pass a realistic groupby-based stat, or whether legitimate scipy post-processors are rejected at commit despite previewing fine in step 11 — a real friction-vs-safety defect.
 
-**13. Add a project summary stat that reports the null fraction of any column, so the deck/age null audit becomes a per-column stat visible in Buckaroo's stats panel.**  _(`mcp__pydata__catalog_add_summary_stat`)_
+**13. Add a project summary stat that reports the null fraction of any column, so the deck/age null audit becomes a per-column stat visible in Buckaroo's stats panel.**  _(`mcp__tallyman__catalog_add_summary_stat`)_
 
 ```python
 catalog_add_summary_stat(name="null_frac", source="def compute(col):\n    return col.isnull().sum() / col.count()")
@@ -854,7 +854,7 @@ name="diamond_features"
 prompt="Engineered regression features: price_per_carat, volume, log-log cols, carat bins. New cols first."
 code='''
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog("diamonds")
 price_per_carat = (t.price / t.carat).name("price_per_carat")
 volume = (t.x * t.y * t.z).name("volume")
@@ -879,7 +879,7 @@ name="diamond_features"
 prompt="Add ordinal encodings cut_ord (Fair=1..Ideal=5), color_ord (J=1..D=7), clarity_ord (I1=1..IF=8) for correlation/modeling."
 code='''
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog("diamond_features")
 cut_ord = ibis.cases((t.cut=="Fair",1),(t.cut=="Good",2),(t.cut=="Very Good",3),(t.cut=="Premium",4),(t.cut=="Ideal",5),else_=0).name("cut_ord")
 color_ord = ibis.cases((t.color=="J",1),(t.color=="I",2),(t.color=="H",3),(t.color=="G",4),(t.color=="F",5),(t.color=="E",6),(t.color=="D",7),else_=0).name("color_ord")
@@ -905,7 +905,7 @@ name="price_corr"
 prompt="Correlation of each numeric/ordinal feature with price (single wide row)."
 code='''
 import xorq.vendor.ibis as ibis
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 t = from_catalog("diamond_features")
 expr = t.aggregate(
     carat=t.carat.corr(t.price),
@@ -955,7 +955,7 @@ def process(expr):
     return pd.DataFrame({"feature": feats, "std_coef": m.coef_}).sort_values("std_coef", ascending=False)
 '''
 ```
-> _Probes:_ THE highest-value bug surface. catalog_run_post_processing execs the source in pydata_core.post_processing._restricted_globals(), whose __builtins__ is the _SAFE_BUILTIN_NAMES allowlist with NO __import__. So `import numpy/pandas/sklearn` inside process() raises ImportError('__import__ not found') at call time (verified). The whole scipy/sklearn modeling escape hatch the system advertises is unreachable through the sandbox. ALSO: run_post_processing reads entry_dir/result.parquet DIRECTLY with no self-heal — diamond_features is cheap so it exists, but if it were expensive (snapshot-cached, in-place parquet evicted) the preview would error with 'no result.parquet' while catalog_diff on the same entry self-heals via cached_result_expr — an inconsistency.
+> _Probes:_ THE highest-value bug surface. catalog_run_post_processing execs the source in tallyman_core.post_processing._restricted_globals(), whose __builtins__ is the _SAFE_BUILTIN_NAMES allowlist with NO __import__. So `import numpy/pandas/sklearn` inside process() raises ImportError('__import__ not found') at call time (verified). The whole scipy/sklearn modeling escape hatch the system advertises is unreachable through the sandbox. ALSO: run_post_processing reads entry_dir/result.parquet DIRECTLY with no self-heal — diamond_features is cheap so it exists, but if it were expensive (snapshot-cached, in-place parquet evicted) the preview would error with 'no result.parquet' while catalog_diff on the same entry self-heals via cached_result_expr — an inconsistency.
 
 **9. Commit a post-processing function that DOES survive the sandbox (pure ibis, no imports): a residual-vs-log-fit column flag for diamonds priced above their carat-bin median, so it lands in the embed dropdown on next session load.**  _(`catalog_add_post_processing`)_
 
@@ -1062,7 +1062,7 @@ def process(expr):
 
 ### Bugs this script is built to surface
 
-- **catalog_run_post_processing / catalog_add_post_processing import sandbox (pydata_core.post_processing._restricted_globals)** — The exec globals' __builtins__ is the hand-maintained _SAFE_BUILTIN_NAMES allowlist, which has no __import__. Any process() that does `import numpy/pandas/scipy/sklearn` (step 8) raises ImportError('__import__ not found') at call time — verified empirically. The advertised scipy/sklearn modeling escape hatch (OLS coefficients, t-tests, clustering) is therefore unreachable through both the dry-run validator and the real-data preview, so the entire 'reach model fitting' path is broken for any function that imports a third-party lib.
+- **catalog_run_post_processing / catalog_add_post_processing import sandbox (tallyman_core.post_processing._restricted_globals)** — The exec globals' __builtins__ is the hand-maintained _SAFE_BUILTIN_NAMES allowlist, which has no __import__. Any process() that does `import numpy/pandas/scipy/sklearn` (step 8) raises ImportError('__import__ not found') at call time — verified empirically. The advertised scipy/sklearn modeling escape hatch (OLS coefficients, t-tests, clustering) is therefore unreachable through both the dry-run validator and the real-data preview, so the entire 'reach model fitting' path is broken for any function that imports a third-party lib.
 - **catalog_diff keyed-diff PK inference on diamonds 54K rows (primary_key._rank_pk_xorq via diff_keys)** — diamonds has no clean primary key (no id; carat/price/x/y/z heavily duplicated). _rank_pk_xorq scans every single column's nunique then composite combos up to width 4 with full distinct-tuple COUNTs over 53,940 rows on every diff of a root-derived entry — a real per-diff perf cost. Worse, the engineered near-unique float price_per_carat/volume can satisfy the 0.98 approximate-key threshold and be chosen as the join key, producing an outer join that looks 1:1 but silently hides duplicate-keyed rows; the chosen key can also flip between V1 and V2 if the inherited-vs-detected path disagrees.
 - **result_cache cheap/expensive split vs run_post_processing result.parquet dependency** — price_corr (Aggregate) is classified EXPENSIVE -> materialized only in the ParquetSnapshotCache, with no in-place result.parquet. catalog_diff self-heals via cached_result_expr, but run_post_processing reads entry_dir/result.parquet DIRECTLY with no self-heal/regen. Running a post-processing preview against an expensive entry (or a cheap entry whose result.parquet was evicted) errors with 'no result.parquet' even though the entry is valid and diffable — an inconsistent self-heal contract between the two read paths on the same branch that added the cache.
 - **catalog_chart multiple specs per entry (steps 6 and 7 both target diamond_features)** — set_chart stores one spec per entry (chart_specs/<hash>); attaching the carat-bin bar in step 7 likely OVERWRITES the step-6 log-log scatter rather than appending, so the scatter silently vanishes from the detail page with no warning in the tool response. If instead multiple specs are supported, the render order / stacking above the table is untested for two specs on a 54K-row entry.
@@ -1092,7 +1092,7 @@ catalog_load_parquet(rel_path="penguins.parquet", prompt="Raw Palmer penguins: 3
 **2. Build the clean feature matrix: drop any row with a null in the four clustering features, and add a stable integer row id (leftmost) so downstream joins and the keyed diff have an unambiguous primary key.**  _(`catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("penguins_raw")
 feats = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm", "body_mass_g"]
@@ -1113,7 +1113,7 @@ expr = clean.select(
 **3. Create the standardized feature matrix as a NAMED alias: replace each raw feature with its population z-score using a window aggregate over the whole table, keeping penguin_id and species for later labeling.**  _(`catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("penguins_clean")
 w = ibis.window()  # whole-table frame
@@ -1179,7 +1179,7 @@ catalog_add_post_processing(name="kmeans_k3", source=code)
 **6. Materialize the cluster assignment as a first-class catalog entry by re-running the KMeans output through an ibis UDF-free path: persist the labeled rows so charts and diffs can target them. Run it as a named alias.**  _(`catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 import pandas as pd
 from sklearn.cluster import KMeans
@@ -1199,7 +1199,7 @@ expr = ibis.memtable(df).select("cluster", "dist_to_centroid", *df.columns[:-2].
 **7. Profile the segments: group the labeled entry by cluster and compute size plus per-cluster mean of each z-feature, so we can read off what distinguishes each segment.**  _(`catalog_create`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("penguin_clusters")
 expr = t.group_by("cluster").aggregate(
@@ -1238,7 +1238,7 @@ catalog_add_summary_stat(name="cluster_purity", source=source)
 **10. Revise the standardized feature matrix to use sample std with explicit null-safe handling, then diff it against the previous version to confirm only the z-values shifted and the row grain / primary key is unchanged.**  _(`catalog_revise`)_
 
 ```python
-from pydata_xorq.io import from_catalog
+from tallyman_xorq.io import from_catalog
 import xorq.vendor.ibis as ibis
 t = from_catalog("penguins_clean")
 w = ibis.window()

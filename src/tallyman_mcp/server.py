@@ -14,6 +14,7 @@ from tallyman_core import (
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
+    DisplayKlassError,
     PostProcessingRunError,
     PostProcessingSourceError,
     StatSourceError,
@@ -22,12 +23,14 @@ from tallyman_core import (
     export_notebook_path,
     get_alias,
     history_for,
+    list_display_klasses,
     list_post_processings,
     list_projects,
     list_stats,
     notebook,
     record_error,
     remove_alias,
+    remove_display_klass,
     remove_post_processing,
     remove_stat,
     rename_alias,
@@ -35,6 +38,7 @@ from tallyman_core import (
     run_post_processing,
     set_alias,
     set_chart,
+    write_display_klass,
     write_post_processing,
     write_stat,
 )
@@ -862,15 +866,13 @@ def catalog_add_summary_stat(name: str, source: str) -> dict:
     """Register a project-authored column summary stat.
 
     ``source`` must define a callable ``compute(col)`` that takes an ibis
-    column expression and returns an ibis expression (scalar). The
-    function is validated by dry-running it against a 1-row in-memory
-    table before the file lands on disk — syntax / type / shape errors
-    surface in the tool response, not later in the buckaroo log.
+    column expression and returns an ibis scalar expression. The function
+    is validated by dry-running it against a 1-row in-memory table before
+    the file lands on disk — syntax / type / shape errors surface in the
+    tool response, not later in the buckaroo log.
 
-    The stat shows up alongside the built-in xorq column stats the next
-    time a catalog entry's buckaroo session is loaded (clicking a
-    different entry, or after a buckaroo restart). V1 does NOT hot-swap
-    already-loaded sessions.
+    The stat is hot-reloaded into all open buckaroo sessions immediately
+    after this call; no page refresh is needed.
 
     ``source`` example::
 
@@ -881,6 +883,20 @@ def catalog_add_summary_stat(name: str, source: str) -> dict:
     under ``<project>/stats/``, and the file's stem is the stat's key in
     every column's stats panel.
 
+    PINNED-ROW NOTE: adding a stat makes it visible in the "summary" stats
+    panel only.  To show it as a pinned row in the *main* table view, call
+    ``catalog_add_display_klass`` immediately after with a class that
+    subclasses ``DefaultMainStyling`` and extends ``pinned_rows``::
+
+        class MainWith<Name>(DefaultMainStyling):
+            df_display_name = "main"
+            requires_summary = ["histogram", "is_numeric", "dtype", "_type", "<name>"]
+            pinned_rows = [
+                {'primary_key_val': 'dtype',     'displayer_args': {'displayer': 'obj'}},
+                {'primary_key_val': 'histogram', 'displayer_args': {'displayer': 'histogram'}},
+                {'primary_key_val': '<name>',    'displayer_args': {'displayer': 'inherit'}},
+            ]
+
     Args:
         name: filename stem (no ``.py``). Must be a valid python identifier.
         source: the file body. Must define ``compute(col) -> ibis_expr``.
@@ -890,7 +906,7 @@ def catalog_add_summary_stat(name: str, source: str) -> dict:
         path = write_stat(project, name, source)
     except StatSourceError as exc:
         return {"error": str(exc)}
-    _notify("stats_changed", extra={"action": "add", "name": name})
+    _notify("summary_stat_changed", extra={"action": "add", "name": name})
     return {"name": name, "path": str(path)}
 
 
@@ -909,7 +925,7 @@ def catalog_remove_summary_stat(name: str) -> dict:
     new_path = remove_stat(project, name)
     if new_path is None:
         return {"error": f"no stat named {name!r}"}
-    _notify("stats_changed", extra={"action": "remove", "name": name})
+    _notify("summary_stat_changed", extra={"action": "remove", "name": name})
     return {"name": name, "moved_to": str(new_path)}
 
 
@@ -923,6 +939,86 @@ def catalog_list_summary_stats() -> list[dict]:
     """
     project = _resolve_active_project()
     return list_stats(project)
+
+
+@mcp.tool()
+@_tag_project
+def catalog_add_display_klass(name: str, source: str) -> dict:
+    """Register a project-authored display klass (ColAnalysis subclass).
+
+    Display klasses control how columns are rendered and which rows are
+    pinned at the top of a buckaroo table.  They are exec'd with
+    ``ColAnalysis``, ``DefaultMainStyling``, ``DefaultSummaryStatsStyling``,
+    and ``StylingAnalysis`` already in scope — no imports needed.
+
+    The klass is hot-reloaded into all open buckaroo sessions immediately
+    after this call; no page refresh is needed.
+
+    PRIMARY USE CASE — adding a stat as a pinned row in the main view:
+    after calling ``catalog_add_summary_stat`` for a new stat, call this
+    tool to extend ``DefaultMainStyling`` so the stat appears as a frozen
+    row at the top of every catalog entry's main table::
+
+        class MainWithMostFreq(DefaultMainStyling):
+            df_display_name = "main"
+            requires_summary = ["histogram", "is_numeric", "dtype", "_type", "most_freq"]
+            pinned_rows = [
+                {'primary_key_val': 'dtype',      'displayer_args': {'displayer': 'obj'}},
+                {'primary_key_val': 'histogram',  'displayer_args': {'displayer': 'histogram'}},
+                {'primary_key_val': 'most_freq',  'displayer_args': {'displayer': 'inherit'}},
+            ]
+
+    Pinned-row displayer options:
+      - ``'inherit'``  — use the column's natural type displayer (recommended)
+      - ``'obj'``      — render as a raw Python object (fallback)
+      - ``'float'``    — fixed decimal places (for numeric stats)
+      - ``'histogram'``— histogram bar (only for the ``histogram`` stat key)
+
+    The ``df_display_name`` must match an existing display slot:
+      - ``"main"``     — the primary table view (override DefaultMainStyling)
+      - ``"summary"``  — the all-stats panel (override DefaultSummaryStatsStyling)
+
+    Args:
+        name: filename stem (no ``.py``). Must be a valid Python identifier.
+        source: class definition. Must produce at least one ColAnalysis
+            subclass with a string ``df_display_name`` attribute.
+    """
+    project = _resolve_active_project()
+    try:
+        path = write_display_klass(project, name, source)
+    except DisplayKlassError as exc:
+        return {"error": str(exc)}
+    _notify("display_changed", extra={"action": "add", "name": name})
+    return {"name": name, "path": str(path)}
+
+
+@mcp.tool()
+@_tag_project
+def catalog_list_display_klasses() -> list[dict]:
+    """List every project-authored display klass (active + disabled).
+
+    Returns ``[{name, path, source, disabled}]`` sorted with active klasses
+    first, then disabled (parked) ones.
+    """
+    project = _resolve_active_project()
+    return list_display_klasses(project)
+
+
+@mcp.tool()
+@_tag_project
+def catalog_remove_display_klass(name: str) -> dict:
+    """Soft-delete a project-authored display klass.
+
+    Moves ``display/<name>.py`` to ``display/_disabled/<name>.py``.
+    The ``_disabled/`` subdirectory is ignored by buckaroo's scanner so
+    the klass disappears from new sessions on the next load.
+    """
+    project = _resolve_active_project()
+    new_path = remove_display_klass(project, name)
+    if new_path is None:
+        return {"error": f"no display klass named {name!r}"}
+    _notify("display_changed", extra={"action": "remove", "name": name})
+    return {"name": name, "moved_to": str(new_path)}
 
 
 @mcp.tool()

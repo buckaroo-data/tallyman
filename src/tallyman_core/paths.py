@@ -181,6 +181,10 @@ def stats_dir(project: str) -> Path:
     return artifacts_dir(project) / "stats"
 
 
+def display_dir(project: str) -> Path:
+    return artifacts_dir(project) / "display"
+
+
 def exports_dir(project: str) -> Path:
     return artifacts_dir(project) / "exports"
 
@@ -297,6 +301,7 @@ def ensure_project(project: str) -> Path:
     (p / "artifacts" / "catalog" / "entries").mkdir(parents=True, exist_ok=True)
     (p / "artifacts" / "post_processing").mkdir(parents=True, exist_ok=True)
     (p / "artifacts" / "stats").mkdir(parents=True, exist_ok=True)
+    (p / "artifacts" / "display").mkdir(parents=True, exist_ok=True)
     (p / "artifacts" / "exports").mkdir(parents=True, exist_ok=True)
     (p / "data").mkdir(parents=True, exist_ok=True)
     (p / "notebooks").mkdir(parents=True, exist_ok=True)

@@ -1132,7 +1132,7 @@ def create_app(
             payload.kind,
             getattr(payload, "hash", None),
         )
-        if payload.kind in ("post_processing_changed", "summary_stat_changed", "project_reset"):
+        if payload.kind in ("post_processing_changed", "summary_stat_changed", "display_changed", "project_reset"):
             if buckaroo:
                 reloaded = buckaroo.reload_project_sessions(project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)

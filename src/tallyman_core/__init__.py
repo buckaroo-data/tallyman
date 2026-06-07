@@ -45,6 +45,12 @@ from tallyman_core.post_processing import (
     run_post_processing,
     write_post_processing,
 )
+from tallyman_core.display_klasses import (
+    DisplayKlassError,
+    list_display_klasses,
+    remove_display_klass,
+    write_display_klass,
+)
 from tallyman_core.summary_stats import (
     StatSourceError,
     list_stats,
@@ -63,6 +69,10 @@ __all__ = [
     "PostProcessingRunError",
     "PostProcessingSourceError",
     "run_post_processing",
+    "DisplayKlassError",
+    "list_display_klasses",
+    "remove_display_klass",
+    "write_display_klass",
     "StatSourceError",
     "list_post_processings",
     "list_stats",

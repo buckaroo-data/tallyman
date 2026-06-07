@@ -96,6 +96,10 @@ def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet
 
 
 def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, orders_parquet: Path):
+    # The base overrides (used by promoted diff entries, which render without
+    # the diff display klasses) color numeric value columns by pct_delta. The
+    # live /diff route strips this via strip_live_diff_color so the per-view
+    # klass coloring wins — see test_strip_live_diff_color below.
     from pydata_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -108,6 +112,37 @@ def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, or
     assert v2_cfg["color_map_config"]["color_rule"] == "color_map"
     assert v2_cfg["color_map_config"]["map_name"] == "DIVERGING_RED_WHITE_BLUE"
     assert v2_cfg["color_map_config"]["val_column"] == "total_pct_delta"
+
+
+def test_strip_live_diff_color_drops_numeric_keeps_categorical():
+    # The live /diff route strips numeric (color_map) value-column coloring so
+    # the display klasses own it, but keeps categorical key/equality colors.
+    from pydata_companion.diff import strip_live_diff_color
+
+    overrides = {
+        "total_v2": {
+            "header_name": "total",
+            "tooltip_config": {"tooltip_type": "simple", "val_column": "total"},
+            "color_map_config": {
+                "color_rule": "color_map",
+                "map_name": "DIVERGING_RED_WHITE_BLUE",
+                "val_column": "total_pct_delta",
+            },
+        },
+        "region_v2": {
+            "header_name": "region",
+            "color_map_config": {"color_rule": "color_categorical", "val_column": "region_eq"},
+        },
+        "region": {"color_map_config": {"color_rule": "color_categorical", "val_column": "membership"}},
+    }
+    stripped = strip_live_diff_color(overrides)
+    # numeric color dropped, rename + tooltip kept
+    assert "color_map_config" not in stripped["total_v2"]
+    assert stripped["total_v2"]["header_name"] == "total"
+    assert stripped["total_v2"]["tooltip_config"]["val_column"] == "total"
+    # categorical colors preserved
+    assert stripped["region_v2"]["color_map_config"]["color_rule"] == "color_categorical"
+    assert stripped["region"]["color_map_config"]["color_rule"] == "color_categorical"
 
 
 def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orders_parquet: Path):

@@ -76,30 +76,37 @@ def _diff_cell_lines(
     overrides_repr = repr(column_config_overrides)
     keys_repr = repr(keys)
 
+    # Wrap everything in a cell-local closure so the two inlined expressions
+    # (each binding ``expr``) plus ``os`` don't collide in marimo's global
+    # dataflow graph. See the non-diff path for the same rationale.
     lines = [
-        "    import os",
-        f'    os.environ.setdefault("TALLYMAN_PROJECT", {project!r})',
+        "    def _build():",
+        "        import os",
+        f'        os.environ.setdefault("TALLYMAN_PROJECT", {project!r})',
         "",
-        f"    # {source_alias} V{va} (catalog entry {a_hash})",
+        f"        # {source_alias} V{va} (catalog entry {a_hash})",
     ]
-    lines += _indent(a_expr_py).splitlines()
+    lines += _indent(a_expr_py, "        ").splitlines()
     lines += [
-        "    a_expr = expr",
+        "        a_expr = expr",
         "",
-        f"    # {source_alias} V{vb} (catalog entry {b_hash})",
+        f"        # {source_alias} V{vb} (catalog entry {b_hash})",
     ]
-    lines += _indent(b_expr_py).splitlines()
+    lines += _indent(b_expr_py, "        ").splitlines()
     lines += [
-        "    b_expr = expr",
+        "        b_expr = expr",
         "",
-        f"    # outer-join diff — keys: {keys_repr}  (catalog diff entry {content_hash})",
-        "    from tallyman_companion.diff import build_compare_expr",
-        f"    _expr, _overrides = build_compare_expr(a_expr, b_expr, keys={keys_repr})",
-        f"    _overrides = {overrides_repr}",
+        f"        # outer-join diff — keys: {keys_repr}  (catalog diff entry {content_hash})",
+        "        from tallyman_companion.diff import build_compare_expr",
+        f"        _expr, _overrides = build_compare_expr(a_expr, b_expr, keys={keys_repr})",
+        f"        _overrides = {overrides_repr}",
         "",
-        "    from buckaroo.xorq_buckaroo import XorqBuckarooInfiniteWidget",
-        "    _widget = XorqBuckarooInfiniteWidget(_expr, column_config_overrides=_overrides)",
-        "    return (_widget,)",
+        "        from buckaroo.xorq_buckaroo import XorqBuckarooInfiniteWidget",
+        "        return XorqBuckarooInfiniteWidget(_expr, column_config_overrides=_overrides)",
+        "",
+        "    _widget = _build()",
+        "    _widget",
+        "    return",
     ]
     return lines
 
@@ -205,16 +212,25 @@ def notebook_to_marimo(project: str) -> str:
         if diff_provenance:
             code_lines = _diff_cell_lines(project, content_hash, diff_provenance, display_config)
         else:
+            # Wrap the inlined expr.py in a cell-local closure so its names
+            # (expr, os, xo, ...) don't leak into marimo's global dataflow
+            # graph — marimo forbids the same variable being defined by more
+            # than one cell. ``_build`` and ``_df`` are underscore-prefixed,
+            # which marimo treats as cell-local and allows to repeat.
             code_lines = [
-                "    import os",
-                f'    os.environ.setdefault("TALLYMAN_PROJECT", {project!r})',
+                "    def _build():",
+                "        import os",
+                f'        os.environ.setdefault("TALLYMAN_PROJECT", {project!r})',
                 "",
             ]
-            code_lines += [f"    {line}" if line.strip() else "" for line in code.splitlines()]
+            code_lines += [f"        {line}" if line.strip() else "" for line in code.splitlines()]
             code_lines += [
                 "",
-                "    _df = expr.execute()",
-                "    return (_df,)",
+                "        return expr.execute()",
+                "",
+                "    _df = _build()",
+                "    _df",
+                "    return",
             ]
 
         parts += [

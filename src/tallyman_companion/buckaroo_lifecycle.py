@@ -344,6 +344,12 @@ class BuckarooManager:
         analysis/post-processing klasses are updated in place — no eviction
         or page-load round-trip to /load_expr is needed.
 
+        After a successful reload the on-disk parquet stat cache for that
+        entry is cleared so the next widget request recomputes all stats
+        (including any newly added ones) from scratch. Without this, a stat
+        added after the session was first loaded would be absent from the
+        cache and silently omitted from the display.
+
         Returns the number of sessions reloaded. Falls back to 0 (with a
         warning) if buckaroo isn't running or a reload call fails.
         """
@@ -371,6 +377,7 @@ class BuckarooManager:
                     to_evict.append(content_hash)
                     continue
                 resp.raise_for_status()
+                self._clear_stat_cache(project, content_hash)
                 reloaded += 1
                 log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
             except httpx.HTTPError as exc:
@@ -381,6 +388,20 @@ class BuckarooManager:
                     self._sessions.pop(h, None)
             self._persist_sessions()
         return reloaded
+
+    def _clear_stat_cache(self, project: str, content_hash: str) -> None:
+        """Delete cached stat parquet files for one entry.
+
+        The parquet files in ``.buckaroo_stat_cache/parquet/`` are written
+        by xorq's ParquetSnapshotCache.  After a klass reload the cache is
+        stale (it was built before the new stat existed) so we delete it
+        here.  The cache directory itself is left intact; buckaroo repopulates
+        it on the next widget request.
+        """
+        cache_dir = entry_dir(project, content_hash) / ".buckaroo_stat_cache" / "parquet"
+        if cache_dir.is_dir():
+            shutil.rmtree(cache_dir, ignore_errors=True)
+            log.info("cleared stat cache for %s/%s", project, content_hash)
 
     # ------------------------------------------------------------------
     # session creation

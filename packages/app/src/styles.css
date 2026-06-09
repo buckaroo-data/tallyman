@@ -514,6 +514,22 @@ table.cache-table .muted { color: var(--muted); }
 .del-btn:hover { background: #2a1b1b; color: #ffb4b4; border-color: #7a4a4a; }
 .del-btn:disabled { opacity: 0.5; cursor: default; }
 
+/* catalog customizations page */
+.cust-section { margin-bottom: 22px; }
+.cust-section-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 2px; }
+.cust-section-head strong { font-size: 14px; }
+.cust-section .cache-note { display: block; margin-bottom: 8px; }
+.cust-item { border: 1px solid var(--border); border-radius: 5px; margin-bottom: 6px; background: var(--panel, transparent); }
+.cust-item > summary { display: flex; align-items: baseline; gap: 10px; padding: 6px 10px; cursor: pointer; list-style: none; }
+.cust-item > summary::-webkit-details-marker { display: none; }
+.cust-item > summary::before { content: "▸"; color: var(--muted); font-size: 11px; }
+.cust-item[open] > summary::before { content: "▾"; }
+.cust-item .cust-name { font-weight: 600; font-family: ui-monospace, monospace; }
+.cust-item .cust-name.muted { color: var(--muted); font-weight: 400; text-decoration: line-through; }
+.cust-item .cust-path { margin-left: auto; font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
+.cust-item .vchip { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+.cust-item > pre.code { margin: 0; border-top: 1px solid var(--border); border-radius: 0 0 5px 5px; }
+
 /* projects management page */
 .projects-page { max-width: 600px; margin: 32px auto; padding: 16px; }
 .projects-page h2 { margin-top: 0; margin-bottom: 16px; }

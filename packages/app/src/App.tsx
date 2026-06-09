@@ -9,6 +9,7 @@ import { LineagePage } from "./pages/LineagePage";
 import { LineageEntryPage } from "./pages/LineageEntryPage";
 import { DiffPage } from "./pages/DiffPage";
 import { CachePage } from "./pages/CachePage";
+import { CustomizationsPage } from "./pages/CustomizationsPage";
 import { EmptyStatePage } from "./pages/EmptyStatePage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { api } from "./api";
@@ -55,6 +56,7 @@ export default function App() {
                 <Route path="lineage" element={<LineagePage />} />
                 <Route path="lineage/:hash" element={<LineageEntryPage />} />
                 <Route path="cache" element={<CachePage />} />
+                <Route path="customizations" element={<CustomizationsPage />} />
                 <Route path="diff/:alias" element={<DiffPage />} />
                 <Route path="diff/:alias/:va/:vb" element={<DiffPage />} />
                 <Route path="*" element={<Navigate to="catalog" replace />} />

@@ -1007,6 +1007,23 @@ def create_app(
             "total_formatted": _fmt_bytes(total),
         }
 
+    @app.get("/{project}/api/customizations")
+    def api_customizations(project: str):
+        """Project-wide buckaroo customizations: summary stats, display
+        klasses and post-processing functions, each with its source. These
+        are global to the catalog (one set per project), not per-entry."""
+        project = _validate_project(project)
+        from tallyman_core.display_klasses import list_display_klasses  # noqa: PLC0415
+        from tallyman_core.post_processing import list_post_processings  # noqa: PLC0415
+        from tallyman_core.summary_stats import list_stats  # noqa: PLC0415
+
+        return {
+            "project": project,
+            "summary_stats": list_stats(project),
+            "display_klasses": list_display_klasses(project),
+            "post_processings": list_post_processings(project),
+        }
+
     @app.delete("/{project}/api/result_cache/{content_hash}")
     async def api_delete_result_cache(project: str, content_hash: str):
         project = _validate_project(project)

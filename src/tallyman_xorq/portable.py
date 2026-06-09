@@ -52,15 +52,16 @@ def expand_to_tmp(build_dir: Path, project_root: Path) -> Path:
     """Copy `build_dir` to a tmp dir, expanding placeholders. Caller must clean up."""
     target = Path(tempfile.mkdtemp(prefix="tallyman_load_"))
     project_root_str = str(project_root)
-    for f in build_dir.iterdir():
-        if not f.is_file():
+    for item in build_dir.iterdir():
+        if item.is_dir():
+            shutil.copytree(item, target / item.name)
             continue
         try:
-            text = f.read_text()
+            text = item.read_text()
         except UnicodeDecodeError:
-            shutil.copyfile(f, target / f.name)
+            shutil.copyfile(item, target / item.name)
             continue
-        (target / f.name).write_text(text.replace(PLACEHOLDER, project_root_str))
+        (target / item.name).write_text(text.replace(PLACEHOLDER, project_root_str))
     return target
 
 

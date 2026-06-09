@@ -107,7 +107,6 @@ expr = t.nonexistent_column.sum()
 
 from tallyman_xorq.build import _ibis_import_hint, lint_catalog_code  # noqa: E402
 
-
 # ---------------------------------------------------------------------------
 # lint_catalog_code — pre-execution static scanner
 # ---------------------------------------------------------------------------

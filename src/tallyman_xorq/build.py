@@ -266,6 +266,7 @@ def _inject_prelude(module: object) -> None:
     try:
         import xorq.api as _xo  # noqa: PLC0415
         import xorq.vendor.ibis as _ibis  # noqa: PLC0415
+
         from tallyman_xorq.io import from_catalog as _from_catalog  # noqa: PLC0415
         from tallyman_xorq.io import from_project as _from_project  # noqa: PLC0415
     except ImportError:

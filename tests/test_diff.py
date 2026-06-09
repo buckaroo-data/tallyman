@@ -370,14 +370,11 @@ def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parque
     # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
     from tallyman_companion.app import _build_compare_expr
     from tallyman_xorq import build_and_persist
-    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    a_expr = cached_result_expr(project, a.content_hash)
-    b_expr = cached_result_expr(project, b.content_hash)
-    p1, _ = _build_compare_expr(a_expr, b_expr, ["region"])
-    p2, _ = _build_compare_expr(a_expr, b_expr, ["region"])
+    p1, _ = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
+    p2, _ = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
     assert p1 == p2
 
 
@@ -390,13 +387,10 @@ def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Pat
     # Non-numeric columns keep the categorical membership palette.
     from tallyman_companion.app import _build_compare_expr
     from tallyman_xorq import build_and_persist
-    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    a_expr = cached_result_expr(project, a.content_hash)
-    b_expr = cached_result_expr(project, b.content_hash)
-    _, overrides = _build_compare_expr(a_expr, b_expr, ["region"])
+    _, overrides = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
 
     # Numeric shared cols: new value displayed, old value via tooltip, a-side
     # hidden. No color_map_config here — coloring is per-view in the klasses.

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import logging
 import os
@@ -18,6 +19,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
 from tallyman_core import (
     alias_for_hash,
     clear_errors,
@@ -42,6 +44,8 @@ from tallyman_xorq import (
     read_prompts,
 )
 from tallyman_xorq.layout import layered_positions
+from tallyman_xorq.primary_key import diff_keys
+from tallyman_xorq.result_cache import cached_result_expr
 
 log = logging.getLogger("tallyman.companion")
 
@@ -206,12 +210,12 @@ def _compute_disk_usage(project: str) -> dict:
     }
 
 
-def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
-    """Build an xorq outer-join comparison expression for two entry exprs.
+@functools.lru_cache(maxsize=None)
+def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> tuple[Path, dict]:
+    """Build and cache an xorq outer-join comparison expression for a diff pair.
 
-    Delegates expression construction to ``tallyman_companion.diff.build_compare_expr``
-    and then calls ``xo.build_expr`` to produce the build_dir Buckaroo needs for
-    its ``/load_expr`` endpoint.
+    Keyed by (project, a_hash, b_hash, keys) — both entries are immutable
+    content-addressed artifacts so the result is stable for the process lifetime.
 
     Returns (build_path, column_config_overrides).
     """
@@ -219,22 +223,21 @@ def _build_compare_expr(a, b, keys: list[str]) -> tuple[Path, dict]:
 
     import xorq.api as xo
 
-    from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
-
-    expr, overrides = build_compare_expr(a, b, keys)
-    # The live /diff route loads the diff display klasses, which own per-view
-    # numeric coloring. Drop the shared numeric color from the overrides so it
-    # doesn't clobber the klass-set color in merge_column_config. (Promoted
-    # entries keep the colored overrides — they render without the klasses.)
+    a = cached_result_expr(project, a_hash)
+    b = cached_result_expr(project, b_hash)
+    expr, overrides = build_compare_expr(a, b, list(keys))
     overrides = strip_live_diff_color(overrides)
 
-    # One session-scoped parent dir so build_expr lands the comparison in a
-    # stable content-hash subdir — re-rendering the same diff reuses it.
     builds_dir = Path(tempfile.gettempdir()) / "tallyman_diff_builds"
     builds_dir.mkdir(parents=True, exist_ok=True)
     build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
 
     return build_path, overrides
+
+
+# Session IDs for which Buckaroo's /load_expr has already succeeded this process.
+# Skips the re-POST on repeat diff views for the same pair.
+_loaded_diff_sessions: set[str] = set()
 
 
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
@@ -389,6 +392,61 @@ def create_app(
         except Exception as exc:
             log.warning("checkpoint after %s %s failed: %s", request.method, path, exc)
         return response
+
+    @app.on_event("startup")
+    async def _warm_expr_cache():
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from tallyman_core.paths import catalog_dir  # noqa: PLC0415
+        from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+        project = _current_project()
+        if project is None:
+            return
+        entries_dir = catalog_dir(project) / "entries"
+        if not entries_dir.is_dir():
+            return
+        hashes = [d.name for d in entries_dir.iterdir() if (d / "xorq_build").is_dir()]
+        if not hashes:
+            return
+
+        _WARMUP_BUDGET = 3.0
+
+        def _warm():
+            import time as _time  # noqa: PLC0415
+
+            t_start = _time.perf_counter()
+            warmed = 0
+            for h in hashes:
+                elapsed = _time.perf_counter() - t_start
+                if elapsed >= _WARMUP_BUDGET:
+                    log.warning(
+                        "expr cache warmup hit %.1fs budget after %d/%d entries"
+                        " — remaining entries will warm on first access",
+                        _WARMUP_BUDGET,
+                        warmed,
+                        len(hashes),
+                    )
+                    return
+                try:
+                    cached_result_expr(project, h)
+                    warmed += 1
+                    log.debug(
+                        "expr cache warmed %s (%.0fms, %.0fms elapsed)",
+                        h[:12],
+                        (_time.perf_counter() - t_start - elapsed) * 1000,
+                        (_time.perf_counter() - t_start) * 1000,
+                    )
+                except Exception as exc:
+                    log.warning("expr cache warmup failed for %s: %s", h[:12], exc)
+            log.info(
+                "expr cache warmed %d/%d entries in %.0fms",
+                warmed,
+                len(hashes),
+                (_time.perf_counter() - t_start) * 1000,
+            )
+
+        await run_in_threadpool(_warm)
 
     # ------------------------------------------------------------------
     # Root redirect
@@ -714,6 +772,8 @@ def create_app(
     @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
+        import traceback as _tb  # noqa: PLC0415
+
         project = _validate_project(project)
         hashes = history_for(project, alias)
         if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
@@ -727,22 +787,22 @@ def create_app(
         if not a_dir.exists() or not b_dir.exists():
             raise HTTPException(404, "one or both entries missing")
 
-        from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
-        from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
-
-        a_expr = cached_result_expr(project, a_hash)
-        b_expr = cached_result_expr(project, b_hash)
-        keys = diff_keys(project, a_hash, b_hash) or None
-        diff = full_diff(
-            a_dir,
-            b_dir,
-            a_label=f"V{va}",
-            b_label=f"V{vb}",
-            backend="xorq",
-            a_expr=a_expr,
-            b_expr=b_expr,
-            keys=keys,
-        )
+        try:
+            a_expr = cached_result_expr(project, a_hash)
+            b_expr = cached_result_expr(project, b_hash)
+            keys = diff_keys(project, a_hash, b_hash) or None
+            diff = full_diff(
+                a_dir,
+                b_dir,
+                a_label=f"V{va}",
+                b_label=f"V{vb}",
+                backend="xorq",
+                a_expr=a_expr,
+                b_expr=b_expr,
+                keys=keys,
+            )
+        except Exception:
+            raise HTTPException(500, detail=_tb.format_exc())
 
         compare_session = None
         buckaroo_ws_base_url = None
@@ -752,28 +812,35 @@ def create_app(
             if keys:
                 session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
                 try:
-                    build_path, overrides = _build_compare_expr(a_expr, b_expr, keys)
-                    from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
-
-                    stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
-                    stat_cache.mkdir(parents=True, exist_ok=True)
-                    _diff_extras = Path(__file__).parent / "diff_extras"
-                    resp = buckaroo._client.post(
-                        f"{buckaroo.base_url}/load_expr",
-                        json={
-                            "session": session_id,
-                            "build_dir": str(build_path),
-                            "no_browser": True,
-                            "column_config_overrides": overrides,
-                            "cache_storage_path": str(stat_cache),
-                            "extra_grid_config": {"searchDebounceMs": 3000},
-                            "project_root": str(_diff_extras),
-                        },
-                        timeout=30.0,
+                    build_path, overrides = _build_compare_expr(
+                        project, a_hash, b_hash, tuple(keys)
                     )
-                    if resp.status_code == 200:
+                    if session_id in _loaded_diff_sessions:
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url
+                    else:
+                        from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
+
+                        stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
+                        stat_cache.mkdir(parents=True, exist_ok=True)
+                        _diff_extras = Path(__file__).parent / "diff_extras"
+                        resp = buckaroo._client.post(
+                            f"{buckaroo.base_url}/load_expr",
+                            json={
+                                "session": session_id,
+                                "build_dir": str(build_path),
+                                "no_browser": True,
+                                "column_config_overrides": overrides,
+                                "cache_storage_path": str(stat_cache),
+                                "extra_grid_config": {"searchDebounceMs": 3000},
+                                "project_root": str(_diff_extras),
+                            },
+                            timeout=30.0,
+                        )
+                        if resp.status_code == 200:
+                            _loaded_diff_sessions.add(session_id)
+                            compare_session = session_id
+                            buckaroo_ws_base_url = buckaroo.ws_base_url
                 except Exception as exc:
                     log.warning("diff /load_expr compare failed: %s", exc)
 

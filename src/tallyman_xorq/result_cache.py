@@ -28,6 +28,7 @@ there's no TTL because entries are permanent history, not expiring scratch.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -85,8 +86,13 @@ def cache_worthy(project: str, content_hash: str) -> bool:
     return classify_build(entry_dir(project, content_hash) / "xorq_build")["worthy"]
 
 
+@functools.lru_cache(maxsize=None)
 def result_cache(project: str):
-    """A ParquetSnapshotCache rooted under the project's result_cache dir."""
+    """A ParquetSnapshotCache rooted under the project's result_cache dir.
+
+    One connection per project per process — lru_cache ensures xo.connect() is
+    called once rather than on every cached_result_expr / ensure_result call.
+    """
     import xorq.api as xo
 
     from tallyman_core.paths import result_cache_dir
@@ -96,6 +102,7 @@ def result_cache(project: str):
     return xo.ParquetSnapshotCache.from_kwargs(source=xo.connect(), base_path=base)
 
 
+@functools.lru_cache(maxsize=None)
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as an expression that resolves its own materialisation.
 

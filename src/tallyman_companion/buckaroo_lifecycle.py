@@ -50,7 +50,6 @@ import httpx
 
 from tallyman_core import entry_dir
 from tallyman_core.paths import artifacts_dir, project_dir
-from tallyman_xorq.portable import expand_to_tmp
 
 
 def _entry_parquet_exists(project: str, content_hash: str) -> bool:
@@ -478,14 +477,19 @@ class BuckarooManager:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
                 return cached["session_id"]
-            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths in a tmp copy —
-            # buckaroo's xorq_loading.load_expr_build_dir calls xorq.api.load_expr
-            # directly and does no placeholder handling, so an unexpanded
-            # build_dir produces a session whose paged reads return zero rows.
-            expanded = self._expanded_dirs.get(content_hash)
-            if expanded is None:
-                expanded = expand_to_tmp(build_dir, project_dir(project))
-                self._expanded_dirs[content_hash] = expanded
+            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths. We expand into
+            # a stable per-entry subdirectory rather than a random tmp dir so
+            # the expanded path is identical across server restarts — xorq
+            # embeds the build_dir path in the expression hash used by
+            # ParquetSnapshotCache, so a random tmp path makes every stat-cache
+            # lookup a miss even when the cache is fully populated on disk.
+            # Entries are content-addressed and immutable, so the expansion is
+            # always correct once written.
+            expanded = entry_dir(project, content_hash) / ".xorq_build_expanded"
+            if not expanded.exists():
+                expanded.mkdir(parents=True, exist_ok=True)
+                from tallyman_xorq.portable import expand_into_dir  # noqa: PLC0415
+                expand_into_dir(build_dir, project_dir(project), expanded)
             stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
             stat_cache.mkdir(parents=True, exist_ok=True)
             payload: dict = {

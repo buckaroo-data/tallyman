@@ -23,6 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_core import entry_dir
 from tallyman_xorq import build_and_persist
 
 
@@ -283,11 +284,13 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
 # ---------------------------------------------------------------------------
 
 
-def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monkeypatch):
-    """The tmp dir created by ensure_session must be deleted by stop().
+def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_parquet: Path, monkeypatch):
+    """ensure_session expands into a stable per-entry .xorq_build_expanded dir.
 
-    Without this, a long-lived companion accumulates per-content-hash
-    tmp dirs in /var/folders/.../tallyman_load_*.
+    The expansion used to go to a random mkdtemp tracked in _expanded_dirs and
+    deleted by stop(); it now lives under the (immutable, content-addressed)
+    entry dir so the path is identical across restarts — which is what lets the
+    ParquetSnapshotCache hit. It must therefore survive stop().
     """
     res = build_and_persist(project, _code(project))
 
@@ -305,15 +308,14 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
 
     mgr.ensure_session(res.content_hash, project)
-    tmp = mgr._expanded_dirs[res.content_hash]
-    assert tmp.is_dir()
+    expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+    assert expanded.is_dir()
 
-    # Simulate already-exited subprocess so stop()'s early-return path runs;
-    # _cleanup_expanded_dirs must fire on that path too.
+    # Simulate already-exited subprocess so stop()'s early-return path runs.
     mgr.proc = None
     mgr.stop()
-    assert not tmp.exists()
-    assert mgr._expanded_dirs == {}
+    # The expansion is reused across restarts — stop() must NOT delete it.
+    assert expanded.is_dir()
 
 
 def test_unit_stop_cleans_many_expanded_dirs(project: str):
@@ -379,7 +381,7 @@ def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path
 
     assert results == ["shared"] * 8
     assert len(post_urls) == 1, post_urls
-    assert len(mgr._expanded_dirs) == 1
+    assert (entry_dir(project, res.content_hash) / ".xorq_build_expanded").is_dir()
 
 
 def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
@@ -426,8 +428,8 @@ def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_pa
         t.join()
 
     assert post_count["n"] == len(hashes)
-    assert len(set(posted_build_dirs)) == len(hashes)  # one tmp dir per hash
-    assert len(mgr._expanded_dirs) == len(hashes)
+    assert len(set(posted_build_dirs)) == len(hashes)  # one expansion dir per hash
+    assert all((entry_dir(project, h) / ".xorq_build_expanded").is_dir() for h in hashes)
 
 
 # ---------------------------------------------------------------------------

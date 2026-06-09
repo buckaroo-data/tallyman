@@ -203,31 +203,36 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     """Execute a xorq expression script and persist it as a catalog entry.
 
     The provided code MUST bind a top-level variable named `expr` to a xorq/ibis
-    expression. Imports allowed; all imports happen in a fresh module scope.
+    expression. The four canonical names are PRE-INJECTED — no import statement
+    needed for basic usage:
 
-    PREFERRED pattern:
+        ibis          # xorq.vendor.ibis — ibis._, ibis.cases, ibis.window,
+                      #   ibis.literal, ibis.coalesce, ibis.desc, ibis.schema
+        xo            # xorq.api — xo.memtable, xo.deferred_read_parquet, xo.connect
+        from_catalog  # read a named catalog entry or content hash
+        from_project  # read a raw file under <project>/data/
 
-        from tallyman_xorq.io import from_project, from_catalog
-        import xorq.vendor.ibis as ibis
-        t = from_catalog("alias_name")            # named catalog entry (alias or hash)
+    MINIMAL PATTERN (no imports needed):
+
+        t = from_catalog("alias_name")            # named entry
         t = from_project("file.parquet")          # raw file under <project>/data/
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
+        expr = t.mutate(pk=ibis._.a + "_" + ibis._.b)   # ibis._ available pre-injected
 
-    THREE NAMESPACES — mixing these up is the #1 build failure:
+    Explicit `import xorq.api as xo` or `import xorq.vendor.ibis as ibis` still work
+    and are fine for clarity — they just overwrite the pre-injected binding with the
+    same module.
 
-        import xorq.api as xo            # backends + deferred reads:
-                                         # xo.memtable, xo.deferred_read_parquet, xo.connect
-        import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
-                                         # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
-        from tallyman_xorq.io import from_project, from_catalog   # reading data
+    FORBIDDEN IMPORTS — the linter rejects these before any code runs:
 
-        t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
-        # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
-        #   xorq._ all raise AttributeError. The api module is `xo` (xorq.api).
-        # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
-        #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
-        # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
-        # Read data only via from_project / from_catalog (no xo.read_parquet / ibis.read_parquet).
+        import ibis           # imports system ibis (no datafusion backend); use
+                              #   the pre-injected ibis or `import xorq.vendor.ibis as ibis`
+        from ibis import X    # same problem — use xorq.vendor.ibis
+        import xorq as xo     # bare xorq has no API methods; use `import xorq.api as xo`
+        import xorq           # same — use `import xorq.api as xo`
+
+    Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
+    Read data only via from_project / from_catalog (no xo.read_parquet / ibis.read_parquet).
 
     ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build

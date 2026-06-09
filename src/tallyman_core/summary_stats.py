@@ -58,6 +58,16 @@ _SAFE_BUILTIN_NAMES = (
     "isinstance",
     "issubclass",
     "type",
+    # Exception types — needed for try/except Exception: in compute()
+    "Exception",
+    "ValueError",
+    "TypeError",
+    "KeyError",
+    "AttributeError",
+    "IndexError",
+    "RuntimeError",
+    "StopIteration",
+    "NotImplementedError",
 )
 _NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 

@@ -105,7 +105,88 @@ expr = t.nonexistent_column.sum()
 # hint only caught bare `import ibis`, the Expr class mismatch, and `xorq._`.
 # ---------------------------------------------------------------------------
 
-from tallyman_xorq.build import _ibis_import_hint  # noqa: E402
+from tallyman_xorq.build import _ibis_import_hint, lint_catalog_code  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# lint_catalog_code — pre-execution static scanner
+# ---------------------------------------------------------------------------
+
+
+def test_lint_rejects_import_ibis():
+    errors = lint_catalog_code("import ibis\nexpr = ibis.table('x')")
+    assert errors
+    assert any("xorq.vendor.ibis" in e for e in errors)
+
+
+def test_lint_rejects_from_ibis_import():
+    errors = lint_catalog_code("from ibis import window\nexpr = None")
+    assert errors
+    assert any("xorq.vendor.ibis" in e for e in errors)
+
+
+def test_lint_rejects_from_ibis_submodule():
+    errors = lint_catalog_code("from ibis.expr.types import Column\nexpr = None")
+    assert errors
+
+
+def test_lint_rejects_bare_import_xorq():
+    errors = lint_catalog_code("import xorq\nexpr = xorq.connect()")
+    assert errors
+    assert any("xorq.api" in e for e in errors)
+
+
+def test_lint_rejects_import_xorq_as_xo():
+    errors = lint_catalog_code("import xorq as xo\nexpr = xo.connect()")
+    assert errors
+    assert any("xorq.api" in e for e in errors)
+
+
+def test_lint_accepts_correct_imports():
+    code = """
+import xorq.api as xo
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import from_catalog, from_project
+t = from_catalog("foo")
+expr = t.filter(t.x > 0)
+"""
+    assert lint_catalog_code(code) == []
+
+
+def test_lint_accepts_no_imports():
+    code = "t = from_catalog('foo')\nexpr = t.filter(t.x > 0)"
+    assert lint_catalog_code(code) == []
+
+
+def test_lint_returns_syntax_error():
+    errors = lint_catalog_code("def broken(\nexpr = None")
+    assert errors
+    assert any("syntax" in e for e in errors)
+
+
+def test_build_lint_fires_before_exec(project: str):
+    # `import ibis` is caught by the linter — no code should execute.
+    code = "import ibis\nexpr = ibis.table('x', schema={'a': 'int64'})"
+    with pytest.raises(BuildError, match="pre-execution lint"):
+        build_and_persist(project, code)
+
+
+def test_preinjected_names_available(project: str, orders_parquet: Path):
+    # ibis, xo, from_project are pre-injected — no import statements needed.
+    code = f"""
+t = xo.deferred_read_parquet({str(orders_parquet)!r})
+expr = t.group_by("region").aggregate(
+    total=t.price.sum(),
+    label=ibis.literal("ok"),
+)
+"""
+    res = build_and_persist(project, code)
+    assert res.row_count == 4
+
+
+# ---------------------------------------------------------------------------
+# Namespace / column-name hints
+# ---------------------------------------------------------------------------
 
 
 def test_hint_bare_xorq_attribute_points_to_api():

@@ -47,6 +47,7 @@ dev = [
     # marimo export in tests; the package generates marimo source without it.
     "marimo>=0.23.9",
     "twine>=6.2.0",
+    "playwright>=1.60.0",
 ]
 
 [build-system]

@@ -3,7 +3,7 @@
     "tallyman": {
       "command": "uv",
       "args": ["run", "tallyman", "mcp"],
-      "cwd": "/Users/paddy/code/tallyman-notebooks",
+      "cwd": "/Users/paddy/tallyman",
       "env": {
         "TALLYMAN_PROJECT": "spike",
         "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860"

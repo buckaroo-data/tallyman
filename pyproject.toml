@@ -1,5 +1,5 @@
 [project]
-name = "tallyman-notebooks"
+name = "tallyman-data"
 version = "0.0.1"
 description = "tallyman — deconstructed notebook platform"
 requires-python = ">=3.13,<3.14"
@@ -46,6 +46,7 @@ dev = [
     # marimo is only needed to run the exported notebooks and to validate the
     # marimo export in tests; the package generates marimo source without it.
     "marimo>=0.23.9",
+    "twine>=6.2.0",
 ]
 
 [build-system]

@@ -22,6 +22,17 @@ from tallyman_core.manifest import read_manifest
 from tallyman_core.notebook import load as load_notebook
 from tallyman_core.paths import entry_dir
 
+# Buckaroo auto-monkeypatches pd.DataFrame._display_ (when imported inside a
+# marimo environment) to an anywidget whose JS ships as an inline data: URI,
+# which marimo refuses to load. We can't reliably toggle that global off in a
+# long-lived reactive kernel, so instead we never display a bare DataFrame:
+# wrapping the result in ``mo.ui.table`` yields a marimo UIElement whose
+# rendering never consults ``_display_``. The exported notebook stays portable,
+# and the Buckaroo viewer lives in the companion app where its assets are served
+# as real files. ``import marimo as mo`` stays inside the closure so ``mo`` does
+# not collide with the bootstrap cell's global ``mo``.
+_NATIVE_RENDER_COMMENT = "        # render via marimo's native table (avoids Buckaroo's data:-URI widget)"
+
 
 def _safe_ident(alias: str) -> str:
     """Turn an alias into a valid Python identifier for a Marimo cell function."""
@@ -226,7 +237,9 @@ def notebook_to_marimo(project: str) -> str:
             code_lines += [f"        {line}" if line.strip() else "" for line in code.splitlines()]
             code_lines += [
                 "",
-                "        return expr.execute()",
+                _NATIVE_RENDER_COMMENT,
+                "        import marimo as mo",
+                "        return mo.ui.table(expr.execute())",
                 "",
                 "    _df = _build()",
                 "    _df",

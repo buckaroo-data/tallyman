@@ -1,87 +1,138 @@
-# ADR: Content-address source reads so entry identity survives reset and transport
+# ADR: Content-addressed source reads (CAS) so `content_hash` tracks source data
 
-- **Status:** Proposed (2026-06-10)
-- **Context ticket:** buckaroo-data/tallyman#30 (precondition for the result-cache rubric's reset-stable `content_hash` key)
-- **Affected code:** `src/tallyman_xorq/io.py` (`from_project`, `from_catalog`)
-- **Related ADR:** `plans/adr-result-cache-cost-rubric.md` (relies on `content_hash` being a stable cache key)
+- **Status:** Proposed (2026-06-10; same-day revision — the original draft's
+  mechanism was disproved by measurement, see "What changed")
+- **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
+  result-cache rubric's content-stable `content_hash` key)
+- **Affected code:** `src/tallyman_xorq/source_identity.py` (new),
+  `src/tallyman_xorq/io.py` (`from_project`), `src/tallyman_xorq/build.py`
+  (`build_and_persist`), `src/tallyman_core/manifest.py` (`sources` map)
+- **Related ADR:** `plans/adr-result-cache-cost-rubric.md` (relies on
+  `content_hash` being a content-stable cache key)
+- **Evidence:** `tests/test_cache_lab.py` (marker `cache_lab`), reports under
+  `tests/cache_lab_reports/`
 
-## Problem
+## What changed since the first draft
 
-An entry's `content_hash` is xorq's build hash, and the README states the
-contract "same code + same inputs → same hash → same entry dir (idempotent)".
-That contract is weaker than it reads, because of how xorq hashes a parquet
-source by default.
+The original draft assumed xorq hashes a parquet source via
+`normalize_read_path_stat` (`(mtime, size, inode)`) and proposed passing
+`normalize_read_path_md5sum` in `from_project` / `from_catalog`. Measurement
+disproved both halves:
 
-`xo.deferred_read_parquet` defaults to `normalize_method=normalize_read_path_stat`
-(`xorq/python/xorq/common/utils/defer_utils.py:235`), which contributes
-`(st_mtime, st_size, st_ino)` to the hash, not the file's content
-(`defer_utils.py:84`). The build-hash tokenizer confirms this: for an absolute
-path that exists it calls `read.normalize_method(p)`
-(`xorq/python/xorq/common/utils/dasher/_relations.py:85`), and the compiler's
-canonicalization defaults to the same stat method (`ibis_yaml/compiler.py:261`,
-`compiler.py:400`). The content-hash variant `normalize_read_path_md5sum` exists
-but is opt-in. (Memtables are separately forced to content-md5 at
-`compiler.py:602`; only file reads use stat.)
+- The build hash never consults `normalize_method`. `content_hash` comes
+  from `get_expr_hash` (xorq `provenance_utils.py:18`), which tokenizes
+  inside `SnapshotStrategy().normalization_context()`; its
+  `snapshot_normalize_read` (xorq `caching/strategy.py:49`) keys a Read on
+  its **path string only**. Neither file stat nor file content reaches the
+  hash, in xorq 0.3.26 and on xorq main.
+- So the md5 opt-in is a no-op for identity, and the failure mode is worse
+  than stat-fragility: identity is *blind to data changes*. The cache lab's
+  `test_append_invalidates` shows it — append rows to `trips.parquet`,
+  rebuild the same code, get the same `content_hash`, and the build-time
+  dedup (`build.py:286`) returns the stale entry's result.
 
-tallyman lands in the stat branch: `from_project` resolves to an **absolute**
-path and calls plain `deferred_read_parquet` (`io.py:38`), and its own docstring
-notes the build embeds absolute paths. So **`content_hash` depends on the source
-file's `(mtime, size, inode)`**, with these consequences:
+Path-only identity means: an in-place content change is invisible (stale
+results served under the old hash — the dangerous direction); a
+byte-identical rewrite or reset is stable (accidentally correct); the
+README's "same code + same inputs → same hash" contract is false exactly
+when inputs change. Cross-machine, the absolute path prefix forks identity —
+that part of the original draft stands, but it is a separate problem this
+ADR does not solve.
 
-1. **Reset-to / git checkout forks identity for identical content.** Checkout
-   writes a new file — new inode, new mtime — so re-deriving an entry after a
-   reset yields a *different* `content_hash` for the same logical input.
-2. **Cross-machine transport forks identity.** `tallyman pack` / `serve` on
-   another machine sees different mtime+inode, so the same project rebuilds to
-   different hashes.
-3. **In-place result regeneration forks downstream identity.** `ensure_result`
-   regenerates a cheap entry's `result.parquet` in place
-   (`result_cache.py:142`), changing its mtime+inode; any child built via
-   `from_catalog` afterward gets a different hash.
-4. **Conversely, a stat-preserving content swap goes stale.** A replacement that
-   preserves size+mtime+inode keeps the hash, so a genuine content change is
-   missed.
-
-This does not corrupt an *existing* entry — `content_hash` is frozen into the
-dir name at build (`build.py:271`) and never recomputed on load, so caches keyed
-on it stay valid through reset and reload. The damage is on *re-derivation*: a
-logically-identical rebuild produces a "new" duplicate entry, defeating the
-build-time dedup (`build.py:275`) and orphaning the caches keyed on the old
-hash.
+xorq is a frozen upstream for this project, so the fix must be entirely
+tallyman-side.
 
 ## Decision
 
-Pass `normalize_method=normalize_read_path_md5sum` in `from_project` and
-`from_catalog`, so a source read contributes its content digest to the build
-hash instead of filesystem stat.
+Content-address the source read path itself. `from_project`:
+
+1. digests the file (md5, memoized per `(mtime_ns, size, inode)` in
+   `artifacts/source_digests.json`, so an unchanged file is hashed once,
+   not once per build);
+2. ensures a copy-on-write clone at `data/.cas/<digest><suffix>` (APFS
+   `cp -c`; plain copy as fallback — never a hardlink, which would share
+   the inode and let an in-place edit corrupt the snapshot);
+3. reads through the clone.
+
+Since xorq hashes reads by path string, the path **is** the content
+identity: same content → same path → same `content_hash`; changed content →
+new digest → new path → new hash. Every xorq-level key derived from the
+expression — the build hash, `ParquetSnapshotCache` keys, anything future —
+becomes content-honest with no further guards.
+
+`from_catalog` is unchanged: it already reads
+`entries/<content_hash>/result.parquet`, so the parent's identity is in the
+path by construction.
+
+Implemented behind `TALLYMAN_SOURCE_IDENTITY=off|cas|salt` (default `off`)
+so the cache lab can benchmark strategies; accepting this ADR means
+flipping the default to `cas` after the consequences below are addressed.
+
+## Measured behavior (cache lab, 150k-row matrix)
+
+| invariant / cost                          | off (today)        | cas         | salt        |
+| ----------------------------------------- | ------------------ | ----------- | ----------- |
+| in-place content change forks identity    | no — serves stale  | yes         | yes         |
+| self-heal faithful after source edit      | no                 | **yes**     | no          |
+| stat-preserving swap                      | stale, incoherent  | stale but coherent | stale, incoherent |
+| byte-identical rewrite keeps identity     | yes                | yes         | yes         |
+| `from_catalog` child stable; reset dedups | yes                | yes         | yes         |
+| build overhead (memo hit / new content)   | —                  | +13ms / +110ms per 71MB | same |
+
+"Self-heal faithful" is load-bearing for the result-cache ADR: its
+budget/eviction loop assumes an evicted `result.parquet` recomputes to what
+was evicted. Under `cas` the clone is a snapshot of the bytes the entry was
+built from, so regeneration is faithful even after the user edits the
+source in place; under `off`/`salt` regeneration silently absorbs the new
+data under the old identity.
 
 ## Alternatives considered
 
-- **Keep stat hashing (status quo).** Fragile under exactly the operations
-  tallyman wants to support — reset-to, pack/serve across machines, in-place
-  regeneration. Rejected.
-- **Build-relative `read_path` hashing.** xorq hashes a build-relative path as
-  the path string alone (`dasher/_relations.py:81`), which is portable but
-  content-*insensitive*: a content swap at the same relative path is never
-  detected. Worse than stat for correctness. Rejected.
-- **mtime-based cache invalidation layered on top.** Rejected on independent
-  grounds: git checkout rewrites mtimes to "now" non-monotonically, so any
-  mtime ordering check is fooled by reset in both directions (false-keep and
-  false-invalidate). Content-addressing is the only reset-safe key.
+- **`normalize_read_path_md5sum` via `deferred_read_parquet` (the original
+  draft).** Ineffective: the snapshot hasher never consults
+  `normalize_method` (see "What changed"). Rejected on measurement.
+- **Salt: mix tallyman-computed source digests into `content_hash`**
+  (`build_and_persist` collects digests recorded by `from_project` during
+  user-code import). Passes the same identity invariants with the same
+  overhead, and keeps human-readable `data/` paths in builds. Rejected
+  because it fixes only the entry *name* while every xorq-level key stays
+  path-only: the lab demonstrated two salted entries (same code and path,
+  different data) colliding on one `ParquetSnapshotCache` key, with the new
+  entry serving the old entry's rows. `result_cache.py` now routes salt-mode
+  reads around that cache, but the collision class survives for any future
+  xorq-key surface, and self-heal stays unfaithful. The implementation is
+  kept in-tree behind the env switch so the lab can re-compare; delete it
+  when `cas` is made the default.
+- **Stat-based identity (mtime/size/inode).** Unreachable for the same
+  snapshot-normalization reason, and undesirable anyway: forks on touch /
+  reset / transport, misses stat-preserving swaps.
+- **Fix the hash in xorq.** Out of scope: frozen upstream.
 
 ## Consequences
 
-- `content_hash` becomes stable across reset, machine, and in-place
-  regeneration; the README idempotency claim becomes true, and `pack`/`serve`
-  portability (currently flagged as not-yet-working in `io.py`) gets its
-  identity precondition.
-- This is the precondition the result-cache ADR relies on when it keys caches on
-  `content_hash` and asserts reset-safety.
-- One md5 pass over each source file per build. Cheap — the file is already read
-  to infer schema — and one-time per content hash.
-- This is a tallyman-side usage change only (which `normalize_method` we pass);
-  **no modification to xorq**. Consistent with xorq's own choice to content-hash
-  memtables.
-- Deliberately recorded as its own ADR, separate from the cache-rubric ADR, so
-  the source-identity decision can be revisited atomically without reopening the
-  caching design.
+- The README idempotency contract becomes true in both directions: same
+  code + same data dedups; changed data forks. `test_append_invalidates`
+  flips from failing to passing and pins it.
+- One md5 pass per *new content version* of a source (~110ms per 71MB,
+  measured), +~13ms per build for the memo hit; the clone is free on APFS.
+  Note the original draft claimed the digest read was free because schema
+  inference already reads the file — wrong, parquet schema inference reads
+  only the footer; the memo is what keeps the cost out of the per-build
+  path.
+- The stat memo reintroduces a stat-keyed shortcut: a swap preserving
+  `(mtime_ns, size, inode)` serves the stale digest (the hole git's index
+  accepts). Failure degrades safely — the entry stays coherent with its own
+  snapshot rather than serving mixed state — and `TALLYMAN_SOURCE_REHASH=1`
+  closes it at full-rehash cost.
+- On filesystems without copy-on-write (ext4), the clone is a real copy:
+  each content version of each source doubles its storage until GC. Before
+  flipping the default: add `cp --reflink=auto` on Linux and document the
+  copy fallback.
+- `.cas/` accumulates one clone per content version. Manifests now record
+  each entry's `{rel_path: digest}` map (`manifest.py`), so GC is "delete
+  digests unreferenced by any live entry"; wire it into reset/bullpen
+  maintenance.
+- Builds embed `data/.cas/<digest>.parquet` paths; UI provenance should
+  display the human name from the manifest `sources` map.
+- Cross-machine identity (absolute path prefix in the hash) remains broken
+  under every mode — `pack`/`serve` portability needs its own decision.

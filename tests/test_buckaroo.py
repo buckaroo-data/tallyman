@@ -552,17 +552,17 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet
         session_id = mgr.ensure_session(res.content_hash, project)
         assert session_id is not None
 
-        # The tmp dir lives for the manager's lifetime; expr.yaml must be
-        # placeholder-free so xorq can read the upstream parquet.
-        tmp = mgr._expanded_dirs[res.content_hash]
-        expr_yaml = (tmp / "expr.yaml").read_text()
+        # The expansion lives in the entry's stable .xorq_build_expanded dir;
+        # expr.yaml must be placeholder-free so xorq can read the upstream parquet.
+        expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+        expr_yaml = (expanded / "expr.yaml").read_text()
         assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
         # /load_expr's response surfaces rows — POST a probe directly to
         # inspect it. With unexpanded paths this comes back rows=0.
         resp = httpx.post(
             f"{mgr.base_url}/load_expr",
-            json={"build_dir": str(tmp), "no_browser": True},
+            json={"build_dir": str(expanded), "no_browser": True},
             timeout=10.0,
         )
         resp.raise_for_status()

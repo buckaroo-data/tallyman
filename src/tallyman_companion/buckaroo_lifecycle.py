@@ -521,6 +521,7 @@ class BuckarooManager:
             # is fully populated on disk. Marker-gated for crash safety. Shared
             # with load_entry's diff path so the two can't drift.
             from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+
             expanded = ensure_expanded_build(
                 build_dir,
                 project_dir(project),

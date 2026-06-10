@@ -127,7 +127,5 @@ def load_expr_portable(build_dir: Path, project_root: Path, cache_dir):
     """
     from xorq.ibis_yaml.compiler import load_expr
 
-    expanded = ensure_expanded_build(
-        build_dir, project_root, build_dir.parent / ".xorq_build_expanded"
-    )
+    expanded = ensure_expanded_build(build_dir, project_root, build_dir.parent / ".xorq_build_expanded")
     return load_expr(expanded, cache_dir=cache_dir)

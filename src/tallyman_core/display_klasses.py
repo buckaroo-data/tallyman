@@ -56,9 +56,8 @@ def validate_display_klass_source(name: str, source: str) -> None:
         raise DisplayKlassError(f"syntax error: {e}") from None
 
     try:
+        from buckaroo.customizations.styling import DefaultMainStyling, DefaultSummaryStatsStyling, StylingAnalysis
         from buckaroo.pluggable_analysis_framework.col_analysis import ColAnalysis
-        from buckaroo.customizations.styling import (
-            DefaultMainStyling, DefaultSummaryStatsStyling, StylingAnalysis)
     except ImportError as e:
         raise DisplayKlassError(f"buckaroo not installed: {e}") from None
 

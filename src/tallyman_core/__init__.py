@@ -13,6 +13,12 @@ from tallyman_core.aliases import (  # noqa: I001 (keep notebook import first)
     version_of_hash,
 )
 from tallyman_core.charts import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
+from tallyman_core.display_klasses import (
+    DisplayKlassError,
+    list_display_klasses,
+    remove_display_klass,
+    write_display_klass,
+)
 from tallyman_core.errors import clear_errors, get_error, list_errors, record_error
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
 from tallyman_core.marimo_export import export_notebook_path, notebook_to_marimo
@@ -44,12 +50,6 @@ from tallyman_core.post_processing import (
     remove_post_processing,
     run_post_processing,
     write_post_processing,
-)
-from tallyman_core.display_klasses import (
-    DisplayKlassError,
-    list_display_klasses,
-    remove_display_klass,
-    write_display_klass,
 )
 from tallyman_core.summary_stats import (
     StatSourceError,

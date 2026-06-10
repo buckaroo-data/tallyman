@@ -48,9 +48,8 @@ def make_portable_inplace(build_dir: Path, project_root: Path) -> int:
     return modified
 
 
-def expand_to_tmp(build_dir: Path, project_root: Path) -> Path:
-    """Copy `build_dir` to a tmp dir, expanding placeholders. Caller must clean up."""
-    target = Path(tempfile.mkdtemp(prefix="tallyman_load_"))
+def expand_into_dir(build_dir: Path, project_root: Path, target: Path) -> None:
+    """Expand placeholders from `build_dir` into an existing `target` directory."""
     project_root_str = str(project_root)
     for item in build_dir.iterdir():
         if item.is_dir():
@@ -62,6 +61,12 @@ def expand_to_tmp(build_dir: Path, project_root: Path) -> Path:
             shutil.copyfile(item, target / item.name)
             continue
         (target / item.name).write_text(text.replace(PLACEHOLDER, project_root_str))
+
+
+def expand_to_tmp(build_dir: Path, project_root: Path) -> Path:
+    """Copy `build_dir` to a tmp dir, expanding placeholders. Caller must clean up."""
+    target = Path(tempfile.mkdtemp(prefix="tallyman_load_"))
+    expand_into_dir(build_dir, project_root, target)
     return target
 
 

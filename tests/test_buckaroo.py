@@ -23,6 +23,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_core import entry_dir
 from tallyman_xorq import build_and_persist
 
 
@@ -283,11 +284,13 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
 # ---------------------------------------------------------------------------
 
 
-def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monkeypatch):
-    """The tmp dir created by ensure_session must be deleted by stop().
+def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_parquet: Path, monkeypatch):
+    """ensure_session expands into a stable per-entry .xorq_build_expanded dir.
 
-    Without this, a long-lived companion accumulates per-content-hash
-    tmp dirs in /var/folders/.../tallyman_load_*.
+    The expansion used to go to a random mkdtemp tracked in _expanded_dirs and
+    deleted by stop(); it now lives under the (immutable, content-addressed)
+    entry dir so the path is identical across restarts — which is what lets the
+    ParquetSnapshotCache hit. It must therefore survive stop().
     """
     res = build_and_persist(project, _code(project))
 
@@ -305,15 +308,84 @@ def test_unit_stop_cleans_expanded_dirs(project: str, orders_parquet: Path, monk
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
 
     mgr.ensure_session(res.content_hash, project)
-    tmp = mgr._expanded_dirs[res.content_hash]
-    assert tmp.is_dir()
+    expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+    assert expanded.is_dir()
 
-    # Simulate already-exited subprocess so stop()'s early-return path runs;
-    # _cleanup_expanded_dirs must fire on that path too.
+    # Simulate already-exited subprocess so stop()'s early-return path runs.
     mgr.proc = None
     mgr.stop()
-    assert not tmp.exists()
-    assert mgr._expanded_dirs == {}
+    # The expansion is reused across restarts — stop() must NOT delete it.
+    assert expanded.is_dir()
+
+
+def test_unit_ensure_session_heals_partial_expansion(project: str, orders_parquet: Path, monkeypatch):
+    """A crash mid-expansion must not poison the stable expanded dir forever.
+
+    The expansion writes files into .xorq_build_expanded; a kill/OOM partway
+    leaves a half-written dir. The old ``if not expanded.exists()`` guard then
+    treated that truncated dir as complete and fed buckaroo a build_dir missing
+    files (zero rows), or — if a subdir landed half-copied — raised
+    FileExistsError out of the lock on every later load. ensure_session must key
+    off a completion marker written last, and re-expand when it's absent.
+    """
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "s"}
+
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
+
+    # Simulate an interrupted expansion: a dir with stray contents, no marker.
+    expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+    marker = entry_dir(project, res.content_hash) / ".xorq_build_expanded.complete"
+    expanded.mkdir(parents=True)
+    (expanded / "stale_partial.txt").write_text("interrupted")
+    assert not marker.exists()
+
+    mgr.ensure_session(res.content_hash, project)
+
+    # Healed: the stray file is gone, the marker exists, and every file from the
+    # source build_dir was expanded in.
+    assert marker.exists()
+    assert not (expanded / "stale_partial.txt").exists()
+    build_dir = entry_dir(project, res.content_hash) / "xorq_build"
+    for item in build_dir.iterdir():
+        assert (expanded / item.name).exists(), item.name
+
+
+def test_unit_diff_sessions_invalidated_on_buckaroo_restart(project: str):
+    """A buckaroo restart must drop loaded diff-compare sessions.
+
+    Buckaroo's /load_expr sessions live only in the subprocess's RAM, so a
+    restart (fresh ``started_at`` from /health) invalidates every session_id —
+    entry sessions (``_sessions``) and diff-compare sessions alike. The diff
+    bookkeeping used to be a module global that nothing reset, so a post-restart
+    diff view skipped the re-POST and handed the client a session the new
+    process never loaded.
+    """
+    mgr = BuckarooManager()
+    mgr._buckaroo_started_at = 1000.0
+    mgr._sessions = {"h": {"session_id": "s", "project": project}}
+    mgr.mark_diff_session_loaded("diff-aaaa-bbbb")
+    assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+
+    # Same started_at → not a restart → bookkeeping preserved.
+    mgr._reset_session_bookkeeping_if_restarted(1000.0)
+    assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+    assert mgr._sessions
+
+    # Fresh started_at → restart → entry and diff sessions both dropped.
+    mgr._reset_session_bookkeeping_if_restarted(2000.0)
+    assert not mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+    assert mgr._sessions == {}
 
 
 def test_unit_stop_cleans_many_expanded_dirs(project: str):
@@ -379,7 +451,7 @@ def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path
 
     assert results == ["shared"] * 8
     assert len(post_urls) == 1, post_urls
-    assert len(mgr._expanded_dirs) == 1
+    assert (entry_dir(project, res.content_hash) / ".xorq_build_expanded").is_dir()
 
 
 def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
@@ -426,8 +498,8 @@ def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_pa
         t.join()
 
     assert post_count["n"] == len(hashes)
-    assert len(set(posted_build_dirs)) == len(hashes)  # one tmp dir per hash
-    assert len(mgr._expanded_dirs) == len(hashes)
+    assert len(set(posted_build_dirs)) == len(hashes)  # one expansion dir per hash
+    assert all((entry_dir(project, h) / ".xorq_build_expanded").is_dir() for h in hashes)
 
 
 # ---------------------------------------------------------------------------
@@ -480,17 +552,17 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet
         session_id = mgr.ensure_session(res.content_hash, project)
         assert session_id is not None
 
-        # The tmp dir lives for the manager's lifetime; expr.yaml must be
-        # placeholder-free so xorq can read the upstream parquet.
-        tmp = mgr._expanded_dirs[res.content_hash]
-        expr_yaml = (tmp / "expr.yaml").read_text()
+        # The expansion lives in the entry's stable .xorq_build_expanded dir;
+        # expr.yaml must be placeholder-free so xorq can read the upstream parquet.
+        expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+        expr_yaml = (expanded / "expr.yaml").read_text()
         assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
         # /load_expr's response surfaces rows — POST a probe directly to
         # inspect it. With unexpanded paths this comes back rows=0.
         resp = httpx.post(
             f"{mgr.base_url}/load_expr",
-            json={"build_dir": str(tmp), "no_browser": True},
+            json={"build_dir": str(expanded), "no_browser": True},
             timeout=10.0,
         )
         resp.raise_for_status()

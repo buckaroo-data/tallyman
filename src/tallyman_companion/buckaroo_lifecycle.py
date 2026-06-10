@@ -50,7 +50,6 @@ import httpx
 
 from tallyman_core import entry_dir
 from tallyman_core.paths import artifacts_dir, project_dir
-from tallyman_xorq.portable import expand_to_tmp
 
 
 def _entry_parquet_exists(project: str, content_hash: str) -> bool:
@@ -123,6 +122,10 @@ class BuckarooManager:
         self._client = httpx.Client(timeout=5.0)
         # Schema: {<content_hash>: {"session_id": str, "project": str}}.
         self._sessions: dict[str, dict] = {}
+        # Diff-compare session_ids (``diff-<a>-<b>``) Buckaroo has loaded this
+        # lifetime. Reset on a Buckaroo restart, same as ``_sessions`` — these
+        # sessions live only in the subprocess's RAM.
+        self._loaded_diff_sessions: set[str] = set()
         self._session_lock = threading.Lock()
         self._buckaroo_started_at: float | None = None
         # Tmp dirs we created by expanding ${TALLYMAN_PROJECT_ROOT} placeholders
@@ -225,17 +228,9 @@ class BuckarooManager:
                     started_at = health.get("started")
                     log.info("buckaroo ready on %s (started=%s)", self.base_url, started_at)
                     # If this Buckaroo started fresh (different start time from
-                    # what we last saw), the cached session_ids are stale and
-                    # we drop them so /load runs again on first hit.
-                    if started_at != self._buckaroo_started_at:
-                        if self._sessions:
-                            log.info(
-                                "buckaroo restart detected; invalidating %d cached sessions",
-                                len(self._sessions),
-                            )
-                        self._sessions = {}
-                        self._buckaroo_started_at = started_at
-                        self._persist_sessions()
+                    # what we last saw), its in-RAM sessions are gone — drop our
+                    # bookkeeping so /load_expr runs again on first hit.
+                    self._reset_session_bookkeeping_if_restarted(started_at)
                     threading.Thread(target=self._drain_stdout, daemon=True).start()
                     return
             except httpx.HTTPError:
@@ -282,6 +277,46 @@ class BuckarooManager:
         for p in self._expanded_dirs.values():
             shutil.rmtree(p, ignore_errors=True)
         self._expanded_dirs.clear()
+
+    # ------------------------------------------------------------------
+    # diff-compare session bookkeeping
+    # ------------------------------------------------------------------
+
+    def diff_session_is_loaded(self, session_id: str) -> bool:
+        """True if Buckaroo has loaded this diff-compare session this lifetime."""
+        return session_id in self._loaded_diff_sessions
+
+    def mark_diff_session_loaded(self, session_id: str) -> None:
+        """Record a successful diff ``/load_expr``.
+
+        Dropped on a Buckaroo restart by ``_reset_session_bookkeeping_if_restarted``
+        — the session exists only in the subprocess's RAM, so a stale entry would
+        point a client at a session the restarted process never loaded.
+        """
+        self._loaded_diff_sessions.add(session_id)
+
+    def _reset_session_bookkeeping_if_restarted(self, started_at) -> None:
+        """Drop in-RAM session bookkeeping when a fresh Buckaroo is detected.
+
+        Buckaroo's ``/load_expr`` sessions — entry (``_sessions``) and
+        diff-compare (``_loaded_diff_sessions``) alike — live only in the
+        subprocess's memory, so a restart (a new ``started_at`` from ``/health``)
+        invalidates every session_id we've handed out. Clearing both forces a
+        re-POST on next access; that reload is cheap because the on-disk
+        stat/result cache survives the restart. Keeping a stale entry instead
+        would hand a client a dead session.
+        """
+        if started_at == self._buckaroo_started_at:
+            return
+        if self._sessions:
+            log.info(
+                "buckaroo restart detected; invalidating %d cached sessions",
+                len(self._sessions),
+            )
+        self._sessions = {}
+        self._loaded_diff_sessions.clear()
+        self._buckaroo_started_at = started_at
+        self._persist_sessions()
 
     # ------------------------------------------------------------------
     # session map (persisted to disk)
@@ -478,14 +513,31 @@ class BuckarooManager:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
                 return cached["session_id"]
-            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths in a tmp copy —
-            # buckaroo's xorq_loading.load_expr_build_dir calls xorq.api.load_expr
-            # directly and does no placeholder handling, so an unexpanded
-            # build_dir produces a session whose paged reads return zero rows.
-            expanded = self._expanded_dirs.get(content_hash)
-            if expanded is None:
-                expanded = expand_to_tmp(build_dir, project_dir(project))
-                self._expanded_dirs[content_hash] = expanded
+            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths. We expand into
+            # a stable per-entry subdirectory rather than a random tmp dir so
+            # the expanded path is identical across server restarts — xorq
+            # embeds the build_dir path in the expression hash used by
+            # ParquetSnapshotCache, so a random tmp path makes every stat-cache
+            # lookup a miss even when the cache is fully populated on disk.
+            # Entries are content-addressed and immutable, so the expansion is
+            # always correct once written.
+            expanded = entry_dir(project, content_hash) / ".xorq_build_expanded"
+            expanded_marker = entry_dir(project, content_hash) / ".xorq_build_expanded.complete"
+            if not expanded_marker.exists():
+                # Re-expand whenever the completion marker is absent: either this
+                # is the first load, or a previous expansion was interrupted
+                # (crash/kill/OOM) and left a partial dir. The marker is written
+                # last, so its presence is the only proof every file landed. An
+                # `exists()` check on the dir itself would treat a truncated
+                # expansion as complete — feeding buckaroo a build_dir missing
+                # files (zero rows), or raising FileExistsError out of the lock
+                # if a subdir landed half-copied — on every subsequent load.
+                if expanded.exists():
+                    shutil.rmtree(expanded)
+                expanded.mkdir(parents=True)
+                from tallyman_xorq.portable import expand_into_dir  # noqa: PLC0415
+                expand_into_dir(build_dir, project_dir(project), expanded)
+                expanded_marker.write_text("")
             stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
             stat_cache.mkdir(parents=True, exist_ok=True)
             payload: dict = {

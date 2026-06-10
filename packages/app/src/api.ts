@@ -13,7 +13,9 @@ import type {
 async function get<T>(url: string): Promise<T> {
   const r = await fetch(url);
   if (!r.ok) {
-    const msg = await r.text().catch(() => `HTTP ${r.status}`);
+    const text = await r.text().catch(() => `HTTP ${r.status}`);
+    let msg = text;
+    try { msg = JSON.parse(text).detail ?? text; } catch { /* not JSON */ }
     throw new Error(msg);
   }
   return r.json();

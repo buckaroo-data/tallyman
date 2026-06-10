@@ -20,7 +20,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo==0.14.15",
+    "buckaroo==0.14.17",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
     # No duckdb extra: the only backend is xorq's built-in datafusion
@@ -47,6 +47,7 @@ dev = [
     # marimo export in tests; the package generates marimo source without it.
     "marimo>=0.23.9",
     "twine>=6.2.0",
+    "playwright>=1.60.0",
 ]
 
 [build-system]

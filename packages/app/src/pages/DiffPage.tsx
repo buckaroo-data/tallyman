@@ -58,14 +58,23 @@ export function DiffPage() {
     return (
       <main>
         <section className="panel detail" style={{ margin: "12px 16px" }}>
-          <h2 style={{ margin: "0 0 4px 0" }}>diff unavailable</h2>
-          <p className="meta" style={{ color: "#ffb4b4", margin: "0 0 12px 0" }}>{error}</p>
-          <p className="meta" style={{ margin: 0 }}>
-            This diff URL doesn&apos;t resolve (the alias, versions, or pairing may be stale).{" "}
+          <h2 style={{ margin: "0 0 8px 0" }}>diff error</h2>
+          <p className="meta" style={{ margin: "0 0 8px 0" }}>
             <Link to={`/${project}/catalog/${alias}`}>view {alias} in the catalog</Link>
             {" · "}
             <Link to={`/${project}/catalog`}>back to catalog</Link>
           </p>
+          <pre style={{
+            background: "#1a1010",
+            color: "#ff9090",
+            padding: 12,
+            borderRadius: 4,
+            fontSize: 12,
+            lineHeight: 1.5,
+            overflow: "auto",
+            whiteSpace: "pre-wrap",
+            margin: 0,
+          }}>{error}</pre>
         </section>
       </main>
     );

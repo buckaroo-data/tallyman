@@ -28,6 +28,7 @@ there's no TTL because entries are permanent history, not expiring scratch.
 
 from __future__ import annotations
 
+import functools
 import re
 from pathlib import Path
 
@@ -85,8 +86,15 @@ def cache_worthy(project: str, content_hash: str) -> bool:
     return classify_build(entry_dir(project, content_hash) / "xorq_build")["worthy"]
 
 
+@functools.lru_cache(maxsize=16)
 def result_cache(project: str):
-    """A ParquetSnapshotCache rooted under the project's result_cache dir."""
+    """A ParquetSnapshotCache rooted under the project's result_cache dir.
+
+    One connection per project per process — lru_cache ensures xo.connect() is
+    called once rather than on every cached_result_expr / ensure_result call.
+    Bounded (a process touches only a handful of projects); an evicted project
+    just reopens its connection on next use.
+    """
     import xorq.api as xo
 
     from tallyman_core.paths import result_cache_dir
@@ -96,8 +104,13 @@ def result_cache(project: str):
     return xo.ParquetSnapshotCache.from_kwargs(source=xo.connect(), base_path=base)
 
 
+@functools.lru_cache(maxsize=256)
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as an expression that resolves its own materialisation.
+
+    Bounded so the cache can't grow without limit across a long-lived process;
+    entries are content-addressed, so an evicted hash rebuilds an identical
+    expression on the next access.
 
     * Expensive entry → its expression wrapped in the snapshot cache: a hit
       reads the cached parquet, a miss recomputes from the build and stores.

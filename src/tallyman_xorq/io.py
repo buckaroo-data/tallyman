@@ -39,10 +39,25 @@ def from_project(rel_path: str, project: str | None = None):
 
     Use this in user code instead of `xo.deferred_read_parquet(absolute_path)`
     so the catalog entry records a project-relative reference.
+
+    Source-content identity (see tallyman_xorq.source_identity): in `cas`
+    mode the read goes through a content-addressed clone so the path xorq
+    hashes embeds the content digest; in `salt` mode the digest is recorded
+    for build_and_persist to mix into the entry hash; `off` is the plain
+    path read.
     """
     import xorq.api as xo
 
-    return xo.deferred_read_parquet(str(project_path(rel_path, project)))
+    from tallyman_xorq import source_identity as si
+
+    proj = resolve_project(project)
+    path = project_path(rel_path, proj)
+    if si.mode() != "off":
+        digest = si.digest_for(proj, path)
+        si.note_source(rel_path, digest)
+        if si.mode() == "cas":
+            path = si.ensure_cas_path(proj, path, digest)
+    return xo.deferred_read_parquet(str(path))
 
 
 def from_catalog(alias_or_hash: str, project: str | None = None):

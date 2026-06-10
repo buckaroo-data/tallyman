@@ -39,6 +39,7 @@ Scenario map (each is independent; run one with -k):
     touch_identity       byte-identical source rewrite (new inode/mtime)
     append_invalidates   real source change MUST fork identity (hard)
     stat_swap            content swap preserving (mtime, size, inode)
+    selfheal_after_edit  evicted result regenerated after the source changed
     reset_roundtrip      reset-to back/forward across built entries + caches
     parent_regen         from_catalog chain after parent result regeneration
     wide_compile         cheap to execute, expensive to compile (deep DAG)
@@ -81,6 +82,7 @@ pytestmark = pytest.mark.cache_lab
 
 TRIPS_ROWS = int(os.environ.get("CACHE_LAB_TRIPS", "150000"))
 CHAIN_DEPTH = int(os.environ.get("CACHE_LAB_CHAIN", "32"))
+IDENTITY_MODE = os.environ.get("TALLYMAN_SOURCE_IDENTITY", "off")
 REPORT_DIR = Path(__file__).resolve().parent / "cache_lab_reports"
 
 
@@ -113,11 +115,12 @@ class LabReport:
                 "platform": platform.platform(),
                 "xorq": version("xorq"),
                 "xorq_dasher": version("xorq-dasher"),
+                "source_identity_mode": IDENTITY_MODE,
             },
             "scenarios": self.scenarios,
         }
         REPORT_DIR.mkdir(exist_ok=True)
-        out = REPORT_DIR / f"{rev}-{self.started.replace(':', '')}.json"
+        out = REPORT_DIR / f"{rev}-{IDENTITY_MODE}-{self.started.replace(':', '')}.json"
         out.write_text(json.dumps(doc, indent=2, default=str))
         print(f"\n=== cache lab report: {out} ===")
         for name, rec in self.scenarios.items():
@@ -667,6 +670,39 @@ def test_stat_swap(lab):
             fresh.sort_values("start_station_id").capacity.to_numpy()
             == swapped.sort_values("station_id").capacity.to_numpy()
         ).all()
+
+
+def test_selfheal_after_edit(lab):
+    """An entry's materializations are evicted AFTER the user edits the
+    source file in place. Self-heal recomputes from the persisted build:
+    does the old entry get back the data it was built from, or silently
+    absorb the new data under the old identity? A content-addressed
+    snapshot (cas) stays faithful; a plain data-path read recomputes over
+    the new bytes. Recorded, not asserted — it differentiates strategies."""
+    code = od_matrix_code(lab.project)
+    b1 = build(lab.project, code)
+    before = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
+
+    src = lab.data / "trips.parquet"
+    df = pd.read_parquet(src)
+    df.head(len(df) // 2).to_parquet(src)  # the user halves the file in place
+
+    rp = entry_dir(lab.project, b1["hash"]) / "result.parquet"
+    if rp.exists():
+        rp.unlink()
+    rc_dir = paths.result_cache_dir(lab.project)
+    if rc_dir.exists():
+        shutil.rmtree(rc_dir)
+
+    healed = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
+    lab.record.update(
+        {
+            "trips_before": int(before.n_trips.sum()),
+            "trips_healed": int(healed.n_trips.sum()),
+            "selfheal_faithful_after_source_edit": int(healed.n_trips.sum()) == int(before.n_trips.sum()),
+        }
+    )
+    assert len(healed) > 0  # self-heal must at least produce a readable result
 
 
 def test_reset_roundtrip(lab):

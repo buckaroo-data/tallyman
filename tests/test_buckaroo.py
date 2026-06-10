@@ -318,6 +318,76 @@ def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_par
     assert expanded.is_dir()
 
 
+def test_unit_ensure_session_heals_partial_expansion(project: str, orders_parquet: Path, monkeypatch):
+    """A crash mid-expansion must not poison the stable expanded dir forever.
+
+    The expansion writes files into .xorq_build_expanded; a kill/OOM partway
+    leaves a half-written dir. The old ``if not expanded.exists()`` guard then
+    treated that truncated dir as complete and fed buckaroo a build_dir missing
+    files (zero rows), or — if a subdir landed half-copied — raised
+    FileExistsError out of the lock on every later load. ensure_session must key
+    off a completion marker written last, and re-expand when it's absent.
+    """
+    res = build_and_persist(project, _code(project))
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "s"}
+
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
+
+    # Simulate an interrupted expansion: a dir with stray contents, no marker.
+    expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
+    marker = entry_dir(project, res.content_hash) / ".xorq_build_expanded.complete"
+    expanded.mkdir(parents=True)
+    (expanded / "stale_partial.txt").write_text("interrupted")
+    assert not marker.exists()
+
+    mgr.ensure_session(res.content_hash, project)
+
+    # Healed: the stray file is gone, the marker exists, and every file from the
+    # source build_dir was expanded in.
+    assert marker.exists()
+    assert not (expanded / "stale_partial.txt").exists()
+    build_dir = entry_dir(project, res.content_hash) / "xorq_build"
+    for item in build_dir.iterdir():
+        assert (expanded / item.name).exists(), item.name
+
+
+def test_unit_diff_sessions_invalidated_on_buckaroo_restart(project: str):
+    """A buckaroo restart must drop loaded diff-compare sessions.
+
+    Buckaroo's /load_expr sessions live only in the subprocess's RAM, so a
+    restart (fresh ``started_at`` from /health) invalidates every session_id —
+    entry sessions (``_sessions``) and diff-compare sessions alike. The diff
+    bookkeeping used to be a module global that nothing reset, so a post-restart
+    diff view skipped the re-POST and handed the client a session the new
+    process never loaded.
+    """
+    mgr = BuckarooManager()
+    mgr._buckaroo_started_at = 1000.0
+    mgr._sessions = {"h": {"session_id": "s", "project": project}}
+    mgr.mark_diff_session_loaded("diff-aaaa-bbbb")
+    assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+
+    # Same started_at → not a restart → bookkeeping preserved.
+    mgr._reset_session_bookkeeping_if_restarted(1000.0)
+    assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+    assert mgr._sessions
+
+    # Fresh started_at → restart → entry and diff sessions both dropped.
+    mgr._reset_session_bookkeeping_if_restarted(2000.0)
+    assert not mgr.diff_session_is_loaded("diff-aaaa-bbbb")
+    assert mgr._sessions == {}
+
+
 def test_unit_stop_cleans_many_expanded_dirs(project: str):
     """Leak guard: stop() must clean every tracked tmp dir, not just one.
 

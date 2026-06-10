@@ -210,12 +210,14 @@ def _compute_disk_usage(project: str) -> dict:
     }
 
 
-@functools.lru_cache(maxsize=None)
+@functools.lru_cache(maxsize=128)
 def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> tuple[Path, dict]:
     """Build and cache an xorq outer-join comparison expression for a diff pair.
 
     Keyed by (project, a_hash, b_hash, keys) — both entries are immutable
     content-addressed artifacts so the result is stable for the process lifetime.
+    Bounded so the cache can't grow without limit over a long-lived process;
+    eviction just rebuilds the (deterministic) comparison on the next view.
 
     Returns (build_path, column_config_overrides).
     """
@@ -233,11 +235,6 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
 
     return build_path, overrides
-
-
-# Session IDs for which Buckaroo's /load_expr has already succeeded this process.
-# Skips the re-POST on repeat diff views for the same pair.
-_loaded_diff_sessions: set[str] = set()
 
 
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
@@ -398,7 +395,6 @@ def create_app(
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
         from tallyman_core.paths import catalog_dir  # noqa: PLC0415
-        from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
         project = _current_project()
         if project is None:
@@ -772,8 +768,6 @@ def create_app(
     @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
-        import traceback as _tb  # noqa: PLC0415
-
         project = _validate_project(project)
         hashes = history_for(project, alias)
         if not hashes or va < 1 or vb < 1 or va > len(hashes) or vb > len(hashes):
@@ -801,8 +795,13 @@ def create_app(
                 b_expr=b_expr,
                 keys=keys,
             )
-        except Exception:
-            raise HTTPException(500, detail=_tb.format_exc())
+        except Exception as exc:
+            # Full traceback to the server log; a concise type+message to the
+            # client (the diff UI renders `detail`). Avoids dumping internal
+            # paths/source if this endpoint ever sits behind anything but
+            # localhost, while still surfacing the real error.
+            log.exception("diff_data failed for %s/%s V%d→V%d", project, alias, va, vb)
+            raise HTTPException(500, detail=f"{type(exc).__name__}: {exc}") from exc
 
         compare_session = None
         buckaroo_ws_base_url = None
@@ -815,7 +814,7 @@ def create_app(
                     build_path, overrides = _build_compare_expr(
                         project, a_hash, b_hash, tuple(keys)
                     )
-                    if session_id in _loaded_diff_sessions:
+                    if buckaroo.diff_session_is_loaded(session_id):
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url
                     else:
@@ -838,7 +837,7 @@ def create_app(
                             timeout=30.0,
                         )
                         if resp.status_code == 200:
-                            _loaded_diff_sessions.add(session_id)
+                            buckaroo.mark_diff_session_loaded(session_id)
                             compare_session = session_id
                             buckaroo_ws_base_url = buckaroo.ws_base_url
                 except Exception as exc:

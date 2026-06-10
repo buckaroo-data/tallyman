@@ -160,6 +160,11 @@ def ensure_result(project: str, content_hash: str) -> Path:
         cache = result_cache(project)
         expr = load_entry(project, content_hash)
         if not cache.exists(expr):
+            # result_cache() is memoized, so its storage's directory is only
+            # created at construction; if the result_cache dir was deleted
+            # since (self-heal covers a deleted *directory*, not just a
+            # deleted file), the write below would land in a missing path.
+            cache.storage.path.mkdir(parents=True, exist_ok=True)
             # Executing the cached expression forces the cache node to write
             # its input; a count is enough and avoids pulling rows to Python.
             expr.cache(cache=cache).count().execute()

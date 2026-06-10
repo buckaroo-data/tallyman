@@ -513,31 +513,20 @@ class BuckarooManager:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
                 return cached["session_id"]
-            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths. We expand into
-            # a stable per-entry subdirectory rather than a random tmp dir so
-            # the expanded path is identical across server restarts — xorq
-            # embeds the build_dir path in the expression hash used by
-            # ParquetSnapshotCache, so a random tmp path makes every stat-cache
-            # lookup a miss even when the cache is fully populated on disk.
-            # Entries are content-addressed and immutable, so the expansion is
-            # always correct once written.
-            expanded = entry_dir(project, content_hash) / ".xorq_build_expanded"
-            expanded_marker = entry_dir(project, content_hash) / ".xorq_build_expanded.complete"
-            if not expanded_marker.exists():
-                # Re-expand whenever the completion marker is absent: either this
-                # is the first load, or a previous expansion was interrupted
-                # (crash/kill/OOM) and left a partial dir. The marker is written
-                # last, so its presence is the only proof every file landed. An
-                # `exists()` check on the dir itself would treat a truncated
-                # expansion as complete — feeding buckaroo a build_dir missing
-                # files (zero rows), or raising FileExistsError out of the lock
-                # if a subdir landed half-copied — on every subsequent load.
-                if expanded.exists():
-                    shutil.rmtree(expanded)
-                expanded.mkdir(parents=True)
-                from tallyman_xorq.portable import expand_into_dir  # noqa: PLC0415
-                expand_into_dir(build_dir, project_dir(project), expanded)
-                expanded_marker.write_text("")
+            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable
+            # per-entry dir (not a random tmp dir) so the expanded path is
+            # identical across server restarts — xorq embeds the build_dir path
+            # in the expression hash used by ParquetSnapshotCache, so a random
+            # tmp path makes every stat-cache lookup a miss even when the cache
+            # is fully populated on disk. Marker-gated for crash safety. Shared
+            # with load_entry's diff path so the two can't drift.
+            from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+
+            expanded = ensure_expanded_build(
+                build_dir,
+                project_dir(project),
+                entry_dir(project, content_hash) / ".xorq_build_expanded",
+            )
             stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
             stat_cache.mkdir(parents=True, exist_ok=True)
             payload: dict = {

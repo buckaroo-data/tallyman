@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import re
@@ -71,6 +72,51 @@ def _user_imports_bare_ibis(code: str) -> bool:
         if line.startswith("from ibis ") or line.startswith("from ibis."):
             return True
     return False
+
+
+def lint_catalog_code(code: str) -> list[str]:
+    """AST-based pre-execution scan. Returns actionable error strings, empty = clean.
+
+    Catches import mistakes that cause cryptic runtime errors. Runs before any
+    code is executed so the model gets a clear rejection on the first bad call
+    rather than after exec blows up with an AttributeError or IbisError.
+    """
+    try:
+        tree = ast.parse(code)
+    except SyntaxError as e:
+        return [f"syntax error: {e}"]
+
+    errors: list[str] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "ibis":
+                    errors.append(
+                        "`import ibis` imports the system ibis package which has no datafusion "
+                        "backend here and will shadow the pre-injected xorq.vendor.ibis. "
+                        "ibis is already available without any import — just use `ibis.window(...)`, "
+                        "`ibis.literal(...)`, `ibis._` etc. directly. If you need an explicit import "
+                        "for clarity, write `import xorq.vendor.ibis as ibis`."
+                    )
+                elif alias.name == "xorq":
+                    stmt = f"`import xorq as {alias.asname}`" if alias.asname else "`import xorq`"
+                    errors.append(
+                        f"{stmt} — the bare `xorq` module has no API methods "
+                        "(connect, memtable, deferred_read_parquet live on `xorq.api`). "
+                        "Use `import xorq.api as xo`, or just use the pre-injected `xo` "
+                        "directly without any import statement."
+                    )
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == "ibis" or module.startswith("ibis."):
+                names = ", ".join(a.name for a in node.names)
+                errors.append(
+                    f"`from {module} import {names}` imports from the system ibis package. "
+                    "Use `import xorq.vendor.ibis as ibis` instead, or just use the pre-injected "
+                    "`ibis` without any import statement."
+                )
+
+    return errors
 
 
 # Read helpers the model reaches for on the wrong namespace. The project-aware
@@ -210,6 +256,27 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
     return "\n\nHint: " + " ".join(hints)
 
 
+def _inject_prelude(module: object) -> None:
+    """Pre-inject the four canonical names into a module before exec_module runs.
+
+    ibis, xo, from_catalog, from_project are available without any import
+    statement. Explicit `import xorq.api as xo` / `import xorq.vendor.ibis as ibis`
+    still work — they just overwrite the same module object.
+    """
+    try:
+        import xorq.api as _xo  # noqa: PLC0415
+        import xorq.vendor.ibis as _ibis  # noqa: PLC0415
+
+        from tallyman_xorq.io import from_catalog as _from_catalog  # noqa: PLC0415
+        from tallyman_xorq.io import from_project as _from_project  # noqa: PLC0415
+    except ImportError:
+        return
+    module.ibis = _ibis  # type: ignore[attr-defined]
+    module.xo = _xo  # type: ignore[attr-defined]
+    module.from_catalog = _from_catalog  # type: ignore[attr-defined]
+    module.from_project = _from_project  # type: ignore[attr-defined]
+
+
 def _import_script(code: str) -> tuple[object, Path]:
     """Write code to a temp file, import it, return (module, temp_path).
 
@@ -221,6 +288,7 @@ def _import_script(code: str) -> tuple[object, Path]:
     if spec is None or spec.loader is None:
         raise BuildError(f"Could not load module spec from {tmp}")
     module = importlib.util.module_from_spec(spec)
+    _inject_prelude(module)
     sys.modules[spec.name] = module
     try:
         spec.loader.exec_module(module)
@@ -241,6 +309,12 @@ def build_and_persist(
     The user code must bind a variable named `expr_name` (default "expr") to an
     ibis/xorq expression. Imports happen in a fresh module scope.
     """
+    lint_errors = lint_catalog_code(code)
+    if lint_errors:
+        raise BuildError(
+            "pre-execution lint:\n" + "\n".join(f"  - {e}" for e in lint_errors)
+        )
+
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
     from tallyman_core.paths import compute_cache_dir

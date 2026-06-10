@@ -59,7 +59,7 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
     for proj, h in (("alpha", "hash_a"), ("beta", "hash_b")):
         d = entry_dir(proj, h) / "xorq_build"
         d.mkdir(parents=True, exist_ok=True)
-        # Minimal expr.yaml so expand_to_tmp has something to read.
+        # Minimal expr.yaml so the build expansion has something to read.
         (d / "expr.yaml").write_text("dummy: yes\n")
 
     # First call from project alpha.

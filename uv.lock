@@ -121,7 +121,7 @@ wheels = [
 
 [[package]]
 name = "buckaroo"
-version = "0.14.15"
+version = "0.14.17"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anywidget" },
@@ -131,9 +131,9 @@ dependencies = [
     { name = "numpy" },
     { name = "pyarrow" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/ea/43/81d21266b4f9e34760b1d8577b8762bcded55d1f8ba776708fc89f5e14cf/buckaroo-0.14.15.tar.gz", hash = "sha256:2b66a6713859c18932c2a52c983309511b458a752c9714486bb52860b2f50d33", size = 1689264, upload-time = "2026-06-06T15:19:17.896Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/ab/64/55e68f475ea3c4a4762042ba2f632ae273109a2bf627b290296743e834bd/buckaroo-0.14.17.tar.gz", hash = "sha256:3526d147472f45b0988ba0ec7ec55756e03f4c8b5abb14506dd0b9872fa2fa76", size = 1694484, upload-time = "2026-06-10T12:51:14.577Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5a/7d/e96c28ac567fe61fd95da6db8b034bc5e2e9aa91a2baa2eb8c89dc38fd39/buckaroo-0.14.15-py3-none-any.whl", hash = "sha256:457d8eb30dcb87af64d8ef94e33f1538562d95c52f02ab0f13a755edbe260044", size = 1543791, upload-time = "2026-06-06T15:19:15.838Z" },
+    { url = "https://files.pythonhosted.org/packages/46/6a/2202624019a9074dcc7e0588b5f45d9fe77075db04a900b439d98cc63d55/buckaroo-0.14.17-py3-none-any.whl", hash = "sha256:190ac4f44765a0c2de0f047b1ad5994d8eb3b2698716df59fb648f31277094a6", size = 1546109, upload-time = "2026-06-10T12:51:12.989Z" },
 ]
 
 [[package]]
@@ -2577,7 +2577,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "buckaroo", specifier = "==0.14.15" },
+    { name = "buckaroo", specifier = "==0.14.17" },
     { name = "click", specifier = ">=8.1" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastmcp", specifier = ">=2.0" },

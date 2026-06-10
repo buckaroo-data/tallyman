@@ -527,7 +527,7 @@ table.cache-table .muted { color: var(--muted); }
 .cust-item .cust-name { font-weight: 600; font-family: ui-monospace, monospace; }
 .cust-item .cust-name.muted { color: var(--muted); font-weight: 400; text-decoration: line-through; }
 .cust-item .cust-path { margin-left: auto; font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 50%; }
-.cust-item .vchip { background: var(--accent-soft); color: var(--accent); padding: 1px 6px; border-radius: 10px; font-size: 11px; }
+.cust-item .cust-flag { color: var(--muted); border: 1px solid var(--border); padding: 0 6px; border-radius: 10px; font-size: 11px; }
 .cust-item > pre.code { margin: 0; border-top: 1px solid var(--border); border-radius: 0 0 5px 5px; }
 
 /* projects management page */

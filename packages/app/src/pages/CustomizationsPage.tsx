@@ -43,7 +43,7 @@ function Section({ title, blurb, items }: { title: string; blurb: string; items:
           <details key={item.path} className="cust-item">
             <summary>
               <span className={`cust-name${item.disabled ? " muted" : ""}`}>{item.name}</span>
-              {item.disabled && <span className="vchip">disabled</span>}
+              {item.disabled && <span className="cust-flag">disabled</span>}
               <span className="meta cust-path" title={item.path}>
                 {item.path}
               </span>
@@ -60,10 +60,17 @@ export function CustomizationsPage() {
   const { project } = useParams<{ project: string }>();
   const { version } = useSSE();
   const [data, setData] = useState<Customizations | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
 
   useEffect(() => {
     if (!project) return;
-    api.customizations(project).then(setData).catch(() => {});
+    // Refetch on `version` bumps but keep the current data on screen — don't
+    // flip back to the loading state, so an SSE event doesn't flash the page.
+    api
+      .customizations(project)
+      .then((d) => { setData(d); setError(""); setLoading(false); })
+      .catch((e) => { setError(String(e)); setLoading(false); });
   }, [project, version]);
 
   return (
@@ -77,9 +84,15 @@ export function CustomizationsPage() {
           </span>
         </div>
 
-        {SECTIONS.map((s) => (
-          <Section key={s.key} title={s.title} blurb={s.blurb} items={data ? data[s.key] : []} />
-        ))}
+        {loading ? (
+          <div className="meta" style={{ padding: 16 }}>loading…</div>
+        ) : error && !data ? (
+          <div className="error-banner">{error}</div>
+        ) : (
+          SECTIONS.map((s) => (
+            <Section key={s.key} title={s.title} blurb={s.blurb} items={data ? data[s.key] : []} />
+          ))
+        )}
       </div>
     </main>
   );

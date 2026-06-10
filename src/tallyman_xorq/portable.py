@@ -17,10 +17,6 @@ don't exist, and `load_expr` fails. The fix is symmetric:
   `xorq_build/database_tables/` reads that source from the expanded dir at
   execute time — which happens long after load. Tearing the dir down first
   makes the read silently yield zero rows.
-
-The verified-against-xorq experiment that established this is the docstring
-of `_load_expr_portable` below; if you're touching this module, re-run that
-experiment in a python repl before pushing.
 """
 
 from __future__ import annotations
@@ -98,6 +94,14 @@ def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -
     interrupted by a crash/OOM leaves a partial dir with no marker and is
     redone, never served truncated. Entries are immutable and content-addressed,
     so the expansion is always correct once written.
+
+    Concurrency caveat: `_expand_lock` is process-local. It serializes
+    concurrent expansions of the same entry within one process, but two
+    separate processes expanding the same entry could still have one `rmtree`
+    the partial dir while the other reads it. That is safe for tallyman's
+    single-process runtime; a cross-process load (CLI `load_entry` alongside
+    the companion serving the viewer) would need an `O_CREAT|O_EXCL` lockfile
+    here instead.
     """
     marker = expanded.with_name(expanded.name + ".complete")
     if marker.exists():

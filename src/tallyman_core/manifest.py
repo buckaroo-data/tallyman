@@ -17,6 +17,9 @@ class Manifest(BaseModel):
     schema_path: str = "schema.json"
     row_count: int | None = None
     execute_seconds: float | None = None
+    # rel data path -> content md5, recorded when a source-identity mode is
+    # active (tallyman_xorq.source_identity); absent under mode=off.
+    sources: dict[str, str] | None = None
 
 
 def write_manifest(entry_path: Path, manifest: Manifest) -> Path:

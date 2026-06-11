@@ -16,3 +16,5 @@ src/tallyman_companion/static/buckaroo-embed.css
 catalog/
 # Stray ./projects/ from anything run with TALLYMAN_HOME unset to repo root.
 projects/
+# cache lab measurement reports (tests/test_cache_lab.py)
+tests/cache_lab_reports/

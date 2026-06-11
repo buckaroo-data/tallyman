@@ -125,8 +125,17 @@ def cached_result_expr(project: str, content_hash: str):
     """
     import xorq.api as xo
 
+    from tallyman_xorq import source_identity as si
     from tallyman_xorq.build import load_entry
 
+    # salt identity mode: the snapshot cache keys on path-only expression
+    # structure, so two salted entries with identical code+paths but
+    # different source CONTENT collide on the same cache key and one serves
+    # the other's stale parquet (demonstrated in the cache lab's
+    # append_invalidates scenario). Route every read through the entry-dir
+    # result.parquet, which is keyed by the salted content_hash.
+    if si.mode() == "salt":
+        return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
     if cache_worthy(project, content_hash):
         return load_entry(project, content_hash).cache(cache=result_cache(project))
     return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
@@ -141,12 +150,21 @@ def ensure_result(project: str, content_hash: str) -> Path:
     pre-existing ``result.parquet``.
     """
     from tallyman_core.paths import entry_dir
+    from tallyman_xorq import source_identity as si
     from tallyman_xorq.build import load_entry
 
-    if cache_worthy(project, content_hash):
+    # salt identity mode bypasses the snapshot cache (path-only keys collide
+    # across salted entries — see cached_result_expr) and always uses the
+    # in-place result.parquet under the salted-hash entry dir.
+    if si.mode() != "salt" and cache_worthy(project, content_hash):
         cache = result_cache(project)
         expr = load_entry(project, content_hash)
         if not cache.exists(expr):
+            # result_cache() is memoized, so its storage's directory is only
+            # created at construction; if the result_cache dir was deleted
+            # since (self-heal covers a deleted *directory*, not just a
+            # deleted file), the write below would land in a missing path.
+            cache.storage.path.mkdir(parents=True, exist_ok=True)
             # Executing the cached expression forces the cache node to write
             # its input; a count is enough and avoids pulling rows to Python.
             expr.cache(cache=cache).count().execute()

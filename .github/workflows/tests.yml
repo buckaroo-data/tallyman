@@ -57,9 +57,11 @@ jobs:
       - name: sync deps
         run: uv sync
       - name: pytest (fast)
-        # pyproject.toml's addopts already excludes `-m integration`;
-        # being explicit here so the job name matches the behaviour.
-        run: uv run pytest -m "not integration"
+        # Marker exclusions (integration, cache_lab) live in pyproject.toml's
+        # addopts. Do NOT pass -m here: a command-line -m replaces the addopts
+        # expression entirely (last -m wins), which is how the on-demand
+        # cache_lab suite once leaked onto CI.
+        run: uv run pytest
 
   integration:
     name: integration suite

@@ -252,7 +252,15 @@ def build_and_persist(
 
     ensure_project(project)
 
-    module, tmp_script = _import_script(code)
+    # Collect source digests while user code imports (from_project notes each
+    # file it reads); cas/salt identity modes consume them below.
+    from tallyman_xorq import source_identity as si
+
+    collect_token = si.begin_collect()
+    try:
+        module, tmp_script = _import_script(code)
+    finally:
+        sources = si.end_collect(collect_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
@@ -269,6 +277,10 @@ def build_and_persist(
             raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
         content_hash = build_path.name
+        if si.mode() == "salt" and sources:
+            # xorq's hash is path-identity only; mixing the source digests in
+            # makes the entry hash content-sensitive (same shape, 12 hex).
+            content_hash = si.salted_hash(content_hash, sources)
         target = entry_dir(project, content_hash)
 
         if target.exists():
@@ -346,6 +358,7 @@ def build_and_persist(
         prompt=prompt,
         row_count=row_count,
         execute_seconds=execute_seconds,
+        sources=sources or None,
     )
     write_manifest(target, manifest)
     _append_prompt(target, prompt)

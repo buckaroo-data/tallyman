@@ -1,0 +1,41 @@
+name: perf report
+
+# Report-only perf regression suite (scripts/perf_report.py): one scenario per
+# known pathology (xorq streaming/agg memory, buckaroo /load_expr stat
+# pipeline cold/warm/no-cache, companion ensure_session timeout headroom).
+# It does NOT fail on bad numbers — current known problems are expected to
+# show up here until fixed. Read it off the job summary or the uploaded
+# artifact. Target: suite wall time under 4 minutes on ubuntu-latest.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  perf-report:
+    name: perf regression report
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v3
+        with:
+          enable-cache: true
+      - name: sync deps
+        run: uv sync
+      - name: run perf regression report
+        run: uv run python scripts/perf_report.py --out perf_report.md --json perf_report.json
+      - name: publish report to job summary
+        if: always()
+        run: '[ -f perf_report.md ] && cat perf_report.md >> "$GITHUB_STEP_SUMMARY" || echo "no report produced" >> "$GITHUB_STEP_SUMMARY"'
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: perf-report
+          path: |
+            perf_report.md
+            perf_report.json
+          if-no-files-found: ignore

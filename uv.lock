@@ -2570,9 +2570,11 @@ dependencies = [
 dev = [
     { name = "marimo" },
     { name = "playwright" },
+    { name = "psutil" },
     { name = "pytest" },
     { name = "ruff" },
     { name = "twine" },
+    { name = "websockets" },
 ]
 
 [package.metadata]
@@ -2607,9 +2609,11 @@ requires-dist = [
 dev = [
     { name = "marimo", specifier = ">=0.23.9" },
     { name = "playwright", specifier = ">=1.60.0" },
+    { name = "psutil", specifier = ">=7.2.2" },
     { name = "pytest", specifier = ">=8" },
     { name = "ruff", specifier = ">=0.15.15" },
     { name = "twine", specifier = ">=6.2.0" },
+    { name = "websockets", specifier = ">=16.0" },
 ]
 
 [[package]]

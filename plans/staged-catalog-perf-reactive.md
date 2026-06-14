@@ -42,22 +42,39 @@ then produces a clean parking catalog for stage 2 to measure.
 
 ### Work
 
-1. **#48 fix.** Move `aliases.json` / `alias_history.json` (and any other non-xorq
-   file the checkpoint commits — audit the full set written under
-   `catalog_dir`, not just the two named) out of the xorq catalog repo.
-   - **Open decision — where they go.** *Recommendation: a sibling
-     `<project>/artifacts/tallyman_state/` git repo, committed in lockstep with
-     the xorq repo by the same `checkpoint_catalog` (matching step tags), and
-     reset by the same `reset_to`.* This keeps the xorq repo holding only what
-     `assert_consistency` expects, while preserving the free `git reset --hard`
-     rollback of alias state — so `test_reset_rolls_back_alias_state` stays green
-     via git rather than bespoke reconciliation. The alternative (files outside
-     any repo + explicit pointer reconciliation in `reset_to`) is simpler to
-     write but reintroduces the manual-reconciliation surface #52 is about. Needs
-     ratification before coding.
+1. **#48 fix — fold the bookkeeping into `catalog.yaml` (decided 2026-06-14).**
+   Stop writing `aliases.json` / `alias_history.json` as separate files; store
+   their content as tallyman keys in `catalog.yaml`, the same way every other
+   tallyman-owned thing already is (`post_processing`, `stats`, `charts`,
+   `display_configs`, `notebook`, `entry_hashes`, `result_cache`,
+   `compute_cache`). The two files are the lone anomaly that breaks #48; folding
+   them in removes them from the tracked file set, so `assert_consistency` (which
+   checks the file *set*, not `catalog.yaml`'s contents, catalog.py:768-785)
+   passes and `xorq catalog add` stops no-opping. xorq's add/add-alias
+   read-modify-write the whole dict and round-trip unknown keys on the `--no-sync`
+   path tallyman always uses.
+   - **Why this over a separate file/repo.** `catalog.yaml` is git-tracked and
+     checkpoint-committed, so `git reset --hard` already rolls alias state back —
+     no sibling repo, no lockstep commits, no bespoke reconciliation, and
+     `test_reset_rolls_back_alias_state` stays green via git. Strictly less code
+     than the alternatives.
+   - **Known caveat (deferred, not regressed).** `catalog.yaml` keys are what xorq
+     drops when it rebuilds the file from entries+aliases on a merge-conflict
+     `pull` (#49). Latent under single-user / `--no-sync`, and the same exposure
+     the authored state already accepts. The multi-user fix is to move all
+     project-global state out of `catalog.yaml` together (#48 + #49 jointly) —
+     `catalog.yaml`-now defers that without foreclosing it.
+   - **Optional refinement.** `set_alias` already calls `_xcat.add_alias`
+     (`aliases.py:111`), so xorq's own `aliases` key holds `{alias: latest_hash}`
+     and `aliases.json` partly duplicates it. Folding only `alias_history` into a
+     tallyman key (and reading current aliases from xorq's native `aliases`)
+     shrinks tallyman bookkeeping and survives merges for the current-alias half.
+   - Audit the full set of non-xorq files the checkpoint commits under
+     `catalog_dir`, not just the two named, in case anything else needs the same
+     treatment.
    - The deferred `test_reset_rolls_back_alias_state` guard (PR #50) ships *with*
-     this fix — moving the files changes reset's rollback behaviour, so the guard
-     must travel with the change per the TDD rule.
+     this fix — the rollback path changes, so the guard travels with the change
+     per the TDD rule.
 
 2. **#52 fix.** Add an explicit cross-view reconciliation + assertion at the end of
    `reset_to`: compare the tracked `entries/*.zip` set against `entry_hashes`,

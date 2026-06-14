@@ -194,16 +194,51 @@ def test_back_then_forward_restores_xorq_recipe(project, orders_parquet):
 def test_failed_registration_is_observable(project, orders_parquet):
     """A failed xorq catalog add must be observable, not reported as success.
 
-    Entry 1 registers and (via the committed bookkeeping files) leaves the
-    catalog inconsistent; the next add then fails ``assert_consistency``. Today
-    ``add_entry``'s failure is swallowed in a best-effort wrapper and its bool
-    return is discarded, so ``build_and_persist`` exposes no signal. The loose,
-    fix-shaped property: a ``catalog_registered``-style flag exists and is
-    ``False`` on failure."""
+    Pre-fix this failure happened on its own (entry 1's checkpoint committed the
+    bookkeeping files, leaving the catalog inconsistent so the next add fails) —
+    that was bug #48 itself, and ``add_entry`` swallowed the failure with no
+    signal. The fix removes that spontaneous failure, so to test the *signal* we
+    inject the same kind of inconsistency a stray tracked file gives, then assert
+    ``build_and_persist`` reports ``catalog_registered is False`` rather than
+    claiming success."""
     _make_entries(project, orders_parquet, 1)
+
+    # A tracked file outside xorq's managed set is exactly the shape #48 created:
+    # assert_consistency then rejects the repo and the next add fails.
+    cd = paths.catalog_dir(project)
+    (cd / "stray.txt").write_text("not xorq-managed\n")
+    _git(project, "add", "stray.txt")
+    subprocess.run(
+        ["git", "-C", str(cd), "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-q", "-m", "stray"],
+        capture_output=True,
+        text=True,
+    )
+
     result = build_and_persist(project, _agg_code(orders_parquet, _AGGS[1]))
-    registered = getattr(result, "catalog_registered", None)
-    assert registered is False, (
+    assert result.catalog_registered is False, (
         "failed xorq catalog add must be observable: build_and_persist should expose "
-        f"catalog_registered=False, got {registered!r}"
+        f"catalog_registered=False, got {result.catalog_registered!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Group E — reset rolls back alias state (regression guard shipping WITH the fix)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.integration
+def test_reset_rolls_back_alias_state(project, orders_parquet):
+    """A reset must roll alias bookkeeping back, even though the files left the repo.
+
+    Pre-fix, ``aliases.json`` was git-tracked, so ``git reset --hard`` rolled it
+    back for free. The #48 fix moves the bookkeeping out of the catalog repo, so
+    ``reset_to`` has to reconcile alias state from the catalog.yaml mirror
+    instead — this guards that it does (it would silently regress otherwise)."""
+    from tallyman_core import aliases as al
+
+    _make_entries(project, orders_parquet, 2)  # creates aliases agg0, agg1
+    assert set(al.load_aliases(project)) == {"agg0", "agg1"}
+    cs.reset_to(project, 1)  # back to the one-entry step
+    assert set(al.load_aliases(project)) == {"agg0"}, (
+        f"reset_to(step-1) did not roll alias state back: {al.load_aliases(project)}"
     )

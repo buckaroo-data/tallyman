@@ -16,7 +16,7 @@ import json
 from pathlib import Path
 
 from tallyman_core import xorq_catalog as _xcat
-from tallyman_core.paths import catalog_dir, ensure_project
+from tallyman_core.paths import alias_state_dir, ensure_project
 
 
 class AliasExists(ValueError):
@@ -28,11 +28,11 @@ class AliasNotFound(KeyError):
 
 
 def _aliases_path(project: str) -> Path:
-    return catalog_dir(project) / "aliases.json"
+    return alias_state_dir(project) / "aliases.json"
 
 
 def _history_path(project: str) -> Path:
-    return catalog_dir(project) / "alias_history.json"
+    return alias_state_dir(project) / "alias_history.json"
 
 
 def _read_json(p: Path, default):
@@ -55,6 +55,17 @@ def load_aliases(project: str) -> dict[str, str]:
 
 def load_history(project: str) -> dict[str, list[str]]:
     return _read_json(_history_path(project), {})
+
+
+def write_state(project: str, aliases: dict[str, str], history: dict[str, list[str]]) -> None:
+    """Overwrite the alias bookkeeping files wholesale.
+
+    Used by ``catalog_state.materialize`` to reconstruct alias state from the
+    catalog.yaml mirror on a ``reset_to``: the files live outside the git repo
+    now (#48), so git can't roll them back — this does.
+    """
+    _write_json(_aliases_path(project), aliases)
+    _write_json(_history_path(project), history)
 
 
 def get_alias(project: str, name: str) -> str | None:

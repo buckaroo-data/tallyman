@@ -11,8 +11,15 @@ xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
     entry_hashes:    [content_hash, ...]      # pointer to untracked entries/<hash>/
     result_cache:    [relpath, ...]           # pointer to untracked result cache
     compute_cache:   [relpath, ...]           # pointer to untracked compute cache
+    alias_map:       {alias: latest_hash}     # mirror of artifacts/alias_state/aliases.json
+    alias_history:   {alias: [hash, ...]}     # mirror of artifacts/alias_state/alias_history.json
 
-The catalog git repo tracks only ``catalog.yaml`` + the two alias files. The
+The catalog git repo tracks only ``catalog.yaml``. tallyman's alias bookkeeping
+(``aliases.json``/``alias_history.json``) lives outside the repo, under
+``artifacts/alias_state/`` — committing it inside made xorq's
+``assert_consistency`` reject the repo and every ``xorq catalog add`` after the
+first silently no-op (#48). Its content is mirrored into ``catalog.yaml`` above
+so ``reset_to`` still rolls alias state back (git no longer can). The
 heavy artifacts (entries/, the caches) are content-addressed, additive, and
 untracked — ``git reset`` can't roll them back, so ``reset_to`` reconciles them
 to the recorded pointer lists: evictions retire to the bullpen (not deleted),
@@ -40,6 +47,7 @@ from pathlib import Path
 
 import yaml
 
+from tallyman_core import aliases as al
 from tallyman_core import charts, notebook
 from tallyman_core import display_configs as dc
 from tallyman_core import post_processing as pp
@@ -60,7 +68,10 @@ log = logging.getLogger(__name__)
 
 # git-level identity flags, so commits work without a global git config.
 _GIT_ID = ["-c", "user.email=tallyman@local", "-c", "user.name=tallyman"]
-_TRACKED = ("catalog.yaml", "aliases.json", "alias_history.json")
+# Only catalog.yaml is git-tracked in the catalog repo. The alias bookkeeping
+# files moved out to artifacts/alias_state/ (#48) — tracking them here made
+# xorq's assert_consistency reject the repo.
+_TRACKED = ("catalog.yaml",)
 _STEP_RE = re.compile(r"^step-(\d+)$")
 # Refs and labels are operator input that ends up as git arguments. A plain
 # tag-shaped name only: no leading dash (option injection), no revision
@@ -96,6 +107,8 @@ def read_tallyman_state(project: str) -> dict:
         "entry_hashes": raw.get("entry_hashes", []),
         "result_cache": raw.get("result_cache", []),
         "compute_cache": raw.get("compute_cache", []),
+        "alias_map": raw.get("alias_map", {}),
+        "alias_history": raw.get("alias_history", {}),
     }
 
 
@@ -154,6 +167,8 @@ def capture_tallyman_state(project: str) -> dict:
         "entry_hashes": sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else [],
         "result_cache": _list_cache_files(result_cache_dir(project)),
         "compute_cache": _list_cache_files(compute_cache_dir(project)),
+        "alias_map": al.load_aliases(project),
+        "alias_history": al.load_history(project),
     }
     write_tallyman_state(project, **state)
     return state
@@ -223,6 +238,8 @@ def materialize(project: str) -> None:
         _materialize_display_configs(project, raw["display_configs"])
     if "notebook" in raw:
         _materialize_notebook(project, raw["notebook"] or {"cells": []})
+    if "alias_map" in raw:
+        al.write_state(project, raw["alias_map"] or {}, raw.get("alias_history") or {})
 
 
 # ---------------------------------------------------------------------------

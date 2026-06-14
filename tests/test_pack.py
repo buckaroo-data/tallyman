@@ -36,7 +36,7 @@ def test_pack_creates_tgz(project: str, orders_parquet: Path, isolated_home: Pat
 
     with tarfile.open(out_path) as tar:
         names = tar.getnames()
-    assert f"{project}/artifacts/catalog/aliases.json" in names
+    assert f"{project}/artifacts/alias_state/aliases.json" in names
     assert f"{project}/data/orders.parquet" in names
     assert any(f"{project}/artifacts/catalog/entries/{h}/" in n for n in names)
 

@@ -7,8 +7,8 @@ Layout (per-project):
     ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
-        │   ├── catalog/entries/<hash>/
-        │   ├── catalog/aliases.json, alias_history.json, chart_specs/
+        │   ├── catalog/entries/<hash>/    # the xorq catalog git repo
+        │   ├── alias_state/aliases.json, alias_history.json
         │   ├── post_processing/<name>.py
         │   ├── stats/<name>.py
         │   ├── exports/...            # marimo .py, screenshots, CSVs
@@ -117,6 +117,20 @@ def artifacts_dir(project: str) -> Path:
 
 def catalog_dir(project: str) -> Path:
     return artifacts_dir(project) / "catalog"
+
+
+def alias_state_dir(project: str) -> Path:
+    """Tallyman's alias bookkeeping — deliberately OUTSIDE the xorq catalog repo.
+
+    ``aliases.json`` / ``alias_history.json`` are tallyman-owned, not
+    xorq-managed. They used to live under ``catalog_dir``, so ``checkpoint_catalog``
+    committed them into the xorq catalog git repo, and xorq's
+    ``assert_consistency`` then refused to open it — every ``xorq catalog add``
+    after the first silently no-op'd (#48). They live here instead; their content
+    is mirrored into ``catalog.yaml`` (tallyman-owned keys), so ``reset_to`` still
+    rolls alias state back even though git no longer tracks the files.
+    """
+    return artifacts_dir(project) / "alias_state"
 
 
 def entries_dir(project: str) -> Path:

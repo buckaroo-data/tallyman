@@ -64,8 +64,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -116,6 +119,72 @@ def _load_perf_report():
 
 pr = _load_perf_report()
 MB = pr.MB
+
+
+# ---------------------------------------------------------------------------
+# buckaroo #926 perf spans (BUCKAROO_PERF) — in-process capture
+# ---------------------------------------------------------------------------
+
+# buckaroo#926 instruments the stat pipeline: with perf on, each timed block
+# emits one `perf span=<label> secs=<n>` line on the `buckaroo.perf` logger
+# (stat.xorq.total / materialize / batch_aggregate, …). Tier B runs that
+# pipeline in-process, so we enable it around the cold stat run and collect
+# the lines — turning the single `cold stats s` number into a where-the-time-
+# goes breakdown. No-op on a buckaroo without #926.
+_PERF_SPAN_RE = re.compile(r"perf span=(?P<label>\S+) secs=(?P<secs>[\d.]+)")
+
+
+@contextmanager
+def _capture_perf_spans():
+    """Enable buckaroo's #926 perf spans and collect them for the block.
+
+    Yields a dict that, once the block exits, maps span label -> summed
+    seconds for every `perf span=` line emitted while it ran. Restores the
+    prior enabled state and detaches the handler afterwards; a buckaroo
+    without the `perf_log` module (pre-#926) degrades to an empty dict.
+    """
+    spans: dict[str, float] = {}
+    try:
+        from buckaroo.pluggable_analysis_framework import perf_log  # noqa: PLC0415
+    except ImportError:
+        yield spans
+        return
+
+    lines: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger("buckaroo.perf")
+    handler = _Collect()
+    logger.addHandler(handler)  # added before enable() so _ensure_logging adds no stderr handler
+    was_enabled = perf_log.enabled()
+    perf_log.enable()
+    try:
+        yield spans
+    finally:
+        if not was_enabled:
+            perf_log.disable()
+        logger.removeHandler(handler)
+        for line in lines:
+            m = _PERF_SPAN_RE.search(line)
+            if m:
+                spans[m["label"]] = spans.get(m["label"], 0.0) + float(m["secs"])
+
+
+# Each captured #926 span gets its own report column (label -> header).
+_SPAN_COLUMNS = [
+    ("stat.xorq.total", "stat total s"),
+    ("stat.xorq.materialize", "materialize s"),
+    ("stat.xorq.batch_aggregate", "batch_agg s"),
+    ("firstpull.summary_stats", "summary_stats s"),
+]
+
+
+def _span_cell(spans: dict | None, label: str) -> str:
+    v = (spans or {}).get(label)
+    return f"{v:.2f}" if v is not None else "—"
 
 
 # ---------------------------------------------------------------------------
@@ -328,7 +397,8 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     load_s = round(time.monotonic() - t0, 2)
 
     t0 = time.monotonic()
-    _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
+    with _capture_perf_spans() as stat_spans:
+        _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
     cold_stats_s = round(time.monotonic() - t0, 2)
     cache_kb, cache_files = pr._dir_kb_and_files(stat_cache)
 
@@ -358,6 +428,8 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         "first_page_kb": len(parquet_bytes) // 1024,
         "stat_cache_kb": cache_kb,
         "stat_cache_files": cache_files,
+        # buckaroo#926 cold-stat span breakdown (empty without BUCKAROO_PERF/#926).
+        "stat_spans": stat_spans,
         "peak_mb": round(sampler.peak() / MB),
         # One build load + (cold) one stat run; warm adds one load + one stat run
         # that should hit the on-disk cache rather than recompute.
@@ -440,17 +512,20 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
         "",
         "## Page load — Tier B proxy (load build + summary stats + 1st page)",
         "",
-        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache |",
-        "|---|---|---|---|---|---|---|---|",
+        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache | "
+        + " | ".join(h for _, h in _SPAN_COLUMNS) + " |",
+        "|" + "---|" * (8 + len(_SPAN_COLUMNS)),
     ]
     for r in loads:
         if "error" in r:
-            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} |||||||")
+            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} " + "|" * (7 + len(_SPAN_COLUMNS)))
         else:
             cache = f"{r['stat_cache_kb']}KB ({r['stat_cache_files']})"
+            spans = r.get("stat_spans")
+            span_cells = " | ".join(_span_cell(spans, lbl) for lbl, _ in _SPAN_COLUMNS)
             L.append(
                 f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['load_s']} | {r['cold_stats_s']} "
-                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} |"
+                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
             )
 
     L += [

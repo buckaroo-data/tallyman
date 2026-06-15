@@ -66,6 +66,7 @@ widen the run.
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 
@@ -143,6 +144,42 @@ def _largest_entry(real_dir: Path, hashes: list[str]) -> str:
             return 0
 
     return max(hashes, key=size)
+
+
+# ---------------------------------------------------------------------------
+# buckaroo #926 server spans (BUCKAROO_PERF) — parsed from the server log
+# ---------------------------------------------------------------------------
+
+# With BUCKAROO_PERF=1 (set in the subprocess env before it spawns), buckaroo's
+# /load_expr handler emits one `perf span=firstpull.<phase> secs=<n> session=<id>`
+# line per phase to its server log. The spans carry session= so they correlate
+# across the cold and warm POSTs (and any concurrent loads). We read the slice of
+# the log appended during the run and pick the cold session's backend phases —
+# turning the single `backend cold s` number into a server-side breakdown.
+_FIRSTPULL_RE = re.compile(
+    r"perf span=(?P<label>firstpull\.\S+) secs=(?P<secs>[\d.]+).*?session=(?P<session>\S+)"
+)
+
+
+def _server_log_path() -> Path:
+    """Where buckaroo's server writes spans (`buckaroo/server/__main__.py`)."""
+    return Path.home() / ".buckaroo" / "logs" / "server.log"
+
+
+def _read_backend_spans(text: str, session_id: str) -> dict[str, float]:
+    """`/load_expr` firstpull spans for *session_id* from a server-log slice.
+
+    Excludes `firstpull.ws_first_payload` — that span fires during the browser
+    render (the WS first send), which Tier A already times separately as
+    `render`, not part of the `/load_expr` backend wait.
+    """
+    spans: dict[str, float] = {}
+    for line in text.splitlines():
+        m = _FIRSTPULL_RE.search(line)
+        if not m or m["session"] != session_id or m["label"] == "firstpull.ws_first_payload":
+            continue
+        spans[m["label"]] = spans.get(m["label"], 0.0) + float(m["secs"])
+    return spans
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +269,11 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
     """
     sampler = pr.ProcTreeSampler(mgr.proc.pid, interval=0.1)
 
+    # Read the server log only from where it stands now, so we parse this run's
+    # spans (BUCKAROO_PERF=1) rather than any prior content.
+    log_path = _server_log_path()
+    log_offset = log_path.stat().st_size if log_path.exists() else 0
+
     # Cold: genuine empty-cache first /load_expr.
     t0 = time.monotonic()
     session_cold = _load_expr(mgr, project, content_hash)
@@ -244,6 +286,14 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
     backend_warm_s = round(time.monotonic() - t0, 2)
     render_warm = _time_grid_render(browser, mgr.base_url, session_warm)
     sampler.stop()
+
+    # buckaroo#926 server-side breakdown for the cold /load_expr, keyed by session.
+    appended = ""
+    if log_path.exists():
+        with log_path.open() as f:
+            f.seek(log_offset)
+            appended = f.read()
+    backend_spans = _read_backend_spans(appended, session_cold)
 
     total_cold_s = round(backend_cold_s + render_cold["grid_s"], 2)
     return {
@@ -258,6 +308,8 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
         "fcp_ms": render_cold["fcp_ms"],
         "dcl_ms": render_cold["dcl_ms"],
         "cells": render_cold["cells"],
+        # buckaroo#926 server-side /load_expr phase breakdown for the cold session.
+        "backend_spans": backend_spans,
         # Buckaroo subprocess tree, not the driver (see docstring).
         "buckaroo_peak_mb": round(sampler.peak_rss() / MB),
         "buckaroo_peak_cpu": round(sampler.peak_cpu()),
@@ -341,6 +393,33 @@ def _render_report(project: str, rows: list[dict], aliases: dict[str, str]) -> s
         if "error" in a:
             continue
         L.append(f"| {label(r['entry'])} | {a['fcp_ms']} | {a['dcl_ms']} | {a['cells']} |")
+
+    L += [
+        "",
+        "## Backend breakdown — `/load_expr` server spans (BUCKAROO_PERF=1, buckaroo#926)",
+        "",
+        "Server-side spans for the **cold** `/load_expr`, parsed from the buckaroo "
+        "server log by `session=`. `firstpull.load_expr` is the outer total the "
+        "`backend cold s` column measures; the rest break it down. "
+        "`firstpull.ws_first_payload` is excluded (it fires during the render).",
+        "",
+        "| entry | span | secs |",
+        "|---|---|---|",
+    ]
+    any_spans = False
+    for r in rows:
+        a = r["tier_a"]
+        if "error" in a:
+            continue
+        spans = a.get("backend_spans") or {}
+        # load_expr (the total) first, then the rest by descending secs.
+        ordered = sorted(spans.items(), key=lambda kv: (kv[0] != "firstpull.load_expr", -kv[1]))
+        for span_label, secs in ordered:
+            any_spans = True
+            L.append(f"| {label(r['entry'])} | {span_label} | {secs:.4f} |")
+    if not any_spans:
+        L.append("| (no spans captured — BUCKAROO_PERF off, or buckaroo < 0.15) | | |")
+
     L.append("")
     return "\n".join(L)
 
@@ -399,6 +478,9 @@ def test_perf_tier_a_calibration(tmp_path_factory, monkeypatch_module):
     try:
         monkeypatch_module.setenv("TALLYMAN_HOME", str(overlay_a))
         monkeypatch_module.setenv("TALLYMAN_PROJECT", project)
+        # #926: the subprocess inherits this env (BuckarooManager.start passes no
+        # env=), so its /load_expr handler emits firstpull spans to the server log.
+        monkeypatch_module.setenv("BUCKAROO_PERF", "1")
         mgr.start()
         assert mgr.is_running, "buckaroo subprocess failed to start"
         for h in hashes:

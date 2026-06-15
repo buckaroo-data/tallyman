@@ -119,6 +119,20 @@ def catalog_dir(project: str) -> Path:
     return artifacts_dir(project) / "catalog"
 
 
+def tallyman_state_dir(project: str) -> Path:
+    """Tallyman-owned state store, a sibling of (not inside) the xorq catalog repo.
+
+    Holds the authored/bookkeeping state that used to live as extra keys in the
+    xorq-managed ``catalog.yaml`` (#49). xorq rebuilds ``catalog.yaml`` from
+    ``entries`` + ``aliases`` only when it resolves a pull merge conflict, so
+    anything kept there is dropped silently; this store sits outside the catalog
+    repo where that reconstruction can't reach it. ``state.yaml`` is the live
+    state; ``snapshots/<commit>.yaml`` is the per-checkpoint copy a reset
+    restores.
+    """
+    return artifacts_dir(project) / "tallyman_state"
+
+
 def entries_dir(project: str) -> Path:
     return catalog_dir(project) / "entries"
 

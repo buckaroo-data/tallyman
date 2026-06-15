@@ -1,7 +1,6 @@
-"""Pydata-owned state in the xorq catalog's catalog.yaml + the reset engine.
+"""Tallyman-owned catalog state store + the reset engine.
 
-catalog.yaml is the versioned state carrier (see plans/adr-reset-to-revision.md).
-xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
+Tallyman owns eight keys of authored/bookkeeping state:
 
     post_processing: [{name, source, disabled}]
     stats:           [{name, source, disabled}]
@@ -12,19 +11,30 @@ xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
     result_cache:    [relpath, ...]           # pointer to untracked result cache
     compute_cache:   [relpath, ...]           # pointer to untracked compute cache
 
-The catalog git repo tracks only ``catalog.yaml`` + the two alias files. The
-heavy artifacts (entries/, the caches) are content-addressed, additive, and
-untracked — ``git reset`` can't roll them back, so ``reset_to`` reconciles them
-to the recorded pointer lists: evictions retire to the bullpen (not deleted),
-and anything the restored step records that is missing comes back from the
-bullpen by copy. Live operations never read the bullpen, so a re-added
-expression still computes cold. The derived files (.py scripts, chart specs,
-the notebook) live outside the repo, so they are reconstructed by
-``materialize``.
+These used to ride as extra top-level keys in the xorq-managed ``catalog.yaml``.
+They no longer do (#49): xorq rebuilds ``catalog.yaml`` from ``entries`` +
+``aliases`` only when it resolves a pull merge conflict, so any extra key there
+is dropped silently. The state lives instead in a tallyman-owned store outside
+the xorq catalog repo — ``<project>/artifacts/tallyman_state/`` — with
+``state.yaml`` as the live copy and ``snapshots/<commit>.yaml`` as the
+per-checkpoint copy a reset restores. ``catalog.yaml`` is left carrying only
+what xorq manages.
 
-A checkpoint captures the live on-disk state into catalog.yaml and commits once,
-through the fork-safe git primitive (git_util) under a per-project lock. This
-keeps the four invariants #33 kept re-breaking structural rather than reviewed.
+The catalog git repo still versions the xorq side (``catalog.yaml``, the alias
+files, ``entries/<hash>.zip``, the metadata sidecars). The heavy artifacts
+(entries/, the caches) are content-addressed, additive, and untracked — ``git
+reset`` can't roll them back, so ``reset_to`` reconciles them to the recorded
+pointer lists: evictions retire to the bullpen (not deleted), and anything the
+restored step records that is missing comes back from the bullpen by copy. Live
+operations never read the bullpen, so a re-added expression still computes cold.
+The derived files (.py scripts, chart specs, the notebook) are reconstructed by
+``materialize`` from the store.
+
+A checkpoint captures the live on-disk state into the store, rewrites
+``catalog.yaml`` to xorq-only, commits the xorq side once through the fork-safe
+git primitive (git_util) under a per-project lock, and snapshots the store keyed
+by that commit. This keeps the four invariants #33 kept re-breaking structural
+rather than reviewed.
 """
 
 from __future__ import annotations
@@ -54,6 +64,7 @@ from tallyman_core.paths import (
     post_processing_dir,
     result_cache_dir,
     stats_dir,
+    tallyman_state_dir,
 )
 
 log = logging.getLogger(__name__)
@@ -69,24 +80,60 @@ _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
-# catalog.yaml read / write (read-modify-write so xorq's keys survive)
+# state store read / write — the tallyman keys live outside the xorq repo (#49)
 # ---------------------------------------------------------------------------
+
+# The eight tallyman-owned keys. Anything else in catalog.yaml is xorq's.
+_TALLYMAN_KEYS = (
+    "post_processing",
+    "stats",
+    "charts",
+    "display_configs",
+    "notebook",
+    "entry_hashes",
+    "result_cache",
+    "compute_cache",
+)
 
 
 def _catalog_yaml(project: str) -> Path:
     return catalog_dir(project) / "catalog.yaml"
 
 
-def _read_raw(project: str) -> dict:
+def _state_file(project: str) -> Path:
+    return tallyman_state_dir(project) / "state.yaml"
+
+
+def _snapshot_file(project: str, commit: str) -> Path:
+    return tallyman_state_dir(project) / "snapshots" / f"{commit.strip()}.yaml"
+
+
+def _read_catalog_yaml(project: str) -> dict:
     p = _catalog_yaml(project)
     if not p.exists():
         return {}
     return yaml.safe_load(p.read_text()) or {}
 
 
+def _read_state(project: str) -> dict:
+    """The raw tallyman state, from the store — falling back to catalog.yaml.
+
+    The state used to live as extra keys in catalog.yaml (#49). When the store
+    file is absent (a project that predates the move, or its first checkpoint
+    after upgrading) the legacy keys are read straight from catalog.yaml, so the
+    project self-migrates on the next ``capture``. Only the eight tallyman keys
+    are lifted — xorq's ``entries``/``aliases`` are never tallyman state.
+    """
+    sf = _state_file(project)
+    if sf.exists():
+        return yaml.safe_load(sf.read_text()) or {}
+    cat = _read_catalog_yaml(project)
+    return {k: cat[k] for k in _TALLYMAN_KEYS if k in cat}
+
+
 def read_tallyman_state(project: str) -> dict:
     """The tallyman-owned keys, each defaulted so callers never KeyError."""
-    raw = _read_raw(project)
+    raw = _read_state(project)
     return {
         "post_processing": raw.get("post_processing", []),
         "stats": raw.get("stats", []),
@@ -100,28 +147,46 @@ def read_tallyman_state(project: str) -> dict:
 
 
 def write_tallyman_state(project: str, **keys) -> None:
-    """Merge tallyman keys into catalog.yaml atomically, preserving xorq's keys.
+    """Merge tallyman keys into the state store atomically (#49).
 
-    xorq's keys are also *seeded* when absent: its ``CatalogYaml.contents``
-    indexes ``entries``/``aliases`` directly (no defaulting for dict-shaped
-    files), so a catalog.yaml born from genesis/capture without them makes
-    every best-effort ``xorq catalog add`` fail — silently. xorq round-trips
-    unknown keys, so the two empty lists are the whole coexistence contract.
+    The store is tallyman-owned and outside the xorq catalog repo, so xorq's
+    merge-conflict reconstruction of catalog.yaml can't drop these keys. xorq's
+    own ``entries``/``aliases`` live only in catalog.yaml and are untouched here.
     """
-    p = _catalog_yaml(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    raw = _read_raw(project)
-    raw.setdefault("entries", [])
-    raw.setdefault("aliases", [])
+    sf = _state_file(project)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    raw = _read_state(project)
     for k, v in keys.items():
         if v is not None:
             raw[k] = v
-    tmp = p.with_name(p.name + ".tmp")
-    # safe_dump, to mirror _read_raw's safe_load: the full Dumper would write a
+    tmp = sf.with_name(sf.name + ".tmp")
+    # safe_dump, to mirror _read_state's safe_load: the full Dumper would write a
     # stray non-plain value (a Path in a chart spec) as a !!python/object tag,
     # after which every read fails until the file is hand-repaired. Raising
     # here — before the tmp replace — keeps the previous file readable.
     tmp.write_text(yaml.safe_dump(raw, default_flow_style=False, sort_keys=False))
+    tmp.replace(sf)
+
+
+def _ensure_catalog_yaml_xorq_only(project: str) -> None:
+    """Strip tallyman keys from catalog.yaml and seed xorq's two keys.
+
+    After the state moved to its own store (#49), catalog.yaml must carry only
+    what xorq manages. xorq's ``CatalogYaml.contents`` indexes ``entries``/
+    ``aliases`` directly with no defaulting for dict-shaped files, so a
+    catalog.yaml born from genesis/capture without them makes every best-effort
+    ``xorq catalog add`` fail — silently; seeding the two empty lists is the
+    whole coexistence contract. Any non-tallyman key xorq itself may add is
+    preserved.
+    """
+    p = _catalog_yaml(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    raw = _read_catalog_yaml(project)
+    cleaned = {k: v for k, v in raw.items() if k not in _TALLYMAN_KEYS}
+    cleaned.setdefault("entries", [])
+    cleaned.setdefault("aliases", [])
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(yaml.safe_dump(cleaned, default_flow_style=False, sort_keys=False))
     tmp.replace(p)
 
 
@@ -141,7 +206,11 @@ def _list_cache_files(root: Path) -> list[str]:
 
 
 def capture_tallyman_state(project: str) -> dict:
-    """Read the live authored state + artifact listings into catalog.yaml."""
+    """Read the live authored state + artifact listings into the store (#49).
+
+    Also rewrites catalog.yaml to xorq-only, so the keys this used to write
+    there are gone and a later ``xorq catalog pull`` merge can't drop them.
+    """
     ed = entries_dir(project)
     state = {
         "post_processing": _scan_scripts(pp.list_post_processings(project)),
@@ -156,6 +225,7 @@ def capture_tallyman_state(project: str) -> dict:
         "compute_cache": _list_cache_files(compute_cache_dir(project)),
     }
     write_tallyman_state(project, **state)
+    _ensure_catalog_yaml_xorq_only(project)
     return state
 
 
@@ -212,7 +282,7 @@ def materialize(project: str) -> None:
     on-disk files are left alone rather than wiped. A present-but-empty list is
     a deliberate "none at this step" and clears the section.
     """
-    raw = _read_raw(project)
+    raw = _read_state(project)
     if "post_processing" in raw:
         _materialize_scripts(post_processing_dir(project), raw["post_processing"])
     if "stats" in raw:
@@ -247,7 +317,7 @@ def _retire(src: Path, dest: Path) -> None:
 
 def prune_entries(project: str) -> int:
     """Retire entry dirs not named by ``entry_hashes``. No-op when key absent."""
-    raw = _read_raw(project)
+    raw = _read_state(project)
     if "entry_hashes" not in raw:
         return 0
     valid = set(raw["entry_hashes"] or [])
@@ -263,7 +333,7 @@ def prune_entries(project: str) -> int:
 
 
 def _prune_cache(project: str, root: Path, key: str) -> int:
-    raw = _read_raw(project)
+    raw = _read_state(project)
     if key not in raw:
         return 0
     valid = set(raw[key] or [])
@@ -295,7 +365,7 @@ def restore_from_bullpen(project: str) -> int:
     live operations never see the bullpen, which is what keeps a re-added
     expression honest (cold).
     """
-    raw = _read_raw(project)
+    raw = _read_state(project)
     bp = bullpen_dir(project)
     restored = 0
     ed = entries_dir(project)
@@ -363,8 +433,26 @@ def _step_tags(project: str) -> list[int]:
     return sorted(nums)
 
 
+def _snapshot_state(project: str, commit: str) -> None:
+    """Copy the live state store to a per-commit snapshot a reset can restore.
+
+    The tallyman state no longer lives in the committed catalog.yaml (#49), so
+    ``git reset`` alone can't roll it back. Keying the snapshot by the commit it
+    rode in on (not the step number) survives a tag force-move: resetting to an
+    earlier step and checkpointing forward writes a fresh commit with its own
+    snapshot, leaving the orphaned one harmlessly behind.
+    """
+    snap = _snapshot_file(project, commit)
+    snap.parent.mkdir(parents=True, exist_ok=True)
+    sf = _state_file(project)
+    if sf.exists():
+        shutil.copy2(sf, snap)
+    else:  # nothing captured yet (e.g. empty genesis) — record an empty state
+        snap.write_text(yaml.safe_dump({}, default_flow_style=False, sort_keys=False))
+
+
 def checkpoint_catalog(project: str, message: str, *, step: int | None = None, label: str | None = None) -> int | None:
-    """Capture state, commit catalog.yaml + alias files once, tag the step.
+    """Capture state, commit the xorq side once, tag the step, snapshot the store.
 
     One commit per operation (not per mutator), through the fork-safe primitive,
     under the per-project lock. Returns the step number, or None when the
@@ -372,7 +460,7 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
     add, which commits to this repo outside the flock). The step tag only
     moves with a landed commit: tagging anyway would stack step-N on
     step-(N-1)'s commit and hide the earlier step from ``list_revisions``,
-    which keys rows by commit.
+    which keys rows by commit. The store snapshot is keyed by that same commit.
     """
     cd = catalog_dir(project)
     with _project_lock(project):
@@ -388,6 +476,9 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
         if rc != 0:
             log.warning("catalog checkpoint commit failed (step %s): %s", step, err)
             return None
+        rc, head, _ = run_git(["rev-parse", "HEAD"], cwd=cd)
+        if rc == 0:
+            _snapshot_state(project, head)
         run_git(["tag", "-f", f"step-{step:03d}"], cwd=cd)
         if label:
             run_git(["tag", "-f", label], cwd=cd)
@@ -410,11 +501,32 @@ def _resolve_tag(project: str, tag: str) -> str:
     return out
 
 
+def _restore_snapshot(project: str, commit: str) -> None:
+    """Restore the tallyman state captured at *commit* into the live store.
+
+    New checkpoints write a snapshot keyed by commit; restore it verbatim. A
+    commit made before the state moved out of catalog.yaml (#49) has no snapshot
+    — fall back to the legacy tallyman keys in the catalog.yaml that ``git
+    reset`` just restored, which is exactly the pre-#49 reset behavior.
+    """
+    sf = _state_file(project)
+    sf.parent.mkdir(parents=True, exist_ok=True)
+    snap = _snapshot_file(project, commit)
+    if snap.exists():
+        shutil.copy2(snap, sf)
+        return
+    cat = _read_catalog_yaml(project)
+    legacy = {k: cat[k] for k in _TALLYMAN_KEYS if k in cat}
+    tmp = sf.with_name(sf.name + ".tmp")
+    tmp.write_text(yaml.safe_dump(legacy, default_flow_style=False, sort_keys=False))
+    tmp.replace(sf)
+
+
 def reset_to(project: str, ref: int | str) -> None:
-    """Restore the catalog to a step/label: git reset --hard, materialize the
-    derived files, then reconcile the untracked artifacts to the recorded
-    pointers — evictions retire to the bullpen, recorded-but-missing files
-    come back from it."""
+    """Restore the catalog to a step/label: git reset --hard the xorq side,
+    restore the store snapshot, materialize the derived files, then reconcile the
+    untracked artifacts to the recorded pointers — evictions retire to the
+    bullpen, recorded-but-missing files come back from it."""
     cd = catalog_dir(project)
     tag = f"step-{ref:03d}" if isinstance(ref, int) else str(ref)
     with _project_lock(project):
@@ -422,6 +534,7 @@ def reset_to(project: str, ref: int | str) -> None:
         rc, _, err = run_git(["reset", "--hard", commit], cwd=cd)
         if rc != 0:
             raise RuntimeError(f"catalog reset to {tag!r} failed: {err}")
+        _restore_snapshot(project, commit)
         materialize(project)
         prune_entries(project)
         prune_result_cache(project)

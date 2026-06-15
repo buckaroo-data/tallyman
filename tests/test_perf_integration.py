@@ -22,7 +22,8 @@ rebuild), each across a cold/warm cache axis:
    then serve the first row page (the ``infinite_request`` 0-300 window).
 3. **Diff stat path** — #45's 27s-on-first-open: ``diff_keys`` → the
    ``build_compare_expr`` outer-join → the same stat pipeline, over the
-   consecutive revision pairs recorded in ``alias_history.json``.
+   consecutive revision pairs in the corpus's alias history (``catalog.yaml``'s
+   ``alias_history`` key, or a legacy ``alias_history.json``).
 
 Cold/warm semantics. Every measurement runs against an **overlay home**: the
 real entries, source ``data``, and catalog bookkeeping are symlinked read-only,
@@ -54,7 +55,9 @@ it never runs on CI. Run it explicitly:
 
 Override the corpus with ``TALLYMAN_PERF_PROJECT`` / ``TALLYMAN_PERF_ENTRIES``
 (comma-separated hashes or aliases) and write the markdown report somewhere
-durable with ``TALLYMAN_PERF_OUT``.
+durable with ``TALLYMAN_PERF_OUT``. Point ``TALLYMAN_PERF_PROJECT`` at the
+truncated corpus (``parking_ticket_analysis_1m``, built by the rebuild script
+with ``--rows 1000000``) for the fast same-DAG variant.
 """
 
 from __future__ import annotations
@@ -160,8 +163,25 @@ def _load_aliases(real_dir: Path) -> dict[str, str]:
 
 
 def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
-    p = real_dir / "artifacts" / "catalog" / "alias_history.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+    """Alias revision chains, from whichever store the corpus uses.
+
+    Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
+    through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
+    them as the ``alias_history`` key in ``catalog.yaml`` (#57 moved alias
+    bookkeeping off separate files). Read the legacy file if present, else fall
+    back to the catalog.yaml key.
+    """
+    catalog = real_dir / "artifacts" / "catalog"
+    legacy = catalog / "alias_history.json"
+    if legacy.exists():
+        return json.loads(legacy.read_text())
+    catalog_yaml = catalog / "catalog.yaml"
+    if catalog_yaml.exists():
+        import yaml  # noqa: PLC0415
+
+        data = yaml.safe_load(catalog_yaml.read_text()) or {}
+        return data.get("alias_history", {}) or {}
+    return {}
 
 
 def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:

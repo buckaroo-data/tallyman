@@ -587,6 +587,36 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
 
 
 # ---------------------------------------------------------------------------
+# reset ↔ xorq-catalog consistency — a pointer with no durable recipe must not
+# pass silently through the bullpen (#52)
+# ---------------------------------------------------------------------------
+
+
+def test_reset_surfaces_pointer_without_durable_recipe(project):
+    """reset_to must not report success when a restored step's entry_hashes
+    pointer names an entry whose durable xorq recipe (entries/<hash>.zip) was
+    never committed (#52).
+
+    This is the shape any interrupted or failed best-effort ``xorq catalog add``
+    leaves behind: the build dir + the ``entry_hashes`` pointer land, but the
+    content-addressed recipe never reaches git. On a forward reset
+    ``restore_from_bullpen`` copies the build dir back, so the tallyman view
+    claims an entry the durable xorq catalog cannot reproduce — its only copy is
+    the evictable bullpen dir. The two views of "what entries exist" disagree;
+    reset must surface that divergence, not mask it and return success."""
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "baseline")  # no entries yet
+
+    # A build dir + pointer whose recipe zip was never committed (failed add).
+    paths.entry_dir(project, "deadbeef").mkdir(parents=True)
+    s1 = cs.checkpoint_catalog(project, "entry whose recipe never reached git")
+
+    cs.reset_to(project, s0)  # evict deadbeef to the bullpen
+    with pytest.raises(RuntimeError, match="deadbeef"):
+        cs.reset_to(project, s1)  # forward: bullpen restores the dir, recipe is gone
+
+
+# ---------------------------------------------------------------------------
 # xorq catalog coexistence — genesis must not break `xorq catalog add`
 # ---------------------------------------------------------------------------
 

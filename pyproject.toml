@@ -74,10 +74,11 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not integration and not cache_lab'"
+addopts = "-m 'not integration and not cache_lab and not perf'"
 markers = [
     "integration: spawns real subprocesses (Buckaroo, MCP stdio); ~3-15s each",
     "cache_lab: adversarial cache-behavior measurement suite; run on demand when touching result_cache/identity/reset (see tests/test_cache_lab.py)",
+    "perf: local-only Tier-B perf integration over the real parking corpus; needs the on-disk catalog, skips when absent (see tests/test_perf_integration.py)",
 ]
 filterwarnings = [
     "ignore::UserWarning:xorq.ibis_yaml.translate",

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
+from tallyman_core import ENTRY_RESULT_FILENAME, data_dir, entry_dir, get_alias, resolve_project
 
 
 class ProjectDataNotFound(FileNotFoundError):
@@ -81,7 +81,7 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
         if latest is None:
             raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
         target = entry_dir(proj, latest)
-    parquet = target / "result.parquet"
+    parquet = target / ENTRY_RESULT_FILENAME
     if not parquet.exists():
         raise ProjectDataNotFound(f"{parquet} not found")
     return xo.deferred_read_parquet(str(parquet))

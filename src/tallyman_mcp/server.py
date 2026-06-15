@@ -20,6 +20,7 @@ from tallyman_core import (
     StatSourceError,
     alias_for_hash,
     entry_dir,
+    entry_schema_path,
     export_notebook_path,
     get_alias,
     history_for,
@@ -1184,7 +1185,7 @@ def _compact_columns(project: str, content_hash: str) -> str | None:
     entry's columns before writing an expression against it — no build, one
     short line to scan. Returns ``None`` when the schema isn't on disk.
     """
-    schema_path = entry_dir(project, content_hash) / "schema.json"
+    schema_path = entry_schema_path(project, content_hash)
     if not schema_path.exists():
         return None
     try:

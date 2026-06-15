@@ -25,6 +25,8 @@ from buckaroo.compare import (
     stats_diff_xorq,
 )
 
+from tallyman_core.paths import ENTRY_RESULT_FILENAME, ENTRY_SCHEMA_FILENAME
+
 __all__ = [
     "code_diff",
     "full_diff",
@@ -110,11 +112,12 @@ def full_diff(
     """
     a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
-    a_schema = json.loads((a_entry / "schema.json").read_text()) if (a_entry / "schema.json").exists() else {}
-    b_schema = json.loads((b_entry / "schema.json").read_text()) if (b_entry / "schema.json").exists() else {}
+    a_sj, b_sj = a_entry / ENTRY_SCHEMA_FILENAME, b_entry / ENTRY_SCHEMA_FILENAME
+    a_schema = json.loads(a_sj.read_text()) if a_sj.exists() else {}
+    b_schema = json.loads(b_sj.read_text()) if b_sj.exists() else {}
 
-    a_pq = a_entry / "result.parquet"
-    b_pq = b_entry / "result.parquet"
+    a_pq = a_entry / ENTRY_RESULT_FILENAME
+    b_pq = b_entry / ENTRY_RESULT_FILENAME
 
     if backend == "xorq":
         # Prefer the passed expressions (each carries its own cache node);

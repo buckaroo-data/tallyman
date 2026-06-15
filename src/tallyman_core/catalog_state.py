@@ -55,6 +55,7 @@ from tallyman_core import post_processing as pp
 from tallyman_core import summary_stats as ss
 from tallyman_core.git_util import run_git
 from tallyman_core.paths import (
+    ENTRIES_DIRNAME,
     bullpen_dir,
     catalog_dir,
     compute_cache_dir,
@@ -276,7 +277,7 @@ def prune_entries(project: str) -> int:
     removed = 0
     for child in ed.iterdir():
         if child.is_dir() and child.name not in valid:
-            _retire(child, bullpen_dir(project) / "entries" / child.name)
+            _retire(child, bullpen_dir(project) / ENTRIES_DIRNAME / child.name)
             removed += 1
     return removed
 
@@ -319,7 +320,7 @@ def restore_from_bullpen(project: str) -> int:
     restored = 0
     ed = entries_dir(project)
     for h in raw.get("entry_hashes") or []:
-        live, parked = ed / h, bp / "entries" / h
+        live, parked = ed / h, bp / ENTRIES_DIRNAME / h
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1

@@ -21,9 +21,15 @@ from sse_starlette.sse import EventSourceResponse
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
 from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
 from tallyman_core import (
+    ENTRY_BUILD_DIRNAME,
+    ENTRY_MANIFEST_FILENAME,
+    ENTRY_RESULT_FILENAME,
+    ENTRY_SCHEMA_FILENAME,
+    ENTRY_STAT_CACHE_DIRNAME,
     alias_for_hash,
     clear_errors,
     entry_dir,
+    entry_result_path,
     get_chart,
     get_error,
     history_for,
@@ -34,7 +40,7 @@ from tallyman_core import (
     version_of_hash,
 )
 from tallyman_core.notebook import CellNotFound
-from tallyman_core.paths import project_dir, validate_project_name
+from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_xorq import (
     catalog_dag,
     column_lineage,
@@ -171,16 +177,16 @@ def _compute_disk_usage(project: str) -> dict:
         for entry in root.iterdir():
             if not entry.is_dir():
                 continue
-            p = entry / "result.parquet"
+            p = entry / ENTRY_RESULT_FILENAME
             if p.exists():
                 try:
                     results += p.stat().st_size
                 except OSError:
                     pass
-            b = entry / "xorq_build"
+            b = entry / ENTRY_BUILD_DIRNAME
             if b.is_dir():
                 builds += _dir_size(b)
-            c = entry / ".buckaroo_stat_cache"
+            c = entry / ENTRY_STAT_CACHE_DIRNAME
             if c.is_dir():
                 cache += _dir_size(c)
 
@@ -394,15 +400,13 @@ def create_app(
     async def _warm_expr_cache():
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
-        from tallyman_core.paths import catalog_dir  # noqa: PLC0415
-
         project = _current_project()
         if project is None:
             return
-        entries_dir = catalog_dir(project) / "entries"
-        if not entries_dir.is_dir():
+        base = entries_dir(project)
+        if not base.is_dir():
             return
-        hashes = [d.name for d in entries_dir.iterdir() if (d / "xorq_build").is_dir()]
+        hashes = [d.name for d in base.iterdir() if (d / ENTRY_BUILD_DIRNAME).is_dir()]
         if not hashes:
             return
 
@@ -511,7 +515,7 @@ def create_app(
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
         entry = entry_dir(project, content_hash)
-        result_path = entry / "result.parquet"
+        result_path = entry / ENTRY_RESULT_FILENAME
         if not result_path.exists():
             raise HTTPException(404, "no result.parquet")
         pf = pq.ParquetFile(result_path)
@@ -553,8 +557,8 @@ def create_app(
         if not entry.exists():
             raise HTTPException(404, f"entry {content_hash!r} not found")
 
-        manifest = json.loads((entry / "manifest.json").read_text())
-        schema = json.loads((entry / "schema.json").read_text())
+        manifest = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
+        schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
         code = (entry / "expr.py").read_text()
 
         if alias is None:
@@ -576,7 +580,7 @@ def create_app(
         chart_spec = get_chart(project, content_hash)
 
         build_artifacts: list[dict] = []
-        build_dir = entry / "xorq_build"
+        build_dir = entry / ENTRY_BUILD_DIRNAME
         if build_dir.is_dir():
             for f in sorted(build_dir.iterdir()):
                 if not f.is_file():
@@ -599,7 +603,7 @@ def create_app(
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
-        result_path = entry / "result.parquet"
+        result_path = entry / ENTRY_RESULT_FILENAME
         total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
 
         return {
@@ -722,10 +726,10 @@ def create_app(
             buckaroo_session = None
             if latest is not None:
                 entry = entry_dir(project, latest)
-                if (entry / "manifest.json").exists():
-                    entry_meta = json.loads((entry / "manifest.json").read_text())
-                    schema = json.loads((entry / "schema.json").read_text())
-                result_path = entry / "result.parquet"
+                if (entry / ENTRY_MANIFEST_FILENAME).exists():
+                    entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
+                    schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
+                result_path = entry / ENTRY_RESULT_FILENAME
                 if result_path.exists():
                     total_rows = pq.ParquetFile(result_path).metadata.num_rows
                 chart_spec = get_chart(project, latest)
@@ -1022,7 +1026,7 @@ def create_app(
             for entry in root.iterdir():
                 if not entry.is_dir():
                     continue
-                p = entry / "result.parquet"
+                p = entry / ENTRY_RESULT_FILENAME
                 if not p.exists():
                     continue
                 try:
@@ -1043,7 +1047,7 @@ def create_app(
                 if not is_current and info is not None:
                     alias = info[0]
                     is_current = False
-                manifest_path = entry / "manifest.json"
+                manifest_path = entry / ENTRY_MANIFEST_FILENAME
                 prompt = None
                 if manifest_path.exists():
                     try:
@@ -1081,7 +1085,7 @@ def create_app(
         # Reject a non-hex hash up front: a 400 reads truer than the
         # "already evicted" 404 below (see _require_hash).
         _require_hash(content_hash)
-        p = entry_dir(project, content_hash) / "result.parquet"
+        p = entry_result_path(project, content_hash)
         if not p.exists():
             raise HTTPException(404, "result.parquet not found")
         try:

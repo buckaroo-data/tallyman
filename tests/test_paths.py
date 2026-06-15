@@ -14,8 +14,25 @@ from tallyman_core import (
     resolve_project,
 )
 from tallyman_core.paths import (
+    ARTIFACTS_DIRNAME,
+    CATALOG_DIRNAME,
+    ENTRIES_DIRNAME,
+    ENTRY_ARTIFACT_NAMES,
+    ENTRY_BUILD_DIRNAME,
+    ENTRY_CACHE_NAMES,
+    ENTRY_EXPANDED_BUILD_DIRNAME,
+    ENTRY_MANIFEST_FILENAME,
+    ENTRY_RESULT_FILENAME,
+    ENTRY_SCHEMA_FILENAME,
+    ENTRY_STAT_CACHE_DIRNAME,
     active_project_file_path,
     delete_project,
+    entry_build_dir,
+    entry_expanded_build_dir,
+    entry_manifest_path,
+    entry_result_path,
+    entry_schema_path,
+    entry_stat_cache_dir,
     errors_path,
     exports_dir,
     post_processing_dir,
@@ -183,6 +200,43 @@ def test_path_helpers_under_artifacts(isolated_home: Path):
     assert errors_path("alpha") == p / "artifacts" / "errors.jsonl"
     # data/ and notebooks/ stay at project root.
     assert data_dir("alpha") == p / "data"
+
+
+# ---------------------------------------------------------------------------
+# Centralized layout constants + per-entry helpers (#66)
+# ---------------------------------------------------------------------------
+
+
+def test_layout_segment_constants_compose_the_helpers(isolated_home: Path):
+    """The segment names are the single source of truth for the dir helpers."""
+    p = project_dir("alpha")
+    assert catalog_dir("alpha") == p / ARTIFACTS_DIRNAME / CATALOG_DIRNAME
+    assert entries_dir("alpha") == p / ARTIFACTS_DIRNAME / CATALOG_DIRNAME / ENTRIES_DIRNAME
+
+
+def test_entry_path_helpers_compose_from_constants(isolated_home: Path):
+    base = entry_dir("alpha", "abc123")
+    assert entry_build_dir("alpha", "abc123") == base / ENTRY_BUILD_DIRNAME
+    assert entry_result_path("alpha", "abc123") == base / ENTRY_RESULT_FILENAME
+    assert entry_manifest_path("alpha", "abc123") == base / ENTRY_MANIFEST_FILENAME
+    assert entry_schema_path("alpha", "abc123") == base / ENTRY_SCHEMA_FILENAME
+    assert entry_stat_cache_dir("alpha", "abc123") == base / ENTRY_STAT_CACHE_DIRNAME
+    assert entry_expanded_build_dir("alpha", "abc123") == base / ENTRY_EXPANDED_BUILD_DIRNAME
+
+
+def test_entry_artifact_cache_partition_is_disjoint():
+    """Artifacts (symlinked read-only by the perf overlay) and caches (left fresh
+    for a cold hit) must not overlap — a name in both would break the overlay's
+    cold guarantee."""
+    assert set(ENTRY_ARTIFACT_NAMES).isdisjoint(ENTRY_CACHE_NAMES)
+    # The immutable build outputs the overlay needs on the read path.
+    assert ENTRY_BUILD_DIRNAME in ENTRY_ARTIFACT_NAMES
+    assert ENTRY_RESULT_FILENAME in ENTRY_ARTIFACT_NAMES
+    assert ENTRY_MANIFEST_FILENAME in ENTRY_ARTIFACT_NAMES
+    assert ENTRY_SCHEMA_FILENAME in ENTRY_ARTIFACT_NAMES
+    # The per-entry caches are classified as caches, never symlinked.
+    assert ENTRY_STAT_CACHE_DIRNAME in ENTRY_CACHE_NAMES
+    assert ENTRY_EXPANDED_BUILD_DIRNAME in ENTRY_CACHE_NAMES
 
 
 def test_active_project_file_path_under_tallyman_home(isolated_home: Path):

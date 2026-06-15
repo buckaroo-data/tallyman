@@ -26,9 +26,9 @@ from pathlib import Path
 
 
 def _entry_columns(project: str, content_hash: str) -> list[str]:
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_schema_path
 
-    sj = entry_dir(project, content_hash) / "schema.json"
+    sj = entry_schema_path(project, content_hash)
     if not sj.exists():
         return []
     fields = json.loads(sj.read_text()).get("fields", [])

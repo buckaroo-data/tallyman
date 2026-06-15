@@ -48,7 +48,12 @@ from pathlib import Path
 
 import httpx
 
-from tallyman_core import entry_dir
+from tallyman_core import (
+    entry_build_dir,
+    entry_expanded_build_dir,
+    entry_result_path,
+    entry_stat_cache_dir,
+)
 from tallyman_core.paths import artifacts_dir, project_dir
 
 
@@ -58,8 +63,7 @@ def _entry_parquet_exists(project: str, content_hash: str) -> bool:
     Used by ``_load_session_file`` to prune stale session entries whose
     project / hash combination no longer maps to anything on disk.
     """
-    p = entry_dir(project, content_hash)
-    return (p / "result.parquet").exists() or (p / "xorq_build").is_dir()
+    return entry_result_path(project, content_hash).exists() or entry_build_dir(project, content_hash).is_dir()
 
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -433,7 +437,7 @@ class BuckarooManager:
         here.  The cache directory itself is left intact; buckaroo repopulates
         it on the next widget request.
         """
-        cache_dir = entry_dir(project, content_hash) / ".buckaroo_stat_cache" / "parquet"
+        cache_dir = entry_stat_cache_dir(project, content_hash) / "parquet"
         if cache_dir.is_dir():
             shutil.rmtree(cache_dir, ignore_errors=True)
             log.info("cleared stat cache for %s/%s", project, content_hash)
@@ -504,7 +508,7 @@ class BuckarooManager:
         self._maybe_restart()
         if not self.is_running or self.bound_port is None:
             return None
-        build_dir = entry_dir(project, content_hash) / "xorq_build"
+        build_dir = entry_build_dir(project, content_hash)
         if not build_dir.is_dir():
             return None
         with self._session_lock:
@@ -525,9 +529,9 @@ class BuckarooManager:
             expanded = ensure_expanded_build(
                 build_dir,
                 project_dir(project),
-                entry_dir(project, content_hash) / ".xorq_build_expanded",
+                entry_expanded_build_dir(project, content_hash),
             )
-            stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
+            stat_cache = entry_stat_cache_dir(project, content_hash)
             stat_cache.mkdir(parents=True, exist_ok=True)
             payload: dict = {
                 "build_dir": str(expanded),

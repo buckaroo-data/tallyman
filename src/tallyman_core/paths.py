@@ -59,6 +59,48 @@ def buckaroo_sessions_path() -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Layout segment + per-entry artifact/cache names (single source of truth)
+# ---------------------------------------------------------------------------
+
+# Per-project layout segments. Whole-tree relocation is the TALLYMAN_HOME knob
+# (above); these name the fixed structure underneath a project, defined once so
+# the dir helpers and ``ensure_project`` can't drift from each other.
+ARTIFACTS_DIRNAME = "artifacts"
+CATALOG_DIRNAME = "catalog"
+ENTRIES_DIRNAME = "entries"
+
+# Per-entry artifacts: immutable build outputs. Safe to symlink read-only into a
+# write-isolated overlay (the perf harness) because nothing rewrites them.
+ENTRY_BUILD_DIRNAME = "xorq_build"
+ENTRY_RESULT_FILENAME = "result.parquet"
+ENTRY_MANIFEST_FILENAME = "manifest.json"
+ENTRY_SCHEMA_FILENAME = "schema.json"
+
+# Per-entry caches: regenerated on demand. An overlay leaves these absent so the
+# first hit is honestly cold; production deletes them to recompute.
+ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
+ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
+
+# Canonical artifact-vs-cache partition of the per-entry names the overlay cares
+# about. The write-isolated perf overlay symlinks ENTRY_ARTIFACT_NAMES read-only
+# and deliberately omits ENTRY_CACHE_NAMES so the cache starts cold; the two
+# must stay disjoint or a name would be both linked and expected-fresh. Adding a
+# new per-entry cache here keeps the overlay's cold guarantee honest instead of
+# leaving the classification in the test harness. (expr.py / prompts.jsonl are
+# real per-entry files but aren't on the overlay read path, so they're neither.)
+ENTRY_ARTIFACT_NAMES = (
+    ENTRY_BUILD_DIRNAME,
+    ENTRY_RESULT_FILENAME,
+    ENTRY_MANIFEST_FILENAME,
+    ENTRY_SCHEMA_FILENAME,
+)
+ENTRY_CACHE_NAMES = (
+    ENTRY_STAT_CACHE_DIRNAME,
+    ENTRY_EXPANDED_BUILD_DIRNAME,
+)
+
+
+# ---------------------------------------------------------------------------
 # Project name validation
 # ---------------------------------------------------------------------------
 
@@ -112,19 +154,54 @@ def project_dir(name: str) -> Path:
 
 
 def artifacts_dir(project: str) -> Path:
-    return project_dir(project) / "artifacts"
+    return project_dir(project) / ARTIFACTS_DIRNAME
 
 
 def catalog_dir(project: str) -> Path:
-    return artifacts_dir(project) / "catalog"
+    return artifacts_dir(project) / CATALOG_DIRNAME
 
 
 def entries_dir(project: str) -> Path:
-    return catalog_dir(project) / "entries"
+    return catalog_dir(project) / ENTRIES_DIRNAME
 
 
 def entry_dir(project: str, content_hash: str) -> Path:
     return entries_dir(project) / content_hash
+
+
+# ---------------------------------------------------------------------------
+# Per-entry artifact/cache paths (compose from the names above)
+# ---------------------------------------------------------------------------
+
+
+def entry_build_dir(project: str, content_hash: str) -> Path:
+    """The xorq build dir (expr.yaml + deps) under an entry."""
+    return entry_dir(project, content_hash) / ENTRY_BUILD_DIRNAME
+
+
+def entry_result_path(project: str, content_hash: str) -> Path:
+    """The entry's materialised ``result.parquet``."""
+    return entry_dir(project, content_hash) / ENTRY_RESULT_FILENAME
+
+
+def entry_manifest_path(project: str, content_hash: str) -> Path:
+    """The entry's ``manifest.json``."""
+    return entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+
+
+def entry_schema_path(project: str, content_hash: str) -> Path:
+    """The entry's ``schema.json``."""
+    return entry_dir(project, content_hash) / ENTRY_SCHEMA_FILENAME
+
+
+def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
+    """Buckaroo summary-stat cache for the entry (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_STAT_CACHE_DIRNAME
+
+
+def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
+    """Stable expanded-build dir beside the entry (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
 
 
 def result_cache_dir(project: str) -> Path:
@@ -298,13 +375,16 @@ def ensure_project(project: str) -> Path:
     """
     validate_project_name(project)
     p = project_dir(project)
-    (p / "artifacts" / "catalog" / "entries").mkdir(parents=True, exist_ok=True)
-    (p / "artifacts" / "post_processing").mkdir(parents=True, exist_ok=True)
-    (p / "artifacts" / "stats").mkdir(parents=True, exist_ok=True)
-    (p / "artifacts" / "display").mkdir(parents=True, exist_ok=True)
-    (p / "artifacts" / "exports").mkdir(parents=True, exist_ok=True)
-    (p / "data").mkdir(parents=True, exist_ok=True)
-    (p / "notebooks").mkdir(parents=True, exist_ok=True)
+    for d in (
+        entries_dir(project),
+        post_processing_dir(project),
+        stats_dir(project),
+        display_dir(project),
+        exports_dir(project),
+        data_dir(project),
+        notebooks_dir(project),
+    ):
+        d.mkdir(parents=True, exist_ok=True)
     return p
 
 

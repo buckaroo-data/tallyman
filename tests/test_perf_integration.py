@@ -71,14 +71,25 @@ from pathlib import Path
 import psutil
 import pytest
 
+from tallyman_core.paths import (
+    ENTRY_ARTIFACT_NAMES,
+    ENTRY_BUILD_DIRNAME,
+    ENTRY_CACHE_NAMES,
+    ENTRY_RESULT_FILENAME,
+)
+
 pytestmark = pytest.mark.perf
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PROJECT = "parking_ticket_analysis"
-# Files/dirs symlinked read-only into an overlay entry; everything else an entry
-# accrues (.xorq_build_expanded, .buckaroo_stat_cache, the pk cache) is written
-# fresh into the writable overlay dir, never back into the real entry.
-_ENTRY_LINK_NAMES = ("xorq_build", "result.parquet", "manifest.json", "schema.json", "prompt.md")
+# The per-entry artifacts symlinked read-only into an overlay entry: the single
+# source of truth is paths.ENTRY_ARTIFACT_NAMES, not a tuple maintained here.
+# Everything an entry accrues that *isn't* an artifact — the per-entry caches
+# (paths.ENTRY_CACHE_NAMES: .xorq_build_expanded, .buckaroo_stat_cache) plus the
+# pk cache — is deliberately omitted, so it's written fresh into the writable
+# overlay dir and the first hit is honestly cold.
+_ENTRY_LINK_NAMES = ENTRY_ARTIFACT_NAMES
+assert set(_ENTRY_LINK_NAMES).isdisjoint(ENTRY_CACHE_NAMES)  # no artifact is also a cache
 # Catalog bookkeeping the read paths need; the caches are deliberately omitted so
 # the overlay starts cold.
 _CATALOG_LINK_NAMES = ("aliases.json", "alias_history.json", "catalog.yaml", "aliases", "chart_specs", "metadata")
@@ -125,7 +136,7 @@ def _entries_with_build(project_dir: Path) -> list[str]:
     return sorted(
         child.name
         for child in base.iterdir()
-        if (child / "xorq_build").is_dir() and (child / "result.parquet").exists()
+        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_RESULT_FILENAME).exists()
     )
 
 
@@ -229,7 +240,7 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
 
     real_entries = real_dir / "artifacts" / "catalog" / "entries"
     for real_entry in real_entries.iterdir():
-        if not (real_entry / "xorq_build").is_dir():
+        if not (real_entry / ENTRY_BUILD_DIRNAME).is_dir():
             continue
         overlay_entry = cat / "entries" / real_entry.name
         overlay_entry.mkdir()
@@ -296,15 +307,20 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
 
 def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     """Tier-B proxy: load the build, run the stat pipeline (cold/warm), 1st page."""
-    from tallyman_core.paths import entry_dir, project_dir  # noqa: PLC0415
+    from tallyman_core.paths import (  # noqa: PLC0415
+        entry_build_dir,
+        entry_expanded_build_dir,
+        entry_stat_cache_dir,
+        project_dir,
+    )
     from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
-    build_dir = entry_dir(project, content_hash) / "xorq_build"
+    build_dir = entry_build_dir(project, content_hash)
     expanded = ensure_expanded_build(
-        build_dir, project_dir(project), entry_dir(project, content_hash) / ".xorq_build_expanded"
+        build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash)
     )
-    stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
+    stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
     t0 = time.monotonic()

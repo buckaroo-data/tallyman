@@ -20,13 +20,13 @@ from __future__ import annotations
 import json
 import re
 
-from tallyman_core import entries_dir, entry_dir
+from tallyman_core import ENTRY_MANIFEST_FILENAME, entries_dir, entry_build_dir
 from tallyman_xorq.portable import PLACEHOLDER
 
 
 def read_internal_lineage(project: str, content_hash: str) -> dict:
     """Return the per-entry expression DAG as recorded by xorq."""
-    meta_path = entry_dir(project, content_hash) / "xorq_build" / "expr_metadata.json"
+    meta_path = entry_build_dir(project, content_hash) / "expr_metadata.json"
     if not meta_path.exists():
         return {"nodes": [], "edges": [], "root": None}
     meta = json.loads(meta_path.read_text())
@@ -43,7 +43,7 @@ def read_data_sources(project: str, content_hash: str) -> list[str]:
     place (the persisted build is portable). Callers wanting absolute paths
     should expand against the current project_dir.
     """
-    yaml_path = entry_dir(project, content_hash) / "xorq_build" / "expr.yaml"
+    yaml_path = entry_build_dir(project, content_hash) / "expr.yaml"
     if not yaml_path.exists():
         return []
     text = yaml_path.read_text()
@@ -113,7 +113,7 @@ def catalog_dag(project: str) -> dict:
     nodes = []
     edges = []
     for child in sorted(base.iterdir()):
-        manifest_p = child / "manifest.json"
+        manifest_p = child / ENTRY_MANIFEST_FILENAME
         if not manifest_p.exists():
             continue
         meta = json.loads(manifest_p.read_text())

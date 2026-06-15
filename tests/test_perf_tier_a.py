@@ -223,8 +223,14 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
     warm pass re-POSTs a fresh session against the now-populated on-disk stat
     cache (the path a Buckaroo restart takes), so a warm ≈ cold backend means
     the cache is unused. Each session is rendered in its own page.
+
+    Resource sampling targets the **Buckaroo subprocess tree** (``mgr.proc.pid``
+    and its children), not this driver process — the stat compute runs server-
+    side, so a driver-process RSS reads a few hundred MB while Buckaroo holds
+    the GBs (the #34 pile-up hit 16.9GB / ~355% CPU). The sampler also records
+    system memory + swap so a run on a pressured machine is self-documenting.
     """
-    sampler = pr.RssSampler(__import__("psutil").Process(), interval=0.05)
+    sampler = pr.ProcTreeSampler(mgr.proc.pid, interval=0.1)
 
     # Cold: genuine empty-cache first /load_expr.
     t0 = time.monotonic()
@@ -252,7 +258,11 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
         "fcp_ms": render_cold["fcp_ms"],
         "dcl_ms": render_cold["dcl_ms"],
         "cells": render_cold["cells"],
-        "peak_mb": round(sampler.peak() / MB),
+        # Buckaroo subprocess tree, not the driver (see docstring).
+        "buckaroo_peak_mb": round(sampler.peak_rss() / MB),
+        "buckaroo_peak_cpu": round(sampler.peak_cpu()),
+        "sys_mem_pct": round(sampler.peak_sys_mem_pct()),
+        "sys_swap_mb": sampler.peak_swap_mb(),
     }
 
 
@@ -281,13 +291,13 @@ def _render_report(project: str, rows: list[dict], aliases: dict[str, str]) -> s
         "## Calibration (Tier A ground truth vs Tier B proxy)",
         "",
         "| entry | backend cold s | render cold s | total cold s | ratio | "
-        "Tier B backend cold s | backend warm s | render warm s | peak MB |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "Tier B backend cold s | backend warm s | render warm s |",
+        "|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         a = r["tier_a"]
         if "error" in a:
-            L.append(f"| {label(r['entry'])} | ERROR: {a['error']} ||||||||")
+            L.append(f"| {label(r['entry'])} | ERROR: {a['error']} |||||||")
             continue
         b = r.get("tier_b", {})
         tier_b_backend = "—" if "error" in b else round(b.get("load_s", 0) + b.get("cold_stats_s", 0), 2)
@@ -295,7 +305,28 @@ def _render_report(project: str, rows: list[dict], aliases: dict[str, str]) -> s
         L.append(
             f"| {label(r['entry'])} | {a['backend_cold_s']} | {a['render_cold_s']} "
             f"| {a['total_cold_s']} | {ratio} | {tier_b_backend} "
-            f"| {a['backend_warm_s']} | {a['render_warm_s']} | {a['peak_mb']} |"
+            f"| {a['backend_warm_s']} | {a['render_warm_s']} |"
+        )
+
+    L += [
+        "",
+        "## Server resource usage (Buckaroo subprocess tree)",
+        "",
+        "`/load_expr` runs in the Buckaroo subprocess, so these are sampled from "
+        "`mgr.proc.pid` + its children — not this test driver, which barely "
+        "moves. `peak CPU` can exceed 100% on multi-core stat compute. "
+        "`sys mem` / `sys swap` are the worst the machine showed during the run.",
+        "",
+        "| entry | Buckaroo peak MB | Buckaroo peak CPU % | sys mem % | sys swap MB |",
+        "|---|---|---|---|---|",
+    ]
+    for r in rows:
+        a = r["tier_a"]
+        if "error" in a:
+            continue
+        L.append(
+            f"| {label(r['entry'])} | {a['buckaroo_peak_mb']} | {a['buckaroo_peak_cpu']} "
+            f"| {a['sys_mem_pct']} | {a['sys_swap_mb']} |"
         )
 
     L += [

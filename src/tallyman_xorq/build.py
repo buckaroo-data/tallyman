@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import re
 import sys
 import tempfile
@@ -376,20 +377,20 @@ def build_and_persist(
     # Best-effort by design (a missing/misconfigured catalog repo must not break
     # the build), but the outcome is surfaced on the result instead of swallowed:
     # a failed add means the recipe never reached git and is not durable (#48).
-    import logging
-
     catalog_registered: bool | None = None
+    cause = ""
     try:
         from tallyman_core.xorq_catalog import add_entry as _xcat_add
 
         catalog_registered = _xcat_add(project, xorq_build_dir, entry_name=content_hash)
     except Exception as exc:
         catalog_registered = False
-        logging.getLogger(__name__).error("xorq catalog add raised for %s: %s", content_hash, exc)
+        cause = f" ({exc})"
     if catalog_registered is False:
         logging.getLogger(__name__).error(
-            "xorq catalog add failed for %s — entry recipe is not durable in the catalog repo (#48)",
+            "xorq catalog add failed for %s%s — entry recipe is not durable in the catalog repo (#48)",
             content_hash,
+            cause,
         )
 
     return BuildResult(

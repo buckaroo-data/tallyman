@@ -63,7 +63,9 @@ def add_entry(
     def _run(d: Path) -> bool:
         r = _xorq(project, "add", "--no-sync", str(d), *alias_flags)
         if r.returncode != 0:
-            log.warning("xorq catalog add failed for %s: %s", d, r.stderr.strip())
+            # error, not warning: a failed add means the recipe never reached git
+            # and is silently lost (#48). The caller surfaces this on BuildResult.
+            log.error("xorq catalog add failed for %s: %s", d, r.stderr.strip())
             return False
         return True
 

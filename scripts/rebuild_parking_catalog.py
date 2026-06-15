@@ -65,8 +65,7 @@ STEPS: tuple[Step, ...] = (
     Step(
         "camera_select_columns",
         "create",
-        "from tallyman_xorq.io import from_project\n"
-        "expr = from_project('camera_select_columns.parquet')\n",
+        "from tallyman_xorq.io import from_project\nexpr = from_project('camera_select_columns.parquet')\n",
     ),
     Step(
         "camera_select_columns",
@@ -86,8 +85,7 @@ STEPS: tuple[Step, ...] = (
     Step(
         "camera_violations",
         "create",
-        "from tallyman_xorq.io import from_project\n"
-        "expr = from_project('camera_violations.parquet')\n",
+        "from tallyman_xorq.io import from_project\nexpr = from_project('camera_violations.parquet')\n",
     ),
     Step(
         "camera_violations",
@@ -104,8 +102,7 @@ STEPS: tuple[Step, ...] = (
     Step(
         "parking_plt_only4",
         "create",
-        "from tallyman_xorq.io import from_project\n"
-        "expr = from_project('parking_plt_only4.parquet')\n",
+        "from tallyman_xorq.io import from_project\nexpr = from_project('parking_plt_only4.parquet')\n",
     ),
     # --- Tier 1: depend on tier-0 aliases ---
     Step(
@@ -340,7 +337,9 @@ def _verify(project: str) -> None:
 
     tracked = subprocess.run(
         ["git", "-C", str(cat_dir), "ls-files", "entries/*.zip"],
-        capture_output=True, text=True, check=True,
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.split()
     tracked_hashes = {Path(p).stem for p in tracked}
     pointers = set(_read_raw(project).get("entry_hashes", []))
@@ -353,7 +352,7 @@ def _verify(project: str) -> None:
 def rebuild(src_dir: Path, project: str, rows: int) -> None:
     from tallyman_core.aliases import set_alias
     from tallyman_core.catalog_state import checkpoint_catalog, ensure_catalog_repo, genesis
-    from tallyman_core.paths import ensure_project, project_dir
+    from tallyman_core.paths import ensure_project, project_dir, set_active_project
     from tallyman_xorq.build import build_and_persist
 
     pdir = project_dir(project)
@@ -364,8 +363,12 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
     ensure_project(project)
     ensure_catalog_repo(project)
     genesis(project)
-    # from_project/from_catalog inside recipe code resolve the active project.
-    os.environ["TALLYMAN_PROJECT"] = project
+    # from_project/from_catalog inside recipe code resolve the active project with
+    # no explicit arg, and resolve_project() reads the active_project file *before*
+    # TALLYMAN_PROJECT (env is only a one-shot seed when the file is absent). Write
+    # the file so resolution is deterministic even when a different project was
+    # previously active in this home.
+    set_active_project(project)
 
     print(f"staging sources (rows={'full' if not rows else rows}):")
     _stage_sources(src_dir, project, rows)
@@ -374,10 +377,16 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
     for i, step in enumerate(STEPS, 1):
         result = build_and_persist(project=project, code=step.code, prompt=f"rebuild: {step.alias}")
         set_alias(project, step.alias, result.content_hash, expect_exists=(step.kind == "revise"))
-        checkpoint_catalog(project, f"rebuild: {step.kind} {step.alias}")
-        flag = "" if result.catalog_registered else "  !! NOT registered in xorq catalog"
-        print(f"  [{i:>2}/{len(STEPS)}] {step.kind:<6} {step.alias:<28} {result.content_hash} "
-              f"({result.row_count:,} rows, {result.execute_seconds:.2f}s){flag}")
+        if checkpoint_catalog(project, f"rebuild: {step.kind} {step.alias}") is None:
+            print(f"  !! checkpoint failed for {step.alias} ({result.content_hash}); recipe may not be durable")
+        # catalog_registered is tri-state: True/False on a fresh build, None on the
+        # re-run path. Every build here is fresh (tree wiped above), so only an
+        # explicit False is a real non-durable build worth flagging.
+        flag = "  !! NOT registered in xorq catalog" if result.catalog_registered is False else ""
+        print(
+            f"  [{i:>2}/{len(STEPS)}] {step.kind:<6} {step.alias:<28} {result.content_hash} "
+            f"({result.row_count:,} rows, {result.execute_seconds:.2f}s){flag}"
+        )
 
     print("verifying:")
     _verify(project)
@@ -386,13 +395,15 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--src", type=Path, default=Path("/Users/paddy/code/parking_speeding_data"),
-                    help="directory holding the raw source parquets")
+    ap.add_argument(
+        "--src",
+        type=Path,
+        default=Path("/Users/paddy/code/parking_speeding_data"),
+        help="directory holding the raw source parquets",
+    )
     ap.add_argument("--project", default="parking_ticket_analysis", help="project name to (re)build")
-    ap.add_argument("--rows", type=int, default=0,
-                    help="truncate each source to N rows (0 = full dataset)")
-    ap.add_argument("--home", type=Path, default=None,
-                    help="override TALLYMAN_HOME (isolated project tree)")
+    ap.add_argument("--rows", type=int, default=0, help="truncate each source to N rows (0 = full dataset)")
+    ap.add_argument("--home", type=Path, default=None, help="override TALLYMAN_HOME (isolated project tree)")
     args = ap.parse_args()
 
     if args.home:

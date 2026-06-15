@@ -209,9 +209,9 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     """Execute a ``process(expr)`` function against a catalog entry's result.
 
     Resolves *entry_name_or_hash* as an alias first, then as a raw content
-    hash. Loads ``result.parquet`` for that entry, execs *source* in a
-    restricted namespace, calls ``process(table)``, executes the result, and
-    returns a preview dict.
+    hash. Materialises the entry's result (``ensure_result``), execs *source*
+    in a restricted namespace, calls ``process(table)``, executes the result,
+    and returns a preview dict.
 
     Returns::
 
@@ -226,15 +226,18 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     as the tool's ``{"error": ...}`` response.
     """
     from tallyman_core.aliases import get_alias  # avoid circular at module level
-    from tallyman_core.paths import entry_result_path
+    from tallyman_core.paths import entry_build_dir
+    from tallyman_xorq.result_cache import ensure_result
 
     # Resolve alias → hash, or treat as bare hash.
     content_hash = get_alias(project, entry_name_or_hash) or entry_name_or_hash
-    parquet_path = entry_result_path(project, content_hash)
-    if not parquet_path.exists():
+    if not entry_build_dir(project, content_hash).is_dir():
         raise PostProcessingRunError(
-            f"no result.parquet found for entry {entry_name_or_hash!r} (resolved hash: {content_hash})"
+            f"no catalog entry found for {entry_name_or_hash!r} (resolved hash: {content_hash})"
         )
+    # #73: cheap entries write no result.parquet at build; ensure_result
+    # materialises one on demand (in place for cheap, result_cache for expensive).
+    parquet_path = ensure_result(project, content_hash)
 
     try:
         import pyarrow.parquet as pq  # noqa: PLC0415

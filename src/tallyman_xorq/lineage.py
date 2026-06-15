@@ -9,10 +9,15 @@
   references in its `read_kwargs.hash_path` values: if any of those paths points
   at another entry's `result.parquet`, that other entry is a parent.
 
-V0 only emits catalog edges when user code uses `tallyman_xorq.io.from_catalog()`
-(or otherwise reads from another entry's `result.parquet`). Without those
-cross-references the catalog DAG is a forest of single-node trees rooted at
-each entry's data source.
+V0 only emitted catalog edges when user code read another entry's
+`result.parquet` directly. As of #73, `from_catalog()` composes the parent's
+*expression* into the child (the parent's own source reads, wrapped in a cache
+node) instead of reading a `result.parquet` path, so `catalog_parents` finds no
+parent reference and the catalog DAG is a forest of single-node trees. Recovering
+cross-entry edges is deferred to a future semantic-dependency mechanism (depend
+on the *concept* a parent computes, not its materialised hash) — see #73. The
+path-matching below is retained for any entry that still reads a result.parquet
+path directly (e.g. legacy builds).
 """
 
 from __future__ import annotations

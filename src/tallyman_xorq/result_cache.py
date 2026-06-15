@@ -6,14 +6,17 @@ computation is — caching only pays off when recompute costs far more than
 reading a cached parquet:
 
   * Expensive entries — the expression contains an Aggregate / Join / Sort /
-    window / UDF, or reads a non-parquet source (e.g. CSV) — are materialised
-    in xorq's ``ParquetSnapshotCache``.  Reads hit the cache; a deleted cache
-    file self-heals by recomputing from the build.
-  * Cheap entries — a parquet read plus projections / renames / row-wise
-    scalar math (the citibike column-reorder/derive case) — get *no* extra
-    cache.  Recompute ≈ re-reading the source, so an extra parquet copy would
-    burn storage for ~no savings.  Their ``result.parquet`` is regenerated in
-    place from the build if missing.
+    window / UDF — are materialised in xorq's ``ParquetSnapshotCache``.  Reads
+    hit the cache; a deleted cache file self-heals by recomputing from the
+    build.
+  * Cheap entries — a source read plus projections / renames / row-wise scalar
+    math (the citibike column-reorder/derive case) — materialise nothing (#73).
+    Recompute ≈ re-reading a columnar source (pushdown), so a stored copy would
+    burn work and storage for ~no savings; a non-parquet source's parse is
+    already cached at the read (see ``tallyman_xorq.source_cache``).  Reads of a
+    cheap entry recompute the expression directly. ``ensure_result`` still
+    materialises a ``result.parquet`` on demand for the few callers that need a
+    parquet *path* (downloads, promote-diff, post-processing).
 
 Why ``ParquetSnapshotCache`` over the other xorq caches: parquet storage is
 what the DuckDB keyed diff and the Buckaroo viewer stream from and is
@@ -45,38 +48,37 @@ _EXPENSIVE_OPS = {
     "WindowFunction",
     "RowNumber",
 }
-# Read methods cheap enough that re-reading the source beats keeping a copy.
-_CHEAP_READS = {"read_parquet", "read_in_memory", "read_delta"}
 
 
 def classify_build(build_dir: Path) -> dict:
     """Decide whether an entry's result is worth caching, from its build.
 
-    Reads the serialized expression (no execution) and looks for expensive ops,
-    UDFs, or a non-parquet source.  Returns ``{"worthy": bool, "why": str}``.
+    Reads the serialized expression (no execution) and looks for expensive ops
+    or UDFs.  Returns ``{"worthy": bool, "why": str}``.
+
+    A non-parquet *source* read (CSV / JSON) is **not** itself worthy (#73):
+    the parse is cached at the read by the injected source-cache node (see
+    ``tallyman_xorq.source_cache``), so an entry earns a ``result_cache``
+    snapshot only when it does expensive work — a shuffle / sort / window / UDF
+    / full materialisation — on top of its source.
     """
     ops: set[str] = set()
-    reads: set[str] = set()
     for y in Path(build_dir).glob("*.yaml"):
         text = y.read_text()
         ops |= set(re.findall(r"op:\s*([A-Za-z_]+)", text))
-        reads |= set(re.findall(r"method_name:\s*([A-Za-z_]+)", text))
 
     expensive = ops & _EXPENSIVE_OPS
     udfs = {o for o in ops if "UDF" in o}
-    nonparquet = {r for r in reads if r not in _CHEAP_READS}
 
-    worthy = bool(expensive or udfs or nonparquet)
+    worthy = bool(expensive or udfs)
     why_bits = []
     if expensive:
         why_bits.append("ops:" + ",".join(sorted(expensive)))
     if udfs:
         why_bits.append("udf:" + ",".join(sorted(udfs)))
-    if nonparquet:
-        why_bits.append("source:" + ",".join(sorted(nonparquet)))
     return {
         "worthy": worthy,
-        "why": "; ".join(why_bits) or "cheap (parquet read + projection/scalar only)",
+        "why": "; ".join(why_bits) or "cheap (no Aggregate/Join/Sort/window/UDF)",
     }
 
 
@@ -84,24 +86,6 @@ def cache_worthy(project: str, content_hash: str) -> bool:
     from tallyman_core.paths import entry_build_dir
 
     return classify_build(entry_build_dir(project, content_hash))["worthy"]
-
-
-@functools.lru_cache(maxsize=16)
-def result_cache(project: str):
-    """A ParquetSnapshotCache rooted under the project's result_cache dir.
-
-    One connection per project per process — lru_cache ensures xo.connect() is
-    called once rather than on every cached_result_expr / ensure_result call.
-    Bounded (a process touches only a handful of projects); an evicted project
-    just reopens its connection on next use.
-    """
-    import xorq.api as xo
-
-    from tallyman_core.paths import result_cache_dir
-
-    base = result_cache_dir(project)
-    base.mkdir(parents=True, exist_ok=True)
-    return xo.ParquetSnapshotCache.from_kwargs(source=xo.connect(), base_path=base)
 
 
 @functools.lru_cache(maxsize=256)
@@ -112,63 +96,42 @@ def cached_result_expr(project: str, content_hash: str):
     entries are content-addressed, so an evicted hash rebuilds an identical
     expression on the next access.
 
-    * Expensive entry → its expression wrapped in the snapshot cache: a hit
-      reads the cached parquet, a miss recomputes from the build and stores.
-    * Cheap entry → a read of its in-place ``result.parquet`` (the
-      materialisation xorq already wrote at build time), regenerated from the
-      build if it was evicted.  Reading the existing parquet keeps the live
-      viewer fast and lazy; recomputing a cheap pipeline twice per diff plus a
-      cross-backend transport is far slower and buys nothing.
+    As of #73 this is simply the loaded build for every entry. An expensive
+    entry's build *carries a baked result-cache node* (see
+    ``tallyman_xorq.source_cache.rewrite_for_build``), so loading it yields an
+    expression that reads its own cached result — a hit reads the cached
+    parquet, a miss recomputes and stores. A cheap entry's build has no result
+    cache, so it recomputes on read; pushdown makes that ~free and its source
+    parse is itself cached at the read. The caller composes ``expr1`` ⋈
+    ``expr2`` and never depends on a pre-existing ``result.parquet``.
 
-    Either way the caller composes ``expr1`` ⋈ ``expr2`` and never depends on a
-    pre-existing ``result.parquet``.
+    salt source-identity mode skips baked caches (path-only snapshot keys would
+    collide across salted entries — see ``rewrite_for_build``), so reads route
+    through the content-honest in-place ``result.parquet`` instead.
     """
     import xorq.api as xo
 
     from tallyman_xorq import source_identity as si
     from tallyman_xorq.build import load_entry
 
-    # salt identity mode: the snapshot cache keys on path-only expression
-    # structure, so two salted entries with identical code+paths but
-    # different source CONTENT collide on the same cache key and one serves
-    # the other's stale parquet (demonstrated in the cache lab's
-    # append_invalidates scenario). Route every read through the entry-dir
-    # result.parquet, which is keyed by the salted content_hash.
     if si.mode() == "salt":
         return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
-    if cache_worthy(project, content_hash):
-        return load_entry(project, content_hash).cache(cache=result_cache(project))
-    return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
+    return load_entry(project, content_hash)
 
 
 def ensure_result(project: str, content_hash: str) -> Path:
-    """Return a guaranteed-present parquet path for the entry's result.
+    """Return a guaranteed-present ``result.parquet`` path for the entry's result.
 
-    Expensive entries are materialised in the snapshot cache (recomputed on a
-    miss).  Cheap entries use their in-place ``result.parquet``, regenerated
-    from the build if it was deleted.  Either way the caller never depends on a
-    pre-existing ``result.parquet``.
+    On-demand materialisation for the callers that need a parquet *path* rather
+    than an expression — downloads, promote-diff, post-processing. Loads the
+    entry and writes its result in place if absent (#73): an expensive entry's
+    build carries a baked result cache, so this reads through that cache (a hit
+    reuses the materialised result, a miss computes once); a cheap entry
+    recomputes. Either way the caller never depends on a pre-existing
+    ``result.parquet``, and a deleted one self-heals on the next call.
     """
     from tallyman_core.paths import entry_result_path
-    from tallyman_xorq import source_identity as si
     from tallyman_xorq.build import load_entry
-
-    # salt identity mode bypasses the snapshot cache (path-only keys collide
-    # across salted entries — see cached_result_expr) and always uses the
-    # in-place result.parquet under the salted-hash entry dir.
-    if si.mode() != "salt" and cache_worthy(project, content_hash):
-        cache = result_cache(project)
-        expr = load_entry(project, content_hash)
-        if not cache.exists(expr):
-            # result_cache() is memoized, so its storage's directory is only
-            # created at construction; if the result_cache dir was deleted
-            # since (self-heal covers a deleted *directory*, not just a
-            # deleted file), the write below would land in a missing path.
-            cache.storage.path.mkdir(parents=True, exist_ok=True)
-            # Executing the cached expression forces the cache node to write
-            # its input; a count is enough and avoids pulling rows to Python.
-            expr.cache(cache=cache).count().execute()
-        return Path(cache.storage.get_path(cache.calc_key(expr)))
 
     result_path = entry_result_path(project, content_hash)
     if not result_path.exists():

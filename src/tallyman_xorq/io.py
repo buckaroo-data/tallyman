@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tallyman_core import ENTRY_RESULT_FILENAME, data_dir, entry_dir, get_alias, resolve_project
+from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
 
 
 class ProjectDataNotFound(FileNotFoundError):
@@ -64,24 +64,28 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
     """Load an existing catalog entry's result as a xorq expression.
 
     This is how you chain catalog entries: build A, then build B from A's result.
-    The resulting build's `expr.yaml` references A's `result.parquet`, which
-    `tallyman_xorq.lineage` uses to derive catalog-level parent links.
+    Returns the entry's *expression*, composed at the expression level rather
+    than read back from a materialised ``result.parquet`` (#73). For an
+    expensive parent (Aggregate / Join / …) that expression resolves its own
+    ``result_cache`` snapshot, so the parent's work is computed once and shared;
+    a cheap parent recomputes (pushdown makes it ~free). Either way the child no
+    longer depends on the parent having a ``result.parquet`` on disk.
+
+    Because the child's build now serialises the parent's own source reads
+    (wrapped in a cache node) rather than a path to the parent entry, the
+    inter-entry catalog DAG (``tallyman_xorq.lineage.catalog_parents``) no longer
+    recovers a parent edge from this. Cross-entry lineage is deferred to a future
+    semantic-dependency mechanism — see #73.
 
     Args:
         alias_or_hash: An alias (e.g. "shoe_sales") or a content hash. Aliases
             resolve to their *current* latest hash.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    import xorq.api as xo
+    from tallyman_xorq.result_cache import cached_result_expr
 
     proj = resolve_project(project)
-    target = entry_dir(proj, alias_or_hash)
-    if not target.exists():
-        latest = get_alias(proj, alias_or_hash)
-        if latest is None:
-            raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
-        target = entry_dir(proj, latest)
-    parquet = target / ENTRY_RESULT_FILENAME
-    if not parquet.exists():
-        raise ProjectDataNotFound(f"{parquet} not found")
-    return xo.deferred_read_parquet(str(parquet))
+    content_hash = alias_or_hash if entry_dir(proj, alias_or_hash).exists() else get_alias(proj, alias_or_hash)
+    if content_hash is None or not entry_dir(proj, content_hash).exists():
+        raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
+    return cached_result_expr(proj, content_hash)

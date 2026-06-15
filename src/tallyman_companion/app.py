@@ -514,10 +514,15 @@ def create_app(
         _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
-        entry = entry_dir(project, content_hash)
-        result_path = entry / ENTRY_RESULT_FILENAME
-        if not result_path.exists():
-            raise HTTPException(404, "no result.parquet")
+        from tallyman_core.paths import entry_build_dir  # noqa: PLC0415
+        from tallyman_xorq.result_cache import ensure_result  # noqa: PLC0415
+
+        if not entry_build_dir(project, content_hash).is_dir():
+            raise HTTPException(404, "no entry")
+        # #73: cheap entries write no result.parquet at build; ensure_result
+        # materialises one on demand (expensive → result_cache snapshot, cheap →
+        # regenerated in place) so this paginated read always has a parquet.
+        result_path = ensure_result(project, content_hash)
         pf = pq.ParquetFile(result_path)
         total = pf.metadata.num_rows
         needed = offset + limit if limit > 0 else 0
@@ -603,8 +608,9 @@ def create_app(
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
-        result_path = entry / ENTRY_RESULT_FILENAME
-        total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
+        # #73: row count comes from the manifest, not a result.parquet (cheap
+        # entries no longer write one at build time).
+        total_rows = (manifest or {}).get("row_count", 0)
 
         return {
             "project": project,
@@ -729,9 +735,8 @@ def create_app(
                 if (entry / ENTRY_MANIFEST_FILENAME).exists():
                     entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
                     schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                result_path = entry / ENTRY_RESULT_FILENAME
-                if result_path.exists():
-                    total_rows = pq.ParquetFile(result_path).metadata.num_rows
+                    # #73: row count from the manifest, not a result.parquet.
+                    total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
@@ -815,9 +820,7 @@ def create_app(
             if keys:
                 session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
                 try:
-                    build_path, overrides = _build_compare_expr(
-                        project, a_hash, b_hash, tuple(keys)
-                    )
+                    build_path, overrides = _build_compare_expr(project, a_hash, b_hash, tuple(keys))
                     if buckaroo.diff_session_is_loaded(session_id):
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url

@@ -405,6 +405,73 @@ def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Pat
     assert overrides["region"]["color_map_config"]["color_rule"] == "color_categorical"
 
 
+def test_compute_column_config_overrides_type_changed_falls_back(project: str):
+    # Issue #68: a non-key column that keeps its name but changes dtype across
+    # revisions (string→date) is not comparable. The override must not reference
+    # a {col}_eq term (none is emitted) and must leave the a-side visible so the
+    # column renders side-by-side, while unchanged columns keep their coloring.
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_companion.diff import compute_column_config_overrides
+
+    a = ibis.schema({"id": "int64", "issue_date": "string", "amt": "int64", "label": "string"})
+    b = ibis.schema({"id": "int64", "issue_date": "date", "amt": "int64", "label": "string"})
+    ov = compute_column_config_overrides(a, b, ["id"])
+
+    # type-changed col: side-by-side, no _eq override, a-side not hidden, no coloring
+    assert "issue_date_eq" not in ov
+    assert ov.get("issue_date", {}).get("merge_rule") != "hidden"
+    assert "color_map_config" not in ov["issue_date_v2"]
+
+    # unchanged numeric col: a-side hidden, value colored by pct_delta
+    assert ov["amt"]["merge_rule"] == "hidden"
+    assert ov["amt_v2"]["color_map_config"]["val_column"] == "amt_pct_delta"
+
+    # unchanged string col: a-side hidden, value colored categorically by _eq
+    assert ov["label"]["merge_rule"] == "hidden"
+    assert ov["label_v2"]["color_map_config"]["val_column"] == "label_eq"
+
+
+def test_build_compare_expr_type_changed_shared_column(tmp_path):
+    # Issue #68: building the comparison expr over a string→date column must not
+    # emit a raw {col} == {col}_v2 equality term, which xorq rejects with
+    # XorqTypeError. The column falls back to side-by-side display: both sides
+    # present, no {col}_eq column.
+    import datetime as dt
+
+    import pyarrow as pa
+    import xorq.api as xo
+
+    from tallyman_companion.diff import build_compare_expr
+
+    a_tbl = pa.table(
+        {
+            "id": pa.array([1, 2], pa.int64()),
+            "issue_date": pa.array(["2024-01-01", "2024-02-01"], pa.string()),
+        }
+    )
+    b_tbl = pa.table(
+        {
+            "id": pa.array([1, 2], pa.int64()),
+            "issue_date": pa.array([dt.date(2024, 1, 1), dt.date(2024, 3, 1)], pa.date32()),
+        }
+    )
+    a_path = tmp_path / "a.parquet"
+    b_path = tmp_path / "b.parquet"
+    pq.write_table(a_tbl, a_path)
+    pq.write_table(b_tbl, b_path)
+
+    a_expr = xo.deferred_read_parquet(str(a_path))
+    b_expr = xo.deferred_read_parquet(str(b_path))
+
+    expr, overrides = build_compare_expr(a_expr, b_expr, ["id"])
+    cols = set(expr.schema().names)
+    assert "issue_date" in cols  # a-side present
+    assert "issue_date_v2" in cols  # b-side present
+    assert "issue_date_eq" not in cols  # no ill-typed equality term
+    assert "issue_date_eq" not in overrides
+
+
 def test_diff_display_klasses_per_view():
     """The three diff display klasses produce the right per-view columns,
     ordering, and coloring from raw (pre-override) column configs.

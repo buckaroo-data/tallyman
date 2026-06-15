@@ -429,11 +429,51 @@ def _resolve_tag(project: str, tag: str) -> str:
     return out
 
 
+def _tracked_recipe_hashes(project: str) -> set[str]:
+    """Hashes of the git-tracked ``entries/<hash>.zip`` recipes.
+
+    The durable, content-addressed xorq artifact set — what survives a clone or
+    a ``git reset`` — as opposed to the untracked ``entries/<hash>/`` build dirs
+    the bullpen reconciles. Sourced from ``git ls-files`` so it reflects the
+    committed tree, not whatever the working dir happens to hold.
+    """
+    rc, out, _ = run_git(["ls-files", "entries"], cwd=catalog_dir(project))
+    if rc != 0:
+        return set()
+    return {line[len("entries/") : -len(".zip")] for line in out.split() if line.endswith(".zip")}
+
+
+def _assert_catalog_consistent(project: str) -> None:
+    """The two views of "what entries exist" must agree after a reset.
+
+    ``git reset --hard`` restores the durable xorq recipe set
+    (``entries/<hash>.zip``); the bullpen restores the untracked build dirs
+    against the ``entry_hashes`` pointers. They are reconciled by different
+    mechanisms that never see each other, so a pointer whose recipe was never
+    committed (any interrupted or failed best-effort ``xorq catalog add``) comes
+    back from the bullpen as a build-dir copy while the recipe it should recompute
+    from does not exist. Surface that divergence instead of returning a catalog
+    whose two views silently disagree and reporting success (#52).
+    """
+    pointers = set(read_tallyman_state(project)["entry_hashes"])
+    tracked = _tracked_recipe_hashes(project)
+    if tracked != pointers:
+        missing = sorted(pointers - tracked)  # pointer present, no durable recipe
+        orphan = sorted(tracked - pointers)  # durable recipe, no pointer
+        raise RuntimeError(
+            "catalog inconsistent after reset: the git-tracked xorq recipe set and the "
+            f"tallyman entry_hashes pointers disagree (pointers with no durable recipe: "
+            f"{missing}; tracked recipes with no pointer: {orphan})"
+        )
+
+
 def reset_to(project: str, ref: int | str) -> None:
     """Restore the catalog to a step/label: git reset --hard, materialize the
     derived files, then reconcile the untracked artifacts to the recorded
     pointers — evictions retire to the bullpen, recorded-but-missing files
-    come back from it."""
+    come back from it. Finally re-validate the git-tracked xorq recipe set
+    against the tallyman pointers, so a step whose two views disagree fails
+    loudly rather than returning a masked divergence (#52)."""
     cd = catalog_dir(project)
     tag = f"step-{ref:03d}" if isinstance(ref, int) else str(ref)
     with _project_lock(project):
@@ -446,6 +486,7 @@ def reset_to(project: str, ref: int | str) -> None:
         prune_result_cache(project)
         prune_compute_cache(project)
         restore_from_bullpen(project)
+        _assert_catalog_consistent(project)
 
 
 def genesis(project: str) -> int | None:

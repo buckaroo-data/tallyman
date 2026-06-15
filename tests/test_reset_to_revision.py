@@ -47,6 +47,20 @@ def _commit_count(project: str) -> int:
     return int(out) if out else 0
 
 
+def _stage_recipe_zip(project: str, content_hash: str) -> None:
+    """Stage a synthetic durable recipe (``entries/<hash>.zip``) so the next
+    ``checkpoint_catalog`` commits it alongside ``catalog.yaml``.
+
+    reset_to's consistency check (#52) requires every ``entry_hashes`` pointer to
+    have a git-tracked recipe; a synthetic build dir alone leaves the two views
+    disagreeing. This mirrors what a real ``xorq catalog add`` commits, without
+    running xorq."""
+    zp = paths.entries_dir(project) / f"{content_hash}.zip"
+    zp.parent.mkdir(parents=True, exist_ok=True)
+    zp.write_bytes(b"PK\x05\x06" + b"\x00" * 18)  # empty-zip EOCD: plausible recipe bytes
+    _git(project, "add", str(zp.relative_to(paths.catalog_dir(project))))
+
+
 # ---------------------------------------------------------------------------
 # Invariant 1 — fork-safe git (the guard, static)
 # ---------------------------------------------------------------------------
@@ -571,6 +585,7 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
     ed = paths.entry_dir(project, "bbbb")
     ed.mkdir(parents=True)
     (ed / "result.parquet").write_bytes(b"big")
+    _stage_recipe_zip(project, "bbbb")  # durable recipe, so the step's two views agree (#52)
     cc = paths.compute_cache_dir(project)
     cc.mkdir(parents=True)
     (cc / "later.parquet").write_bytes(b"warm")

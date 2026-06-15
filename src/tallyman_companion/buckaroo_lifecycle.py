@@ -51,6 +51,7 @@ import httpx
 from tallyman_core import (
     entry_build_dir,
     entry_expanded_build_dir,
+    entry_result_expanded_build_dir,
     entry_result_path,
     entry_stat_cache_dir,
 )
@@ -484,10 +485,12 @@ class BuckarooManager:
     ) -> str | None:
         """Return a Buckaroo session_id for ``content_hash``, creating it if needed.
 
-        Posts the entry's ``xorq_build/`` dir to Buckaroo's ``/load_expr``
-        endpoint so the session is backed by the xorq expression (push-down
-        sort/search against the underlying backend), not by paging over the
-        materialised parquet.
+        Posts an expanded xorq build dir to Buckaroo's ``/load_expr`` endpoint so
+        the session is backed by an xorq expression (push-down sort/search
+        against the underlying backend). For a cheap entry that build is the
+        entry's recipe (``xorq_build/``); for a cache-worthy entry it's a read of
+        the materialised ``result.parquet`` (#71) so count()/paging don't re-run
+        the Aggregate/Join/Sort — push-down still holds on a parquet scan.
 
         ``project`` names the project that owns the parquet. Sessions cache
         across projects via content hash (globally unique), so a second call
@@ -526,10 +529,38 @@ class BuckarooManager:
             # with load_entry's diff path so the two can't drift.
             from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
 
+            # #71: a cache-worthy entry (Aggregate/Join/Sort) re-runs the whole
+            # DAG on every count() and every paged window if we hand Buckaroo the
+            # raw recipe. Serve a read of the materialised result.parquet instead
+            # — push-down still holds on a parquet scan, and the per-page cost
+            # drops from the full aggregation to a parquet read. Cheap entries
+            # keep loading the recipe (their recompute ≈ a parquet read, so the
+            # indirection buys nothing). A failure in result-build prep falls
+            # back to the recipe: a cache hiccup must not blank the detail page.
+            src_build = build_dir
+            expanded_target = entry_expanded_build_dir(project, content_hash)
+            try:
+                from tallyman_xorq.result_cache import (  # noqa: PLC0415
+                    cache_worthy,
+                    ensure_result_build,
+                )
+
+                if cache_worthy(project, content_hash):
+                    src_build = ensure_result_build(project, content_hash)
+                    expanded_target = entry_result_expanded_build_dir(project, content_hash)
+            except Exception as exc:  # noqa: BLE0001 — never let cache prep break the viewer
+                log.warning(
+                    "result-read build prep failed for %s: %s; serving recipe",
+                    content_hash,
+                    exc,
+                )
+                src_build = build_dir
+                expanded_target = entry_expanded_build_dir(project, content_hash)
+
             expanded = ensure_expanded_build(
-                build_dir,
+                src_build,
                 project_dir(project),
-                entry_expanded_build_dir(project, content_hash),
+                expanded_target,
             )
             stat_cache = entry_stat_cache_dir(project, content_hash)
             stat_cache.mkdir(parents=True, exist_ok=True)

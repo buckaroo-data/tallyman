@@ -35,6 +35,14 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
+def _cheap_code(project: str) -> str:  # parquet read + projection → not cache-worthy
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price")
+"""
+
+
 # ---------------------------------------------------------------------------
 # unit: session map only
 # ---------------------------------------------------------------------------
@@ -336,8 +344,11 @@ def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_par
     deleted by stop(); it now lives under the (immutable, content-addressed)
     entry dir so the path is identical across restarts — which is what lets the
     ParquetSnapshotCache hit. It must therefore survive stop().
+
+    Uses a cheap entry so the recipe is the served build (a cache-worthy entry
+    serves its result-read build, expanded under a different dir — see #71).
     """
-    res = build_and_persist(project, _code(project))
+    res = build_and_persist(project, _cheap_code(project))
 
     mgr = BuckarooManager()
     mgr.bound_port = 65000
@@ -372,8 +383,11 @@ def test_unit_ensure_session_heals_partial_expansion(project: str, orders_parque
     files (zero rows), or — if a subdir landed half-copied — raised
     FileExistsError out of the lock on every later load. ensure_session must key
     off a completion marker written last, and re-expand when it's absent.
+
+    Uses a cheap entry so the recipe is the served build (a cache-worthy entry
+    serves its result-read build, expanded under a different dir — see #71).
     """
-    res = build_and_persist(project, _code(project))
+    res = build_and_persist(project, _cheap_code(project))
 
     mgr = BuckarooManager()
     mgr.bound_port = 65000
@@ -457,8 +471,12 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
 
 def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path, monkeypatch):
     """N threads racing on the same content_hash must produce exactly one
-    /load_expr POST and one tmp dir — the session_lock serialises."""
-    res = build_and_persist(project, _code(project))
+    /load_expr POST and one tmp dir — the session_lock serialises.
+
+    Cheap entry so the served build is the recipe (asserted below via
+    .xorq_build_expanded); cache-worthy entries take the result-read path.
+    """
+    res = build_and_persist(project, _cheap_code(project))
 
     mgr = BuckarooManager()
     mgr.bound_port = 65000
@@ -501,9 +519,14 @@ def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path
 
 def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
     """Threads racing on N distinct content_hashes each get their own
-    /load_expr POST + tmp dir; no cross-talk through the session_lock."""
+    /load_expr POST + tmp dir; no cross-talk through the session_lock.
+
+    Cheap entries so the served builds are the recipes (asserted below via
+    .xorq_build_expanded); cache-worthy entries take the result-read path.
+    """
     hashes = [
-        build_and_persist(project, _code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash for i in range(5)
+        build_and_persist(project, _cheap_code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash
+        for i in range(5)
     ]
 
     mgr = BuckarooManager()

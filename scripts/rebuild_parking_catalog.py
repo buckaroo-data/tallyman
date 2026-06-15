@@ -213,6 +213,17 @@ STEPS: tuple[Step, ...] = (
         ")\n",
     ),
     Step(
+        # A third revision of an aggregated alias: reads the current head and adds
+        # a derived column. Same ~day-cardinality row count, so it gives the perf
+        # harness a cheap diff pair (no high-card nunique blowup, unlike the raw
+        # multi-million-row aliases).
+        "tickets_per_day",
+        "revise",
+        "from tallyman_xorq.io import from_catalog\n"
+        "t = from_catalog('tickets_per_day')\n"
+        "expr = t.mutate(total_tickets=t.parking_count + t.speeding_count)\n",
+    ),
+    Step(
         "habitual_speeder_stats",
         "create",
         "from tallyman_xorq.io import from_catalog\n"

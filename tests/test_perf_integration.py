@@ -20,11 +20,11 @@ rebuild), each across a cold/warm cache axis:
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
    10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
    then serve the first row page (the ``infinite_request`` 0-300 window).
-
-The diff stat path (#45) used to be measured here too, but on the full corpus
-its revision pairs hit the grouped-exact-nunique blowup (#46) — minutes of wall
-time and 10GB+ RSS per pair — which made the harness unusable at scale. It was
-removed; reintroduce it behind a size cap once #46's stat cost is bounded.
+3. **Diff stat path** — #45's diff: ``diff_keys`` → ``build_compare_expr``
+   outer-join → the same stat pipeline, over consecutive revision pairs. Capped
+   to small **aggregated** aliases by result row count (``DIFF_MAX_ROWS``,
+   default 1M): the raw multi-million-row aliases hit the grouped-exact-nunique
+   blowup (#46, 10GB+/minutes per pair), so only aggregated pairs are measured.
 
 Cold/warm semantics. Every measurement runs against an **overlay home**: the
 real entries, source ``data``, and catalog bookkeeping are symlinked read-only,
@@ -242,6 +242,70 @@ def _load_aliases(real_dir: Path) -> dict[str, str]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
+def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
+    """Alias revision chains, from whichever store the corpus uses.
+
+    Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
+    through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
+    them as the ``alias_history`` key in ``catalog.yaml``. Read the legacy file
+    if present, else fall back to the catalog.yaml key.
+    """
+    catalog = real_dir / "artifacts" / "catalog"
+    legacy = catalog / "alias_history.json"
+    if legacy.exists():
+        return json.loads(legacy.read_text())
+    catalog_yaml = catalog / "catalog.yaml"
+    if catalog_yaml.exists():
+        import yaml  # noqa: PLC0415
+
+        data = yaml.safe_load(catalog_yaml.read_text()) or {}
+        return data.get("alias_history", {}) or {}
+    return {}
+
+
+def _entry_rows(real_dir: Path, h: str) -> int:
+    """Row count of an entry's result.parquet via parquet metadata (no full read)."""
+    import pyarrow.parquet as pq  # noqa: PLC0415
+
+    p = real_dir / "artifacts" / "catalog" / "entries" / h / ENTRY_RESULT_FILENAME
+    try:
+        return pq.ParquetFile(str(p)).metadata.num_rows
+    except Exception:
+        return 0
+
+
+# Diffing the raw aliases triggers the #46 grouped-exact-nunique blowup (10GB+ /
+# minutes per pair). Cap the diff step to genuinely *aggregated* results by row
+# count — low enough to exclude the raw scans (1M/side on the truncated corpus,
+# 23.9M on the full one) and the high-card by-plate aggregate, keeping the
+# day-aggregated aliases. Override with TALLYMAN_PERF_DIFF_MAX_ROWS.
+DIFF_MAX_ROWS = int(os.environ.get("TALLYMAN_PERF_DIFF_MAX_ROWS", 100_000))
+
+
+def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
+    """Consecutive (alias, prev, cur) revision pairs with both sides built.
+
+    Capped at ``DIFF_MAX_ROWS`` by result row count — the #45 diff path computes
+    exact per-column nunique, so the big raw aliases (camera_*, 23.9M rows) blow
+    up (#46). Restricting to small aggregated results (tickets_per_day &c.) keeps
+    the measurement usable. Dropped pairs are logged, never silently skipped.
+    """
+    pairs: list[tuple[str, str, str]] = []
+    dropped: list[tuple[str, int]] = []
+    for alias, history in _load_alias_history(real_dir).items():
+        for prev, cur in zip(history, history[1:]):
+            if prev not in built or cur not in built:
+                continue
+            rows = max(_entry_rows(real_dir, prev), _entry_rows(real_dir, cur))
+            (dropped.append((alias, rows)) if rows > DIFF_MAX_ROWS else pairs.append((alias, prev, cur)))
+    if dropped:
+        print(
+            f"\ndiff: skipped {len(dropped)} pair(s) over {DIFF_MAX_ROWS:,} rows (#46 nunique blowup): "
+            + ", ".join(f"{a} ({r:,})" for a, r in dropped)
+        )
+    return pairs
+
+
 def _link(src: Path, dst: Path) -> None:
     if src.exists() or src.is_symlink():
         dst.symlink_to(src)
@@ -402,12 +466,61 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     }
 
 
+def measure_diff(project: str, alias: str, a_hash: str, b_hash: str, scratch: Path) -> dict:
+    """#45's diff stat path: key resolution → compare expr → stat pipeline.
+
+    Only invoked for pairs under ``DIFF_MAX_ROWS`` (see ``_diff_pairs``) so the
+    exact-nunique cost stays bounded.
+    """
+    from tallyman_companion.diff import build_compare_expr  # noqa: PLC0415
+    from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
+    from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+    xorq_loading = _import_buckaroo_loading()
+
+    sampler = pr.RssSampler(psutil.Process(), interval=0.05)
+    t0 = time.monotonic()
+    keys = diff_keys(project, a_hash, b_hash)
+    keys_s = round(time.monotonic() - t0, 2)
+
+    a_expr = cached_result_expr(project, a_hash)
+    b_expr = cached_result_expr(project, b_hash)
+    cmp_expr, _overrides = build_compare_expr(a_expr, b_expr, keys)
+
+    cache_dir = diff_stat_cache_dir(project, a_hash, b_hash)
+    t0 = time.monotonic()
+    _df, meta = _stats_dataflow(xorq_loading, cmp_expr, cache_dir)
+    cold_s = round(time.monotonic() - t0, 2)
+    cache_kb, cache_files = pr._dir_kb_and_files(cache_dir)
+
+    t0 = time.monotonic()
+    _stats_dataflow(xorq_loading, cmp_expr, cache_dir)
+    warm_s = round(time.monotonic() - t0, 2)
+    sampler.stop()
+
+    return {
+        "pair": f"{alias} {a_hash[:8]}→{b_hash[:8]}",
+        "keys": ",".join(keys) or "(none)",
+        "rows": meta["rows"],
+        "cols": len(meta["columns"]),
+        "keys_s": keys_s,
+        "cold_stats_s": cold_s,
+        "warm_stats_s": warm_s,
+        "stat_cache_kb": cache_kb,
+        "stat_cache_files": cache_files,
+        "peak_mb": round(sampler.peak() / MB),
+        "loads": 2,
+        "stat_runs": 2,
+    }
+
+
 # ---------------------------------------------------------------------------
 # report rendering
 # ---------------------------------------------------------------------------
 
 
-def _render_report(project: str, hashes: list[str], execs, loads, aliases: dict[str, str]) -> str:
+def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases: dict[str, str]) -> str:
     by_hash = {h: a for a, h in aliases.items()}
 
     def label(h: str) -> str:
@@ -445,6 +558,24 @@ def _render_report(project: str, hashes: list[str], execs, loads, aliases: dict[
             L.append(
                 f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['load_s']} | {r['cold_stats_s']} "
                 f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
+            )
+
+    L += [
+        "",
+        f"## Diff stat path (aggregated revision pairs, #45; ≤ {DIFF_MAX_ROWS:,} rows)",
+        "",
+        "| pair | keys | rows | cols | keys s | cold stats s | warm stats s | peak MB |",
+        "|---|---|---|---|---|---|---|---|",
+    ]
+    if not diffs:
+        L.append("| (no aggregated revision pairs under the row cap) | | | | | | | |")
+    for r in diffs:
+        if "error" in r:
+            L.append(f"| {r['pair']} | ERROR: {r['error']} |||||||")
+        else:
+            L.append(
+                f"| {r['pair']} | {r['keys']} | {r['rows']:,} | {r['cols']} | {r['keys_s']} "
+                f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['peak_mb']} |"
             )
 
     L.append("")
@@ -501,7 +632,13 @@ def test_perf_integration_report(corpus, tmp_path_factory):
         r_load.setdefault("entry", h)
         loads.append(r_load)
 
-    _emit_report(_render_report(project, hashes, execs, loads, aliases))
+    diffs = []
+    for alias, a, b in _diff_pairs(real_dir, set(hashes)):
+        r_diff = pr._safe(measure_diff, project, alias, a, b, scratch)
+        r_diff.setdefault("pair", f"{alias} {a[:8]}→{b[:8]}")
+        diffs.append(r_diff)
+
+    _emit_report(_render_report(project, hashes, execs, loads, diffs, aliases))
 
     # Report-only: assert every measurement produced a row and at least one
     # succeeded end to end. No wall-clock threshold.

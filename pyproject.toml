@@ -20,7 +20,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo==0.14.17",
+    "buckaroo==0.15.0",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
     # No duckdb extra: the only backend is xorq's built-in datafusion
@@ -74,11 +74,12 @@ select = ["E", "F", "I", "W"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not integration and not cache_lab and not perf'"
+addopts = "-m 'not integration and not cache_lab and not perf and not perf_tier_a'"
 markers = [
     "integration: spawns real subprocesses (Buckaroo, MCP stdio); ~3-15s each",
     "cache_lab: adversarial cache-behavior measurement suite; run on demand when touching result_cache/identity/reset (see tests/test_cache_lab.py)",
     "perf: local-only Tier-B perf integration over the real parking corpus; needs the on-disk catalog, skips when absent (see tests/test_perf_integration.py)",
+    "perf_tier_a: local-only Tier-A perf calibration — real Buckaroo subprocess + Playwright browser to data-grid-visible, calibrates the Tier-B proxy; heavy, skips without corpus/browser (see tests/test_perf_tier_a.py)",
 ]
 filterwarnings = [
     "ignore::UserWarning:xorq.ibis_yaml.translate",

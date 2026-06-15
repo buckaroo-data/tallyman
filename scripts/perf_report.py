@@ -147,6 +147,111 @@ class RssSampler:
         return max(vals, default=0)
 
 
+class ProcTreeSampler:
+    """Sample RSS + CPU% of a process *and all its descendants* on a bg thread.
+
+    ``RssSampler`` watches a single process — right when the work runs
+    in-process (Tier B), wrong when it runs in a spawned server (Tier A): the
+    Buckaroo subprocess and any workers it forks are where the GBs live, and a
+    driver-process sampler reports a few hundred MB while the machine swaps.
+    This samples the whole tree rooted at ``root_pid``, so server child
+    processes count toward the peak, and records system memory + swap each tick
+    so a run on a memory-pressured machine is self-documenting.
+
+    ``peak_rss`` is the max over ticks of the summed RSS of every live process
+    in the tree; ``peak_cpu`` the max summed ``cpu_percent`` (can exceed 100 on
+    multi-core compute — the #34 pile-up hit ~355%). System fields are the
+    worst (lowest free / highest swap) seen across the run.
+    """
+
+    def __init__(self, root_pid: int, interval: float = 0.1):
+        import psutil
+
+        self._psutil = psutil
+        self._root_pid = root_pid
+        self._interval = interval
+        self._stop = threading.Event()
+        self._t0 = time.monotonic()
+        self.rss_samples: list[int] = []
+        self.cpu_samples: list[float] = []
+        self.sys_mem_pct: list[float] = []
+        self.sys_swap_mb: list[int] = []
+        # pid -> psutil.Process, kept across ticks: cpu_percent() diffs against
+        # the previous call *on the same instance*, so a fresh Process every
+        # tick would read 0.0 forever. Cache and reuse the instances.
+        self._procs: dict[int, object] = {}
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _refresh_tree(self) -> list:
+        """Current tree procs, reusing cached instances so cpu_percent has a
+        reference point. New children are primed (first cpu_percent → 0.0) and
+        dead pids dropped."""
+        psutil = self._psutil
+        try:
+            root = self._procs.get(self._root_pid) or psutil.Process(self._root_pid)
+        except psutil.Error:
+            return []
+        self._procs[self._root_pid] = root
+        alive = {self._root_pid}
+        try:
+            for child in root.children(recursive=True):
+                alive.add(child.pid)
+                if child.pid not in self._procs:
+                    self._procs[child.pid] = child
+                    try:
+                        child.cpu_percent()  # prime the new child
+                    except psutil.Error:
+                        pass
+        except psutil.Error:
+            pass
+        for pid in [p for p in self._procs if p not in alive]:
+            del self._procs[pid]
+        return [self._procs[pid] for pid in alive if pid in self._procs]
+
+    def _run(self) -> None:
+        psutil = self._psutil
+        # Prime cpu_percent: the first call per process returns 0.0 (it measures
+        # since the previous call), so seed every proc before the first reading.
+        for p in self._refresh_tree():
+            try:
+                p.cpu_percent()
+            except psutil.Error:
+                pass
+        while not self._stop.is_set():
+            rss = 0
+            cpu = 0.0
+            for p in self._refresh_tree():
+                try:
+                    rss += p.memory_info().rss
+                    cpu += p.cpu_percent()  # 0.0 the first time a new child appears
+                except psutil.Error:
+                    continue
+            self.rss_samples.append(rss)
+            self.cpu_samples.append(cpu)
+            vm = psutil.virtual_memory()
+            sw = psutil.swap_memory()
+            self.sys_mem_pct.append(vm.percent)
+            self.sys_swap_mb.append(round(sw.used / MB))
+            self._stop.wait(self._interval)
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+
+    def peak_rss(self) -> int:
+        return max(self.rss_samples, default=0)
+
+    def peak_cpu(self) -> float:
+        return max(self.cpu_samples, default=0.0)
+
+    def peak_sys_mem_pct(self) -> float:
+        return max(self.sys_mem_pct, default=0.0)
+
+    def peak_swap_mb(self) -> int:
+        return max(self.sys_swap_mb, default=0)
+
+
 def _dir_kb_and_files(path: Path) -> tuple[int, int]:
     total = 0
     files = 0
@@ -263,15 +368,17 @@ def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
         "small_limit": (
             f"from tallyman_xorq.io import from_project\nexpr = from_project('events.parquet').limit({limit})\n"
         ),
-        # Grouped exact nunique — the datafusion memory bomb. Lives on its own
-        # small dataset; keep it OFF the 4M-row events table (see docstring).
+        # Grouped approximate distinct count. The exact `nunique()` here is the
+        # datafusion memory bomb (#46: ~37KB transient/group); `approx_nunique`
+        # is the bounded-state alternative an entry should use. Kept on its own
+        # small dataset regardless; keep it OFF the 4M-row events table.
         "agg_nunique": (
             "from tallyman_xorq.io import from_project\n"
             "t = from_project('agg_small.parquet')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
-            "    n_days=t.issue_ts.nunique(),\n"
-            "    n_states=t.state.nunique(),\n"
+            "    n_days=t.issue_ts.approx_nunique(),\n"
+            "    n_states=t.state.approx_nunique(),\n"
             ")\n"
         ),
     }

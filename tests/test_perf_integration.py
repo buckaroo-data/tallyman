@@ -20,10 +20,11 @@ rebuild), each across a cold/warm cache axis:
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
    10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
    then serve the first row page (the ``infinite_request`` 0-300 window).
-3. **Diff stat path** — #45's 27s-on-first-open: ``diff_keys`` → the
-   ``build_compare_expr`` outer-join → the same stat pipeline, over the
-   consecutive revision pairs in the corpus's alias history (``catalog.yaml``'s
-   ``alias_history`` key, or a legacy ``alias_history.json``).
+3. **Diff stat path** — #45's diff: ``diff_keys`` → ``build_compare_expr``
+   outer-join → the same stat pipeline, over consecutive revision pairs. Capped
+   to small **aggregated** aliases by result row count (``DIFF_MAX_ROWS``,
+   default 1M): the raw multi-million-row aliases hit the grouped-exact-nunique
+   blowup (#46, 10GB+/minutes per pair), so only aggregated pairs are measured.
 
 Cold/warm semantics. Every measurement runs against an **overlay home**: the
 real entries, source ``data``, and catalog bookkeeping are symlinked read-only,
@@ -45,8 +46,7 @@ consolidation work, which this harness will read once it lands.
 Deferred to follow-ups: Tier A Playwright; the full-vs-truncated corpus variants
 (needs the Stage 1 ``scripts/rebuild_parking_catalog.py`` rebuild on
 ``perf/parking-catalog-rebuild`` to land and a ``head(1M)`` raw-source truncate);
-the Tier-A/Tier-B calibration ratio; promoting #45's diff time to a regression
-gate once baselined.
+the Tier-A/Tier-B calibration ratio.
 
 Local-only, marker-gated (``perf``), and skipped when the corpus is absent, so
 it never runs on CI. Run it explicitly:
@@ -64,8 +64,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -116,6 +119,72 @@ def _load_perf_report():
 
 pr = _load_perf_report()
 MB = pr.MB
+
+
+# ---------------------------------------------------------------------------
+# buckaroo #926 perf spans (BUCKAROO_PERF) — in-process capture
+# ---------------------------------------------------------------------------
+
+# buckaroo#926 instruments the stat pipeline: with perf on, each timed block
+# emits one `perf span=<label> secs=<n>` line on the `buckaroo.perf` logger
+# (stat.xorq.total / materialize / batch_aggregate, …). Tier B runs that
+# pipeline in-process, so we enable it around the cold stat run and collect
+# the lines — turning the single `cold stats s` number into a where-the-time-
+# goes breakdown. No-op on a buckaroo without #926.
+_PERF_SPAN_RE = re.compile(r"perf span=(?P<label>\S+) secs=(?P<secs>[\d.]+)")
+
+
+@contextmanager
+def _capture_perf_spans():
+    """Enable buckaroo's #926 perf spans and collect them for the block.
+
+    Yields a dict that, once the block exits, maps span label -> summed
+    seconds for every `perf span=` line emitted while it ran. Restores the
+    prior enabled state and detaches the handler afterwards; a buckaroo
+    without the `perf_log` module (pre-#926) degrades to an empty dict.
+    """
+    spans: dict[str, float] = {}
+    try:
+        from buckaroo.pluggable_analysis_framework import perf_log  # noqa: PLC0415
+    except ImportError:
+        yield spans
+        return
+
+    lines: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger("buckaroo.perf")
+    handler = _Collect()
+    logger.addHandler(handler)  # added before enable() so _ensure_logging adds no stderr handler
+    was_enabled = perf_log.enabled()
+    perf_log.enable()
+    try:
+        yield spans
+    finally:
+        if not was_enabled:
+            perf_log.disable()
+        logger.removeHandler(handler)
+        for line in lines:
+            m = _PERF_SPAN_RE.search(line)
+            if m:
+                spans[m["label"]] = spans.get(m["label"], 0.0) + float(m["secs"])
+
+
+# Each captured #926 span gets its own report column (label -> header).
+_SPAN_COLUMNS = [
+    ("stat.xorq.total", "stat total s"),
+    ("stat.xorq.materialize", "materialize s"),
+    ("stat.xorq.batch_aggregate", "batch_agg s"),
+    ("firstpull.summary_stats", "summary_stats s"),
+]
+
+
+def _span_cell(spans: dict | None, label: str) -> str:
+    v = (spans or {}).get(label)
+    return f"{v:.2f}" if v is not None else "—"
 
 
 # ---------------------------------------------------------------------------
@@ -178,9 +247,8 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
 
     Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
     through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
-    them as the ``alias_history`` key in ``catalog.yaml`` (#57 moved alias
-    bookkeeping off separate files). Read the legacy file if present, else fall
-    back to the catalog.yaml key.
+    them as the ``alias_history`` key in ``catalog.yaml``. Read the legacy file
+    if present, else fall back to the catalog.yaml key.
     """
     catalog = real_dir / "artifacts" / "catalog"
     legacy = catalog / "alias_history.json"
@@ -195,17 +263,46 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
     return {}
 
 
-def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
-    """Consecutive (alias, prev_hash, cur_hash) revisions with both sides built.
+def _entry_rows(real_dir: Path, h: str) -> int:
+    """Row count of an entry's result.parquet via parquet metadata (no full read)."""
+    import pyarrow.parquet as pq  # noqa: PLC0415
 
-    This is the revision-pair definition #45 cares about: re-opening an entry's
-    diff against its immediate predecessor.
+    p = real_dir / "artifacts" / "catalog" / "entries" / h / ENTRY_RESULT_FILENAME
+    try:
+        return pq.ParquetFile(str(p)).metadata.num_rows
+    except Exception:
+        return 0
+
+
+# Diffing the raw aliases triggers the #46 grouped-exact-nunique blowup (10GB+ /
+# minutes per pair). Cap the diff step to genuinely *aggregated* results by row
+# count — low enough to exclude the raw scans (1M/side on the truncated corpus,
+# 23.9M on the full one) and the high-card by-plate aggregate, keeping the
+# day-aggregated aliases. Override with TALLYMAN_PERF_DIFF_MAX_ROWS.
+DIFF_MAX_ROWS = int(os.environ.get("TALLYMAN_PERF_DIFF_MAX_ROWS", 100_000))
+
+
+def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
+    """Consecutive (alias, prev, cur) revision pairs with both sides built.
+
+    Capped at ``DIFF_MAX_ROWS`` by result row count — the #45 diff path computes
+    exact per-column nunique, so the big raw aliases (camera_*, 23.9M rows) blow
+    up (#46). Restricting to small aggregated results (tickets_per_day &c.) keeps
+    the measurement usable. Dropped pairs are logged, never silently skipped.
     """
     pairs: list[tuple[str, str, str]] = []
+    dropped: list[tuple[str, int]] = []
     for alias, history in _load_alias_history(real_dir).items():
         for prev, cur in zip(history, history[1:]):
-            if prev in built and cur in built:
-                pairs.append((alias, prev, cur))
+            if prev not in built or cur not in built:
+                continue
+            rows = max(_entry_rows(real_dir, prev), _entry_rows(real_dir, cur))
+            (dropped.append((alias, rows)) if rows > DIFF_MAX_ROWS else pairs.append((alias, prev, cur)))
+    if dropped:
+        print(
+            f"\ndiff: skipped {len(dropped)} pair(s) over {DIFF_MAX_ROWS:,} rows (#46 nunique blowup): "
+            + ", ".join(f"{a} ({r:,})" for a, r in dropped)
+        )
     return pairs
 
 
@@ -328,7 +425,8 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     load_s = round(time.monotonic() - t0, 2)
 
     t0 = time.monotonic()
-    _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
+    with _capture_perf_spans() as stat_spans:
+        _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
     cold_stats_s = round(time.monotonic() - t0, 2)
     cache_kb, cache_files = pr._dir_kb_and_files(stat_cache)
 
@@ -358,6 +456,8 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         "first_page_kb": len(parquet_bytes) // 1024,
         "stat_cache_kb": cache_kb,
         "stat_cache_files": cache_files,
+        # buckaroo#926 cold-stat span breakdown (empty without BUCKAROO_PERF/#926).
+        "stat_spans": stat_spans,
         "peak_mb": round(sampler.peak() / MB),
         # One build load + (cold) one stat run; warm adds one load + one stat run
         # that should hit the on-disk cache rather than recompute.
@@ -367,7 +467,11 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
 
 
 def measure_diff(project: str, alias: str, a_hash: str, b_hash: str, scratch: Path) -> dict:
-    """#45's diff stat path: key resolution → compare expr → stat pipeline."""
+    """#45's diff stat path: key resolution → compare expr → stat pipeline.
+
+    Only invoked for pairs under ``DIFF_MAX_ROWS`` (see ``_diff_pairs``) so the
+    exact-nunique cost stays bounded.
+    """
     from tallyman_companion.diff import build_compare_expr  # noqa: PLC0415
     from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
     from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
@@ -440,26 +544,31 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
         "",
         "## Page load — Tier B proxy (load build + summary stats + 1st page)",
         "",
-        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache |",
-        "|---|---|---|---|---|---|---|---|",
+        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache | "
+        + " | ".join(h for _, h in _SPAN_COLUMNS) + " |",
+        "|" + "---|" * (8 + len(_SPAN_COLUMNS)),
     ]
     for r in loads:
         if "error" in r:
-            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} |||||||")
+            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} " + "|" * (7 + len(_SPAN_COLUMNS)))
         else:
             cache = f"{r['stat_cache_kb']}KB ({r['stat_cache_files']})"
+            spans = r.get("stat_spans")
+            span_cells = " | ".join(_span_cell(spans, lbl) for lbl, _ in _SPAN_COLUMNS)
             L.append(
                 f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['load_s']} | {r['cold_stats_s']} "
-                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} |"
+                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
             )
 
     L += [
         "",
-        "## Diff stat path (revision pairs, #45)",
+        f"## Diff stat path (aggregated revision pairs, #45; ≤ {DIFF_MAX_ROWS:,} rows)",
         "",
         "| pair | keys | rows | cols | keys s | cold stats s | warm stats s | peak MB |",
         "|---|---|---|---|---|---|---|---|",
     ]
+    if not diffs:
+        L.append("| (no aggregated revision pairs under the row cap) | | | | | | | |")
     for r in diffs:
         if "error" in r:
             L.append(f"| {r['pair']} | ERROR: {r['error']} |||||||")
@@ -468,6 +577,7 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
                 f"| {r['pair']} | {r['keys']} | {r['rows']:,} | {r['cols']} | {r['keys_s']} "
                 f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['peak_mb']} |"
             )
+
     L.append("")
     return "\n".join(L)
 
@@ -531,8 +641,7 @@ def test_perf_integration_report(corpus, tmp_path_factory):
     _emit_report(_render_report(project, hashes, execs, loads, diffs, aliases))
 
     # Report-only: assert every measurement produced a row and at least one
-    # succeeded end to end. No wall-clock threshold yet (#45's diff time is the
-    # obvious first gate once baselined).
+    # succeeded end to end. No wall-clock threshold.
     assert len(execs) == len(hashes) and len(loads) == len(hashes)
     assert any("error" not in r for r in execs), "no execute measurement succeeded"
     assert any("error" not in r for r in loads), "no page-load measurement succeeded"

@@ -81,9 +81,9 @@ def classify_build(build_dir: Path) -> dict:
 
 
 def cache_worthy(project: str, content_hash: str) -> bool:
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_build_dir
 
-    return classify_build(entry_dir(project, content_hash) / "xorq_build")["worthy"]
+    return classify_build(entry_build_dir(project, content_hash))["worthy"]
 
 
 @functools.lru_cache(maxsize=16)
@@ -149,7 +149,7 @@ def ensure_result(project: str, content_hash: str) -> Path:
     from the build if it was deleted.  Either way the caller never depends on a
     pre-existing ``result.parquet``.
     """
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_result_path
     from tallyman_xorq import source_identity as si
     from tallyman_xorq.build import load_entry
 
@@ -170,7 +170,7 @@ def ensure_result(project: str, content_hash: str) -> Path:
             expr.cache(cache=cache).count().execute()
         return Path(cache.storage.get_path(cache.calc_key(expr)))
 
-    result_path = entry_dir(project, content_hash) / "result.parquet"
+    result_path = entry_result_path(project, content_hash)
     if not result_path.exists():
         load_entry(project, content_hash).to_parquet(str(result_path))
     return result_path

@@ -226,11 +226,11 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     as the tool's ``{"error": ...}`` response.
     """
     from tallyman_core.aliases import get_alias  # avoid circular at module level
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_result_path
 
     # Resolve alias → hash, or treat as bare hash.
     content_hash = get_alias(project, entry_name_or_hash) or entry_name_or_hash
-    parquet_path = entry_dir(project, content_hash) / "result.parquet"
+    parquet_path = entry_result_path(project, content_hash)
     if not parquet_path.exists():
         raise PostProcessingRunError(
             f"no result.parquet found for entry {entry_name_or_hash!r} (resolved hash: {content_hash})"

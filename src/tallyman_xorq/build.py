@@ -14,10 +14,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from tallyman_core import (
+    ENTRY_MANIFEST_FILENAME,
     Manifest,
     ensure_project,
     entries_dir,
+    entry_build_dir,
     entry_dir,
+    entry_manifest_path,
+    entry_result_path,
+    entry_schema_path,
     project_dir,
     write_manifest,
 )
@@ -291,7 +296,7 @@ def build_and_persist(
         if target.exists():
             # Same content hash already on disk — nothing to do beyond return.
             # Record this invocation's prompt as a re-run event.
-            manifest_path = target / "manifest.json"
+            manifest_path = entry_manifest_path(project, content_hash)
             if manifest_path.exists():
                 meta = json.loads(manifest_path.read_text())
                 _append_prompt(target, prompt)
@@ -300,13 +305,13 @@ def build_and_persist(
                     entry_path=target,
                     row_count=meta.get("row_count", 0),
                     execute_seconds=meta.get("execute_seconds", 0.0),
-                    schema=json.loads((target / "schema.json").read_text()),
+                    schema=json.loads(entry_schema_path(project, content_hash).read_text()),
                 )
 
         target.mkdir(parents=True, exist_ok=True)
 
         # Move xorq's build directory contents (expr.yaml + deps) under the entry.
-        xorq_build_dir = target / "xorq_build"
+        xorq_build_dir = entry_build_dir(project, content_hash)
         xorq_build_dir.mkdir(exist_ok=True)
         for item in build_path.rglob("*"):
             dest = xorq_build_dir / item.relative_to(build_path)
@@ -336,7 +341,7 @@ def build_and_persist(
             hint = _ibis_import_hint(str(exc), code)
             raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
-        result_path = target / "result.parquet"
+        result_path = entry_result_path(project, content_hash)
         t0 = time.monotonic()
         try:
             loaded.to_parquet(str(result_path))
@@ -355,7 +360,7 @@ def build_and_persist(
         "fields": [{"name": f.name, "type": str(f.type)} for f in arrow_schema],
         "row_count": row_count,
     }
-    (target / "schema.json").write_text(json.dumps(schema_doc, indent=2))
+    entry_schema_path(project, content_hash).write_text(json.dumps(schema_doc, indent=2))
 
     manifest = Manifest(
         content_hash=content_hash,
@@ -410,7 +415,7 @@ def list_entries(project: str) -> list[dict]:
         return []
     out = []
     for child in sorted(base.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        meta_path = child / "manifest.json"
+        meta_path = child / ENTRY_MANIFEST_FILENAME
         if meta_path.exists():
             out.append(json.loads(meta_path.read_text()))
     return out
@@ -431,8 +436,7 @@ def load_entry(project: str, content_hash: str):
     from tallyman_core.paths import compute_cache_dir
     from tallyman_xorq.portable import load_expr_portable
 
-    target = entry_dir(project, content_hash)
-    build_dir = target / "xorq_build"
+    build_dir = entry_build_dir(project, content_hash)
     if not build_dir.is_dir():
         raise FileNotFoundError(f"no xorq_build dir for {content_hash} in project {project}")
     cache_dir = compute_cache_dir(project)

@@ -25,6 +25,8 @@ import shutil
 import threading
 from pathlib import Path
 
+from tallyman_core.paths import ENTRY_EXPANDED_BUILD_DIRNAME
+
 PLACEHOLDER = "${TALLYMAN_PROJECT_ROOT}"
 
 # Per-expanded-path locks so two concurrent loads of the same entry don't race
@@ -127,5 +129,5 @@ def load_expr_portable(build_dir: Path, project_root: Path, cache_dir):
     """
     from xorq.ibis_yaml.compiler import load_expr
 
-    expanded = ensure_expanded_build(build_dir, project_root, build_dir.parent / ".xorq_build_expanded")
+    expanded = ensure_expanded_build(build_dir, project_root, build_dir.parent / ENTRY_EXPANDED_BUILD_DIRNAME)
     return load_expr(expanded, cache_dir=cache_dir)

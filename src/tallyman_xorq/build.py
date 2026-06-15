@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import re
 import sys
 import tempfile
@@ -51,6 +52,10 @@ class BuildResult:
     row_count: int
     execute_seconds: float
     schema: dict
+    # Whether the entry's recipe landed in the xorq catalog git repo. None on the
+    # re-run path (entry already on disk, registration not re-attempted); True/False
+    # on a fresh build. False means the recipe is NOT durable — see #48.
+    catalog_registered: bool | None = None
 
 
 class BuildError(RuntimeError):
@@ -369,15 +374,24 @@ def build_and_persist(
     except OSError:
         pass
 
-    # Best-effort: register with the xorq catalog git repo.
+    # Best-effort by design (a missing/misconfigured catalog repo must not break
+    # the build), but the outcome is surfaced on the result instead of swallowed:
+    # a failed add means the recipe never reached git and is not durable (#48).
+    catalog_registered: bool | None = None
+    cause = ""
     try:
         from tallyman_core.xorq_catalog import add_entry as _xcat_add
 
-        _xcat_add(project, xorq_build_dir, entry_name=content_hash)
+        catalog_registered = _xcat_add(project, xorq_build_dir, entry_name=content_hash)
     except Exception as exc:
-        import logging
-
-        logging.getLogger(__name__).warning("xorq catalog add skipped: %s", exc)
+        catalog_registered = False
+        cause = f" ({exc})"
+    if catalog_registered is False:
+        logging.getLogger(__name__).error(
+            "xorq catalog add failed for %s%s — entry recipe is not durable in the catalog repo (#48)",
+            content_hash,
+            cause,
+        )
 
     return BuildResult(
         content_hash=content_hash,
@@ -385,6 +399,7 @@ def build_and_persist(
         row_count=row_count,
         execute_seconds=execute_seconds,
         schema=schema_doc,
+        catalog_registered=catalog_registered,
     )
 
 

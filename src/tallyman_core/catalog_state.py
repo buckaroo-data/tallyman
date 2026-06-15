@@ -11,9 +11,18 @@ xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
     entry_hashes:    [content_hash, ...]      # pointer to untracked entries/<hash>/
     result_cache:    [relpath, ...]           # pointer to untracked result cache
     compute_cache:   [relpath, ...]           # pointer to untracked compute cache
+    alias_map:       {alias: latest_hash}     # tallyman's alias bookkeeping
+    alias_history:   {alias: [hash, ...]}     # tallyman's alias bookkeeping
 
-The catalog git repo tracks only ``catalog.yaml`` + the two alias files. The
-heavy artifacts (entries/, the caches) are content-addressed, additive, and
+The catalog git repo tracks only ``catalog.yaml``. tallyman's alias bookkeeping
+lives *in* it, as the ``alias_map``/``alias_history`` keys above (owned by
+``aliases.py``) — committing separate ``aliases.json``/``alias_history.json``
+files inside the repo made xorq's ``assert_consistency`` reject it and every
+``xorq catalog add`` after the first silently no-op (#48). Keeping the state as
+catalog.yaml keys means there are no extra tracked files, and ``reset_to``'s
+``git reset`` rolls alias state back with the rest of the file (no separate
+reconcile). The heavy artifacts (entries/, the caches) are content-addressed,
+additive, and
 untracked — ``git reset`` can't roll them back, so ``reset_to`` reconciles them
 to the recorded pointer lists: evictions retire to the bullpen (not deleted),
 and anything the restored step records that is missing comes back from the
@@ -60,7 +69,10 @@ log = logging.getLogger(__name__)
 
 # git-level identity flags, so commits work without a global git config.
 _GIT_ID = ["-c", "user.email=tallyman@local", "-c", "user.name=tallyman"]
-_TRACKED = ("catalog.yaml", "aliases.json", "alias_history.json")
+# Only catalog.yaml is git-tracked in the catalog repo. Alias bookkeeping is
+# carried as catalog.yaml keys, not separate files — tracking those alongside
+# xorq's managed set made its assert_consistency reject the repo (#48).
+_TRACKED = ("catalog.yaml",)
 _STEP_RE = re.compile(r"^step-(\d+)$")
 # Refs and labels are operator input that ends up as git arguments. A plain
 # tag-shaped name only: no leading dash (option injection), no revision
@@ -96,6 +108,8 @@ def read_tallyman_state(project: str) -> dict:
         "entry_hashes": raw.get("entry_hashes", []),
         "result_cache": raw.get("result_cache", []),
         "compute_cache": raw.get("compute_cache", []),
+        "alias_map": raw.get("alias_map", {}),
+        "alias_history": raw.get("alias_history", {}),
     }
 
 
@@ -155,6 +169,9 @@ def capture_tallyman_state(project: str) -> dict:
         "result_cache": _list_cache_files(result_cache_dir(project)),
         "compute_cache": _list_cache_files(compute_cache_dir(project)),
     }
+    # alias_map/alias_history are written live by aliases.py and already in
+    # catalog.yaml; write_tallyman_state preserves keys it isn't given, so
+    # capture leaves them untouched rather than re-snapshotting.
     write_tallyman_state(project, **state)
     return state
 
@@ -223,6 +240,8 @@ def materialize(project: str) -> None:
         _materialize_display_configs(project, raw["display_configs"])
     if "notebook" in raw:
         _materialize_notebook(project, raw["notebook"] or {"cells": []})
+    # alias_map/alias_history need no materialize step: aliases.py reads them
+    # straight from catalog.yaml, which git reset has already rolled back.
 
 
 # ---------------------------------------------------------------------------
@@ -364,7 +383,7 @@ def _step_tags(project: str) -> list[int]:
 
 
 def checkpoint_catalog(project: str, message: str, *, step: int | None = None, label: str | None = None) -> int | None:
-    """Capture state, commit catalog.yaml + alias files once, tag the step.
+    """Capture state, commit catalog.yaml once, tag the step.
 
     One commit per operation (not per mutator), through the fork-safe primitive,
     under the per-project lock. Returns the step number, or None when the

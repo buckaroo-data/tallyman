@@ -7,8 +7,8 @@ Layout (per-project):
     ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
-        │   ├── catalog/entries/<hash>/
-        │   ├── catalog/aliases.json, alias_history.json, chart_specs/
+        │   ├── catalog/entries/<hash>/    # the xorq catalog git repo
+        │   │                              # (alias bookkeeping is catalog.yaml keys, not files)
         │   ├── post_processing/<name>.py
         │   ├── stats/<name>.py
         │   ├── exports/...            # marimo .py, screenshots, CSVs

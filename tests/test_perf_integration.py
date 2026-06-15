@@ -20,10 +20,11 @@ rebuild), each across a cold/warm cache axis:
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
    10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
    then serve the first row page (the ``infinite_request`` 0-300 window).
-3. **Diff stat path** — #45's 27s-on-first-open: ``diff_keys`` → the
-   ``build_compare_expr`` outer-join → the same stat pipeline, over the
-   consecutive revision pairs in the corpus's alias history (``catalog.yaml``'s
-   ``alias_history`` key, or a legacy ``alias_history.json``).
+
+The diff stat path (#45) used to be measured here too, but on the full corpus
+its revision pairs hit the grouped-exact-nunique blowup (#46) — minutes of wall
+time and 10GB+ RSS per pair — which made the harness unusable at scale. It was
+removed; reintroduce it behind a size cap once #46's stat cost is bounded.
 
 Cold/warm semantics. Every measurement runs against an **overlay home**: the
 real entries, source ``data``, and catalog bookkeeping are symlinked read-only,
@@ -45,8 +46,7 @@ consolidation work, which this harness will read once it lands.
 Deferred to follow-ups: Tier A Playwright; the full-vs-truncated corpus variants
 (needs the Stage 1 ``scripts/rebuild_parking_catalog.py`` rebuild on
 ``perf/parking-catalog-rebuild`` to land and a ``head(1M)`` raw-source truncate);
-the Tier-A/Tier-B calibration ratio; promoting #45's diff time to a regression
-gate once baselined.
+the Tier-A/Tier-B calibration ratio.
 
 Local-only, marker-gated (``perf``), and skipped when the corpus is absent, so
 it never runs on CI. Run it explicitly:
@@ -242,42 +242,6 @@ def _load_aliases(real_dir: Path) -> dict[str, str]:
     return json.loads(p.read_text()) if p.exists() else {}
 
 
-def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
-    """Alias revision chains, from whichever store the corpus uses.
-
-    Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
-    through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
-    them as the ``alias_history`` key in ``catalog.yaml`` (#57 moved alias
-    bookkeeping off separate files). Read the legacy file if present, else fall
-    back to the catalog.yaml key.
-    """
-    catalog = real_dir / "artifacts" / "catalog"
-    legacy = catalog / "alias_history.json"
-    if legacy.exists():
-        return json.loads(legacy.read_text())
-    catalog_yaml = catalog / "catalog.yaml"
-    if catalog_yaml.exists():
-        import yaml  # noqa: PLC0415
-
-        data = yaml.safe_load(catalog_yaml.read_text()) or {}
-        return data.get("alias_history", {}) or {}
-    return {}
-
-
-def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
-    """Consecutive (alias, prev_hash, cur_hash) revisions with both sides built.
-
-    This is the revision-pair definition #45 cares about: re-opening an entry's
-    diff against its immediate predecessor.
-    """
-    pairs: list[tuple[str, str, str]] = []
-    for alias, history in _load_alias_history(real_dir).items():
-        for prev, cur in zip(history, history[1:]):
-            if prev in built and cur in built:
-                pairs.append((alias, prev, cur))
-    return pairs
-
-
 def _link(src: Path, dst: Path) -> None:
     if src.exists() or src.is_symlink():
         dst.symlink_to(src)
@@ -438,57 +402,12 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     }
 
 
-def measure_diff(project: str, alias: str, a_hash: str, b_hash: str, scratch: Path) -> dict:
-    """#45's diff stat path: key resolution → compare expr → stat pipeline."""
-    from tallyman_companion.diff import build_compare_expr  # noqa: PLC0415
-    from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
-    from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
-    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
-
-    xorq_loading = _import_buckaroo_loading()
-
-    sampler = pr.RssSampler(psutil.Process(), interval=0.05)
-    t0 = time.monotonic()
-    keys = diff_keys(project, a_hash, b_hash)
-    keys_s = round(time.monotonic() - t0, 2)
-
-    a_expr = cached_result_expr(project, a_hash)
-    b_expr = cached_result_expr(project, b_hash)
-    cmp_expr, _overrides = build_compare_expr(a_expr, b_expr, keys)
-
-    cache_dir = diff_stat_cache_dir(project, a_hash, b_hash)
-    t0 = time.monotonic()
-    _df, meta = _stats_dataflow(xorq_loading, cmp_expr, cache_dir)
-    cold_s = round(time.monotonic() - t0, 2)
-    cache_kb, cache_files = pr._dir_kb_and_files(cache_dir)
-
-    t0 = time.monotonic()
-    _stats_dataflow(xorq_loading, cmp_expr, cache_dir)
-    warm_s = round(time.monotonic() - t0, 2)
-    sampler.stop()
-
-    return {
-        "pair": f"{alias} {a_hash[:8]}→{b_hash[:8]}",
-        "keys": ",".join(keys) or "(none)",
-        "rows": meta["rows"],
-        "cols": len(meta["columns"]),
-        "keys_s": keys_s,
-        "cold_stats_s": cold_s,
-        "warm_stats_s": warm_s,
-        "stat_cache_kb": cache_kb,
-        "stat_cache_files": cache_files,
-        "peak_mb": round(sampler.peak() / MB),
-        "loads": 2,
-        "stat_runs": 2,
-    }
-
-
 # ---------------------------------------------------------------------------
 # report rendering
 # ---------------------------------------------------------------------------
 
 
-def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases: dict[str, str]) -> str:
+def _render_report(project: str, hashes: list[str], execs, loads, aliases: dict[str, str]) -> str:
     by_hash = {h: a for a, h in aliases.items()}
 
     def label(h: str) -> str:
@@ -528,21 +447,6 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
                 f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
             )
 
-    L += [
-        "",
-        "## Diff stat path (revision pairs, #45)",
-        "",
-        "| pair | keys | rows | cols | keys s | cold stats s | warm stats s | peak MB |",
-        "|---|---|---|---|---|---|---|---|",
-    ]
-    for r in diffs:
-        if "error" in r:
-            L.append(f"| {r['pair']} | ERROR: {r['error']} |||||||")
-        else:
-            L.append(
-                f"| {r['pair']} | {r['keys']} | {r['rows']:,} | {r['cols']} | {r['keys_s']} "
-                f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['peak_mb']} |"
-            )
     L.append("")
     return "\n".join(L)
 
@@ -597,17 +501,10 @@ def test_perf_integration_report(corpus, tmp_path_factory):
         r_load.setdefault("entry", h)
         loads.append(r_load)
 
-    diffs = []
-    for alias, a, b in _diff_pairs(real_dir, set(hashes)):
-        r_diff = pr._safe(measure_diff, project, alias, a, b, scratch)
-        r_diff.setdefault("pair", f"{alias} {a[:8]}→{b[:8]}")
-        diffs.append(r_diff)
-
-    _emit_report(_render_report(project, hashes, execs, loads, diffs, aliases))
+    _emit_report(_render_report(project, hashes, execs, loads, aliases))
 
     # Report-only: assert every measurement produced a row and at least one
-    # succeeded end to end. No wall-clock threshold yet (#45's diff time is the
-    # obvious first gate once baselined).
+    # succeeded end to end. No wall-clock threshold.
     assert len(execs) == len(hashes) and len(loads) == len(hashes)
     assert any("error" not in r for r in execs), "no execute measurement succeeded"
     assert any("error" not in r for r in loads), "no page-load measurement succeeded"

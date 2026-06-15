@@ -18,56 +18,93 @@ from __future__ import annotations
 from typing import Any
 
 
+def _is_comparable(dt_a: Any, dt_b: Any) -> bool:
+    """True if two dtypes can be compared with ibis ``==`` without a XorqTypeError.
+
+    Identical dtypes always compare; two numeric dtypes are mutually castable
+    (the numeric diff path already casts both to float64).  A name-shared column
+    whose dtype changed across revisions to an incomparable type (e.g.
+    string→date, #68) returns False and falls back to side-by-side display.
+    """
+    return dt_a == dt_b or (dt_a.is_numeric() and dt_b.is_numeric())
+
+
+def _classify_shared(a_schema: Any, b_schema: Any, keys: list[str]) -> tuple[list, list, set, set]:
+    """Partition non-key columns shared by name into numeric / comparable sets.
+
+    Returns (a_non_keys, b_non_keys, numeric_shared, eq_shared):
+      numeric_shared  name-shared and numeric on *both* sides → pct/abs deltas
+      eq_shared       name-shared and dtype-comparable → emit a {col}_eq term
+
+    numeric_shared ⊆ eq_shared.  A name-shared column in neither set changed to
+    an incomparable dtype and renders side-by-side with no equality term.
+    """
+    a_non_keys = [c for c in a_schema if c not in keys]
+    b_non_keys = [c for c in b_schema if c not in keys]
+    shared = [c for c in a_non_keys if c in b_non_keys]
+    numeric_shared = {c for c in shared if a_schema[c].is_numeric() and b_schema[c].is_numeric()}
+    eq_shared = {c for c in shared if _is_comparable(a_schema[c], b_schema[c])}
+    return a_non_keys, b_non_keys, numeric_shared, eq_shared
+
+
 def compute_column_config_overrides(a_schema: Any, b_schema: Any, keys: list[str]) -> dict:
     """Compute Buckaroo column_config_overrides from two ibis schemas and join keys.
 
     Pure schema analysis — no expression building.  Called by both build_compare_expr
     and the promote paths so the expression is only constructed once (during build).
     """
-    a_non_keys = [c for c in a_schema if c not in keys]
-    b_non_keys = [c for c in b_schema if c not in keys]
-    shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
-    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
+    a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)
 
     eq_map = ["#e8b4b8", "#73ae80", "#90b2b3", "#6c83b5"]
     pk_color = "#6c5fc7"
     pk_map = [pk_color] * 4
     overrides: dict = {"membership": {"merge_rule": "hidden"}}
     for col in a_non_keys:
-        if col in b_non_keys:
-            overrides[col] = {"merge_rule": "hidden"}
-            overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
-            if col in numeric_shared:
-                # _pct_delta and _abs_delta are not hidden here so that
-                # DiffDetailedPctStyling / DiffDetailedAbsoluteStyling can
-                # display them.  DiffMainStyling filters them by name.
-                #
-                # This pct_delta coloring is what a *promoted* diff entry
-                # renders with: it's persisted into display_configs and applied
-                # without the diff display klasses (which only load on the live
-                # /diff route).  The live diff route strips this numeric color
-                # via strip_live_diff_color() so the per-view klass coloring
-                # (pct_delta for main/detailed_pct, abs_delta for
-                # detailed_absolute) isn't clobbered by merge_column_config.
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_map",
-                        "map_name": "DIVERGING_RED_WHITE_BLUE",
-                        "val_column": f"{col}_pct_delta",
-                    },
-                }
-            else:
-                overrides[f"{col}_v2"] = {
-                    "header_name": col,
-                    "tooltip_config": {"tooltip_type": "simple", "val_column": col},
-                    "color_map_config": {
-                        "color_rule": "color_categorical",
-                        "map_name": eq_map,
-                        "val_column": f"{col}_eq",
-                    },
-                }
+        if col not in b_non_keys:
+            continue
+        if col not in eq_shared:
+            # #68: dtype changed to an incomparable type across revisions, so no
+            # {col}_eq term is emitted.  Render side-by-side — a-side stays
+            # visible, b-side shows the new value with the old in a tooltip and
+            # no equality/magnitude coloring.
+            overrides[f"{col}_v2"] = {
+                "header_name": f"{col} (v2)",
+                "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+            }
+            continue
+        overrides[col] = {"merge_rule": "hidden"}
+        overrides[f"{col}_eq"] = {"merge_rule": "hidden"}
+        if col in numeric_shared:
+            # _pct_delta and _abs_delta are not hidden here so that
+            # DiffDetailedPctStyling / DiffDetailedAbsoluteStyling can
+            # display them.  DiffMainStyling filters them by name.
+            #
+            # This pct_delta coloring is what a *promoted* diff entry
+            # renders with: it's persisted into display_configs and applied
+            # without the diff display klasses (which only load on the live
+            # /diff route).  The live diff route strips this numeric color
+            # via strip_live_diff_color() so the per-view klass coloring
+            # (pct_delta for main/detailed_pct, abs_delta for
+            # detailed_absolute) isn't clobbered by merge_column_config.
+            overrides[f"{col}_v2"] = {
+                "header_name": col,
+                "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                "color_map_config": {
+                    "color_rule": "color_map",
+                    "map_name": "DIVERGING_RED_WHITE_BLUE",
+                    "val_column": f"{col}_pct_delta",
+                },
+            }
+        else:
+            overrides[f"{col}_v2"] = {
+                "header_name": col,
+                "tooltip_config": {"tooltip_type": "simple", "val_column": col},
+                "color_map_config": {
+                    "color_rule": "color_categorical",
+                    "map_name": eq_map,
+                    "val_column": f"{col}_eq",
+                },
+            }
     for k in keys:
         overrides[k] = {
             "color_map_config": {
@@ -118,10 +155,7 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
 
     a_schema = a_expr.schema()
     b_schema = b_expr.schema()
-    a_non_keys = [c for c in a_schema if c not in keys]
-    b_non_keys = [c for c in b_schema if c not in keys]
-    shared_non_keys = [c for c in a_non_keys if c in b_non_keys]
-    numeric_shared = {c for c, dtype in a_schema.items() if c in shared_non_keys and dtype.is_numeric()}
+    a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)
 
     a_expr, b_expr = _align_backends(a_expr, b_expr)
     b_renamed = b_expr.rename({f"{c}_v2": c for c in b_non_keys})
@@ -151,7 +185,7 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
     ).name("membership")
     sel.append(membership)
 
-    for col in shared_non_keys:
+    for col in (c for c in a_non_keys if c in eq_shared):
         eq = (
             membership
             + ibis.cases(

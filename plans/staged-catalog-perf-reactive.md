@@ -58,13 +58,12 @@ then produces a clean parking catalog for stage 2 to measure.
    shipped with the fix and guards the rollback; the non-xorq-fileset audit
    landed too (`_TRACKED` is `catalog.yaml` only).
 
-2. **OPEN — #52 fix (the live stage-1 work item).** Not touched by #57: that fix
-   reconciles *alias state*, not the xorq `.zip`-vs-`entry_hashes` divergence. Add
-   an explicit cross-view reconciliation + assertion at the end of `reset_to`:
-   compare the tracked `entries/*.zip` set against `entry_hashes`, re-register (or
-   fail loudly on) any pointer whose recipe is missing, and assert
-   `Catalog.from_kwargs(init=False)` opens. Turns the silent divergence
-   observable. (PR #50's Group B is the failing-test half, already on `main`.)
+2. **✅ DONE (PR #58, merged) — #52 fix, reset cross-view reconciliation.**
+   `reset_to` now asserts the git-tracked recipe set (`entries/<hash>.zip`) equals
+   the `entry_hashes` pointers after the bullpen reconcile; any pointer with no
+   durable recipe (or recipe with no pointer) raises `RuntimeError` instead of
+   returning a silently-divergent catalog. The open recovery-policy question
+   ("re-register vs fail loudly") was settled **fail-loud**. **#52 closed.**
 
 3. **PARTLY DONE — surface the silent swallow.** #57 exposed
    `BuildResult.catalog_registered` and logs the failed entry-`add` at ERROR. The
@@ -84,15 +83,15 @@ then produces a clean parking catalog for stage 2 to measure.
 ### Tests / acceptance
 
 - ✅ PR #50's failing integration tests (Groups A/B/D) landed on `main`
-  (`80d2e9b`); #57 made the #48 ones (A, and D rewritten) pass and added Group F
-  (alias registration durability). The TDD red-then-green split is satisfied for
-  #48.
-- **Still red / unwritten:** Group B (reset divergence) stays failing until #52 is
-  fixed — that's the next fix to land.
-- One end-to-end demo-walk invariant test still wanted: genesis → multiple creates
-  → revise → reset back → forward → back, asserting at every step that the catalog
-  opens, every recipe is durable as a tracked `.zip`, alias state is correct, and
-  (where in scope) authored state survives. Lands with the #52 fix.
+  (`80d2e9b`); #57 made the #48 ones pass and added Group F (alias registration
+  durability); #58 added `test_reset_surfaces_pointer_without_durable_recipe` for
+  the reset divergence and made it pass. The TDD red-then-green split is satisfied
+  for both #48 and #52.
+- A broader end-to-end demo-walk invariant test (genesis → creates → revise →
+  reset back → forward → back, asserting catalog-opens + recipe-durable +
+  alias-correct + authored-state-survives at every step) would still be a nice
+  umbrella over the now-passing per-bug tests, but the core invariants are pinned.
+  Optional; not blocking stage 2.
 
 ---
 
@@ -110,7 +109,7 @@ can do what we need *and is fast enough*, lean on it and write no code; where it
 can't, or is too slow for interactive use, build our own. Each capability gets a
 native-or-build verdict backed by a number, not an opinion.
 
-### Deliverable 0 — consolidate perf instrumentation, make noise configurable
+### Deliverable 0 — consolidate perf instrumentation, make noise configurable (#60)
 
 Across tallyman and buckaroo, perf/cache-stat logging has been added and then
 turned back off in churn (buckaroo `19abae89` "log cache stats", `72bcf2ad`
@@ -172,7 +171,7 @@ depth (ADR open question, untimed); how many expressions are needlessly rebuilt 
 reloaded per app open; does revising a source re-execute dependents at all today
 (ADR says no — fast but stale).
 
-### Deliverable 2 — performance integration tests
+### Deliverable 2 — performance integration tests (#59)
 
 Three measurements, each on both corpus variants (full / truncated) and across a
 cold/warm cache axis. Local-only on this Mac, marker-gated off CI (same convention

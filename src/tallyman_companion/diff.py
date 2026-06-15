@@ -157,11 +157,22 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
     b_schema = b_expr.schema()
     a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)
 
+    # #68 (reopened after #69): a *key* column whose dtype changed across
+    # revisions to an incomparable type (issue_date string→date) would make the
+    # join predicate and the key coalesce compare incompatible dtypes and abort
+    # the whole diff. Cast both sides of such keys to string — a universally
+    # comparable type — for the join and coalesce, the same "never compare
+    # incompatible dtypes" invariant #69 established for the non-key _eq path.
+    recast_keys = {k for k in keys if not _is_comparable(a_schema[k], b_schema[k])}
+
+    def _key(expr: Any, k: str) -> Any:
+        return expr[k].cast("string") if k in recast_keys else expr[k]
+
     a_expr, b_expr = _align_backends(a_expr, b_expr)
     b_renamed = b_expr.rename({f"{c}_v2": c for c in b_non_keys})
-    joined = a_expr.outer_join(b_renamed, [a_expr[k] == b_renamed[k] for k in keys])
+    joined = a_expr.outer_join(b_renamed, [_key(a_expr, k) == _key(b_renamed, k) for k in keys])
 
-    sel: list = [ibis.coalesce(a_expr[k], b_renamed[k]).name(k) for k in keys]
+    sel: list = [ibis.coalesce(_key(a_expr, k), _key(b_renamed, k)).name(k) for k in keys]
     for col in a_non_keys:
         sel.append(joined[col])
         if col in b_non_keys:

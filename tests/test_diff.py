@@ -472,6 +472,50 @@ def test_build_compare_expr_type_changed_shared_column(tmp_path):
     assert "issue_date_eq" not in overrides
 
 
+def test_build_compare_expr_type_changed_key_column(tmp_path):
+    # Issue #68 (reopened after #69): #69 gated the non-key {col}_eq term, but
+    # the same string→date failure still aborts the diff through the *join key*.
+    # build_compare_expr joins on raw key equality (a_expr[k] == b_renamed[k])
+    # and coalesces the key — both type-sensitive. When the key keeps its name
+    # but changes dtype across revisions, xorq raises XorqTypeError and the whole
+    # diff pipeline aborts. Both sides of such a key are cast to a common type
+    # (string) for the join and coalesce so the comparison is well-typed.
+    import datetime as dt
+
+    import pyarrow as pa
+    import xorq.api as xo
+
+    from tallyman_companion.diff import build_compare_expr
+
+    a_tbl = pa.table(
+        {
+            "issue_date": pa.array(["2024-01-01", "2024-02-01"], pa.string()),
+            "amt": pa.array([10, 20], pa.int64()),
+        }
+    )
+    b_tbl = pa.table(
+        {
+            "issue_date": pa.array([dt.date(2024, 1, 1), dt.date(2024, 3, 1)], pa.date32()),
+            "amt": pa.array([15, 25], pa.int64()),
+        }
+    )
+    a_path = tmp_path / "a.parquet"
+    b_path = tmp_path / "b.parquet"
+    pq.write_table(a_tbl, a_path)
+    pq.write_table(b_tbl, b_path)
+
+    a_expr = xo.deferred_read_parquet(str(a_path))
+    b_expr = xo.deferred_read_parquet(str(b_path))
+
+    # Building and executing must not raise XorqTypeError on the type-changed key.
+    expr, _ = build_compare_expr(a_expr, b_expr, ["issue_date"])
+    assert "issue_date" in expr.schema().names
+    df = expr.execute()
+    # The string-cast date matches the string side: 2024-01-01 is shared,
+    # 2024-02-01 is a-only, 2024-03-01 is b-only — a well-formed outer join.
+    assert {"2024-01-01", "2024-02-01", "2024-03-01"} == {str(d) for d in df["issue_date"]}
+
+
 def test_diff_display_klasses_per_view():
     """The three diff display klasses produce the right per-view columns,
     ordering, and coloring from raw (pre-override) column configs.

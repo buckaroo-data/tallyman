@@ -34,75 +34,65 @@ then produces a clean parking catalog for stage 2 to measure.
   durable catalog cannot reproduce and reports success. Compounded by #48 today,
   but independent: any failed/interrupted `add` (which `checkpoint_catalog` already
   anticipates, `catalog_state.py:388-390`) triggers it after #48 is fixed.
-- **#49** — authored state (charts, post_processing, …) stored as extra
-  `catalog.yaml` keys is dropped when xorq rebuilds `catalog.yaml` from
-  entries+aliases on a merge. **Deprioritised out of stage 1's critical path:**
-  latent only under multi-user `pull`/sync, which does not happen single-user /
-  `--no-sync`. Stays filed; not fixed this stage.
+- **#49 / #54** — authored state (charts, post_processing, stats, notebook, …)
+  stored as `catalog.yaml` keys is dropped when xorq rebuilds `catalog.yaml` from
+  entries+aliases on a merge. **Resolution direction settled by #54 (and the #57
+  precedent):** this state is shareable catalog content and *belongs* in
+  `catalog.yaml` so it clones and versions with the catalog — #49's proposed
+  relocation to an out-of-repo store would stop that. So the fix is on the
+  *durability* side (make the keys survive xorq's merge-rebuild — e.g. per-entry
+  state into the entry metadata sidecar, which xorq treats as opaque), not
+  relocation. **Deprioritised out of stage 1's critical path:** the drop is latent
+  only under multi-user `pull`/sync, which does not happen single-user /
+  `--no-sync`. Stays filed (#49, #54); not fixed this stage.
 
 ### Work
 
-1. **#48 fix — fold the bookkeeping into `catalog.yaml` (decided 2026-06-14).**
-   Stop writing `aliases.json` / `alias_history.json` as separate files; store
-   their content as tallyman keys in `catalog.yaml`, the same way every other
-   tallyman-owned thing already is (`post_processing`, `stats`, `charts`,
-   `display_configs`, `notebook`, `entry_hashes`, `result_cache`,
-   `compute_cache`). The two files are the lone anomaly that breaks #48; folding
-   them in removes them from the tracked file set, so `assert_consistency` (which
-   checks the file *set*, not `catalog.yaml`'s contents, catalog.py:768-785)
-   passes and `xorq catalog add` stops no-opping. xorq's add/add-alias
-   read-modify-write the whole dict and round-trip unknown keys on the `--no-sync`
-   path tallyman always uses.
-   - **Why this over a separate file/repo.** `catalog.yaml` is git-tracked and
-     checkpoint-committed, so `git reset --hard` already rolls alias state back —
-     no sibling repo, no lockstep commits, no bespoke reconciliation, and
-     `test_reset_rolls_back_alias_state` stays green via git. Strictly less code
-     than the alternatives.
-   - **Known caveat (deferred, not regressed).** `catalog.yaml` keys are what xorq
-     drops when it rebuilds the file from entries+aliases on a merge-conflict
-     `pull` (#49). Latent under single-user / `--no-sync`, and the same exposure
-     the authored state already accepts. The multi-user fix is to move all
-     project-global state out of `catalog.yaml` together (#48 + #49 jointly) —
-     `catalog.yaml`-now defers that without foreclosing it.
-   - **Optional refinement.** `set_alias` already calls `_xcat.add_alias`
-     (`aliases.py:111`), so xorq's own `aliases` key holds `{alias: latest_hash}`
-     and `aliases.json` partly duplicates it. Folding only `alias_history` into a
-     tallyman key (and reading current aliases from xorq's native `aliases`)
-     shrinks tallyman bookkeeping and survives merges for the current-alias half.
-   - Audit the full set of non-xorq files the checkpoint commits under
-     `catalog_dir`, not just the two named, in case anything else needs the same
-     treatment.
-   - The deferred `test_reset_rolls_back_alias_state` guard (PR #50) ships *with*
-     this fix — the rollback path changes, so the guard travels with the change
-     per the TDD rule.
+1. **✅ DONE (PR #57, merged) — #48 fix, alias bookkeeping in `catalog.yaml`.**
+   `aliases.py` now reads/writes `alias_map` / `alias_history` as `catalog.yaml`
+   keys via `catalog_state` (no `aliases.json`, no out-of-repo sidecar — #53's
+   alternative was rejected). The tracked file set is back to xorq's expected set,
+   `assert_consistency` passes, `xorq catalog add` stops no-opping. `reset_to`'s
+   `git reset` rolls the alias keys back with the rest of `catalog.yaml` — no
+   separate reconcile path. **#48 closed.** `test_reset_rolls_back_alias_state`
+   shipped with the fix and guards the rollback; the non-xorq-fileset audit
+   landed too (`_TRACKED` is `catalog.yaml` only).
 
-2. **#52 fix.** Add an explicit cross-view reconciliation + assertion at the end of
-   `reset_to`: compare the tracked `entries/*.zip` set against `entry_hashes`,
-   re-register (or fail loudly on) any pointer whose recipe is missing, and assert
-   `Catalog.from_kwargs(init=False)` opens. Turns the silent divergence observable.
+2. **OPEN — #52 fix (the live stage-1 work item).** Not touched by #57: that fix
+   reconciles *alias state*, not the xorq `.zip`-vs-`entry_hashes` divergence. Add
+   an explicit cross-view reconciliation + assertion at the end of `reset_to`:
+   compare the tracked `entries/*.zip` set against `entry_hashes`, re-register (or
+   fail loudly on) any pointer whose recipe is missing, and assert
+   `Catalog.from_kwargs(init=False)` opens. Turns the silent divergence
+   observable. (PR #50's Group B is the failing-test half, already on `main`.)
 
-3. **#48 secondary — surface the silent swallow.** `add_entry` is best-effort and
-   discards its result (`xorq_catalog.py:63-68`, `build.py`); expose a
-   `BuildResult.catalog_registered`-style signal, log failures at ERROR, and emit a
-   one-time companion warning. PR #50's Group D pins this.
+3. **PARTLY DONE — surface the silent swallow.** #57 exposed
+   `BuildResult.catalog_registered` and logs the failed entry-`add` at ERROR. The
+   remainder is **#56 (open):** `catalog_registered` is computed but dies in
+   `_run_and_record` (never propagated to the caller / companion), and `set_alias`
+   still discards `add_alias`'s bool, so a failed *alias* add stays swallowed.
+   Finish #56 to actually surface both failures.
 
-4. **Reproducible parking-catalog rebuild script.** No migration/repair of the
-   existing broken catalog — rebuild from scratch through the *fixed* machinery.
-   One script drives the parking sources through `catalog_create`/`catalog_revise`
-   to produce the canonical catalog, and emits both corpus variants for stage 2
-   (full ≈10M+ rows, truncated ≈1M). This replaces "repair" on the task list and
-   doubles as the stage-2 corpus generator. Depends on #48 + #52 being fixed first
-   (otherwise the rebuild is born broken again).
+4. **OPEN — reproducible parking-catalog rebuild script.** No migration/repair —
+   rebuild from scratch through the now-fixed machinery. One script drives the
+   parking sources through `catalog_create`/`catalog_revise` to produce the
+   canonical catalog and emits both corpus variants for stage 2 (full ≈10M+ rows,
+   truncated ≈1M). Doubles as the stage-2 corpus generator. Now unblocked on the
+   #48 side; still wants #52 fixed first so a back/forward rebuild stays durable.
+   **Blocking input:** confirm the parking source parquet(s) still exist / where.
 
 ### Tests / acceptance
 
-- PR #50's failing integration tests (Groups A/B/D) go green.
-- One end-to-end demo-walk invariant test: genesis → multiple creates → revise →
-  reset back → forward → back, asserting at every step that the catalog opens,
-  every recipe is durable as a tracked `.zip`, alias state is correct, and (where
-  in scope) authored state survives.
-- TDD split per house rule: failing tests (PR #50) seen red on CI first, then the
-  fixes; the alias-rollback guard ships with the fix commit.
+- ✅ PR #50's failing integration tests (Groups A/B/D) landed on `main`
+  (`80d2e9b`); #57 made the #48 ones (A, and D rewritten) pass and added Group F
+  (alias registration durability). The TDD red-then-green split is satisfied for
+  #48.
+- **Still red / unwritten:** Group B (reset divergence) stays failing until #52 is
+  fixed — that's the next fix to land.
+- One end-to-end demo-walk invariant test still wanted: genesis → multiple creates
+  → revise → reset back → forward → back, asserting at every step that the catalog
+  opens, every recipe is durable as a tracked `.zip`, alias state is correct, and
+  (where in scope) authored state survives. Lands with the #52 fix.
 
 ---
 

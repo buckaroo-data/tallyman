@@ -368,15 +368,17 @@ def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
         "small_limit": (
             f"from tallyman_xorq.io import from_project\nexpr = from_project('events.parquet').limit({limit})\n"
         ),
-        # Grouped exact nunique — the datafusion memory bomb. Lives on its own
-        # small dataset; keep it OFF the 4M-row events table (see docstring).
+        # Grouped approximate distinct count. The exact `nunique()` here is the
+        # datafusion memory bomb (#46: ~37KB transient/group); `approx_nunique`
+        # is the bounded-state alternative an entry should use. Kept on its own
+        # small dataset regardless; keep it OFF the 4M-row events table.
         "agg_nunique": (
             "from tallyman_xorq.io import from_project\n"
             "t = from_project('agg_small.parquet')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
-            "    n_days=t.issue_ts.nunique(),\n"
-            "    n_states=t.state.nunique(),\n"
+            "    n_days=t.issue_ts.approx_nunique(),\n"
+            "    n_states=t.state.approx_nunique(),\n"
             ")\n"
         ),
     }

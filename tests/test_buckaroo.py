@@ -279,6 +279,51 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
 
+def test_unit_ensure_session_cache_worthy_serves_result_read(project: str, orders_parquet: Path, monkeypatch):
+    """A cache-worthy entry must be served to Buckaroo as a read of its
+    materialised result.parquet, not the raw recipe (#71).
+
+    The recipe is an Aggregate/Join/Sort that re-runs the full DAG on every
+    ``count()`` and every ``LIMIT 300`` page. Handing Buckaroo a build whose
+    expression is a ``deferred_read_parquet`` of the cached result turns those
+    per-page recomputes into a parquet scan, while keeping push-down.
+    """
+    from tallyman_xorq.result_cache import cache_worthy, classify_build
+
+    res = build_and_persist(project, _code(project))  # group_by.aggregate → worthy
+    assert cache_worthy(project, res.content_hash) is True
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "s"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+    mgr.ensure_session(res.content_hash, project)
+
+    posted = Path(captured["json"]["build_dir"])
+    assert posted.is_dir(), posted
+    # The posted build serves a parquet read (cheap), not the aggregate recipe.
+    assert classify_build(posted)["worthy"] is False, classify_build(posted)
+    # The recipe itself is still expensive — we swapped it, not rewrote it.
+    recipe = entry_dir(project, res.content_hash) / "xorq_build"
+    assert classify_build(recipe)["worthy"] is True
+    # And the posted build is expanded (no placeholder), like the recipe path.
+    assert "${TALLYMAN_PROJECT_ROOT}" not in (posted / "expr.yaml").read_text()
+
+
 # ---------------------------------------------------------------------------
 # stress: tmp-dir lifecycle, concurrency
 # ---------------------------------------------------------------------------

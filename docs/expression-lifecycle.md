@@ -98,6 +98,19 @@ In order:
 | Source digests (cas/salt only) | `<project>/artifacts/source_digests.json` | `source_identity`, step 1 |
 | Alias + pointers | `<catalog>/catalog.yaml` keys (`alias_map`, `alias_history`, `entry_hashes`) + a git commit | `set_alias` (step 3 below) + `_xcat_add`, step 7 |
 
+`result.parquet`, `xorq_build/`, `manifest.json`, and `schema.json` are
+`ENTRY_ARTIFACT_NAMES` (`paths.py:91`) — immutable build outputs, partitioned
+from the regenerable `ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`,
+`.xorq_build_expanded`). The perf overlay symlinks the artifacts read-only and
+omits the caches, which is the operational proof of the split: `result.parquet`
+is a durable artifact written **once** for every entry at build, expensive or
+cheap — not a cache. For an expensive entry the read-time `result_cache/`
+snapshot (§6) is an *additional* copy layered on top; `result.parquet` itself
+is never rewritten (a deleted one self-heals, but that is recovery, not its
+role). Only `catalog.yaml` is git-tracked, so the bytes are
+untracked-but-durable: recorded via the `entry_hashes` pointer and reconciled
+to the bullpen by `reset_to`.
+
 What is **not** written yet — these are lazy, and that is the whole point of
 the timeline:
 

@@ -103,6 +103,15 @@ content-addressed artifact — its result must not invalidate just because
 an upstream file's mtime drifts. No TTL: entries are permanent history,
 not expiring scratch.
 
+Both cases sit on top of `result.parquet`, which `build_and_persist` writes
+for *every* entry at build time (`loaded.to_parquet`), expensive or cheap.
+That file is the entry's canonical materialization — an immutable artifact,
+not a cache (see *Per-entry immutable records*). The `result_cache/` snapshot
+above is an *additional* read-time layer for expensive entries, not a
+replacement; the cheap path reads `result.parquet` directly. So "regenerated
+from the build if missing" is a self-heal for a deleted artifact, not the
+file's normal role.
+
 ### Compute cache (`compute_cache_dir` in `src/tallyman_core/paths.py`)
 
 `<project>/artifacts/catalog/compute_cache/` holds xorq's sub-expression
@@ -156,9 +165,22 @@ On companion startup, a 3-second warmup budget pre-populates
 
 ### Per-entry immutable records
 
-Not caches in the eviction sense — records that are valid forever because
-the entry they describe never changes:
+Not caches in the eviction sense — immutable build outputs, valid forever
+because the entry they describe never changes. `paths.py:91` draws the line
+explicitly: `ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `result.parquet`,
+`manifest.json`, `schema.json`) are the immutable artifacts; the
+write-isolated perf overlay symlinks them read-only — safe because nothing
+ever rewrites them — and omits `ENTRY_CACHE_NAMES` so a benchmark starts
+honestly cold.
 
+- **Materialized result** (`<entry>/result.parquet`) — written by
+  `build_and_persist` for *every* entry at build time (`loaded.to_parquet`),
+  expensive or cheap. It is the entry's canonical result and an
+  `ENTRY_ARTIFACT_NAME`, not a cache: the expensive-entry `result_cache/`
+  snapshot and the "regenerate if missing" fallback both layer on top of it.
+  Only `catalog.yaml` is git-tracked, so the bytes are untracked-but-durable
+  — recorded via the `entry_hashes` pointer and reconciled (to the bullpen)
+  by `reset_to`, never silently rewritten.
 - **Primary key** (`src/tallyman_xorq/primary_key.py`) —
   `<entry>/primary_key.json` saves a full-table cardinality scan. A cheap
   row-preserving entry with no cached key inherits its parent version's
@@ -168,7 +190,9 @@ the entry they describe never changes:
   last, gates reuse; a crashed expansion redoes on next access. The
   expansion must live at a stable path: xorq's snapshot key includes the
   read path, so a random tmp dir would change the expression hash and
-  bust the result cache on every process restart.
+  bust the result cache on every process restart. (Content-addressed but
+  regenerable, so it is an `ENTRY_CACHE_NAME`, not an artifact — the overlay
+  omits it rather than symlinking it.)
 - **Manifest / schema / alias history** — `manifest.json`,
   `schema.json`, `aliases.json` + `alias_history.json`: row counts,
   timings, schemas, and the append-only alias version log. They save

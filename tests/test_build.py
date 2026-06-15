@@ -24,8 +24,12 @@ def test_build_writes_entry(project: str, orders_parquet: Path):
     assert res.execute_seconds >= 0.0
     target = entry_dir(project, res.content_hash)
     assert target.is_dir()
-    for child in ("manifest.json", "result.parquet", "schema.json", "expr.py"):
+    # #73: no build-time result.parquet — an expensive entry's rows live in its
+    # baked cache, a cheap entry's in nothing. The durable per-entry artifacts
+    # are the recipe, manifest, schema, and source.
+    for child in ("manifest.json", "schema.json", "expr.py", "xorq_build"):
         assert (target / child).exists(), child
+    assert not (target / "result.parquet").exists()
     manifest = json.loads((target / "manifest.json").read_text())
     assert manifest["content_hash"] == res.content_hash
     assert manifest["prompt"] == "region totals"

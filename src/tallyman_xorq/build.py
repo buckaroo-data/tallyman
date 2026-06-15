@@ -423,6 +423,43 @@ def build_and_persist(
     )
 
 
+_MIGRATION_MARKER = ".migrated_no_build_result_parquet"
+
+
+def migrate_drop_result_parquet(project: str) -> int:
+    """#73 upgrade migration: delete every per-entry build-time result.parquet.
+
+    Safe — ``xorq_build/`` is the durable recipe. After this, an expensive
+    entry's result lives in its baked cache (rebuilt entries) or repopulates
+    lazily on first view, and a cheap entry recomputes trivially via
+    ``ensure_result`` on demand. Runs once per project (guarded by a marker in
+    the catalog dir so it doesn't churn lazily-regenerated caches on restart),
+    is idempotent and best-effort, and returns the count deleted.
+    """
+    from tallyman_core.paths import ENTRY_RESULT_FILENAME, catalog_dir
+
+    marker = catalog_dir(project) / _MIGRATION_MARKER
+    if marker.exists():
+        return 0
+    base = entries_dir(project)
+    deleted = 0
+    if base.is_dir():
+        for child in base.iterdir():
+            rp = child / ENTRY_RESULT_FILENAME
+            if rp.is_file():
+                try:
+                    rp.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("")
+    except OSError:
+        pass  # best-effort; a missed marker just reruns a no-op next time
+    return deleted
+
+
 def list_entries(project: str) -> list[dict]:
     """Cheap listing: read every entry's manifest.json."""
     base = entries_dir(project)

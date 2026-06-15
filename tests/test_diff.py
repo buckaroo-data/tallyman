@@ -275,9 +275,9 @@ def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):
     from tallyman_xorq import build_and_persist
 
     res = build_and_persist(project, _agg_code(project))
-    from tallyman_core import entry_dir
+    from tallyman_xorq.result_cache import ensure_result
 
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    pq_path = ensure_result(project, res.content_hash)
     d = head_diff_polars(pq_path, pq_path, n=2)
     assert d["n"] == 2
     assert d["a_total"] == d["b_total"]
@@ -301,11 +301,12 @@ def test_full_diff_polars_backend(project: str, orders_parquet: Path):
 
 
 def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
 
     res = build_and_persist(project, _agg_code(project))
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    from tallyman_xorq.result_cache import ensure_result
+
+    pq_path = ensure_result(project, res.content_hash)
     pd_result = {
         r["name"]: r
         for r in stats_diff(
@@ -323,24 +324,26 @@ def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
 
 
 def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
 
     res = build_and_persist(project, _agg_code(project))
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    from tallyman_xorq.result_cache import ensure_result
+
+    pq_path = ensure_result(project, res.content_hash)
     d = head_diff_xorq(pq_path, pq_path, n=3)
     assert d["n"] == 3
     assert "<table" in d["before"]
 
 
 def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    a_pq = entry_dir(project, a.content_hash) / "result.parquet"
-    b_pq = entry_dir(project, b.content_hash) / "result.parquet"
+    from tallyman_xorq.result_cache import ensure_result
+
+    a_pq = ensure_result(project, a.content_hash)
+    b_pq = ensure_result(project, b.content_hash)
     d = key_diff_xorq(a_pq, b_pq)
     assert d is not None
     assert "region" in d["keys"]

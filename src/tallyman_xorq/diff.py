@@ -88,6 +88,26 @@ def schema_diff(a_schema: dict, b_schema: dict) -> dict:
     }
 
 
+def _ensure_entry_parquet(entry: Path) -> Path:
+    """Return *entry*'s ``result.parquet`` path, materialising it on demand (#73).
+
+    Entries no longer write a build-time ``result.parquet``; the parquet-backed
+    diff backends still want a file. Derive ``(project, hash)`` from the entry
+    dir layout (``<project>/artifacts/catalog/entries/<hash>``) and regenerate
+    via ``ensure_result``. Returns the (possibly still-absent) path either way —
+    callers guard on ``.exists()``.
+    """
+    pq_path = entry / ENTRY_RESULT_FILENAME
+    if not pq_path.exists() and (entry / "xorq_build").is_dir():
+        from tallyman_xorq.result_cache import ensure_result
+
+        try:
+            ensure_result(entry.parents[3].name, entry.name)
+        except Exception:
+            pass
+    return pq_path
+
+
 def full_diff(
     a_entry: Path,
     b_entry: Path,
@@ -116,7 +136,11 @@ def full_diff(
     a_schema = json.loads(a_sj.read_text()) if a_sj.exists() else {}
     b_schema = json.loads(b_sj.read_text()) if b_sj.exists() else {}
 
-    a_pq = a_entry / ENTRY_RESULT_FILENAME
+    # #73: entries no longer carry a build-time result.parquet. The parquet-backed
+    # diff backends (and the xorq fallback when no expr is passed) need a file, so
+    # materialise it on demand via ensure_result.
+    a_pq = _ensure_entry_parquet(a_entry)
+    b_pq = _ensure_entry_parquet(b_entry)
     b_pq = b_entry / ENTRY_RESULT_FILENAME
 
     if backend == "xorq":

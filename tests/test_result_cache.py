@@ -41,29 +41,55 @@ def test_classifier_skips_cheap_caches_expensive(project, orders_parquet, monkey
     assert "cheap" in classify_build(entry_dir(project, proj_h) / "xorq_build")["why"]
 
 
-def test_ensure_result_cheap_regenerates_in_place(project, orders_parquet, monkeypatch):
+def test_cheap_entry_writes_no_result_parquet_at_build(project, orders_parquet, monkeypatch):
+    # #73: a cheap entry materialises nothing at build — no result.parquet, and
+    # nothing under the (retired) result_cache dir.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("proj", _project_code(project))
     h = _hash_of(project)
     rp = entry_dir(project, h) / "result.parquet"
-    assert rp.exists()
-    rp.unlink()  # evict
-    out = ensure_result(project, h)  # should self-heal in place
-    assert out == rp and out.exists()  # cheap → no extra cache dir
+    assert not rp.exists()
     assert not result_cache_dir(project).exists() or not any(result_cache_dir(project).glob("**/*.parquet"))
+    # ensure_result regenerates it on demand, in place, and a deleted one self-heals.
+    out = ensure_result(project, h)
+    assert out == rp and out.exists()
+    out.unlink()
+    assert ensure_result(project, h).exists()
 
 
-def test_ensure_result_expensive_uses_snapshot_cache(project, orders_parquet, monkeypatch):
+def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
+    # #73: an expensive entry bakes a top-level result-cache node into its build
+    # (so every loader reads the cached result), materialised in the compute
+    # cache — not a build-time entry result.parquet, not the retired result_cache dir.
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq.build import load_entry
+    from tallyman_xorq.result_cache import cached_result_expr
+
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
+    assert not (entry_dir(project, h) / "result.parquet").exists()
+    assert not result_cache_dir(project).exists() or not any(result_cache_dir(project).glob("**/*.parquet"))
+    # The build carries a baked CachedNode, so loading it (and cached_result_expr)
+    # yields a cache-resolving expression rather than the bare recipe.
+    assert type(load_entry(project, h).op()).__name__ == "CachedNode"
+    assert type(cached_result_expr(project, h).op()).__name__ == "CachedNode"
+    assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
+    # ensure_result still hands back a parquet path on demand, self-healing.
     out = ensure_result(project, h)
-    # materialised under the project's result_cache dir, not the entry dir
     assert out.exists()
-    assert result_cache_dir(project) in out.parents
-    out.unlink()  # delete the cache file
-    out2 = ensure_result(project, h)  # self-heals via recompute
-    assert out2.exists()
+    out.unlink()
+    assert ensure_result(project, h).exists()
+
+
+def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parquet, monkeypatch):
+    # A cheap entry recomputes on read — its expression is not a CachedNode.
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    assert type(cached_result_expr(project, h).op()).__name__ != "CachedNode"
 
 
 def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):

@@ -310,6 +310,17 @@ def create_app(
         except (FileNotFoundError, ValueError):
             pass
 
+    # #73 upgrade migration: drop the old per-entry build-time result.parquet
+    # once. Runs at construction (before any lazy ensure_result regenerates one)
+    # and is guarded by a per-project marker, so it's a no-op on later starts.
+    if seed and not read_only:
+        try:
+            from tallyman_xorq.build import migrate_drop_result_parquet
+
+            migrate_drop_result_parquet(seed)
+        except Exception:  # best-effort; cleanup must never block startup
+            log.warning("result.parquet migration failed for %s", seed, exc_info=True)
+
     app = FastAPI(title="tallyman companion")
     if STATIC_DIR.exists():
         app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")

@@ -156,11 +156,24 @@ subprocess, and a from-scratch rebuild never recreates them.)
   `compresslevel`) so the blob doesn't churn on identical rebuilds. (Single
   machine, so cross-zlib reproducibility is moot; pinning the level keeps the
   blob byte-stable across same-machine rebuilds regardless of zlib defaults.)
-- **Drop the wheel + requirements.txt** xorq injected (~178KB → ~6KB per entry);
-  nothing reads them. Because the zip is deterministic and content-addressed, git
-  stores each blob once and a `git add -A` over an unchanged zip is a no-op that
-  adds no history — so the saving is a smaller durable blob and working tree per
-  entry, not avoided per-checkpoint churn (there is none once the zip is byte-stable).
+- **Drop the wheel + requirements.txt** the `xorq catalog add` subprocess injects
+  (~178KB → ~6KB per entry). These are xorq's *per-expression* reproducibility
+  mechanism — `WheelPackager`/`PackagedBuilder`/`PackagedRunner`
+  (`xorq/ibis_yaml/packager.py`) bundle a built wheel + pinned `requirements.txt` so
+  `xorq run` can re-execute an entry in its *own* isolated `uv` env. tallyman does
+  not use that path: it pins the whole environment once (`xorq==0.3.26` + `uv.lock`)
+  and runs every expression in one shared `.venv` via in-process
+  `build_expr`/`load_expr` (`build.py:317`), never a per-expression `uv` env — that
+  per-entry env is the slow, expensive thing tallyman deliberately avoids. The
+  in-process build output (`xorq_build/`) never held the wheel anyway (the
+  `build_expr` file set is `expr.yaml`/SQL/`deferred_reads.yaml`/`profiles.yaml`); only
+  the catalog zip did, and nothing reads it back (fact 1). So the drop forfeits
+  xorq's per-entry env reconstruction — **unused here** — not tallyman's
+  reproducibility, which rides on the pinned project env. Separately: because the zip
+  is deterministic and content-addressed, git stores each blob once and a
+  `git add -A` over an unchanged zip is a no-op that adds no history — so the saving
+  is a smaller durable blob and working tree per entry, not avoided per-checkpoint
+  churn (there is none once the zip is byte-stable).
 - **The checkpoint owns zip creation, not the build.** The build persists a
   complete `entries/<hash>/` on success and cleans up the dir if this call
   created it and the build failed (no partial dirs, no orphan zips). The

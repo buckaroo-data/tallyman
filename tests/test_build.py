@@ -154,3 +154,56 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
     with pytest.raises(BuildError, match="xorq.api"):
         build_and_persist(project, code)
+
+
+# ---------------------------------------------------------------------------
+# Nondeterminism lint (#88). Execution-nondeterministic ops (now / random /
+# uuid / sample) make an entry's result vary run-to-run under one structural
+# content_hash; #74's recompute-on-cold-read then serves different bytes than
+# were built, and the hash never notices. build_and_persist surfaces an
+# advisory lint, not a hard stop.
+# ---------------------------------------------------------------------------
+
+
+def _nondeterministic_code(parquet_path: Path) -> str:
+    return f"""
+import xorq.api as xo
+import xorq.vendor.ibis as ibis
+t = xo.deferred_read_parquet({str(parquet_path)!r})
+expr = t.mutate(built_at=ibis.now())
+"""
+
+
+def test_build_lints_nondeterministic_now(project: str, orders_parquet: Path):
+    res = build_and_persist(project, _nondeterministic_code(orders_parquet))
+    joined = " ".join(res.lint_warnings)
+    assert res.lint_warnings, "expected a nondeterminism lint warning"
+    assert "now()" in joined
+    assert "#88" in joined
+
+
+def test_build_no_lint_for_deterministic_recipe(project: str, orders_parquet: Path):
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    assert res.lint_warnings == []
+
+
+def test_nondeterminism_warnings_lists_friendly_ops():
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    expr = t.mutate(r=ibis.random(), n=ibis.now())
+    joined = " ".join(_nondeterminism_warnings(expr))
+    assert "random()" in joined
+    assert "now()" in joined
+
+
+def test_nondeterminism_warnings_empty_for_deterministic():
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    expr = t.mutate(y=t.x + 1)
+    assert _nondeterminism_warnings(expr) == []

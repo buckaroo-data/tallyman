@@ -27,6 +27,10 @@ from tallyman_core import (
 )
 from tallyman_xorq.portable import make_portable_inplace
 
+# Perf instrumentation rides a dedicated child namespace so it can be dialed up
+# independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
+perf_log = logging.getLogger("tallyman.perf")
+
 
 def _append_prompt(entry_path: Path, prompt: str | None) -> None:
     """Append a prompt event to the entry's prompts.jsonl."""
@@ -60,6 +64,13 @@ class BuildResult:
     # re-run path (entry already on disk, registration not re-attempted); True/False
     # on a fresh build. False means the recipe is NOT durable — see #48.
     catalog_registered: bool | None = None
+    # Cache-admission instrumentation (#87), mirrored from the manifest for
+    # in-process callers. See Manifest for the fields' meaning. None on entries
+    # built before #87 (read back from a manifest that predates the keys).
+    compile_seconds: float | None = None
+    cache_worthy: bool | None = None
+    cache_worthy_why: str | None = None
+    cache_bytes: int | None = None
 
 
 class BuildError(RuntimeError):
@@ -284,6 +295,11 @@ def build_and_persist(
     # submitted form).
     from tallyman_xorq.source_cache import InMemoryReadError, rewrite_for_build
 
+    # The author's DAG before cache injection — compile_seconds (#87) times its
+    # expr->backend-plan step, the un-truncated "large expression DAG" recompile
+    # that #30's profiling found dominates per-view cost. The rewritten expression
+    # carries cache boundaries that would truncate that compile.
+    author_expr = expr_obj
     try:
         expr_obj = rewrite_for_build(expr_obj, project)
     except InMemoryReadError as exc:
@@ -319,6 +335,10 @@ def build_and_persist(
                     row_count=meta.get("row_count", 0),
                     execute_seconds=meta.get("execute_seconds", 0.0),
                     schema=json.loads(entry_schema_path(project, content_hash).read_text()),
+                    compile_seconds=meta.get("compile_seconds"),
+                    cache_worthy=meta.get("cache_worthy"),
+                    cache_worthy_why=meta.get("cache_worthy_why"),
+                    cache_bytes=meta.get("cache_bytes"),
                 )
 
         target.mkdir(parents=True, exist_ok=True)
@@ -377,12 +397,58 @@ def build_and_persist(
     }
     entry_schema_path(project, content_hash).write_text(json.dumps(schema_doc, indent=2))
 
+    # Cache-admission instrumentation (#87): record the structural verdict and
+    # the measured value-per-byte inputs side by side, so #30's structural→
+    # measured flip is decidable from data. classify_build's verdict is what
+    # cache_worthy already computes (and throws away); compile_seconds times the
+    # author DAG's expr->backend-plan step (the dominant per-view cost per #30),
+    # separate from execute; cache_bytes is the baked snapshot size (None for a
+    # cheap entry that bakes nothing). loaded is the build_path expression whose
+    # execute just baked the snapshot, so its CachedNode names that exact file.
+    from tallyman_xorq.result_cache import _cached_node_path, classify_build
+
+    verdict = classify_build(xorq_build_dir)
+    cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
+
+    compile_seconds: float | None = None
+    try:
+        import xorq.api as xo
+
+        t_compile = time.monotonic()
+        xo.to_sql(author_expr)
+        compile_seconds = round(time.monotonic() - t_compile, 3)
+    except Exception:
+        # Best-effort: a DAG xorq can't render to SQL must not break the build.
+        pass
+
+    cache_bytes: int | None = None
+    snap = _cached_node_path(loaded)
+    if snap is not None and snap.exists():
+        try:
+            cache_bytes = snap.stat().st_size
+        except OSError:
+            pass
+
+    perf_log.info(
+        "cache admission %s: structural worthy=%s (%s) | compile=%ss execute=%ss bytes=%s",
+        content_hash,
+        cache_worthy_v,
+        cache_worthy_why,
+        compile_seconds,
+        execute_seconds,
+        cache_bytes,
+    )
+
     manifest = Manifest(
         content_hash=content_hash,
         project=project,
         prompt=prompt,
         row_count=row_count,
         execute_seconds=execute_seconds,
+        compile_seconds=compile_seconds,
+        cache_worthy=cache_worthy_v,
+        cache_worthy_why=cache_worthy_why,
+        cache_bytes=cache_bytes,
         sources=sources or None,
     )
     write_manifest(target, manifest)
@@ -420,6 +486,10 @@ def build_and_persist(
         execute_seconds=execute_seconds,
         schema=schema_doc,
         catalog_registered=catalog_registered,
+        compile_seconds=compile_seconds,
+        cache_worthy=cache_worthy_v,
+        cache_worthy_why=cache_worthy_why,
+        cache_bytes=cache_bytes,
     )
 
 

@@ -33,9 +33,15 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import logging
 import re
 import sys
+import time
 from pathlib import Path
+
+# Perf instrumentation rides a dedicated child namespace so it can be dialed up
+# independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
+perf_log = logging.getLogger("tallyman.perf")
 
 # Ops whose presence makes an expression worth caching: they require a
 # shuffle / sort / full materialisation rather than a streaming row-wise pass.
@@ -187,6 +193,42 @@ def _recipe_expr(project: str, content_hash: str):
             pass
 
 
+def _cached_node_path(baked) -> Path | None:
+    """On-disk path of the top-level baked result-cache snapshot, or None.
+
+    ``baked`` is ``rewrite_for_build``'s output (the expression carrying the
+    build's cache nodes). Returns the snapshot path when its top node is the
+    baked result ``CachedNode``; None when the top isn't a cache — a cheap
+    expression bakes nothing, or ``classify_build`` (serialized) and
+    ``_is_worthy_expr`` (live) disagreed.
+    """
+    node = baked.op()
+    if type(node).__name__ != "CachedNode":
+        return None
+    return Path(node.cache.storage.get_path(node.cache.calc_key(node.parent)))
+
+
+def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
+    """Path of the entry's baked result-cache snapshot, or None if it bakes none.
+
+    Mirrors ``cached_result_expr``'s derivation — re-import the recipe, rewrite
+    it for build, read the top-level ``CachedNode``'s storage path — so it names
+    the very file a cold read returns. None for a cheap entry (bakes nothing), a
+    worthiness disagreement, or salt mode (reads route through ``result.parquet``,
+    not a snapshot). The build uses it to size the snapshot (#87, the
+    value-per-byte denominator); other callers use it to find the snapshot
+    without reconstructing the read expression.
+    """
+    from tallyman_xorq import source_identity as si
+
+    if si.mode() == "salt" or not cache_worthy(project, content_hash):
+        return None
+
+    from tallyman_xorq.source_cache import rewrite_for_build
+
+    return _cached_node_path(rewrite_for_build(_recipe_expr(project, content_hash), project))
+
+
 @functools.lru_cache(maxsize=256)
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as a single-backend expression on the default backend.
@@ -223,12 +265,28 @@ def cached_result_expr(project: str, content_hash: str):
 
     from tallyman_xorq import source_identity as si
 
+    # This function is LRU-memoised, so its body runs only on a miss: every line
+    # below is a cold read. Tag each return with the #74 path it took and the
+    # reconstruct wall-clock (#82's lever) on the perf namespace (#87), so a
+    # Join-descendant that is structurally worthy but cost-cheap shows up on the
+    # read path, not just in lifecycle counts.
+    t0 = time.monotonic()
+
+    def _read(expr, tag):
+        perf_log.debug(
+            "cached_result_expr cold read %s: path=%s wall_ms=%.1f",
+            content_hash,
+            tag,
+            (time.monotonic() - t0) * 1000,
+        )
+        return expr
+
     if si.mode() == "salt":
-        return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
+        return _read(xo.deferred_read_parquet(str(ensure_result(project, content_hash))), "salt-result-parquet")
 
     raw = _recipe_expr(project, content_hash)
     if not cache_worthy(project, content_hash):
-        return raw
+        return _read(raw, "cheap-recompute")
 
     # Expensive: locate the baked snapshot via the same rewrite the build used,
     # then read it as a bare parquet. rewrite_for_build wraps the expression in a
@@ -237,15 +295,15 @@ def cached_result_expr(project: str, content_hash: str):
     from tallyman_xorq.source_cache import rewrite_for_build
 
     baked = rewrite_for_build(raw, project)
-    node = baked.op()
-    if type(node).__name__ != "CachedNode":
+    path = _cached_node_path(baked)
+    if path is None:
         # classify_build (serialized) and _is_worthy_expr (live) disagreed — fall
         # back to recompute rather than dereference a cache that wasn't baked.
-        return raw
-    path = Path(node.cache.storage.get_path(node.cache.calc_key(node.parent)))
+        return _read(raw, "worthy-recompute-fallback")
     if not path.exists():
         baked.count().execute()  # evicted snapshot: repopulate once, then read
-    return xo.deferred_read_parquet(str(path))
+        return _read(xo.deferred_read_parquet(str(path)), "evicted-self-heal")
+    return _read(xo.deferred_read_parquet(str(path)), "baked-read")
 
 
 def ensure_result(project: str, content_hash: str) -> Path:

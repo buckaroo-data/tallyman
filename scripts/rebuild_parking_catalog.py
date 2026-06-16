@@ -324,11 +324,24 @@ def _stage_sources(src_dir: Path, project: str, rows: int) -> None:
             sys.exit(f"source not found: {src}")
         target = dst / name
         if rows and rows > 0:
+            import pyarrow as pa
             import pyarrow.parquet as pq
 
-            table = pq.read_table(src)
-            pq.write_table(table.slice(0, rows), target)
-            print(f"  staged {name}: {min(rows, table.num_rows):,} rows (truncated)")
+            # Stream only the first `rows` rows — never materialise the whole
+            # source. parking_plt_only4 is 107M rows; pq.read_table() of it
+            # spikes resident memory to tens of GB (a perf-rebuild blowup the
+            # watchdog caught), so pull row-group batches until we have enough
+            # and stop. See scripts/run_under_watchdog.py.
+            pf = pq.ParquetFile(src)
+            batches, collected = [], 0
+            for batch in pf.iter_batches(batch_size=min(rows, 1_000_000)):
+                batches.append(batch)
+                collected += batch.num_rows
+                if collected >= rows:
+                    break
+            table = pa.Table.from_batches(batches, schema=pf.schema_arrow).slice(0, rows)
+            pq.write_table(table, target)
+            print(f"  staged {name}: {table.num_rows:,} rows (truncated)")
         else:
             shutil.copy2(src, target)
             print(f"  staged {name}: full copy")

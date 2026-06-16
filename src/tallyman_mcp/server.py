@@ -488,7 +488,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
         rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool)
         _notify("build_failed", error_id=rec["id"], tool=tool)
         return {"error": str(exc), "error_id": rec["id"]}
-    return {
+    reply = {
         "_build": result,
         "hash": result.content_hash,
         "row_count": result.row_count,
@@ -497,6 +497,9 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
         "entry_path": str(result.entry_path),
         "url": _entry_url(project, result.content_hash),
     }
+    if result.lint_warnings:
+        reply["lint_warnings"] = result.lint_warnings
+    return reply
 
 
 @mcp.tool()

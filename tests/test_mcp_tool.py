@@ -67,6 +67,22 @@ def test_catalog_load_parquet_with_name_creates_alias(project: str, orders_parqu
     assert cells[0]["alias"] == "orders"
 
 
+def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_parquet: Path, monkeypatch):
+    # An execution-nondeterministic recipe (now()) builds fine but must carry an
+    # advisory lint in the tool reply so the model/user sees it (#88).
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+import xorq.api as xo
+import xorq.vendor.ibis as ibis
+t = xo.deferred_read_parquet({str(orders_parquet)!r})
+expr = t.mutate(built_at=ibis.now())
+"""
+    out = catalog_run(code, prompt="nondeterministic")
+    assert "error" not in out
+    assert "lint_warnings" in out
+    assert any("now()" in w for w in out["lint_warnings"])
+
+
 def test_catalog_load_parquet_name_collision_rejected(project: str, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_load_parquet("orders.parquet", name="orders")

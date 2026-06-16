@@ -137,6 +137,35 @@ expr = t.order_by("order_id").select("order_id", "region", "price")
     assert not rp.exists()  # #90: no duplicate per-entry parquet written on read
 
 
+def test_api_data_missing_manifest_serves_page_without_500(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """#90: a missing manifest must not 500 the row read.
+
+    The build dir is written before manifest.json (build.py creates the dir, then
+    writes the manifest after executing), so a half-built or pruned entry can pass
+    the build-dir check yet have no manifest. cached_result_expr needs none — only
+    ``total`` reads it — so the read must be guarded: serve the page with a
+    best-effort total rather than raising FileNotFoundError on the manifest read.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price")
+"""
+    h = build_and_persist(project, code, prompt="cols").content_hash
+    (entry_dir(project, h) / "manifest.json").unlink()  # half-built / pruned entry
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/data/{h}?offset=0&limit=10")
+    assert r.status_code == 200  # served off the expression, not the manifest
+    body = r.json()
+    assert len(body["data"]) == 10
+    assert set(body["data"][0]) == {"region", "price"}
+    assert body["total"] == 0  # no manifest → best-effort total, not a crash
+
+
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):

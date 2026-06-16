@@ -37,6 +37,18 @@ class Manifest(BaseModel):
     schema_path: str = ENTRY_SCHEMA_FILENAME
     row_count: int | None = None
     execute_seconds: float | None = None
+    # Cache-admission instrumentation (#87): the two verdicts recorded side by
+    # side so the structural-vs-measured cache decision (#30) is decidable from
+    # data. cache_worthy / cache_worthy_why are the structural classify_build
+    # verdict (today computed and thrown away). compile_seconds (the author DAG's
+    # expr->backend-plan step, the dominant per-view cost) and cache_bytes (the
+    # baked snapshot size, the value-per-byte denominator) are the measured side;
+    # with execute_seconds they give recompute_cost. cache_bytes is None for a
+    # cheap entry that bakes no snapshot. All absent on entries built before #87.
+    compile_seconds: float | None = None
+    cache_worthy: bool | None = None
+    cache_worthy_why: str | None = None
+    cache_bytes: int | None = None
     # rel data path -> content md5, recorded when a source-identity mode is
     # active (tallyman_xorq.source_identity); absent under mode=off.
     sources: dict[str, str] | None = None

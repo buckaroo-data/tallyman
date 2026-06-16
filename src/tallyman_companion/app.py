@@ -132,13 +132,16 @@ def _compute_disk_usage(project: str) -> dict:
     """Walk a project's on-disk footprint and return the disk_usage payload.
 
     Covers raw input data, each entry's result.parquet / xorq_build /
-    .buckaroo_stat_cache, and the per-pair Buckaroo diff stat cache
-    (diff_stat_cache/), which can dwarf the rest. (The retired result_cache/
-    dir is gone as of #73 — baked results now live in the compute cache.)
+    .buckaroo_stat_cache, the per-project compute cache (compute_cache/, where
+    #74's baked result snapshots and source-read caches live), and the per-pair
+    Buckaroo diff stat cache (diff_stat_cache/), which can dwarf the rest. (The
+    retired result_cache/ dir is gone as of #73 — baked results moved to the
+    compute cache, which this counted nowhere until #87.)
 
     This is the expensive path; callers should rate-limit it via the
     api_disk_usage TTL cache rather than invoking per request.
     """
+    from tallyman_core.paths import compute_cache_dir as _compute_cache_dir
     from tallyman_core.paths import data_dir as _data_dir
     from tallyman_core.paths import diff_stat_cache_root as _diff_stat_cache_root
     from tallyman_core.paths import entries_dir as _entries_dir
@@ -165,16 +168,22 @@ def _compute_disk_usage(project: str) -> dict:
             if c.is_dir():
                 cache += _dir_size(c)
 
+    # Per-project compute cache (#74 baked snapshots + source-read caches),
+    # uncounted until #87 — the #74 disk-usage follow-up. Content-addressed and
+    # shared across entries, so it's a single project-level walk, not per-entry.
+    compute_cache = _dir_size(_compute_cache_dir(project))
+
     # Project-level diff stat cache (#12), previously uncounted. _dir_size
     # returns 0 for a dir that doesn't exist yet, so no existence guard needed.
     diff_cache = _dir_size(_diff_stat_cache_root(project))
 
-    total = data + results + builds + cache + diff_cache
+    total = data + results + builds + cache + compute_cache + diff_cache
     return {
         "data": data,
         "results": results,
         "builds": builds,
         "cache": cache,
+        "compute_cache": compute_cache,
         "diff_cache": diff_cache,
         "total": total,
         "formatted": {
@@ -182,6 +191,7 @@ def _compute_disk_usage(project: str) -> dict:
             "results": _fmt_bytes(results),
             "builds": _fmt_bytes(builds),
             "cache": _fmt_bytes(cache),
+            "compute_cache": _fmt_bytes(compute_cache),
             "diff_cache": _fmt_bytes(diff_cache),
             "total": _fmt_bytes(total),
         },

@@ -744,7 +744,6 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
         b_dir,
         a_label=f"V{a_idx}",
         b_label=f"V{b_idx}",
-        backend="xorq",
         a_expr=cached_result_expr(project, a_hash),
         b_expr=cached_result_expr(project, b_hash),
     )
@@ -1116,9 +1115,10 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
 
     Use this to iterate on ``process(expr)`` code before committing it with
     ``catalog_add_post_processing``. The function is executed against the
-    entry's materialised result (``ensure_result``) — you see real output
-    rows, not the small dry-run memtable that ``catalog_add_post_processing``
-    validates against.
+    entry's result (read via ``cached_result_expr`` — a cheap entry recomputes,
+    an expensive one reads its baked snapshot) — you see real output rows, not
+    the small dry-run memtable that ``catalog_add_post_processing`` validates
+    against.
 
     SANDBOX: same restricted namespace as ``catalog_add_post_processing`` —
     ``expr`` / ``ibis`` / ``expr.execute()`` are available, but ``import`` of

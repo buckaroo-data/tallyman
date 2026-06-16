@@ -8,7 +8,6 @@ from pydantic import BaseModel, Field
 
 from tallyman_core.paths import (
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_SCHEMA_FILENAME,
 )
 
@@ -33,7 +32,6 @@ class Manifest(BaseModel):
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     prompt: str | None = None
     code_path: str = "expr.py"
-    result_path: str = ENTRY_RESULT_FILENAME
     schema_path: str = ENTRY_SCHEMA_FILENAME
     row_count: int | None = None
     execute_seconds: float | None = None

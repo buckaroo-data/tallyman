@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import markdown as md_lib
-import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -22,19 +21,18 @@ from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
 from tallyman_core import (
     ENTRY_BUILD_DIRNAME,
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_SCHEMA_FILENAME,
     ENTRY_STAT_CACHE_DIRNAME,
     alias_for_hash,
     clear_errors,
     entry_dir,
-    entry_result_path,
     get_chart,
     get_error,
     history_for,
     list_errors,
     load_aliases,
     notebook,
+    read_manifest,
     resolve_project,
     version_of_hash,
 )
@@ -50,7 +48,7 @@ from tallyman_xorq import (
 )
 from tallyman_xorq.layout import layered_positions
 from tallyman_xorq.primary_key import diff_keys
-from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
 log = logging.getLogger("tallyman.companion")
 
@@ -131,12 +129,13 @@ _DISK_USAGE_TTL = 3.0
 def _compute_disk_usage(project: str) -> dict:
     """Walk a project's on-disk footprint and return the disk_usage payload.
 
-    Covers raw input data, each entry's result.parquet / xorq_build /
-    .buckaroo_stat_cache, the per-project compute cache (compute_cache/, where
-    #74's baked result snapshots and source-read caches live), and the per-pair
-    Buckaroo diff stat cache (diff_stat_cache/), which can dwarf the rest. (The
-    retired result_cache/ dir is gone as of #73 — baked results moved to the
-    compute cache, which this counted nowhere until #87.)
+    Covers raw input data, each entry's xorq_build / .buckaroo_stat_cache, the
+    per-project compute cache (compute_cache/, where the baked result snapshots
+    and source-read caches live — the single materialised copy of an entry's
+    rows since #73), and the per-pair Buckaroo diff stat cache (diff_stat_cache/),
+    which can dwarf the rest. No per-entry ``result.parquet`` is written any more,
+    so there is no separate "results" bucket — the baked snapshots it would have
+    counted are under compute_cache.
 
     This is the expensive path; callers should rate-limit it via the
     api_disk_usage TTL cache rather than invoking per request.
@@ -150,17 +149,11 @@ def _compute_disk_usage(project: str) -> dict:
     data = _dir_size(_data_dir(project))
 
     root = _entries_dir(project)
-    results = builds = cache = 0
+    builds = cache = 0
     if root.is_dir():
         for entry in root.iterdir():
             if not entry.is_dir():
                 continue
-            p = entry / ENTRY_RESULT_FILENAME
-            if p.exists():
-                try:
-                    results += p.stat().st_size
-                except OSError:
-                    pass
             b = entry / ENTRY_BUILD_DIRNAME
             if b.is_dir():
                 builds += _dir_size(b)
@@ -168,19 +161,18 @@ def _compute_disk_usage(project: str) -> dict:
             if c.is_dir():
                 cache += _dir_size(c)
 
-    # Per-project compute cache (#74 baked snapshots + source-read caches),
-    # uncounted until #87 — the #74 disk-usage follow-up. Content-addressed and
-    # shared across entries, so it's a single project-level walk, not per-entry.
+    # Per-project compute cache (baked result snapshots + source-read caches),
+    # counted since #87. The baked snapshots are the single materialised copy of
+    # an entry's rows, so this subsumes the retired per-entry "results" bucket.
     compute_cache = _dir_size(_compute_cache_dir(project))
 
-    # Project-level diff stat cache (#12), previously uncounted. _dir_size
-    # returns 0 for a dir that doesn't exist yet, so no existence guard needed.
+    # Project-level diff stat cache (#12). _dir_size returns 0 for a dir that
+    # doesn't exist yet, so no existence guard needed.
     diff_cache = _dir_size(_diff_stat_cache_root(project))
 
-    total = data + results + builds + cache + compute_cache + diff_cache
+    total = data + builds + cache + compute_cache + diff_cache
     return {
         "data": data,
-        "results": results,
         "builds": builds,
         "cache": cache,
         "compute_cache": compute_cache,
@@ -188,7 +180,6 @@ def _compute_disk_usage(project: str) -> dict:
         "total": total,
         "formatted": {
             "data": _fmt_bytes(data),
-            "results": _fmt_bytes(results),
             "builds": _fmt_bytes(builds),
             "cache": _fmt_bytes(cache),
             "compute_cache": _fmt_bytes(compute_cache),
@@ -292,9 +283,10 @@ def create_app(
         except (FileNotFoundError, ValueError):
             pass
 
-    # #73 upgrade migration: drop the old per-entry build-time result.parquet
-    # once. Runs at construction (before any lazy ensure_result regenerates one)
-    # and is guarded by a per-project marker, so it's a no-op on later starts.
+    # Upgrade migration: sweep any per-entry result.parquet and #71 viewer-read
+    # build dirs once. The marker was bumped for this change, so an install that
+    # already ran the #73 sweep re-runs it once to clear anything written since.
+    # Guarded by a per-project marker, so it's a no-op on later starts.
     if seed and not read_only:
         try:
             from tallyman_xorq.build import migrate_drop_result_parquet
@@ -795,7 +787,6 @@ def create_app(
                 b_dir,
                 a_label=f"V{va}",
                 b_label=f"V{vb}",
-                backend="xorq",
                 a_expr=a_expr,
                 b_expr=b_expr,
                 keys=keys,
@@ -1025,20 +1016,27 @@ def create_app(
             for entry in root.iterdir():
                 if not entry.is_dir():
                     continue
-                p = entry / ENTRY_RESULT_FILENAME
-                if not p.exists():
-                    continue
                 try:
-                    stat = p.stat()
-                    size = stat.st_size
-                    created = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-                except OSError:
-                    continue
-                content_hash = entry.name
-                try:
-                    row_count = pq.ParquetFile(p).metadata.num_rows
+                    m = read_manifest(entry)
                 except Exception:
-                    row_count = 0
+                    continue
+                # The page lists deletable baked snapshots — an entry with a
+                # recorded snapshot size (manifest.cache_bytes, #87). A cheap
+                # entry bakes none (cache_bytes is None) and has nothing to
+                # delete, so it's absent: this matches the old file-walk (which
+                # only listed entries that had a materialised file) and keeps the
+                # delete button from 404ing on an undeletable row.
+                if m.cache_bytes is None:
+                    continue
+                size = int(m.cache_bytes)
+                content_hash = entry.name
+                # created_at is an ISO-8601 UTC string; render it in the table's
+                # existing "%Y-%m-%d %H:%M:%S" shape (CachePage renders `created`
+                # verbatim) so the Created column is unchanged.
+                try:
+                    created = datetime.datetime.fromisoformat(m.created_at).strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    created = m.created_at or ""
                 alias = alias_for_hash(project, content_hash)
                 info = version_of_hash(project, content_hash)
                 version = info[1] if info else None
@@ -1046,25 +1044,20 @@ def create_app(
                 if not is_current and info is not None:
                     alias = info[0]
                     is_current = False
-                manifest_path = entry / ENTRY_MANIFEST_FILENAME
-                prompt = None
-                if manifest_path.exists():
-                    try:
-                        m = json.loads(manifest_path.read_text())
-                        prompt = m.get("prompt")
-                    except Exception:
-                        pass
                 entries.append(
                     {
                         "hash": content_hash,
                         "size": size,
                         "size_formatted": _fmt_bytes(size),
-                        "row_count": row_count,
+                        # row_count is int|None on the manifest, but CacheEntry
+                        # types it number and CachePage calls .toLocaleString()
+                        # with no null guard — coerce so a null can't reach JS.
+                        "row_count": int(m.row_count or 0),
                         "created": created,
                         "alias": alias,
                         "version": version,
                         "is_current": is_current,
-                        "prompt": prompt,
+                        "prompt": m.prompt,
                     }
                 )
         entries.sort(key=lambda e: -e["size"])
@@ -1084,9 +1077,12 @@ def create_app(
         # Reject a non-hex hash up front: a 400 reads truer than the
         # "already evicted" 404 below (see _require_hash).
         _require_hash(content_hash)
-        p = entry_result_path(project, content_hash)
-        if not p.exists():
-            raise HTTPException(404, "result.parquet not found")
+        # Evict the baked .cache() snapshot — the single materialised copy. None
+        # for a cheap entry (nothing to delete) or one already evicted; reading
+        # the entry's viewer page afterward self-heals (re-bakes) it.
+        p = baked_snapshot_path(project, content_hash)
+        if p is None or not p.exists():
+            raise HTTPException(404, "no baked snapshot for this entry")
         try:
             p.unlink()
         except OSError as exc:

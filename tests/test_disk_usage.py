@@ -23,8 +23,11 @@ def test_disk_usage_counts_diff_cache(fresh_companion_app, project, orders_parqu
     assert d["diff_cache"] >= 2048
     assert "diff_cache" in d["formatted"]
     assert "result_cache" not in d and "result_cache" not in d["formatted"]
+    # No per-entry "results" bucket any more — no result.parquet is written, and
+    # baked snapshots are counted under compute_cache.
+    assert "results" not in d and "results" not in d["formatted"]
     # It folds into the headline total.
-    assert d["total"] == d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"]
+    assert d["total"] == d["data"] + d["builds"] + d["cache"] + d["diff_cache"]
 
 
 def test_disk_usage_counts_compute_cache(fresh_companion_app, project, orders_parquet):
@@ -42,7 +45,7 @@ def test_disk_usage_counts_compute_cache(fresh_companion_app, project, orders_pa
     assert "compute_cache" in d["formatted"]
     # It folds into the headline total alongside the other cache buckets.
     assert d["total"] == (
-        d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"] + d["compute_cache"]
+        d["data"] + d["builds"] + d["cache"] + d["diff_cache"] + d["compute_cache"]
     )
 
 

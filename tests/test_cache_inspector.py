@@ -7,16 +7,17 @@ from tallyman_core.aliases import history_for
 from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
-from tallyman_xorq.result_cache import ensure_result
+from tallyman_xorq.result_cache import baked_snapshot_path
 
 # The cache pane is a React page (CachePage) backed by JSON: GET
-# /{project}/api/result_cache lists materialised parquets, DELETE
-# /{project}/api/result_cache/{hash} evicts one. These tests exercise that
+# /{project}/api/result_cache lists each entry's baked xorq .cache() snapshot,
+# DELETE /{project}/api/result_cache/{hash} evicts one. These tests exercise that
 # contract; the rendering itself is the SPA's job.
 #
-# #73: a build no longer writes result.parquet; it's materialised on demand by
-# ensure_result, so these tests populate it first (matching the real lifecycle:
-# a result.parquet exists once an entry has been viewed / downloaded / diffed).
+# The page is manifest-driven: an expensive entry records its snapshot size
+# (manifest.cache_bytes, #87) at build, so it lists with no extra setup; a cheap
+# entry bakes no snapshot and is absent. Deleting unlinks the baked snapshot,
+# which self-heals (re-bakes) on the next read.
 
 
 def _agg_code(project: str) -> str:
@@ -36,36 +37,53 @@ expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 """
 
 
-def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, monkeypatch):
+def _cheap_code(project: str) -> str:  # projection → cheap, bakes no snapshot
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price")
+"""
+
+
+def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("shoe_sales", _agg_code(project))
-    catalog_revise("shoe_sales", _filter_code(project))
-    for e in list_entries(project):
-        ensure_result(project, e["content_hash"])  # materialise on demand
+    catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
+    catalog_revise("shoe_sales", _filter_code(project))  # still expensive
+    cheap = catalog_create("cheap_one", _cheap_code(project))  # projection → no snapshot
+    cheap_h = cheap["hash"]
+
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/result_cache")
     assert r.status_code == 200
     body = r.json()
+    listed = {e["hash"] for e in body["entries"]}
+
+    # Both expensive shoe_sales versions list with their baked-snapshot size.
+    for e in list_entries(project):
+        if e["content_hash"] == cheap_h:
+            continue
+        assert e["content_hash"] in listed
     aliases = [e["alias"] for e in body["entries"] if e["alias"]]
     assert "shoe_sales" in aliases  # alias surfaced on the row
-    # every materialised entry shows up in the listing
-    listed = {e["hash"] for e in body["entries"]}
-    for e in list_entries(project):
-        assert e["content_hash"] in listed
-    # rows carry size + created metadata for the table
-    assert all("size_formatted" in e and "created" in e for e in body["entries"])
+    # rows carry size + created + a non-null int row_count for the table
+    for e in body["entries"]:
+        assert "size_formatted" in e and "created" in e
+        assert isinstance(e["row_count"], int)
     assert "total_formatted" in body
 
+    # The cheap entry bakes no snapshot (cache_bytes is None) → absent, so its
+    # always-failing delete button never appears on the page.
+    assert cheap_h not in listed
 
-def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):
+
+def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("shoe_sales", _agg_code(project))
+    catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
     h = list_entries(project)[0]["content_hash"]
-    ensure_result(project, h)  # materialise on demand
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
     edir = entry_dir(project, h)
-    pq_path = edir / "result.parquet"
-    assert pq_path.exists()
-    # stat cache + code that must survive a parquet delete
+    # stat cache + code that must survive a snapshot delete
     stat_cache = edir / ".buckaroo_stat_cache"
     stat_cache.mkdir(exist_ok=True)
     (stat_cache / "marker").write_text("keep me")
@@ -76,21 +94,20 @@ def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_
     assert r.status_code == 200
     assert r.json()["hash"] == h
 
-    assert not pq_path.exists()  # parquet gone
+    assert not snap.exists()  # baked snapshot gone
     assert (stat_cache / "marker").read_text() == "keep me"  # stat cache kept
     assert (edir / "expr.py").exists()  # code kept
     assert (edir / "manifest.json").exists()  # entry kept
     assert h in history_for(project, "shoe_sales")  # alias history intact
 
 
-def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_delete_missing_snapshot_404(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
-    ensure_result(project, h)  # materialise on demand
     c = TestClient(fresh_companion_app)
     assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 200
-    # second delete: parquet already gone
+    # second delete: baked snapshot already evicted
     assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 404
 
 
@@ -98,14 +115,13 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
-    ensure_result(project, h)  # materialise on demand
-    pq_path = entry_dir(project, h) / "result.parquet"
-    assert pq_path.exists()
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
 
     c = TestClient(create_app(project, read_only=True))
-    # serve mode: the parquet must not be deletable.
+    # serve mode: the snapshot must not be deletable.
     assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 403
-    assert pq_path.exists()  # untouched
+    assert snap.exists()  # untouched
 
 
 def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_parquet, monkeypatch):
@@ -113,7 +129,7 @@ def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_
     c = TestClient(fresh_companion_app)
     # A content hash is lowercase hex (it names an entry dir). A junk value can
     # only ever resolve outside the entries tree, so reject it as a bad request
-    # rather than letting it fall through to the "no result.parquet" 404 — that
+    # rather than letting it fall through to the "no baked snapshot" 404 — that
     # 404 reads as "valid entry, already evicted", which a malformed hash isn't.
     for bad in ("NOPE-not-a-hash", "Deadbeef", "abc def"):
         r = c.delete(f"/{project}/api/result_cache/{bad}")

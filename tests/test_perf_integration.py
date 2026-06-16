@@ -83,7 +83,6 @@ from tallyman_core.paths import (
     ENTRY_BUILD_DIRNAME,
     ENTRY_CACHE_NAMES,
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
 )
 
 pytestmark = pytest.mark.perf
@@ -276,11 +275,11 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
 
 
 def _entry_rows(real_dir: Path, h: str) -> int:
-    """Row count of an entry, from ``manifest.json`` (#73-safe).
+    """Row count of an entry, from ``manifest.json``.
 
-    Both build eras write ``row_count`` to the manifest, so it works whether or
-    not ``result.parquet`` exists (a #73 build writes none). Falls back to
-    parquet metadata only when the manifest lacks the count.
+    Both build eras write ``row_count`` to the manifest, so this works without a
+    materialised ``result.parquet`` (no entry writes one any more). Returns 0 if
+    the manifest somehow lacks the count.
     """
     entry = real_dir / "artifacts" / "catalog" / "entries" / h
     try:
@@ -289,12 +288,7 @@ def _entry_rows(real_dir: Path, h: str) -> int:
             return rc
     except (OSError, json.JSONDecodeError):
         pass
-    import pyarrow.parquet as pq  # noqa: PLC0415
-
-    try:
-        return pq.ParquetFile(str(entry / ENTRY_RESULT_FILENAME)).metadata.num_rows
-    except Exception:
-        return 0
+    return 0
 
 
 # Diffing the raw aliases triggers the #46 grouped-exact-nunique blowup (10GB+ /
@@ -341,12 +335,12 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
     ``schema.json``, i.e. ``ENTRY_ARTIFACT_NAMES``, plus the recipe ``expr.py``),
     the source ``data``, catalog bookkeeping and project-authored stats are
     symlinked so no bytes are copied; the per-entry/per-project caches are left
-    empty so the first hit is honestly cold. ``result.parquet`` is one of those
-    caches as of #73 (it lives in ``ENTRY_CACHE_NAMES``, not
-    ``ENTRY_ARTIFACT_NAMES``), so it is deliberately *not* symlinked — the read
-    path regenerates it on demand. Anything an entry writes lands in the
-    writable overlay dir, so the user's real catalog is never mutated. Returns
-    *overlay_home*.
+    empty so the first hit is honestly cold. No per-entry ``result.parquet``
+    exists to mirror — an expensive entry's rows live in its baked snapshot under
+    the (deliberately unmirrored) compute cache, and a cheap entry recomputes —
+    so the read path is honestly cold either way. Anything an entry writes lands
+    in the writable overlay dir, so the user's real catalog is never mutated.
+    Returns *overlay_home*.
 
     *Every* built entry is mirrored, not just the measured subset — entries
     chain (``from_catalog(parent_hash)``), and post-#73 a measured entry's build
@@ -413,10 +407,10 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
     expensive parent self-heals an evicted parent snapshot by re-running the
     recipe. ``load_entry`` (replaying the serialized build) can't do that last
     case — its *bare* read of the parent's snapshot dangles on a cold compute
-    cache ("At least one path is required") — so it is not the path a #73 reader
-    (download / promote-diff / viewer via ``ensure_result``) takes. Cold = first
-    reconstruct + self-heal + execute; warm = re-execute against the warmed
-    snapshot (reconstruction is memoised).
+    cache ("At least one path is required") — so it is not the path a reader
+    (post-processing / promote-diff / viewer via ``cached_result_expr``) takes.
+    Cold = first reconstruct + self-heal + execute; warm = re-execute against the
+    warmed snapshot (reconstruction is memoised).
     """
     import pyarrow.parquet as pq  # noqa: PLC0415
 
@@ -450,17 +444,21 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
 
 def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     """Tier-B proxy: self-heal, load the build, run the stat pipeline (cold/warm), 1st page."""
-    from tallyman_core.paths import entry_stat_cache_dir  # noqa: PLC0415
-    from tallyman_xorq.result_cache import (  # noqa: PLC0415
-        cached_result_expr,
-        ensure_viewer_expanded_build,
+    from tallyman_core.paths import (  # noqa: PLC0415
+        entry_build_dir,
+        entry_expanded_build_dir,
+        entry_stat_cache_dir,
+        project_dir,
     )
+    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
-    # Same recipe-vs-result-read choice the companion's ensure_session makes
-    # (#71), so the proxy pages over what Buckaroo would actually be served:
-    # a cache-worthy entry reads its materialised result.parquet, not the recipe.
-    expanded = ensure_viewer_expanded_build(project, content_hash)
+    # ensure_session serves Buckaroo the entry's recipe build dir; page over the
+    # same expanded recipe so the proxy exercises what Buckaroo is actually given
+    # (an expensive entry's recipe replays onto its baked snapshot — a read).
+    build_dir = entry_build_dir(project, content_hash)
+    expanded = ensure_expanded_build(build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash))
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)

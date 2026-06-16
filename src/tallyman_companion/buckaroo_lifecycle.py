@@ -50,19 +50,20 @@ import httpx
 
 from tallyman_core import (
     entry_build_dir,
-    entry_result_path,
+    entry_expanded_build_dir,
     entry_stat_cache_dir,
 )
-from tallyman_core.paths import artifacts_dir
+from tallyman_core.paths import artifacts_dir, project_dir
 
 
-def _entry_parquet_exists(project: str, content_hash: str) -> bool:
-    """True if the project's catalog has an entry for *content_hash*.
+def _entry_exists(project: str, content_hash: str) -> bool:
+    """True if the project's catalog has a built entry for *content_hash*.
 
-    Used by ``_load_session_file`` to prune stale session entries whose
-    project / hash combination no longer maps to anything on disk.
+    The build dir is the entry's existence proof now (there is no on-demand
+    ``result.parquet``). Used by ``_load_session_file`` to prune stale session
+    entries whose project / hash combination no longer maps to a build on disk.
     """
-    return entry_result_path(project, content_hash).exists() or entry_build_dir(project, content_hash).is_dir()
+    return entry_build_dir(project, content_hash).is_dir()
 
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -355,7 +356,7 @@ class BuckarooManager:
             project = info.get("project")
             if not project:
                 continue
-            if not _entry_parquet_exists(project, h):
+            if not _entry_exists(project, h):
                 continue
             kept[h] = {"session_id": info["session_id"], "project": project}
         self._sessions = kept
@@ -519,7 +520,7 @@ class BuckarooManager:
         # cold compute cache — a fresh clone, or an entry the startup warmup
         # didn't reach — the replay reads zero rows and the grid renders empty.
         # cached_result_expr repopulates it (idempotent; lru-cached, so a warmed
-        # entry is ~free), mirroring ensure_result's heal for the paginated read.
+        # entry is ~free), the same heal the paginated read (api_data) relies on.
         # Done before the lock: a cold entry's recompute mustn't block other
         # sessions, and a warm one is a cheap cache hit.
         try:
@@ -541,17 +542,13 @@ class BuckarooManager:
             # tmp path makes every stat-cache lookup a miss even when the cache
             # is fully populated on disk. Marker-gated for crash safety. Shared
             # with load_entry's diff path so the two can't drift.
-            # #71: a cache-worthy entry (Aggregate/Join/Sort) re-runs the whole
-            # DAG on every count() and every paged window if we hand Buckaroo the
-            # raw recipe. ensure_viewer_expanded_build serves a read of the
-            # materialised result.parquet instead (push-down still holds on a
-            # parquet scan), or the recipe for a cheap entry / on any cache
-            # hiccup. Shared with the Tier-B perf proxy so the two can't drift.
-            from tallyman_xorq.result_cache import (  # noqa: PLC0415
-                ensure_viewer_expanded_build,
-            )
+            from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
 
-            expanded = ensure_viewer_expanded_build(project, content_hash)
+            expanded = ensure_expanded_build(
+                build_dir,
+                project_dir(project),
+                entry_expanded_build_dir(project, content_hash),
+            )
             stat_cache = entry_stat_cache_dir(project, content_hash)
             stat_cache.mkdir(parents=True, exist_ok=True)
             payload: dict = {

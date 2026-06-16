@@ -181,7 +181,7 @@ function SortableCell({
         />
       ) : cell.latest_hash ? (
         <div className="nb-empty">
-          no result.parquet for {cell.latest_hash}
+          no preview for {cell.latest_hash}
         </div>
       ) : (
         <div className="nb-empty">

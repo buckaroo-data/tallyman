@@ -22,7 +22,6 @@ from tallyman_core.paths import (
     ENTRY_CACHE_NAMES,
     ENTRY_EXPANDED_BUILD_DIRNAME,
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_SCHEMA_FILENAME,
     ENTRY_STAT_CACHE_DIRNAME,
     active_project_file_path,
@@ -30,7 +29,6 @@ from tallyman_core.paths import (
     entry_build_dir,
     entry_expanded_build_dir,
     entry_manifest_path,
-    entry_result_path,
     entry_schema_path,
     entry_stat_cache_dir,
     errors_path,
@@ -217,7 +215,6 @@ def test_layout_segment_constants_compose_the_helpers(isolated_home: Path):
 def test_entry_path_helpers_compose_from_constants(isolated_home: Path):
     base = entry_dir("alpha", "abc123")
     assert entry_build_dir("alpha", "abc123") == base / ENTRY_BUILD_DIRNAME
-    assert entry_result_path("alpha", "abc123") == base / ENTRY_RESULT_FILENAME
     assert entry_manifest_path("alpha", "abc123") == base / ENTRY_MANIFEST_FILENAME
     assert entry_schema_path("alpha", "abc123") == base / ENTRY_SCHEMA_FILENAME
     assert entry_stat_cache_dir("alpha", "abc123") == base / ENTRY_STAT_CACHE_DIRNAME
@@ -233,10 +230,9 @@ def test_entry_artifact_cache_partition_is_disjoint():
     assert ENTRY_BUILD_DIRNAME in ENTRY_ARTIFACT_NAMES
     assert ENTRY_MANIFEST_FILENAME in ENTRY_ARTIFACT_NAMES
     assert ENTRY_SCHEMA_FILENAME in ENTRY_ARTIFACT_NAMES
-    # #73: result.parquet is no longer a build artifact — it's regenerated on
-    # demand by ensure_result, so it's a cache (the overlay omits it for a cold hit).
-    assert ENTRY_RESULT_FILENAME in ENTRY_CACHE_NAMES
-    # The per-entry caches are classified as caches, never symlinked.
+    # No per-entry result.parquet exists any more — the only per-entry caches are
+    # the stat cache and the expanded build, both classified as caches and never
+    # symlinked into the cold overlay.
     assert ENTRY_STAT_CACHE_DIRNAME in ENTRY_CACHE_NAMES
     assert ENTRY_EXPANDED_BUILD_DIRNAME in ENTRY_CACHE_NAMES
 

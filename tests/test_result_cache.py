@@ -24,6 +24,23 @@ expr = t.select("region", "price")
 """
 
 
+def _parent_code(project: str, col: str) -> str:  # single-column rename → distinct, unionable
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select(k=t.{col})
+"""
+
+
+def _union_code(parent_a: str, parent_b: str) -> str:  # combine two from_catalog parents
+    return f"""
+from tallyman_xorq.io import from_catalog
+a = from_catalog({parent_a!r}).select(k="k")
+b = from_catalog({parent_b!r}).select(k="k")
+expr = a.union(b)
+"""
+
+
 def _hash_of(project: str) -> str:
     return list_entries(project)[0]["content_hash"]
 
@@ -92,6 +109,37 @@ def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parq
     catalog_create("proj", _project_code(project))
     h = _hash_of(project)
     assert type(cached_result_expr(project, h).op()).__name__ != "CachedNode"
+
+
+def test_multi_parent_from_catalog_shares_one_backend(project, orders_parquet, monkeypatch):
+    # #75: combining two from_catalog parents in one expression must resolve to a
+    # single backend. #73's expression-level from_catalog loaded each parent into
+    # its own backend, so a union/join raised "Multiple backends found".
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.io import from_catalog
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("pa", _parent_code(project, "region"))
+    catalog_create("pb", _parent_code(project, "category"))
+
+    a = from_catalog("pa").select(k="k")
+    b = from_catalog("pb").select(k="k")
+    # Must not raise XorqError: Multiple backends found for this expression.
+    ibis.union(a, b)._find_backend()
+
+
+def test_multi_parent_from_catalog_union_builds(project, orders_parquet, monkeypatch):
+    # #75: an entry that unions two from_catalog parents must build end-to-end.
+    # On the #73 branch this aborted with BuildError: Multiple backends found.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("pa", _parent_code(project, "region"))
+    catalog_create("pb", _parent_code(project, "category"))
+
+    res = catalog_create("ab", _union_code("pa", "pb"))
+    assert "error" not in res, res
+    # 200 source rows per parent → 400 unioned.
+    assert res["row_count"] == 400
 
 
 def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):

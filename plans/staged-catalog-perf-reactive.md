@@ -1,8 +1,18 @@
 # Plan: three-stage path to reactive catalog recalc
 
-Status: **proposed (2026-06-14).** Synthesises the decisions from the planning
-conversation around the reactive-catalog ADR (`plans/adr-reactive-catalog-recalc.md`).
-Splits the work into three sequenced stages. No implementation here.
+Status: **proposed (2026-06-14); reconciled with PR #74 (merged 2026-06-16).**
+Synthesises the decisions from the planning conversation around the
+reactive-catalog ADR (`plans/adr-reactive-catalog-recalc.md`). Splits the work
+into three sequenced stages. No implementation here.
+
+**#74 reconciliation.** #74 dropped the blanket per-entry `result.parquet` and
+moved to materialization only at expensive boundaries — the model intended all
+along; the prior blanket behaviour was a misread of the codebase (see the ADR's
+Reconciliation section). Net effect on this plan: stage 1 is unaffected (its
+prerequisites closed); stage 2's cache-layer inventory and the build-cost
+measurement are updated below (#82); and stage 3's "landable early" tagged-read
+spine is removed — #74 took the composition fork instead, so cross-entry lineage
+is now a deferred semantic-dependency mechanism, not a `HashingTag` walk.
 
 The throughline: don't build the reactive layer on machinery that doesn't yet
 hold its own invariants, and don't redesign the caching until it's measured. So
@@ -130,6 +140,17 @@ summary), `execute_seconds` in `build.py:335-341`. The work:
   the level of everything else.
 - For the buckaroo JS side, gate the bk-flash / cross-stream tracing behind a
   debug flag rather than deleting it in a "console cleanup."
+- Log the **admission decision** with both verdicts side by side, so the
+  structural-vs-measured tradeoff (#30) is decidable from data — not just
+  lifecycle counts. Persist the structural `cache_worthy` verdict (today it is
+  computed and thrown away), and record the measured value-per-byte inputs:
+  `compile_seconds` (new — the dominant per-view cost), the result/snapshot
+  byte-size (new), and `execute_seconds` (already recorded). Tag each cold
+  `cached_result_expr` read with the #74 path it took (cheap-recompute /
+  baked-read / evicted-self-heal). Counts alone can't show that a Join-descendant
+  is structurally worthy but cost-cheap. Fixing disk accounting to count
+  `compute_cache` per entry supplies the byte denominator and closes the #74
+  disk-usage follow-up at once.
 
 This is a prerequisite for the rest of stage 2: the lifecycle counts in
 deliverable 1 and the harness in deliverable 2 read these logs as the in-app
@@ -145,9 +166,11 @@ how many get **re-executed** (`.execute()`), and which of those were avoidable.
 Build/load/execute counts are the explanatory variable; wall-clock is the symptom.
 
 - **Build cost** dominates with graph depth and count — long xorq graphs are
-  expensive to construct independent of execution, which is the whole reason
-  `from_catalog` truncates at a parquet read (ADR). So "how many entries, how deep
-  each graph" is a first-order lever.
+  expensive to construct independent of execution. Pre-#74 `from_catalog`
+  truncated every parent at a parquet read; #74 truncates only at expensive
+  parents (baked snapshot) and composes cheap ones, so "how many entries, how deep
+  each chain, and where the expensive boundaries sit" is the first-order lever
+  (measured by #82).
 - **Load cost** is distinct from build — #34 (the 10s `/load_expr` timeout that
   abandons cold loads) is a load-path problem, not a cache-key problem.
 - **Re-execution timing** is where caching actually shows up, but the lever is
@@ -158,18 +181,26 @@ Build/load/execute counts are the explanatory variable; wall-clock is the sympto
 The cache layers matter only insofar as they change those counts (a hit skips a
 re-execution; a shallow graph skips a build). The catalogue of layers already
 exists — the `docs/caching-architecture` branch ("map every cache in the
-tallyman/xorq/buckaroo stack", `xorq` `SnapshotStrategy`, tallyman `result_cache`,
-the `.cas` store + `content_hash`, buckaroo's stat/session caches). Reuse it as
+tallyman/xorq/buckaroo stack", `xorq` `SnapshotStrategy`, the `.cas` store +
+`content_hash`, buckaroo's stat/session caches). **Refresh it for #74:** the
+separate `result_cache/` dir is retired (baked results now co-locate in the
+per-project content-addressed `compute_cache`), and a new source-read cache
+(snapshot `.cache()` after each `read_csv`/`read_json`, shared across entries,
+parquet exempt) was added. #74's own follow-ups are part of this refresh —
+disk-usage reporting still points at the now-empty `result_cache/` and doesn't
+count `compute_cache`, and the cache-inspector still reflects on-demand
+`result.parquet` rather than the baked compute-cache results. Reuse the map as
 the levers section; the deliverable here is the lifecycle model on top, not a
 re-derived cache-key taxonomy.
 
 Existing backlog items are findings against this model: #21 (lazy warm), #22
 (checkpoint capture cost per mutating request), #30 (measured cost rubric vs
 structural `cache_worthy`), #35 (leftover result dirs). The hypotheses to settle
-with numbers: does the parquet-truncation boundary actually cut build cost at
-depth (ADR open question, untimed); how many expressions are needlessly rebuilt or
-reloaded per app open; does revising a source re-execute dependents at all today
-(ADR says no — fast but stale).
+with numbers: build cost as a function of `from_catalog` chain depth now that #74
+truncates only at expensive boundaries and composes cheap parents (#82 — reframes
+the ADR's untimed deep-chain question); how many expressions are needlessly
+rebuilt or reloaded per app open; does revising a source re-execute dependents at
+all today (ADR says no — fast but stale).
 
 ### Deliverable 2 — performance integration tests (#59)
 
@@ -228,37 +259,62 @@ Design captured in `plans/adr-reactive-catalog-recalc.md`. Two of its open
 questions are answered by stage 2's measurements, so stage 3 design is gated on
 stage 2:
 
-- deep-chain build cost (ADR open question, explicitly untimed) → stage 2's
-  build-cost-at-depth measurement.
-- is `cas` affordable as the default for recalc-enabled projects (disk cost) →
-  stage 2's disk/cold-warm numbers.
+- deep-chain build cost → #82 (reframed by #74: `cached_result_expr`
+  reconstruction at depth, not eager `load_expr` against a tagged read).
+- `cas` is a prerequisite, not an open question (resolved in the reactive ADR):
+  #74's recompute-on-cold-read means only cas keeps "this hash ⇒ these bytes"
+  true. Stage 2 measures only its disk cost, to size the reflink/GC mitigation —
+  not whether to adopt it.
 
-**Landable early (low-risk, ADR-verified, net-neutral).** These can go in during
-the stage-1/2 window:
+**Superseded by #74 — the "landable early" tagged-read spine is dropped.** This
+plan previously proposed landing, during the stage-1/2 window, a tagged read
+(`deferred_read_parquet(<entry>/result.parquet).hashing_tag(…)`) plus a
+`walk_nodes(HashingTag)` rewrite of `lineage.py`. #74 took the other fork:
+`from_catalog` reconstructs the parent expression (`cached_result_expr`) instead
+of reading a `result.parquet`, and `catalog_parents` is allowed to go dark. There
+is no per-entry `result.parquet` read left to tag, so neither item can or should
+land. But the cross-entry DAG itself is restorable cheaply: `from_catalog` knows
+the resolved parent hash at build, so recording it in the manifest (a `parents`
+field, parallel to `sources`) brings `catalog_parents` back as a manifest read.
+Only the *follow-the-concept* layer (depend on what a parent computes, not its
+materialised hash — #73) is the genuinely deferred semantic-dependency work.
 
-- The tagged-read spine: replace the anonymous `deferred_read_parquet` in
-  `io.py` with `deferred_read_parquet(<entry>/result.parquet).hashing_tag(
-  CatalogTag.SOURCE, entry_name=…)` (ADR: built in 0.019s, stayed shallow).
-- Drop the regex `result.parquet`-path matching in `lineage.py` for
-  `walk_nodes(HashingTag)`.
+**Prerequisites — landable now, ahead of the reactive feature** (each filed as
+its own issue; the 2026-06-16 design review settled their direction):
 
-**Still open (settle after stage 2):** read-intent recording (alias-follow vs
-hash-pin at build time), trigger model (button vs scan-on-load vs
-auto-cascade — leaning button + scan), cascade/transaction semantics, archive
-overlay (derived vs stored).
+- **Restore the cross-entry DAG + read-intent** — manifest
+  `parents: [{hash, ref, follow}]`; `catalog_parents` reads the manifest.
+  Foundational: reactive recalc can't find dependents to recompute without it.
+- **Fix the alias-history ambiguity** — thread the requested alias through
+  `previous_version` / `_resolve_noncyclic_hash` so follow-resolution can't step
+  back through the wrong lineage (the #74-review follow-up).
+- **Flip the default to `cas`** (+ reflink on Linux, `.cas` GC) — the identity
+  prerequisite from #74's recompute-on-cold-read.
+- **Admission-decision telemetry** — deliverable 0 above; gates the #30 flip.
+- **Determinism lint** — build-time hint on nondeterministic ops; durable fix #83.
+- **In-process LRU invalidation on reset** — #80.
+
+**Still genuinely open (the reactive feature's design):** trigger model (button
+vs scan-on-load vs auto-cascade — leaning button + scan), cascade/transaction
+semantics, archive overlay (derived vs stored). These staleness-layer decisions
+sit on top of the prerequisites, once the DAG, cas, and read-intent are in place.
 
 ---
 
 ## Cross-stage dependencies
 
 ```
-#48 fix ─┐
-#52 fix ─┴─► rebuild script ─► clean parking catalog ─► stage 2 corpus
-                                                          │
-cache-architecture map ───────────────────────────────► perf tests ─► numbers
-                                                                         │
+#48 ✓ ─┐
+#52 ✓ ─┴─► rebuild script ─► clean parking catalog ─► stage 2 corpus
+                                                        │
+cache-architecture map (refresh for #74) ────────────► perf tests ─► numbers
+                                                        (incl. #82)      │
                                                           ┌──────────────┘
-tagged-read spine (early) ──────────────────────────────►│
+PR #74 substrate (merged: source-cache + baked result) ─►│
                                                           ▼
-                                                  stage 3 reactive design
+              prerequisites: parents-DAG + read-intent, cas default,
+              previous_version fix, admission telemetry, determinism lint
+                                                          │
+                                                          ▼
+              stage 3 reactive feature (trigger model, cascade, archive)
 ```

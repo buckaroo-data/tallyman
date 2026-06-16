@@ -1,6 +1,11 @@
 # ADR: Result-cache admission and eviction by measured cost vs size
 
-- **Status:** Proposed (2026-06-10)
+- **Status:** Proposed (2026-06-10); reconciled with PR #74 (merged 2026-06-16).
+  #74 shipped the *structural* `cache_worthy` test as the live admission rule and
+  moved the materialised result from `result_cache/` into the per-project
+  `compute_cache` (with `result.parquet` now an on-demand artifact). This ADR's
+  measured value-per-byte model is still the target; the path to it is now
+  shadow-then-flip, not remove-now — see Decision §2.
 - **Context ticket:** buckaroo-data/tallyman#30 (measured cost/size cache rubric; supersedes #12, feeds #10 and #21)
 - **Affected code:** `src/tallyman_xorq/result_cache.py` (`classify_build`, `cache_worthy`, `cached_result_expr`, `ensure_result`), `src/tallyman_xorq/build.py` (`build_and_persist`, manifest write), `src/tallyman_core/manifest.py`
 - **Related ADR:** `plans/adr-source-identity-content-hash.md` (why `content_hash` is a stable cache key)
@@ -51,11 +56,17 @@ cost-aware eviction.
    (the `to_sqlglot`/sqlize path), timed separately from execution. Record the
    materialised result's size in bytes.
 
-2. **Admit permissively; do not gate per entry.** There is no structural or
-   cost-floor admission test. Any built result is a cache candidate. The
-   structural `classify_build` / `cache_worthy` path is removed (this supersedes
-   #12, which sought to make that classifier robust — there is nothing left to
-   robustify).
+2. **Admit permissively; do not gate per entry — reached by shadow-then-flip.**
+   The target is no structural or cost-floor admission test: any built result is a
+   cache candidate, ranked by value-per-byte. But #74 shipped the structural
+   `classify_build` / `cache_worthy` test as the live admission rule, so rather
+   than remove it blind, keep it live and compute the measured value-per-byte *in
+   shadow* alongside it (the admission-decision telemetry — staged plan deliverable
+   0). Watch the disagreement set — entries `cache_worthy` admits that the cost
+   model rates near-zero (the 2.5M intermediate) — and flip to measured-only when
+   the data confirms it. This still supersedes #12 (no point robustifying a
+   classifier we are removing); it just removes it on evidence, not on first
+   principles.
 
 3. **Rank by value-per-byte.** A cache's value is what reading it back saves
    over recomputing: `value ≈ recompute_cost − cache_read_cost`, divided by
@@ -108,10 +119,17 @@ model wants. v0 caches per-entry results only.
 - route_distance diffs stay fast: both 6.4k endpoints are small and
   high-value, so they are cached, and the diff is `read ⋈ read`.
 - Requires new instrumentation: `compile_seconds` in the build path and result
-  byte-size in the manifest. Accurate cache accounting is a prerequisite for
-  eviction — the `/api/disk_usage` pill currently omits `result_cache/` and
-  `diff_stat_cache/` (noted in #10) and must be corrected.
-- Eviction depends on correct recompute self-healing, which already exists.
+  byte-size in the manifest (the admission-decision telemetry — staged plan
+  deliverable 0). Accurate cache accounting is a prerequisite for eviction — and
+  post-#74 the `/api/disk_usage` pill points at the now-empty `result_cache/`
+  rather than the `compute_cache` where baked results actually live (the #74
+  disk-usage follow-up), so it must be corrected to count `compute_cache`.
+- Eviction depends on correct recompute self-healing, which already exists — with
+  one soundness hole #74 widened: an entry with *execution* nondeterminism
+  (`.sample()`, `ibis.now()`, unordered `.limit()`, impure UDF) recomputes to
+  *different* bytes than were evicted, silently, because its `content_hash` is
+  structural and can't see the difference. Such an entry must be retained, not
+  evicted-and-recomputed. Tracked as #83.
 - The `value ≈ recompute_cost − cache_read_cost` estimate is a heuristic; the
   read-cost term is approximated from bytes rather than measured. Acceptable
   because misranking only costs a recompute, never correctness.

@@ -69,6 +69,13 @@ path by construction.
 Implemented behind `TALLYMAN_SOURCE_IDENTITY=off|cas|salt` (default `off`)
 so the cache lab can benchmark strategies; accepting this ADR means
 flipping the default to `cas` after the consequences below are addressed.
+PR #74 (merged 2026-06-16) raised the stakes from "should we" to "we must":
+it reconstructs an entry on every cold read (`cached_result_expr` re-runs a
+cheap entry's recipe, self-heals an expensive entry's evicted snapshot), and
+under `off` that cold read pulls the *current* source bytes, so an in-place
+edit is served under the entry's old `content_hash`. cas is the only mode that
+keeps reconstruction faithful, so it is now a prerequisite for the reactive
+layer, not a tuning choice (see `plans/adr-reactive-catalog-recalc.md`).
 
 ## Measured behavior (cache lab, 150k-row matrix)
 
@@ -105,9 +112,16 @@ data under the old identity.
   xorq-key surface, and self-heal stays unfaithful. The implementation is
   kept in-tree behind the env switch so the lab can re-compare; delete it
   when `cas` is made the default.
-- **Stat-based identity (mtime/size/inode).** Unreachable for the same
-  snapshot-normalization reason, and undesirable anyway: forks on touch /
-  reset / transport, misses stat-preserving swaps.
+- **Stat-based identity (mtime/size/inode) / `ModificationTimeStrategy`.**
+  Unreachable for *identity*: the build hash is computed in a hardwired
+  `SnapshotStrategy().normalization_context()` (`provenance_utils.py:24`), so no
+  cache-strategy choice reaches it. Undesirable as a cache strategy anyway: it
+  forks on touch / reset / transport — every `reset_to` and checkout bumps
+  mtime/inode without changing a byte, so it would treat each as a full
+  invalidation and trigger a recompute storm in a reset-heavy workflow — and it
+  misses stat-preserving swaps. So it can't carry identity, and at the cache layer
+  it fights reset-to; cas keys on content and stays warm across a byte-identical
+  reset.
 - **Fix the hash in xorq.** Out of scope: frozen upstream.
 
 ## Consequences

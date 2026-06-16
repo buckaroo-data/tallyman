@@ -386,3 +386,23 @@ def test_revise_in_place_self_reference_terminates(project, orders_parquet, monk
     # Correct reconstruction == v1's rows plus the mutated column.
     assert "doubled" in expr.schema().names
     assert expr.execute().shape[0] == cached_result_expr(project, v1).execute().shape[0]
+
+
+def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_parquet, monkeypatch):
+    # #73 made entry reconstruction (cached_result_expr -> _recipe_expr ->
+    # _import_script) a per-READ operation. _import_script registers the recipe
+    # module in sys.modules under a unique uuid name; left there, every cold read
+    # leaks a module object that pins its whole expression graph. Reconstructing
+    # the same entry repeatedly must not accumulate sys.modules entries.
+    import sys
+
+    from tallyman_xorq.result_cache import _recipe_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    before = [m for m in sys.modules if m.startswith("tallyman_expr_")]
+    for _ in range(5):
+        _recipe_expr(project, h)  # not lru-cached: re-imports every call
+    after = [m for m in sys.modules if m.startswith("tallyman_expr_")]
+    assert len(after) == len(before), f"leaked {len(after) - len(before)} recipe modules"

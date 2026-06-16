@@ -79,11 +79,12 @@ ENTRY_SCHEMA_FILENAME = "schema.json"
 # first hit is honestly cold; production deletes them to recompute.
 ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
 ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
-# result.parquet is no longer written at build (#73): only an expensive entry is
-# materialised (into result_cache/), and a cheap entry materialises nothing.
-# ensure_result regenerates this on demand for callers that need a parquet path
-# (downloads, promote-diff, post-processing), so it is a regenerable cache, not
-# an immutable artifact — the overlay omits it rather than symlinking it.
+# result.parquet is no longer written at build (#73): an expensive entry's rows
+# live in its baked result cache (under the per-project compute_cache), and a
+# cheap entry materialises nothing. ensure_result regenerates this on demand for
+# callers that need a parquet path (downloads, promote-diff, post-processing), so
+# it is a regenerable cache, not an immutable artifact — the overlay omits it
+# rather than symlinking it.
 ENTRY_RESULT_FILENAME = "result.parquet"
 
 # Canonical artifact-vs-cache partition of the per-entry names the overlay cares
@@ -207,16 +208,6 @@ def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
 def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     """Stable expanded-build dir beside the entry (regenerated on demand)."""
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
-
-
-def result_cache_dir(project: str) -> Path:
-    """Root for xorq's ParquetSnapshotCache of catalog-entry results.
-
-    Materialised results are content-addressed parquet files written here by
-    xorq, not the per-entry result.parquet — so a deleted cache file simply
-    recomputes on next access.
-    """
-    return catalog_dir(project) / "result_cache"
 
 
 def compute_cache_dir(project: str) -> Path:

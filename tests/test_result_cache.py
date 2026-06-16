@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from tallyman_core.paths import entry_dir, result_cache_dir
+from tallyman_core.paths import catalog_dir, entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.result_cache import cache_worthy, classify_build, ensure_result
@@ -49,7 +49,8 @@ def test_cheap_entry_writes_no_result_parquet_at_build(project, orders_parquet, 
     h = _hash_of(project)
     rp = entry_dir(project, h) / "result.parquet"
     assert not rp.exists()
-    assert not result_cache_dir(project).exists() or not any(result_cache_dir(project).glob("**/*.parquet"))
+    # The result_cache/ dir was retired in #73 and must never be re-created.
+    assert not (catalog_dir(project) / "result_cache").exists()
     # ensure_result regenerates it on demand, in place, and a deleted one self-heals.
     out = ensure_result(project, h)
     assert out == rp and out.exists()
@@ -69,7 +70,8 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
     assert not (entry_dir(project, h) / "result.parquet").exists()
-    assert not result_cache_dir(project).exists() or not any(result_cache_dir(project).glob("**/*.parquet"))
+    # The result_cache/ dir was retired in #73 — baked results live in the compute cache.
+    assert not (catalog_dir(project) / "result_cache").exists()
     # The build carries a baked CachedNode, so loading it (and cached_result_expr)
     # yields a cache-resolving expression rather than the bare recipe.
     assert type(load_entry(project, h).op()).__name__ == "CachedNode"

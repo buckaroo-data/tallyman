@@ -9,7 +9,6 @@ xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
     display_configs: [{content_hash, config}]
     notebook:        {cells: [{cell_id, alias, markdown}]}
     entry_hashes:    [content_hash, ...]      # pointer to untracked entries/<hash>/
-    result_cache:    [relpath, ...]           # pointer to untracked result cache
     compute_cache:   [relpath, ...]           # pointer to untracked compute cache
     alias_map:       {alias: latest_hash}     # tallyman's alias bookkeeping
     alias_history:   {alias: [hash, ...]}     # tallyman's alias bookkeeping
@@ -62,7 +61,6 @@ from tallyman_core.paths import (
     entries_dir,
     notebooks_dir,
     post_processing_dir,
-    result_cache_dir,
     stats_dir,
 )
 
@@ -107,7 +105,6 @@ def read_tallyman_state(project: str) -> dict:
         "display_configs": raw.get("display_configs", []),
         "notebook": raw.get("notebook", {"cells": []}),
         "entry_hashes": raw.get("entry_hashes", []),
-        "result_cache": raw.get("result_cache", []),
         "compute_cache": raw.get("compute_cache", []),
         "alias_map": raw.get("alias_map", {}),
         "alias_history": raw.get("alias_history", {}),
@@ -167,7 +164,6 @@ def capture_tallyman_state(project: str) -> dict:
         ],
         "notebook": notebook.load(project),
         "entry_hashes": sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else [],
-        "result_cache": _list_cache_files(result_cache_dir(project)),
         "compute_cache": _list_cache_files(compute_cache_dir(project)),
     }
     # alias_map/alias_history are written live by aliases.py and already in
@@ -297,10 +293,6 @@ def _prune_cache(project: str, root: Path, key: str) -> int:
     return removed
 
 
-def prune_result_cache(project: str) -> int:
-    return _prune_cache(project, result_cache_dir(project), "result_cache")
-
-
 def prune_compute_cache(project: str) -> int:
     return _prune_cache(project, compute_cache_dir(project), "compute_cache")
 
@@ -324,13 +316,13 @@ def restore_from_bullpen(project: str) -> int:
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1
-    for key, root in (("result_cache", result_cache_dir(project)), ("compute_cache", compute_cache_dir(project))):
-        for rel in raw.get(key) or []:
-            live, parked = root / rel, bp / key / rel
-            if not live.exists() and parked.is_file():
-                live.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(parked, live)
-                restored += 1
+    root = compute_cache_dir(project)
+    for rel in raw.get("compute_cache") or []:
+        live, parked = root / rel, bp / "compute_cache" / rel
+        if not live.exists() and parked.is_file():
+            live.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(parked, live)
+            restored += 1
     return restored
 
 
@@ -484,7 +476,6 @@ def reset_to(project: str, ref: int | str) -> None:
             raise RuntimeError(f"catalog reset to {tag!r} failed: {err}")
         materialize(project)
         prune_entries(project)
-        prune_result_cache(project)
         prune_compute_cache(project)
         restore_from_bullpen(project)
         _assert_catalog_consistent(project)

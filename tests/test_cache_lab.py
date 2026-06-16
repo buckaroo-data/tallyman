@@ -214,12 +214,11 @@ def disk(project: str) -> dict:
     entries = paths.entries_dir(project)
     results = sum(f.stat().st_size for f in entries.rglob("result.parquet")) if entries.exists() else 0
     data = du(paths.data_dir(project))
-    caches = results + du(paths.result_cache_dir(project)) + du(paths.compute_cache_dir(project))
+    caches = results + du(paths.compute_cache_dir(project))
     return {
         "data_bytes": data,
         "entry_result_bytes": results,
         "entry_total_bytes": du(entries),
-        "result_cache_bytes": du(paths.result_cache_dir(project)),
         "compute_cache_bytes": du(paths.compute_cache_dir(project)),
         "bullpen_bytes": du(paths.bullpen_dir(project)),
         "cache_to_data_ratio": round(caches / data, 3) if data else None,
@@ -690,9 +689,11 @@ def test_selfheal_after_edit(lab):
     rp = entry_dir(lab.project, b1["hash"]) / "result.parquet"
     if rp.exists():
         rp.unlink()
-    rc_dir = paths.result_cache_dir(lab.project)
-    if rc_dir.exists():
-        shutil.rmtree(rc_dir)
+    # #73: baked results + source parses live in the compute cache; wipe it to
+    # evict every materialization and force a self-heal recompute from the build.
+    cc_dir = paths.compute_cache_dir(lab.project)
+    if cc_dir.exists():
+        shutil.rmtree(cc_dir)
 
     healed = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
     lab.record.update(

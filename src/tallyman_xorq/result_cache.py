@@ -61,6 +61,11 @@ def classify_build(build_dir: Path) -> dict:
     ``tallyman_xorq.source_cache``), so an entry earns a ``result_cache``
     snapshot only when it does expensive work — a shuffle / sort / window / UDF
     / full materialisation — on top of its source.
+
+    Two implementations of one predicate: this reads the serialized build,
+    ``source_cache._is_worthy_expr`` walks the live expression to make the same
+    bake decision at build time. They share ``_EXPENSIVE_OPS`` and must stay in
+    lockstep — change one, change both.
     """
     ops: set[str] = set()
     for y in Path(build_dir).glob("*.yaml"):

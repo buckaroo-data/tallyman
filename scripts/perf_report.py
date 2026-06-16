@@ -424,7 +424,10 @@ def child_build(key: str, workdir: Path, scale: float) -> None:
                 "wall_s": round(wall, 2),
                 "execute_s": res.execute_seconds,
                 "peak_mb": round(max(sampler.peak(), _ru_maxrss_bytes()) / MB),
-                "result_mb": round(result_path.stat().st_size / MB, 1),
+                # #73: a build no longer writes result.parquet (cheap entries
+                # materialise nothing; expensive ones bake into the compute
+                # cache). None when absent — the comparable signal is wall/exec.
+                "result_mb": round(result_path.stat().st_size / MB, 1) if result_path.exists() else None,
             }
         )
     )

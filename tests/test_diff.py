@@ -367,6 +367,31 @@ def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
     assert "stats" in diff
 
 
+def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders_parquet: Path):
+    # #73: the wired diff path passes both entries' cache-resolving expressions,
+    # which compose at the expression level. full_diff must NOT eagerly
+    # materialise a result.parquet for either entry — those parquets are never
+    # read on this path and re-introduce exactly the build-time materialisation
+    # #73 removed.
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_dir, b_dir = entry_dir(project, a.content_hash), entry_dir(project, b.content_hash)
+    diff = full_diff(
+        a_dir,
+        b_dir,
+        backend="xorq",
+        a_expr=cached_result_expr(project, a.content_hash),
+        b_expr=cached_result_expr(project, b.content_hash),
+    )
+    assert diff["keyed"] is not None
+    assert not (a_dir / "result.parquet").exists()
+    assert not (b_dir / "result.parquet").exists()
+
+
 def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parquet: Path):
     # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
     # Re-rendering the same diff must reuse one session-scoped build dir, not

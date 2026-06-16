@@ -414,7 +414,6 @@ def child_build(key: str, workdir: Path, scale: float) -> None:
     res = build_and_persist(PROJECT, code)
     wall = time.monotonic() - t0
     sampler.stop()
-    result_path = res.entry_path / "result.parquet"
     print(
         json.dumps(
             {
@@ -424,10 +423,10 @@ def child_build(key: str, workdir: Path, scale: float) -> None:
                 "wall_s": round(wall, 2),
                 "execute_s": res.execute_seconds,
                 "peak_mb": round(max(sampler.peak(), _ru_maxrss_bytes()) / MB),
-                # #73: a build no longer writes result.parquet (cheap entries
-                # materialise nothing; expensive ones bake into the compute
-                # cache). None when absent — the comparable signal is wall/exec.
-                "result_mb": round(result_path.stat().st_size / MB, 1) if result_path.exists() else None,
+                # No per-entry result.parquet is written: an expensive entry's rows
+                # live in its baked snapshot (cache_bytes, #87), a cheap entry
+                # materialises nothing (None). The comparable signal is wall/exec.
+                "result_mb": round(res.cache_bytes / MB, 1) if res.cache_bytes else None,
             }
         )
     )

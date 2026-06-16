@@ -346,8 +346,8 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
     not-yet-warmed entry) that read resolves to zero files, so the grid renders
     empty — the same zero-row symptom as the unexpanded-build_dir case above, a
     different cause. ensure_session must self-heal it first
-    (``cached_result_expr`` repopulates the snapshot), mirroring
-    ``ensure_result``'s heal for the paginated REST read.
+    (``cached_result_expr`` repopulates the snapshot), the same heal the
+    paginated REST read (api_data) relies on.
     """
     import shutil
 

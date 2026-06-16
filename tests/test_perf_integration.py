@@ -362,6 +362,11 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
         overlay_entry.mkdir()
         for name in _ENTRY_LINK_NAMES:
             _link(real_entry / name, overlay_entry / name)
+        # #73: cached_result_expr reconstructs an entry by re-importing its
+        # recipe (expr.py) onto the default backend, so the read path now needs
+        # expr.py in the overlay too — pre-#73 it resolved via xorq_build /
+        # result.parquet only. (Belongs in paths.ENTRY_ARTIFACT_NAMES proper.)
+        _link(real_entry / "expr.py", overlay_entry / "expr.py")
     return overlay_home
 
 

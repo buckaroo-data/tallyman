@@ -9,7 +9,7 @@ import tempfile
 import time
 import traceback
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -60,6 +60,9 @@ class BuildResult:
     # re-run path (entry already on disk, registration not re-attempted); True/False
     # on a fresh build. False means the recipe is NOT durable — see #48.
     catalog_registered: bool | None = None
+    # Advisory build-time lints (#88): execution-nondeterministic ops whose result
+    # varies run-to-run under one content_hash. Empty when the recipe is clean.
+    lint_warnings: list[str] = field(default_factory=list)
 
 
 class BuildError(RuntimeError):
@@ -219,6 +222,54 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
     return "\n\nHint: " + " ".join(hints)
 
 
+# Execution-nondeterministic ops (#88): their result varies run-to-run for the
+# *same* expression graph, so the structural content_hash can't see the change
+# and #74's recompute-on-cold-read can serve different bytes than were built.
+# Mapped to the friendly call that builds each. Deliberately NOT flagged: bare
+# unordered LIMIT/head (deterministic-enough, and far too common to warn on
+# without an ordering analysis) and impure UDFs (purity is undetectable from the
+# graph). The durable, hash-invisible fix is tracked in #83.
+_NONDETERMINISTIC_OPS = {
+    "TimestampNow": "now()",
+    "DateNow": "today()",
+    "RandomScalar": "random()",
+    "RandomUUID": "uuid()",
+    "Sample": "sample()",
+}
+
+
+def _nondeterminism_warnings(expr) -> list[str]:
+    """Advisory lint: flag execution-nondeterministic ops in a recipe (#88).
+
+    Returns at most one hint (or none). Best-effort by design — a walk failure
+    must never break an otherwise-valid build, so any error yields no warning.
+    """
+    try:
+        import xorq.vendor.ibis.expr.operations as ops
+
+        types = []
+        for name in _NONDETERMINISTIC_OPS:
+            op_cls = getattr(ops, name, None)
+            if op_cls is not None:
+                types.append(op_cls)
+        if not types:
+            return []
+        found = {type(node).__name__ for node in expr.op().find(tuple(types))}
+    except Exception:
+        return []
+    pretty = sorted({_NONDETERMINISTIC_OPS[n] for n in found if n in _NONDETERMINISTIC_OPS})
+    if not pretty:
+        return []
+    return [
+        "nondeterministic op(s) "
+        + ", ".join(pretty)
+        + " make this entry's result vary run-to-run under one content_hash; on a "
+        "cold cache the viewer or a diff can show different bytes than were built "
+        "(#88). Seed the sample or materialize the value at author time for a "
+        "reproducible entry."
+    ]
+
+
 def _import_script(code: str) -> tuple[object, Path]:
     """Write code to a temp file, import it, return (module, temp_path).
 
@@ -275,6 +326,10 @@ def build_and_persist(
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
         raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
 
+    # Advisory nondeterminism lint (#88) on the author's expression, before the
+    # rewrite wraps it in cache nodes. Surfaced on the result, never fatal.
+    lint_warnings = _nondeterminism_warnings(expr_obj)
+
     # Rewrite-then-build (#73): cache each non-parquet source read, bake a
     # top-level result cache when the expression is expensive (so every loader,
     # incl. the Buckaroo viewer, reads the cached result instead of re-running
@@ -319,6 +374,7 @@ def build_and_persist(
                     row_count=meta.get("row_count", 0),
                     execute_seconds=meta.get("execute_seconds", 0.0),
                     schema=json.loads(entry_schema_path(project, content_hash).read_text()),
+                    lint_warnings=lint_warnings,
                 )
 
         target.mkdir(parents=True, exist_ok=True)
@@ -420,6 +476,7 @@ def build_and_persist(
         execute_seconds=execute_seconds,
         schema=schema_doc,
         catalog_registered=catalog_registered,
+        lint_warnings=lint_warnings,
     )
 
 

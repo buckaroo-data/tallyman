@@ -58,6 +58,13 @@ def test_catalog_load_parquet_with_name_creates_alias(project: str, orders_parqu
     out = catalog_load_parquet("orders.parquet", prompt="raw", name="orders")
     assert "error" not in out
     assert out["alias"] == "orders"
+    assert out["version"] == 1
+    # Notebook auto-appended.
+    from tallyman_core import notebook
+
+    cells = notebook.load(project)["cells"]
+    assert len(cells) == 1
+    assert cells[0]["alias"] == "orders"
 
 
 def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_parquet: Path, monkeypatch):
@@ -74,13 +81,6 @@ expr = t.mutate(built_at=ibis.now())
     assert "error" not in out
     assert "lint_warnings" in out
     assert any("now()" in w for w in out["lint_warnings"])
-    assert out["version"] == 1
-    # Notebook auto-appended.
-    from tallyman_core import notebook
-
-    cells = notebook.load(project)["cells"]
-    assert len(cells) == 1
-    assert cells[0]["alias"] == "orders"
 
 
 def test_catalog_load_parquet_name_collision_rejected(project: str, orders_parquet, monkeypatch):

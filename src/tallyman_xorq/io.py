@@ -64,18 +64,22 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
     """Load an existing catalog entry's result as a xorq expression.
 
     This is how you chain catalog entries: build A, then build B from A's result.
-    Returns the entry's *expression*, composed at the expression level rather
-    than read back from a materialised ``result.parquet`` (#73). For an
-    expensive parent (Aggregate / Join / …) that expression resolves its own
-    ``result_cache`` snapshot, so the parent's work is computed once and shared;
-    a cheap parent recomputes (pushdown makes it ~free). Either way the child no
+    Returns the entry's *expression* on the in-process default backend (#73/#75),
+    not a read of a materialised entry ``result.parquet``. An expensive parent
+    (Aggregate / Join / …) resolves to a direct read of its baked ``result_cache``
+    snapshot, so its work is computed once and shared; a cheap parent re-runs its
+    recipe (pushdown makes that ~free). Crucially both root on the *same* default
+    backend, so combining two ``from_catalog`` parents — or a ``from_catalog`` and
+    a ``from_project`` — in one ``union`` / ``join`` resolves to a single backend
+    rather than raising "Multiple backends found" (#75). Either way the child no
     longer depends on the parent having a ``result.parquet`` on disk.
 
-    Because the child's build now serialises the parent's own source reads
-    (wrapped in a cache node) rather than a path to the parent entry, the
-    inter-entry catalog DAG (``tallyman_xorq.lineage.catalog_parents``) no longer
-    recovers a parent edge from this. Cross-entry lineage is deferred to a future
-    semantic-dependency mechanism — see #73.
+    Because the child's build serialises the parent's source reads (cheap) or a
+    read of the parent's baked snapshot (expensive) rather than a path to the
+    parent entry, the inter-entry catalog DAG
+    (``tallyman_xorq.lineage.catalog_parents``) no longer recovers a parent edge
+    from this. Cross-entry lineage is deferred to a future semantic-dependency
+    mechanism — see #73.
 
     Args:
         alias_or_hash: An alias (e.g. "shoe_sales") or a content hash. Aliases

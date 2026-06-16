@@ -93,22 +93,65 @@ def cache_worthy(project: str, content_hash: str) -> bool:
     return classify_build(entry_build_dir(project, content_hash))["worthy"]
 
 
+# The recipe variable name build_and_persist binds and persists into expr.py.
+_RECIPE_VAR = "expr"
+
+
+def _recipe_expr(project: str, content_hash: str):
+    """Re-import the entry's persisted recipe (``expr.py``) as a live expression.
+
+    Symmetric with the original build's ``_import_script`` — same source code,
+    same source-identity handling — so the reconstructed expression is
+    structurally identical to what was built. The recipe's ``from_project`` /
+    deferred readers bind to the in-process *default* backend, so the returned
+    expression roots there and composes with ``from_project`` and other
+    ``from_catalog`` results as a single backend (#75).
+    """
+    from tallyman_core.paths import entry_dir, project_dir
+    from tallyman_xorq.build import BuildError, _import_script
+    from tallyman_xorq.portable import PLACEHOLDER
+
+    code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
+    module, tmp = _import_script(code)
+    try:
+        expr = getattr(module, _RECIPE_VAR, None)
+        if expr is None:
+            raise BuildError(f"recipe for {content_hash} in {project!r} binds no {_RECIPE_VAR!r}")
+        return expr
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 @functools.lru_cache(maxsize=256)
 def cached_result_expr(project: str, content_hash: str):
-    """The entry's result as an expression that resolves its own materialisation.
+    """The entry's result as a single-backend expression on the default backend.
 
-    Bounded so the cache can't grow without limit across a long-lived process;
-    entries are content-addressed, so an evicted hash rebuilds an identical
-    expression on the next access.
+    Reconstituting a catalog entry for chaining (``from_catalog``) or diffing
+    must yield an expression rooted on the *one* in-process backend, so two
+    entries combined in a ``union`` / ``join`` resolve to a single backend
+    instead of raising "Multiple backends found" (#75). #73's predecessor loaded
+    each entry's build into its own backend, so any composition spanned two.
+    Both paths below root on the default backend and materialise no entry
+    ``result.parquet``:
 
-    As of #73 this is simply the loaded build for every entry. An expensive
-    entry's build *carries a baked result-cache node* (see
-    ``tallyman_xorq.source_cache.rewrite_for_build``), so loading it yields an
-    expression that reads its own cached result — a hit reads the cached
-    parquet, a miss recomputes and stores. A cheap entry's build has no result
-    cache, so it recomputes on read; pushdown makes that ~free and its source
-    parse is itself cached at the read. The caller composes ``expr1`` ⋈
-    ``expr2`` and never depends on a pre-existing ``result.parquet``.
+      * Cheap entry — re-import its recipe (``expr.py``) and hand back the live
+        expression. Recompute on read is ~free (pushdown over a columnar source;
+        a non-parquet parse is cached at the read), and the recipe binds to the
+        default backend.
+      * Expensive entry — read its baked ``result_cache`` snapshot directly as a
+        single ``deferred_read_parquet`` on the default backend. The snapshot was
+        materialised when the entry built (``rewrite_for_build``'s top-level
+        result cache); reading it skips re-running the DAG *and* keeps the cache
+        node's own backend out of the caller's expression (a baked
+        ``CachedNode`` carries its own storage connection, which is the second
+        backend #73 tripped over). Self-heals: an evicted snapshot is recomputed
+        once via the cache node, then read.
+
+    Bounded LRU so the cache can't grow without limit; entries are
+    content-addressed, so an evicted hash rebuilds an identical expression.
 
     salt source-identity mode skips baked caches (path-only snapshot keys would
     collide across salted entries — see ``rewrite_for_build``), so reads route
@@ -117,11 +160,30 @@ def cached_result_expr(project: str, content_hash: str):
     import xorq.api as xo
 
     from tallyman_xorq import source_identity as si
-    from tallyman_xorq.build import load_entry
 
     if si.mode() == "salt":
         return xo.deferred_read_parquet(str(ensure_result(project, content_hash)))
-    return load_entry(project, content_hash)
+
+    raw = _recipe_expr(project, content_hash)
+    if not cache_worthy(project, content_hash):
+        return raw
+
+    # Expensive: locate the baked snapshot via the same rewrite the build used,
+    # then read it as a bare parquet. rewrite_for_build wraps the expression in a
+    # ParquetSnapshotCache whose structural key matches the file baked at build
+    # time, so storage/calc_key give its on-disk path without re-executing.
+    from tallyman_xorq.source_cache import rewrite_for_build
+
+    baked = rewrite_for_build(raw, project)
+    node = baked.op()
+    if type(node).__name__ != "CachedNode":
+        # classify_build (serialized) and _is_worthy_expr (live) disagreed — fall
+        # back to recompute rather than dereference a cache that wasn't baked.
+        return raw
+    path = Path(node.cache.storage.get_path(node.cache.calc_key(node.parent)))
+    if not path.exists():
+        baked.count().execute()  # evicted snapshot: repopulate once, then read
+    return xo.deferred_read_parquet(str(path))
 
 
 def ensure_result(project: str, content_hash: str) -> Path:

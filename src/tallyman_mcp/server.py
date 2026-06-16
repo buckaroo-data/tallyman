@@ -731,8 +731,9 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     if not a_dir.exists() or not b_dir.exists():
         return {"error": "one or both entries are missing on disk"}
 
-    # Diff the two entries' (cache-resolving) expressions — streaming xorq
-    # aggregates, and self-healing if a result.parquet was evicted.
+    # Diff the two entries' (cache-resolving) expressions — an expensive entry
+    # reads its baked result cache, a cheap one recomputes (#73); neither
+    # depends on a result.parquet existing.
     from tallyman_xorq.result_cache import cached_result_expr
 
     diff = full_diff(
@@ -1112,9 +1113,9 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
 
     Use this to iterate on ``process(expr)`` code before committing it with
     ``catalog_add_post_processing``. The function is executed against the
-    entry's stored ``result.parquet`` — you see real output rows, not the
-    small dry-run memtable that ``catalog_add_post_processing`` validates
-    against.
+    entry's materialised result (``ensure_result``) — you see real output
+    rows, not the small dry-run memtable that ``catalog_add_post_processing``
+    validates against.
 
     SANDBOX: same restricted namespace as ``catalog_add_post_processing`` —
     ``expr`` / ``ibis`` / ``expr.execute()`` are available, but ``import`` of

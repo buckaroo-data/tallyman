@@ -156,9 +156,9 @@ def _compute_disk_usage(project: str) -> dict:
     """Walk a project's on-disk footprint and return the disk_usage payload.
 
     Covers raw input data, each entry's result.parquet / xorq_build /
-    .buckaroo_stat_cache, and the two project-level caches added in #12 — the
-    xorq ParquetSnapshotCache (result_cache/) and the per-pair Buckaroo diff
-    stat cache (diff_stat_cache/), either of which can dwarf the rest.
+    .buckaroo_stat_cache, and the per-pair Buckaroo diff stat cache
+    (diff_stat_cache/), which can dwarf the rest. (The retired result_cache/
+    dir is gone as of #73 — baked results now live in the compute cache.)
 
     This is the expensive path; callers should rate-limit it via the
     api_disk_usage TTL cache rather than invoking per request.
@@ -166,7 +166,6 @@ def _compute_disk_usage(project: str) -> dict:
     from tallyman_core.paths import data_dir as _data_dir
     from tallyman_core.paths import diff_stat_cache_root as _diff_stat_cache_root
     from tallyman_core.paths import entries_dir as _entries_dir
-    from tallyman_core.paths import result_cache_dir as _result_cache_dir
 
     # raw input files
     data = _dir_size(_data_dir(project))
@@ -190,18 +189,16 @@ def _compute_disk_usage(project: str) -> dict:
             if c.is_dir():
                 cache += _dir_size(c)
 
-    # Project-level caches (#12), previously uncounted. _dir_size returns 0 for
-    # a dir that doesn't exist yet, so no existence guard needed.
-    result_cache = _dir_size(_result_cache_dir(project))
+    # Project-level diff stat cache (#12), previously uncounted. _dir_size
+    # returns 0 for a dir that doesn't exist yet, so no existence guard needed.
     diff_cache = _dir_size(_diff_stat_cache_root(project))
 
-    total = data + results + builds + cache + result_cache + diff_cache
+    total = data + results + builds + cache + diff_cache
     return {
         "data": data,
         "results": results,
         "builds": builds,
         "cache": cache,
-        "result_cache": result_cache,
         "diff_cache": diff_cache,
         "total": total,
         "formatted": {
@@ -209,7 +206,6 @@ def _compute_disk_usage(project: str) -> dict:
             "results": _fmt_bytes(results),
             "builds": _fmt_bytes(builds),
             "cache": _fmt_bytes(cache),
-            "result_cache": _fmt_bytes(result_cache),
             "diff_cache": _fmt_bytes(diff_cache),
             "total": _fmt_bytes(total),
         },
@@ -309,6 +305,17 @@ def create_app(
             _sap(project)
         except (FileNotFoundError, ValueError):
             pass
+
+    # #73 upgrade migration: drop the old per-entry build-time result.parquet
+    # once. Runs at construction (before any lazy ensure_result regenerates one)
+    # and is guarded by a per-project marker, so it's a no-op on later starts.
+    if seed and not read_only:
+        try:
+            from tallyman_xorq.build import migrate_drop_result_parquet
+
+            migrate_drop_result_parquet(seed)
+        except Exception:  # best-effort; cleanup must never block startup
+            log.warning("result.parquet migration failed for %s", seed, exc_info=True)
 
     app = FastAPI(title="tallyman companion")
     if STATIC_DIR.exists():
@@ -514,10 +521,15 @@ def create_app(
         _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
-        entry = entry_dir(project, content_hash)
-        result_path = entry / ENTRY_RESULT_FILENAME
-        if not result_path.exists():
-            raise HTTPException(404, "no result.parquet")
+        from tallyman_core.paths import entry_build_dir  # noqa: PLC0415
+        from tallyman_xorq.result_cache import ensure_result  # noqa: PLC0415
+
+        if not entry_build_dir(project, content_hash).is_dir():
+            raise HTTPException(404, "no entry")
+        # #73: cheap entries write no result.parquet at build; ensure_result
+        # materialises one on demand (expensive → result_cache snapshot, cheap →
+        # regenerated in place) so this paginated read always has a parquet.
+        result_path = ensure_result(project, content_hash)
         pf = pq.ParquetFile(result_path)
         total = pf.metadata.num_rows
         needed = offset + limit if limit > 0 else 0
@@ -603,8 +615,9 @@ def create_app(
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
-        result_path = entry / ENTRY_RESULT_FILENAME
-        total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
+        # #73: row count comes from the manifest, not a result.parquet (cheap
+        # entries no longer write one at build time).
+        total_rows = (manifest or {}).get("row_count", 0)
 
         return {
             "project": project,
@@ -729,9 +742,8 @@ def create_app(
                 if (entry / ENTRY_MANIFEST_FILENAME).exists():
                     entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
                     schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                result_path = entry / ENTRY_RESULT_FILENAME
-                if result_path.exists():
-                    total_rows = pq.ParquetFile(result_path).metadata.num_rows
+                    # #73: row count from the manifest, not a result.parquet.
+                    total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
@@ -815,9 +827,7 @@ def create_app(
             if keys:
                 session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
                 try:
-                    build_path, overrides = _build_compare_expr(
-                        project, a_hash, b_hash, tuple(keys)
-                    )
+                    build_path, overrides = _build_compare_expr(project, a_hash, b_hash, tuple(keys))
                     if buckaroo.diff_session_is_loaded(session_id):
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url

@@ -7,11 +7,16 @@ from tallyman_core.aliases import history_for
 from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
+from tallyman_xorq.result_cache import ensure_result
 
 # The cache pane is a React page (CachePage) backed by JSON: GET
 # /{project}/api/result_cache lists materialised parquets, DELETE
 # /{project}/api/result_cache/{hash} evicts one. These tests exercise that
 # contract; the rendering itself is the SPA's job.
+#
+# #73: a build no longer writes result.parquet; it's materialised on demand by
+# ensure_result, so these tests populate it first (matching the real lifecycle:
+# a result.parquet exists once an entry has been viewed / downloaded / diffed).
 
 
 def _agg_code(project: str) -> str:
@@ -35,6 +40,8 @@ def test_cache_pane_lists_entries(fresh_companion_app, project, orders_parquet, 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
+    for e in list_entries(project):
+        ensure_result(project, e["content_hash"])  # materialise on demand
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/result_cache")
     assert r.status_code == 200
@@ -54,6 +61,7 @@ def test_cache_delete_removes_only_parquet(fresh_companion_app, project, orders_
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
+    ensure_result(project, h)  # materialise on demand
     edir = entry_dir(project, h)
     pq_path = edir / "result.parquet"
     assert pq_path.exists()
@@ -79,6 +87,7 @@ def test_cache_delete_missing_parquet_404(fresh_companion_app, project, orders_p
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
+    ensure_result(project, h)  # materialise on demand
     c = TestClient(fresh_companion_app)
     assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 200
     # second delete: parquet already gone
@@ -89,6 +98,7 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
+    ensure_result(project, h)  # materialise on demand
     pq_path = entry_dir(project, h) / "result.parquet"
     assert pq_path.exists()
 

@@ -231,9 +231,11 @@ def test_entry_artifact_cache_partition_is_disjoint():
     assert set(ENTRY_ARTIFACT_NAMES).isdisjoint(ENTRY_CACHE_NAMES)
     # The immutable build outputs the overlay needs on the read path.
     assert ENTRY_BUILD_DIRNAME in ENTRY_ARTIFACT_NAMES
-    assert ENTRY_RESULT_FILENAME in ENTRY_ARTIFACT_NAMES
     assert ENTRY_MANIFEST_FILENAME in ENTRY_ARTIFACT_NAMES
     assert ENTRY_SCHEMA_FILENAME in ENTRY_ARTIFACT_NAMES
+    # #73: result.parquet is no longer a build artifact — it's regenerated on
+    # demand by ensure_result, so it's a cache (the overlay omits it for a cold hit).
+    assert ENTRY_RESULT_FILENAME in ENTRY_CACHE_NAMES
     # The per-entry caches are classified as caches, never symlinked.
     assert ENTRY_STAT_CACHE_DIRNAME in ENTRY_CACHE_NAMES
     assert ENTRY_EXPANDED_BUILD_DIRNAME in ENTRY_CACHE_NAMES

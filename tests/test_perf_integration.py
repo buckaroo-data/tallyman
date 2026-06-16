@@ -16,7 +16,8 @@ what a user actually waits for when opening a large catalog entry:
 What this PR measures, against the **existing on-disk corpus** (reuse, don't
 rebuild), each across a cold/warm cache axis:
 
-1. **Execution time** — ``load_entry`` then ``to_parquet`` per entry.
+1. **Execution time** — ``cached_result_expr`` (#73's reconstruct-on-read path)
+   then ``to_parquet`` per entry.
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
    10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
    then serve the first row page (the ``infinite_request`` 0-300 window).
@@ -78,6 +79,7 @@ from tallyman_core.paths import (
     ENTRY_ARTIFACT_NAMES,
     ENTRY_BUILD_DIRNAME,
     ENTRY_CACHE_NAMES,
+    ENTRY_MANIFEST_FILENAME,
     ENTRY_RESULT_FILENAME,
 )
 
@@ -199,13 +201,20 @@ def _real_projects_root() -> Path:
 
 
 def _entries_with_build(project_dir: Path) -> list[str]:
+    """Built entries, keyed on ``xorq_build/`` + ``manifest.json``.
+
+    Not ``result.parquet``: #73 stopped writing it at build time (it is a
+    regenerable cache now, not an artifact), so a corpus built on that branch has
+    none. ``manifest.json`` is written by both the pre- and post-#73 build, so it
+    is the stable existence marker that keeps discovery working across both eras.
+    """
     base = project_dir / "artifacts" / "catalog" / "entries"
     if not base.is_dir():
         return []
     return sorted(
         child.name
         for child in base.iterdir()
-        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_RESULT_FILENAME).exists()
+        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_MANIFEST_FILENAME).exists()
     )
 
 
@@ -264,12 +273,23 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
 
 
 def _entry_rows(real_dir: Path, h: str) -> int:
-    """Row count of an entry's result.parquet via parquet metadata (no full read)."""
+    """Row count of an entry, from ``manifest.json`` (#73-safe).
+
+    Both build eras write ``row_count`` to the manifest, so it works whether or
+    not ``result.parquet`` exists (a #73 build writes none). Falls back to
+    parquet metadata only when the manifest lacks the count.
+    """
+    entry = real_dir / "artifacts" / "catalog" / "entries" / h
+    try:
+        rc = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text()).get("row_count")
+        if isinstance(rc, int):
+            return rc
+    except (OSError, json.JSONDecodeError):
+        pass
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    p = real_dir / "artifacts" / "catalog" / "entries" / h / ENTRY_RESULT_FILENAME
     try:
-        return pq.ParquetFile(str(p)).metadata.num_rows
+        return pq.ParquetFile(str(entry / ENTRY_RESULT_FILENAME)).metadata.num_rows
     except Exception:
         return 0
 
@@ -343,6 +363,11 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
         overlay_entry.mkdir()
         for name in _ENTRY_LINK_NAMES:
             _link(real_entry / name, overlay_entry / name)
+        # #73: cached_result_expr reconstructs an entry by re-importing its
+        # recipe (expr.py) onto the default backend, so the read path now needs
+        # expr.py in the overlay too — pre-#73 it resolved via xorq_build /
+        # result.parquet only. (Belongs in paths.ENTRY_ARTIFACT_NAMES proper.)
+        _link(real_entry / "expr.py", overlay_entry / "expr.py")
     return overlay_home
 
 
@@ -371,21 +396,33 @@ def _stats_dataflow(xorq_loading, expr, cache_dir: Path):
 
 
 def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
-    """``load_entry`` → ``to_parquet``, cold then warm (compute cache)."""
+    """``cached_result_expr`` → ``to_parquet``, cold then warm (compute cache).
+
+    #73 materialises an entry by reconstructing it on the default backend
+    (``cached_result_expr``): a cheap entry recomputes from source, an expensive
+    one reads its baked snapshot, and an entry that ``from_catalog``s an
+    expensive parent self-heals an evicted parent snapshot by re-running the
+    recipe. ``load_entry`` (replaying the serialized build) can't do that last
+    case — its *bare* read of the parent's snapshot dangles on a cold compute
+    cache ("At least one path is required") — so it is not the path a #73 reader
+    (download / promote-diff / viewer via ``ensure_result``) takes. Cold = first
+    reconstruct + self-heal + execute; warm = re-execute against the warmed
+    snapshot (reconstruction is memoised).
+    """
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    from tallyman_xorq.build import load_entry  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     out = scratch / f"exec_{content_hash}.parquet"
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
     t0 = time.monotonic()
-    load_entry(project, content_hash).to_parquet(str(out))
+    cached_result_expr(project, content_hash).to_parquet(str(out))
     cold_s = round(time.monotonic() - t0, 2)
     rows = pq.ParquetFile(str(out)).metadata.num_rows
 
     t0 = time.monotonic()
-    load_entry(project, content_hash).to_parquet(str(out))
+    cached_result_expr(project, content_hash).to_parquet(str(out))
     warm_s = round(time.monotonic() - t0, 2)
     sampler.stop()
 
@@ -395,8 +432,8 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
         "cold_s": cold_s,
         "warm_s": warm_s,
         "peak_mb": round(sampler.peak() / MB),
-        # Each timing issues exactly one load + one execute; the headline number
-        # is attributable to that fixed count (#59's count-over-wall premise).
+        # Each timing issues exactly one reconstruct + one execute; the headline
+        # number is attributable to that fixed count (#59's count-over-wall premise).
         "loads": 1,
         "executes": 1,
     }
@@ -529,7 +566,7 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
     L = ["# tallyman Tier-B perf integration report", "", f"project `{project}` · {len(hashes)} entries", ""]
 
     L += [
-        "## Execution (`load_entry` → `to_parquet`)",
+        "## Execution (`cached_result_expr` → `to_parquet`)",
         "",
         "| entry | rows | cold s | warm s | peak MB |",
         "|---|---|---|---|---|",

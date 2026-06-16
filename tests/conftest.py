@@ -72,9 +72,8 @@ def _clear_expr_lru_caches():
     """
 
     def _clear() -> None:
-        from tallyman_xorq.result_cache import cached_result_expr, result_cache
+        from tallyman_xorq.result_cache import cached_result_expr
 
-        result_cache.cache_clear()
         cached_result_expr.cache_clear()
         try:
             from tallyman_companion.app import _build_compare_expr

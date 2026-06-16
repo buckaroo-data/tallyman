@@ -21,7 +21,6 @@ from tallyman_core import (
     entry_build_dir,
     entry_dir,
     entry_manifest_path,
-    entry_result_path,
     entry_schema_path,
     project_dir,
     write_manifest,
@@ -276,6 +275,20 @@ def build_and_persist(
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
         raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
 
+    # Rewrite-then-build (#73): cache each non-parquet source read, bake a
+    # top-level result cache when the expression is expensive (so every loader,
+    # incl. the Buckaroo viewer, reads the cached result instead of re-running
+    # the DAG), and reject in-memory reads. The content_hash below is computed
+    # from this rewritten expression; xorq_build/ carries the cache nodes, while
+    # expr.py keeps the author's literal source (tallyman does not depend on the
+    # submitted form).
+    from tallyman_xorq.source_cache import InMemoryReadError, rewrite_for_build
+
+    try:
+        expr_obj = rewrite_for_build(expr_obj, project)
+    except InMemoryReadError as exc:
+        raise BuildError(str(exc)) from exc
+
     # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
     # things into our catalog layout afterwards.
     with tempfile.TemporaryDirectory(prefix="tallyman_build_") as builds_str:
@@ -341,21 +354,23 @@ def build_and_persist(
             hint = _ibis_import_hint(str(exc), code)
             raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
-        result_path = entry_result_path(project, content_hash)
+        # Execute (#73). A worthy entry's build carries a baked result-cache
+        # node (rewrite_for_build), so executing materialises it once into the
+        # compute cache — and every later loader (the Buckaroo viewer, diffs,
+        # from_catalog) reads that cached result instead of re-running the DAG.
+        # A cheap entry materialises nothing: this is a pushdown count() over a
+        # columnar source plus a schema read, no parquet written.
         t0 = time.monotonic()
         try:
-            loaded.to_parquet(str(result_path))
+            arrow_schema = loaded.schema().to_pyarrow()
+            row_count = int(loaded.count().execute())
         except Exception as exc:
             hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(f"to_parquet failed: {exc}{hint}\n{traceback.format_exc()}") from exc
+            raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
         execute_seconds = round(time.monotonic() - t0, 3)
 
-    # Schema + row count via pyarrow (no pandas materialize needed).
-    import pyarrow.parquet as pq
-
-    pf = pq.ParquetFile(result_path)
-    arrow_schema = pf.schema_arrow
-    row_count = pf.metadata.num_rows
+    # Schema + row count come from the expression directly (no result.parquet to
+    # read back); a worthy entry's rows are already materialised in its cache.
     schema_doc = {
         "fields": [{"name": f.name, "type": str(f.type)} for f in arrow_schema],
         "row_count": row_count,
@@ -406,6 +421,43 @@ def build_and_persist(
         schema=schema_doc,
         catalog_registered=catalog_registered,
     )
+
+
+_MIGRATION_MARKER = ".migrated_no_build_result_parquet"
+
+
+def migrate_drop_result_parquet(project: str) -> int:
+    """#73 upgrade migration: delete every per-entry build-time result.parquet.
+
+    Safe — ``xorq_build/`` is the durable recipe. After this, an expensive
+    entry's result lives in its baked cache (rebuilt entries) or repopulates
+    lazily on first view, and a cheap entry recomputes trivially via
+    ``ensure_result`` on demand. Runs once per project (guarded by a marker in
+    the catalog dir so it doesn't churn lazily-regenerated caches on restart),
+    is idempotent and best-effort, and returns the count deleted.
+    """
+    from tallyman_core.paths import ENTRY_RESULT_FILENAME, catalog_dir
+
+    marker = catalog_dir(project) / _MIGRATION_MARKER
+    if marker.exists():
+        return 0
+    base = entries_dir(project)
+    deleted = 0
+    if base.is_dir():
+        for child in base.iterdir():
+            rp = child / ENTRY_RESULT_FILENAME
+            if rp.is_file():
+                try:
+                    rp.unlink()
+                    deleted += 1
+                except OSError:
+                    pass
+    try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        marker.write_text("")
+    except OSError:
+        pass  # best-effort; a missed marker just reruns a no-op next time
+    return deleted
 
 
 def list_entries(project: str) -> list[dict]:

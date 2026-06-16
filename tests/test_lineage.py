@@ -55,13 +55,20 @@ def test_no_catalog_parents_for_a_root_entry(project: str, orders_parquet: Path)
     assert catalog_parents(project, res.content_hash) == []
 
 
-def test_catalog_parents_via_from_catalog(project: str, orders_parquet: Path):
+def test_from_catalog_no_longer_recovers_parent_edge(project: str, orders_parquet: Path):
+    # #73: from_catalog composes the parent's *expression* (the parent's own
+    # source reads, wrapped in a cache node) rather than reading a path to the
+    # parent's result.parquet, so there is no `entries/<hash>/result.parquet`
+    # string for catalog_parents to match — the inter-entry edge goes dark.
+    # Recovering it is deferred to a future semantic-dependency mechanism.
     parent = build_and_persist(project, _agg_code(project), prompt="parent")
     child = build_and_persist(project, _from_catalog_code(project, parent.content_hash), prompt="child")
-    assert catalog_parents(project, child.content_hash) == [parent.content_hash]
+    assert catalog_parents(project, child.content_hash) == []
 
 
-def test_catalog_dag_links_parent_to_child(project: str, orders_parquet: Path):
+def test_catalog_dag_has_nodes_but_no_inter_entry_edges(project: str, orders_parquet: Path):
+    # #73: every entry is a node, but chained entries no longer surface a
+    # parent→child edge (see test_from_catalog_no_longer_recovers_parent_edge).
     parent = build_and_persist(project, _agg_code(project))
     child = build_and_persist(project, _from_catalog_code(project, parent.content_hash))
 
@@ -69,20 +76,7 @@ def test_catalog_dag_links_parent_to_child(project: str, orders_parquet: Path):
     hashes = {n["hash"] for n in dag["nodes"]}
     assert parent.content_hash in hashes
     assert child.content_hash in hashes
-    assert {"from": parent.content_hash, "to": child.content_hash} in dag["edges"]
-
-
-def test_catalog_dag_handles_alias_referenced_child(project: str, orders_parquet: Path):
-    """When the child references a parent via its alias name, lineage still
-    resolves to the parent's content hash (because from_catalog dereferences
-    the alias at build time)."""
-    from tallyman_core import set_alias
-
-    parent = build_and_persist(project, _agg_code(project), prompt="parent")
-    set_alias(project, "by_region", parent.content_hash)
-
-    child = build_and_persist(project, _from_catalog_code(project, "by_region"))
-    assert catalog_parents(project, child.content_hash) == [parent.content_hash]
+    assert dag["edges"] == []
 
 
 def test_column_lineage_returns_per_column_trees(project: str, orders_parquet: Path):

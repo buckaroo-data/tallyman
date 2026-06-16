@@ -49,6 +49,31 @@ expr = t.mutate(doubled=t.price * 2)
 """
 
 
+def _chain_off_expensive_code(parent: str) -> str:  # cheap child chaining off ONE expensive parent
+    return f"""
+from tallyman_xorq.io import from_catalog
+t = from_catalog({parent!r})
+expr = t.mutate(total2=t.total * 2)
+"""
+
+
+def _agg_avg_code(project: str) -> str:  # a second Aggregate → expensive, joins on region
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(avg_price=t.price.mean())
+"""
+
+
+def _join_two_expensive_code(parent_a: str, parent_b: str) -> str:  # multi-parent: join two expensive parents
+    return f"""
+from tallyman_xorq.io import from_catalog
+a = from_catalog({parent_a!r})
+b = from_catalog({parent_b!r})
+expr = a.join(b, "region", how="left")
+"""
+
+
 def _call_under_tight_recursion_guard(fn, *args):
     """Run *fn* with the recursion limit pinned just above the current depth.
 
@@ -247,6 +272,88 @@ def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, order
     assert r.status_code == 200
     diff = r.json()["diff"]
     assert "stats" in diff or "keyed" in diff
+
+
+def test_ensure_result_self_heals_expensive_parent_chain_on_cold_cache(project, orders_parquet, monkeypatch):
+    """#73/#74: materialising an entry that ``from_catalog``s an expensive parent
+    must self-heal an evicted parent snapshot, not error.
+
+    An expensive parent bakes its result into the per-project compute cache; a
+    child that chains off it serialises a *bare* ``deferred_read_parquet`` of
+    that snapshot (no recipe, no source to recompute from — #75 strips the
+    parent's ``CachedNode`` so the composed expression stays on one backend). On
+    a cold compute cache (fresh clone / write-isolated overlay) that read
+    resolves to zero files and ``load_entry`` raises ``ValueError: At least one
+    path is required``. ``ensure_result`` must instead reconstruct via the recipe
+    — re-resolving ``from_catalog`` and recomputing the parent — the way
+    ``cached_result_expr`` already self-heals.
+    """
+    import shutil
+
+    import pyarrow.parquet as pq
+
+    from tallyman_core.paths import compute_cache_dir, entry_result_path
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))  # expensive parent (Aggregate)
+    res = catalog_create("chain", _chain_off_expensive_code("agg"))  # cheap mutate child off it
+    assert "error" not in res, res
+    expected_rows = res["row_count"]
+    child_h = _hash_of(project)
+
+    # Cold start, as a fresh clone / write-isolated overlay / restarted app has:
+    # evict every baked snapshot (the parent's included), so the build's bare
+    # snapshot read dangles, AND clear the reconstruction lru — the in-process
+    # build above warmed it with the parent's pre-eviction snapshot read, which a
+    # fresh process would not carry (the perf overlay where this surfaced is cold).
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+    rp = entry_result_path(project, child_h)
+    if rp.exists():
+        rp.unlink()
+
+    out = ensure_result(project, child_h)  # pre-fix: ValueError "At least one path is required"
+    assert pq.ParquetFile(out).metadata.num_rows == expected_rows
+
+
+def test_ensure_result_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_parquet, monkeypatch):
+    """#73/#75: a multi-parent entry joining two expensive ``from_catalog`` parents
+    must self-heal *both* evicted parent snapshots on a cold cache.
+
+    This is the ``tickets_and_ghosts`` shape: a join of two expensive parents.
+    The child is itself expensive (Join), so its build is a top-level
+    ``CachedNode`` whose parent joins two *bare* snapshot reads. On a cold cache
+    the child's cache node recomputes — but the two parent reads dangle (both
+    snapshots evicted) → ``ValueError: At least one path is required``. The fix
+    reconstructs via the recipe, recomputing each parent in turn.
+    """
+    import shutil
+
+    import pyarrow.parquet as pq
+
+    from tallyman_core.paths import compute_cache_dir, entry_result_path
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg_a", _agg_code(project))  # expensive parent 1 → (region, total, n)
+    catalog_create("agg_b", _agg_avg_code(project))  # expensive parent 2 → (region, avg_price)
+    res = catalog_create("joined", _join_two_expensive_code("agg_a", "agg_b"))
+    assert "error" not in res, res
+    expected_rows = res["row_count"]
+    child_h = _hash_of(project)
+
+    # Cold start (fresh clone / overlay / restart): evict both parent snapshots
+    # and the child's, and clear the reconstruction lru the in-process build
+    # warmed — so every snapshot in the chain must self-heal from the recipe.
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+    rp = entry_result_path(project, child_h)
+    if rp.exists():
+        rp.unlink()
+
+    out = ensure_result(project, child_h)  # pre-fix: ValueError "At least one path is required"
+    assert pq.ParquetFile(out).metadata.num_rows == expected_rows
 
 
 def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):

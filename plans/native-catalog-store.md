@@ -117,7 +117,7 @@ Then `git add -A` stages exactly the meaningful state, and the tracked tree is:
 ```
 entries/<hash>.zip            # immutable recipe, one blob per entry
 aliases.jsonl                 # one line per alias
-notebook.jsonl                # one line per cell
+notebook.jsonl                # one line per cell (moved under the repo)
 entries.jsonl                 # pointer list: untracked build dirs (bullpen reconcile)
 compute_cache.jsonl           # pointer list: untracked compute-cache warm set
 chart_specs/<hash>.vl.json    # one Vega-Lite spec per entry
@@ -191,7 +191,8 @@ tracking extra files. With xorq gone:
   `aliases.jsonl` (one line per alias: `{"alias","latest","history":[...]}`); the
   read-only alias functions ride on `_read`/`_write` untouched, and the only reader
   off `read_tallyman_state` is `aliases.py` itself (verified). But `aliases.py` also
-  has a *module-level* `import xorq_catalog as _xcat` (`aliases.py:24`) and
+  has a *module-level* `from tallyman_core import xorq_catalog as _xcat`
+  (`aliases.py:24`) and
   `set_alias`/`remove_alias` still call `_xcat.add_alias`/`remove_alias`
   (`:129`,`:155`) — the xorq subprocess. Both must be stripped in the *same* commit
   that deletes `xorq_catalog.py`: `aliases.py` is its only remaining caller once
@@ -225,7 +226,7 @@ Replace `import xorq.api as xo` with narrow imports (all verified
 symbol-identical and catalog-free): `xorq.ibis_yaml.compiler` (build/load),
 `xorq.expr.api` (`deferred_read_*`, `memtable`, `to_sql`), `xorq.caching`
 (`ParquetSnapshotCache`). The one non-mechanical swap is **no-arg `xo.connect()`**
-(used at `source_cache.py:133,151`). `xorq.expr.api` is *not* a drop-in here: it
+(used at `source_cache.py:133,152`). `xorq.expr.api` is *not* a drop-in here: it
 does export a `connect`, but it is ibis's `connect(resource, **kwargs)`
 (re-exported via `from xorq.vendor.ibis.expr.api import *`), a different function
 requiring a positional `resource` — not the no-arg datafusion `xorq.api.connect`
@@ -326,7 +327,7 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
 2. **Native recipe store** — `tallyman_core/catalog.py` `write_recipe_zip`;
    `build.py` persists the complete dir + cleans up on failure; delete
    `xorq_catalog.py` *and* strip its only other caller's coupling in the same
-   commit — `aliases.py`'s module-level `import xorq_catalog` plus the
+   commit — `aliases.py`'s module-level `from tallyman_core import xorq_catalog` plus the
    `_xcat.add_alias`/`remove_alias` calls in `set_alias`/`remove_alias` — so the
    package stays importable (the failing-first suite from commit 1 can't run red
    against an un-importable tree).
@@ -337,8 +338,9 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
    tracked directly; notebook → `notebook.jsonl`; pointers → `entries.jsonl` +
    `compute_cache.jsonl`; delete `capture`/`materialize` for the six sections;
    relocate the `prompts.jsonl` writer/reader (`build.py`, `read_prompts`,
-   `app.py`) from `entry_dir` to tracked `prompts/<hash>.jsonl`; move
-   `post_processing/`+`stats/` under the repo.
+   `app.py`) from `entry_dir` to tracked `prompts/<hash>.jsonl`; relocate
+   `post_processing/`, `stats/`, and the notebook (`project_dir/notebooks/`) under
+   the repo.
 5. **Cut B** — narrow catalog-free imports + connect shim across the 8 modules.
 6. **Test-cleanup commit** — rewrite/delete the xorq-coupled integration tests;
    re-target `test_failed_registration_is_observable` to a native failure; drop the

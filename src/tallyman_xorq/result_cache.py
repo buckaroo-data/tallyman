@@ -244,17 +244,34 @@ def ensure_result(project: str, content_hash: str) -> Path:
     """Return a guaranteed-present ``result.parquet`` path for the entry's result.
 
     On-demand materialisation for the callers that need a parquet *path* rather
-    than an expression — downloads, promote-diff, post-processing. Loads the
-    entry and writes its result in place if absent (#73): an expensive entry's
-    build carries a baked result cache, so this reads through that cache (a hit
-    reuses the materialised result, a miss computes once); a cheap entry
-    recomputes. Either way the caller never depends on a pre-existing
-    ``result.parquet``, and a deleted one self-heals on the next call.
+    than an expression — downloads, promote-diff, post-processing. Writes the
+    result in place if absent (#73), and a deleted one self-heals on the next call.
+
+    Reconstructs through ``cached_result_expr`` (the recipe path), not
+    ``load_entry`` (the serialized build). An entry that ``from_catalog``s an
+    expensive parent serialises a *bare* ``deferred_read_parquet`` of the
+    parent's baked snapshot — #75 strips the parent's ``CachedNode`` so the
+    composed expression stays on one backend — with no recipe or source embedded
+    to recompute from. On a cold compute cache (fresh clone / write-isolated
+    overlay) ``load_entry`` resolves that read to zero files and raises
+    ``ValueError: At least one path is required`` (#73/#74). Re-running the recipe
+    re-resolves ``from_catalog`` and recomputes the parent, so an evicted snapshot
+    anywhere in the chain self-heals (``cached_result_expr`` repopulates it).
+
+    salt source-identity mode is the exception: there ``cached_result_expr``
+    routes its reads back through ``ensure_result`` (path-only snapshot keys would
+    collide across salted entries — see ``rewrite_for_build``), so we load the
+    serialized build here instead, to avoid recursing into ourselves.
     """
     from tallyman_core.paths import entry_result_path
-    from tallyman_xorq.build import load_entry
+    from tallyman_xorq import source_identity as si
 
     result_path = entry_result_path(project, content_hash)
     if not result_path.exists():
-        load_entry(project, content_hash).to_parquet(str(result_path))
+        if si.mode() == "salt":
+            from tallyman_xorq.build import load_entry
+
+            load_entry(project, content_hash).to_parquet(str(result_path))
+        else:
+            cached_result_expr(project, content_hash).to_parquet(str(result_path))
     return result_path

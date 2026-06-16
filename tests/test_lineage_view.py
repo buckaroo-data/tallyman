@@ -69,9 +69,9 @@ def test_lineage_overview_with_chain(fresh_companion_app, project: str, orders_p
     node_hashes = [n["hash"] for n in body["nodes"]]
     assert parent.content_hash in node_hashes
     assert child.content_hash in node_hashes
-    # #73: chained entries no longer surface an inter-entry edge (the catalog
-    # DAG goes dark) — deferred to a future semantic-dependency mechanism.
-    assert body["edges"] == []
+    # #84: the chained entry surfaces an inter-entry parent->child edge again,
+    # recovered from manifest.parents.
+    assert {"from": parent.content_hash, "to": child.content_hash} in body["edges"]
     assert "positions" in body
 
 
@@ -99,9 +99,8 @@ def test_api_catalog_dag_returns_nodes_and_edges(fresh_companion_app, project: s
     assert r.status_code == 200
     body = r.json()
     assert len(body["nodes"]) >= 2
-    # #73: inter-entry edges go dark (see test_lineage.py); nodes still listed.
-    assert body["edges"] == []
-    assert child.content_hash  # referenced to keep the build meaningful
+    # #84: inter-entry edges are recovered from manifest.parents (see test_lineage.py).
+    assert {"from": parent.content_hash, "to": child.content_hash} in body["edges"]
 
 
 def test_api_lineage_returns_internal(fresh_companion_app, project: str, orders_parquet: Path):

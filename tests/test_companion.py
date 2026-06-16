@@ -4,6 +4,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from tallyman_core import entry_dir
 from tallyman_xorq import build_and_persist
 
 
@@ -72,6 +73,68 @@ def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_pa
     rd = c.get(f"/{project}/api/data/{h}")
     assert rd.status_code == 200
     assert rd.json()["total"] > 0
+
+
+def test_api_data_cheap_entry_serves_page_without_materialising(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """#90: a paginated read comes off cached_result_expr, not a full result.parquet.
+
+    A cheap entry (parquet read + projection) materialises nothing at build (#74).
+    Serving one page must not reverse that by dumping the entry's whole result to
+    disk — the old path called ensure_result, which wrote result.parquet to serve
+    an O(limit) request.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price")
+"""
+    h = build_and_persist(project, code, prompt="cols").content_hash
+    rp = entry_dir(project, h) / "result.parquet"
+    assert not rp.exists()  # #74: cheap entry bakes no per-entry result
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/data/{h}?offset=0&limit=10")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["total"] == 200  # from the manifest's row_count, not a parquet
+    assert len(body["data"]) == 10
+    assert set(body["data"][0]) == {"region", "price"}
+
+    assert not rp.exists()  # #90: serving a page wrote no per-entry result.parquet
+
+
+def test_api_data_expensive_entry_paginates_without_per_entry_parquet(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """#90: pages off an expensive entry read the baked snapshot, not a duplicate.
+
+    An expensive entry (Sort) bakes its result into the result_cache snapshot but
+    writes no per-entry result.parquet. Paginating must read that snapshot through
+    the expression, not ensure_result a second on-disk copy under the entry.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.order_by("order_id").select("order_id", "region", "price")
+"""
+    h = build_and_persist(project, code, prompt="ordered").content_hash
+    rp = entry_dir(project, h) / "result.parquet"
+    assert not rp.exists()  # #73/#74: baked in the snapshot, not under the entry
+
+    c = TestClient(fresh_companion_app)
+    page1 = c.get(f"/{project}/api/data/{h}?offset=0&limit=50").json()
+    page2 = c.get(f"/{project}/api/data/{h}?offset=50&limit=50").json()
+    assert page1["total"] == page2["total"] == 200
+    ids1 = [row["order_id"] for row in page1["data"]]
+    ids2 = [row["order_id"] for row in page2["data"]]
+    assert ids1 == list(range(1, 51))  # ordered, contiguous, deep-offset correct
+    assert ids2 == list(range(51, 101))
+
+    assert not rp.exists()  # #90: no duplicate per-entry parquet written on read
 
 
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(

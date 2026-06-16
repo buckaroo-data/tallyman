@@ -263,13 +263,17 @@ def build_and_persist(
 
     # Collect source digests while user code imports (from_project notes each
     # file it reads); cas/salt identity modes consume them below.
+    from tallyman_xorq import parent_capture as pc
     from tallyman_xorq import source_identity as si
 
     collect_token = si.begin_collect()
+    parent_token = pc.begin_collect()
     try:
         module, tmp_script = _import_script(code)
     finally:
         sources = si.end_collect(collect_token)
+        # Resolved from_catalog parent edges captured during import (#84).
+        parents = pc.end_collect(parent_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
@@ -384,6 +388,7 @@ def build_and_persist(
         row_count=row_count,
         execute_seconds=execute_seconds,
         sources=sources or None,
+        parents=parents or None,
     )
     write_manifest(target, manifest)
     _append_prompt(target, prompt)

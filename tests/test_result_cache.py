@@ -41,6 +41,38 @@ expr = a.union(b)
 """
 
 
+def _self_chain_code(alias: str) -> str:  # the documented revise pattern: chain off own alias
+    return f"""
+from tallyman_xorq.io import from_catalog
+t = from_catalog({alias!r})
+expr = t.mutate(doubled=t.price * 2)
+"""
+
+
+def _call_under_tight_recursion_guard(fn, *args):
+    """Run *fn* with the recursion limit pinned just above the current depth.
+
+    A genuine infinite self-recursion then raises ``RecursionError`` after a
+    handful of frames (tens of MB) instead of growing the expression tree until
+    the box swaps to death — so a *failing* run of this test is CI-safe rather
+    than a machine-locking ~50GB RSS spike. A correct (bounded) reconstruction
+    fits well within the margin.
+    """
+    import sys
+
+    depth = 0
+    frame = sys._getframe()
+    while frame is not None:
+        depth += 1
+        frame = frame.f_back
+    old = sys.getrecursionlimit()
+    sys.setrecursionlimit(depth + 80)
+    try:
+        return fn(*args)
+    finally:
+        sys.setrecursionlimit(old)
+
+
 def _hash_of(project: str) -> str:
     return list_entries(project)[0]["content_hash"]
 
@@ -215,3 +247,35 @@ def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, order
     assert r.status_code == 200
     diff = r.json()["diff"]
     assert "stats" in diff or "keyed" in diff
+
+
+def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):
+    """A revise-in-place recipe that reads ``from_catalog`` of its OWN alias must
+    not self-recurse forever when later reconstructed.
+
+    ``catalog_revise`` repoints the alias to the new head *after* building, so a
+    recipe that chains off ``from_catalog(name)`` (the pattern its own docstring
+    recommends) resolves to the *previous* revision at build time but to *itself*
+    afterwards. #73 made ``cached_result_expr`` re-import the raw recipe and
+    re-resolve ``from_catalog`` against the live head, so post-revise
+    reconstruction (diff, further chaining) recursed without bound — a ~50GB RSS
+    spike that locked a 48GB machine. The fix resolves a self-referential
+    ``from_catalog`` to the build-time parent revision.
+    """
+    from tallyman_core.aliases import get_alias
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("tpd", _project_code(project))  # v1: region, price
+    v1 = get_alias(project, "tpd")
+    catalog_revise("tpd", _self_chain_code("tpd"))  # v2: from_catalog('tpd').mutate(doubled=price*2)
+    v2 = get_alias(project, "tpd")
+    assert v2 != v1
+
+    # Pre-fix: infinite recursion (guarded so the failure is a fast RecursionError,
+    # not an OOM). Post-fix: resolves from_catalog('tpd') to v1 and returns.
+    expr = _call_under_tight_recursion_guard(cached_result_expr, project, v2)
+
+    # Correct reconstruction == v1's rows plus the mutated column.
+    assert "doubled" in expr.schema().names
+    assert expr.execute().shape[0] == cached_result_expr(project, v1).execute().shape[0]

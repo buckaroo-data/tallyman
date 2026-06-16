@@ -207,3 +207,15 @@ def test_nondeterminism_warnings_empty_for_deterministic():
     t = ibis.table({"x": "int64"}, name="t")
     expr = t.mutate(y=t.x + 1)
     assert _nondeterminism_warnings(expr) == []
+
+
+def test_nondeterminism_warnings_skips_seeded_sample():
+    # A seeded sample is reproducible run-to-run, so it must not be flagged;
+    # the lint's "seed the sample" advice would otherwise contradict itself (#88).
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    assert _nondeterminism_warnings(t.sample(0.5)) != []
+    assert _nondeterminism_warnings(t.sample(0.5, seed=42)) == []

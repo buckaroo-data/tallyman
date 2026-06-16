@@ -37,7 +37,9 @@ consumer call sites below.
 - **Scope: A** — remove only the `result.parquet` layer; keep the classifier.
 - **pandas/polars diff backends: drop** — `full_diff` is xorq-only (§4).
 - **Cache inspector + delete: repoint** — inspector is manifest-driven
-  (`cache_bytes`); delete unlinks `baked_snapshot_path` (§5). Frontend untouched.
+  (`cache_bytes`, filtered to entries that bake a snapshot); delete unlinks
+  `baked_snapshot_path` (§5). Frontend JSON contract untouched; stale display copy
+  swept separately (§5).
 - **Cache lab: migrate** onto `cached_result_expr`, re-baselining its metrics;
   `ensure_result` fully deleted (§12).
 - **Lab `view_timings`: snapshot cold-vs-warm** is the redefined metric (§12).
@@ -112,7 +114,11 @@ docstrings is stale; nothing to convert there beyond fixing the text.
 - `df = cached_result_expr(project, content_hash).execute()` then
   `xo.memtable(df, name="_post_processing_run")`. This is the same expression the
   viewer's `api_data` executes, so cheap/expensive/self-heal all behave
-  identically. Keep `pyarrow`/`xorq` import-guard for the dependency error.
+  identically.
+- **Drop `pyarrow` from the import-guard.** `pyarrow.parquet as pq` (243) is used
+  only by the deleted `pq.read_table` step (248) — nothing else in the function
+  touches it — so leaving it imported trips ruff F401. Keep only `import xorq.api
+  as xo` inside the `try/except ImportError → PostProcessingRunError` guard.
 - Update the function docstring (212) — no longer "materialises the result".
 
 ### 3. `src/tallyman_companion/diff.py` (`build_diff_expr`)
@@ -148,14 +154,34 @@ those backends.
   else, so removing the `results` sub-bucket needs no TS change.
 - **cache inspector** `/api/result_cache` (1015-1077): drive it from the
   **manifest, not a file walk** — read `manifest.cache_bytes` (the baked snapshot
-  size, recorded at build per #87, `build.py:430`), `row_count`, and `created_at`
-  per entry. No per-entry recipe reconstruction (`baked_snapshot_path` re-imports
-  the recipe — too slow to call across every entry). An entry with
-  `cache_bytes` set lists as cached; cheap/`None` entries list as `size: 0`
-  (pre-#87 expensive entries also read `None` — acceptable staleness). Keep the
-  `CacheEntry` JSON shape exactly (hash, size, size_formatted, row_count, created,
-  alias, version, is_current, prompt) so `CachePage.tsx`/`types.ts` are untouched.
-  Drop the `ENTRY_RESULT_FILENAME` import (25).
+  size, recorded at build per #87, `build.py:428-432`), `row_count`, and
+  `created_at` per entry. No per-entry recipe reconstruction (`baked_snapshot_path`
+  re-imports the recipe — too slow to call across every entry). Three points where
+  the manifest doesn't drop straight into the existing `CacheEntry` shape:
+  - **Filter to entries with `cache_bytes` set** (skip cheap/`None`). The page is
+    a "Parquet result cache" of *deletable snapshots*; a cheap entry has none, and
+    the repointed delete (below) 404s on it because `baked_snapshot_path` is
+    `None`. Listing cheap entries as `size: 0` would put undeletable rows on the
+    page whose delete button always `alert`s "delete failed" (CachePage.tsx:31).
+    Filtering also matches today's behavior (the file walk only lists entries that
+    actually have a file, app.py:1029). Trade-off: a pre-#87 expensive entry has
+    `cache_bytes=None` and so drops off the list until it rebuilds — the same
+    staleness #87 already lives with; acceptable and self-correcting.
+  - **Coerce `row_count` to a non-null int** (`int(manifest.row_count or 0)`).
+    `manifest.row_count` is `int | None` (manifest.py:38, default `None`), but the
+    `CacheEntry` contract types it `number` and `CachePage.tsx:71` renders
+    `e.row_count.toLocaleString()` with no null guard — passing `null` through
+    would throw at render. Today's endpoint already guarantees an int (app.py:1041).
+  - **Reformat `created`** from `manifest.created_at`. The current field is the
+    parquet mtime formatted `"%Y-%m-%d %H:%M:%S"` (app.py:1034); `created_at` is an
+    ISO-8601 UTC string with offset + microseconds. `CachePage.tsx:72` renders
+    `{e.created}` verbatim, so emit it in the existing format
+    (`datetime.fromisoformat(created_at).strftime("%Y-%m-%d %H:%M:%S")`) to keep
+    the Created column unchanged.
+
+  Keep the rest of the `CacheEntry` JSON shape exactly (hash, size,
+  size_formatted, row_count, created, alias, version, is_current, prompt) so
+  `types.ts` is untouched. Drop the `ENTRY_RESULT_FILENAME` import (25).
 - **delete endpoint** `/api/result_cache/{hash}` (1079-1094): unlink
   `baked_snapshot_path(project, hash)` instead of `entry_result_path(...)`; 404
   when it returns `None`/missing (cheap entry or already evicted). Evicting the
@@ -165,12 +191,23 @@ those backends.
   (re-sweep). Update the comment.
 
 The inspector/delete repoint keeps the cache page working against the xorq
-`.cache()` snapshots; the `CacheEntry`/`ResultCache` JSON contract is unchanged,
-so `CachePage.tsx` and `types.ts` are untouched. The inspector reads the manifest
-(cheap); only the single-entry delete reconstructs via `baked_snapshot_path`
-(acceptable per-request cost). One copy nit: `CachePage.tsx:24`'s confirm string
-("Delete result.parquet for …", "re-materialises on next run") is now inaccurate
-— it deletes a baked snapshot. Optional copy tweak, non-functional.
+`.cache()` snapshots; the `CacheEntry`/`ResultCache` JSON *contract* (keys +
+types) is unchanged, so `types.ts` needs no edit and `CachePage.tsx` keeps
+rendering. The inspector reads the manifest (cheap); only the single-entry delete
+reconstructs via `baked_snapshot_path` (acceptable per-request cost).
+
+**Stale display copy (optional sweep, non-functional).** Several user-visible
+strings still describe the deleted "materialise a `result.parquet` on next run"
+model. None are logic — each is keyed on unrelated state (`total_rows`,
+`cell.latest_hash`), so there's no TS behavior change — but they read wrong after
+the repoint and are worth fixing in one pass:
+- `CachePage.tsx`: the confirm string (24, "Delete result.parquet for …",
+  "re-materialises on next run"), the "Parquet result cache" heading (≈41), the
+  "{n} materialised" counter (≈44), the "Deleting frees the parquet only … the
+  entry re-materialises on next run" note (≈47-48), and the "no materialised
+  result.parquets" empty state (≈53) — reword around the baked snapshot.
+- `CatalogPage.tsx:233` — the `"no result.parquet"` zero-rows fallback.
+- `NotebookPage.tsx:184` — `"no result.parquet for {cell.latest_hash}"`.
 
 ### 6. `src/tallyman_companion/buckaroo_lifecycle.py`
 - `_entry_parquet_exists` (60-66): the build dir is the entry's existence proof
@@ -253,7 +290,20 @@ less tidy error string for the truly-unrecoverable case; acceptable.
 **Commit 3 — test cleanup / repoint** (passes immediately, separate from the
 failing-tests commit per the test-vs-fix rule):
 - `test_manifest.py:27` — drop the `result_path` assertion.
-- `test_cache_inspector.py` — repoint expectations to baked snapshots.
+- `test_paths.py` — **must change in lockstep with §7/§8 or the suite breaks at
+  collection.** It imports `ENTRY_RESULT_FILENAME` (25) and `entry_result_path`
+  (33) at module level, so deleting those symbols turns the whole module into an
+  `ImportError` (a collection error, not a single failed assertion). Drop both
+  from the import block; remove the `entry_result_path(...) == base /
+  ENTRY_RESULT_FILENAME` line in `test_entry_path_helpers_compose_from_constants`
+  (220); and in `test_entry_artifact_cache_partition_is_disjoint` drop the
+  `assert ENTRY_RESULT_FILENAME in ENTRY_CACHE_NAMES` (238) — §7 removes it from
+  `ENTRY_CACHE_NAMES`, so that assertion inverts. (The disjoint-partition check
+  itself stays valid.)
+- `test_cache_inspector.py` — repoint expectations to baked snapshots: assert an
+  expensive entry (with `cache_bytes`) is listed with its snapshot size and a
+  non-null `row_count`, and that a cheap entry is **absent** from `entries` (the
+  §5 filter), not listed at `size: 0`.
 - `test_reset_to_revision.py:557-594` and `test_buckaroo_multi_project.py:86-119`
   — these write `result.parquet` as a stand-in artifact; switch the fixtures to a
   surviving artifact (build dir / manifest) or assert it is **not** restored,
@@ -327,7 +377,12 @@ incidentally but as a measurement subject, so migrate it onto `cached_result_exp
 5. Diff two versions in the UI and promote it — succeeds, no `result.parquet`.
 6. `GET /{project}/api/disk_usage` returns no `results` key; `compute_cache`
    reflects the baked snapshots.
-7. Confirm the bumped migration marker swept any pre-existing `result.parquet`
+7. Cache page (`/{project}/cache`): the expensive entry lists with its snapshot
+   size, a non-null row count, and a `created` column in the old `YYYY-MM-DD
+   HH:MM:SS` format; the cheap entry is **not** listed. Delete the expensive
+   entry's snapshot — it succeeds and the row drops; reading that entry's viewer
+   page afterward self-heals (re-bakes) the snapshot.
+8. Confirm the bumped migration marker swept any pre-existing `result.parquet`
    on first boot.
 
 ## Out of scope

@@ -40,7 +40,7 @@ of mutable catalog state becomes its own git-tracked file. The #48 unlock
 
 ### Cut B — the RUNTIME cut
 `import xorq.api` transitively loads the entire `xorq.catalog` package
-(`xorq/api.py:65 import xorq.catalog.api as catalog`; verified: bare
+(`xorq/api.py:62 import xorq.catalog.api as catalog`; verified: bare
 `import xorq` loads zero catalog modules, `import xorq.api` loads 12). Replace
 tallyman's ~9 `import xorq.api as xo` sites with narrow catalog-free imports plus
 a datafusion `connect()` shim.
@@ -157,8 +157,10 @@ subprocess, and a from-scratch rebuild never recreates them.)
   machine, so cross-zlib reproducibility is moot; pinning the level keeps the
   blob byte-stable across same-machine rebuilds regardless of zlib defaults.)
 - **Drop the wheel + requirements.txt** xorq injected (~178KB → ~6KB per entry);
-  nothing reads them, and the payoff is git *history* (every checkpoint re-stages
-  the zip).
+  nothing reads them. Because the zip is deterministic and content-addressed, git
+  stores each blob once and a `git add -A` over an unchanged zip is a no-op that
+  adds no history — so the saving is a smaller durable blob and working tree per
+  entry, not avoided per-checkpoint churn (there is none once the zip is byte-stable).
 - **The checkpoint owns zip creation, not the build.** The build persists a
   complete `entries/<hash>/` on success and cleans up the dir if this call
   created it and the build failed (no partial dirs, no orphan zips). The
@@ -186,11 +188,22 @@ tracking extra files. With xorq gone:
   revision granularity is unchanged — but a chart revision becomes a legible
   `git diff` to its file instead of opaque `catalog.yaml` churn.
 - `aliases.py`'s `_read`/`_write` switch from `catalog_state` keys to
-  `aliases.jsonl` (one line per alias: `{"alias","latest","history":[...]}`);
-  every other alias function rides on `_read`/`_write` untouched, and the only
-  reader off `read_tallyman_state` is `aliases.py` itself (verified).
-- `post_processing/` and `stats/` move from `artifacts/<name>` (outside the repo)
-  to under `catalog/` so they can be tracked. Layout change, trivially a rebuild.
+  `aliases.jsonl` (one line per alias: `{"alias","latest","history":[...]}`); the
+  read-only alias functions ride on `_read`/`_write` untouched, and the only reader
+  off `read_tallyman_state` is `aliases.py` itself (verified). But `aliases.py` also
+  has a *module-level* `import xorq_catalog as _xcat` (`aliases.py:24`) and
+  `set_alias`/`remove_alias` still call `_xcat.add_alias`/`remove_alias`
+  (`:129`,`:155`) — the xorq subprocess. Both must be stripped in the *same* commit
+  that deletes `xorq_catalog.py`: `aliases.py` is its only remaining caller once
+  `build.py`'s recipe path is rewritten, and because the import is module-level,
+  deleting `xorq_catalog.py` without it makes `aliases.py` — and the whole package —
+  un-importable.
+- `post_processing/`, `stats/`, and the notebook move from outside the repo
+  (`artifacts/post_processing`, `artifacts/stats`, and `project_dir/notebooks/`
+  respectively) to under `catalog/` so they can be tracked. `chart_specs/` and
+  `display_configs/` already live under `catalog/` (`charts.py`/`display_configs.py`
+  write to `catalog_dir`), so they need no move — only `post_processing/`, `stats/`,
+  and the notebook do. Layout change, trivially a rebuild.
 - **Prompt history is a seventh tracked file, with a different origin.** Unlike
   the six above it never round-tripped through `catalog.yaml` — it has always
   been a loose `entry_dir/prompts.jsonl` (written by `build.py:35`; read back by
@@ -212,8 +225,13 @@ Replace `import xorq.api as xo` with narrow imports (all verified
 symbol-identical and catalog-free): `xorq.ibis_yaml.compiler` (build/load),
 `xorq.expr.api` (`deferred_read_*`, `memtable`, `to_sql`), `xorq.caching`
 (`ParquetSnapshotCache`). The one non-mechanical swap is **no-arg `xo.connect()`**
-(used at `source_cache.py:133,151`), which is bound to `xorq.api.connect` and
-absent from `xorq.expr.api`. Add a tallyman datafusion connect shim in
+(used at `source_cache.py:133,151`). `xorq.expr.api` is *not* a drop-in here: it
+does export a `connect`, but it is ibis's `connect(resource, **kwargs)`
+(re-exported via `from xorq.vendor.ibis.expr.api import *`), a different function
+requiring a positional `resource` — not the no-arg datafusion `xorq.api.connect`
+(verified: `xorq.expr.api.connect is xorq.api.connect` → `False`). So a naive swap
+resolves the symbol (no `ImportError`) and then fails at *call* time on the missing
+arg, or silently builds the wrong backend. Add a tallyman datafusion connect shim in
 `tallyman_xorq` (`Backend(); do_connect(None)`; returns the identical `Backend`),
 with a determinism-equivalence test (the shim-built `ParquetSnapshotCache` must
 produce byte-identical content-addressed snapshots, since source-cache keys feed
@@ -283,7 +301,7 @@ over a full cycle, and (b) a static grep that `src/` has no
 |---|---|---|---|
 | 1 | `git add -A` is allow-by-default; a `.gitignore` denylist silently tracks any unlisted artifact (build dirs, `result.parquet`, future strays) | High | `.gitignore` (`entries/*/` etc.) covers today's heavy artifacts, but the durable guard is `assert_catalog_consistent` enforcing the tracked surface as a path **allowlist** (deny-by-default). Regression test asserts no build-dir file — and no unlisted path — is tracked. |
 | 2 | `sys.modules`-based "dropped" assertion is unsatisfiable (recipes load `xorq.api`) | High | Definition of done = subprocess guard + `src/` static grep, not `sys.modules`. |
-| 3 | Naive `xorq.api`→`xorq.expr.api` swap breaks no-arg `xo.connect()` | High | Datafusion connect shim + determinism-equivalence test. |
+| 3 | `xo.connect()` survives the `xorq.api`→`xorq.expr.api` swap as ibis's `connect(resource, …)` (present, not absent), so it fails at *call* time / builds the wrong backend rather than at import — easy to miss | High | Datafusion connect shim + determinism-equivalence test. |
 | 4 | `test_catalog_xorq_integration.py` imports `xorq.catalog.catalog.Catalog` | High | Rewrite in the fix commits: drop `_open_xorq_catalog`/alias-symlink tests; keep the `git ls-files` durability guards. |
 | 5 | Salt-mode zip must be named by the salted hash | High | Name `entries/<salted_hash>.zip`; test under `TALLYMAN_SOURCE_IDENTITY=salt`. |
 | 6 | Commit timing inverts (inline → checkpoint); tests that build with no checkpoint and assert tracked fail | Med | Canonical failing-first test; update `test_xorq_catalog_add_registers_after_genesis` to checkpoint first. |
@@ -307,7 +325,11 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
    `run_git` is posix_spawn (it is) before relying on the monkeypatch.
 2. **Native recipe store** — `tallyman_core/catalog.py` `write_recipe_zip`;
    `build.py` persists the complete dir + cleans up on failure; delete
-   `xorq_catalog.py`.
+   `xorq_catalog.py` *and* strip its only other caller's coupling in the same
+   commit — `aliases.py`'s module-level `import xorq_catalog` plus the
+   `_xcat.add_alias`/`remove_alias` calls in `set_alias`/`remove_alias` — so the
+   package stays importable (the failing-first suite from commit 1 can't run red
+   against an un-importable tree).
 3. **Checkpoint owns zipping** — `.gitignore`; `checkpoint_catalog` zips pending +
    `git add -A`; `prune_entries`/consistency move into `catalog.py`, with
    `assert_catalog_consistent` extended to enforce the tracked-path allowlist.

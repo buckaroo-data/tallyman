@@ -19,8 +19,11 @@ rebuild), each across a cold/warm cache axis:
 1. **Execution time** — ``cached_result_expr`` (#73's reconstruct-on-read path)
    then ``to_parquet`` per entry.
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
-   10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
-   then serve the first row page (the ``infinite_request`` 0-300 window).
+   10s ``/load_expr`` timeout: self-heal the baked snapshot the build reads
+   (``cached_result_expr``, as the live ``ensure_session`` does — the ``heal s``
+   column), load the xorq expr + compute the summary stats, then serve the first
+   row page (the ``infinite_request`` 0-300 window). A pre-#73 corpus whose
+   builds read a parent ``result.parquet`` won't heal (rebuild it); see #73.
 3. **Diff stat path** — #45's diff: ``diff_keys`` → ``build_compare_expr``
    outer-join → the same stat pipeline, over consecutive revision pairs. Capped
    to small **aggregated** aliases by result row count (``DIFF_MAX_ROWS``,
@@ -334,16 +337,22 @@ def _link(src: Path, dst: Path) -> None:
 def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
     """Construct a write-isolated overlay of *project* under *overlay_home*.
 
-    Big, immutable artifacts (``xorq_build``, ``result.parquet``, the source
-    ``data``, catalog bookkeeping, project-authored stats) are symlinked so no
-    bytes are copied; the per-project caches are left empty so the first hit is
-    honestly cold. Anything an entry writes lands in the writable overlay dir,
-    so the user's real catalog is never mutated. Returns *overlay_home*.
+    The immutable per-entry artifacts (``xorq_build`` + ``manifest.json`` +
+    ``schema.json``, i.e. ``ENTRY_ARTIFACT_NAMES``, plus the recipe ``expr.py``),
+    the source ``data``, catalog bookkeeping and project-authored stats are
+    symlinked so no bytes are copied; the per-entry/per-project caches are left
+    empty so the first hit is honestly cold. ``result.parquet`` is one of those
+    caches as of #73 (it lives in ``ENTRY_CACHE_NAMES``, not
+    ``ENTRY_ARTIFACT_NAMES``), so it is deliberately *not* symlinked — the read
+    path regenerates it on demand. Anything an entry writes lands in the
+    writable overlay dir, so the user's real catalog is never mutated. Returns
+    *overlay_home*.
 
     *Every* built entry is mirrored, not just the measured subset — entries
-    chain (``from_catalog(parent_hash)``), so a measured entry's build can read
-    a parent entry's ``result.parquet``; omitting parents breaks the path
-    resolution at execute time.
+    chain (``from_catalog(parent_hash)``), and post-#73 a measured entry's build
+    reads its parent's baked ``result_cache`` snapshot (or re-runs the parent's
+    recipe via ``cached_result_expr``), not a parent ``result.parquet``; omitting
+    parents breaks that resolution at execute time.
     """
     proj = overlay_home / "projects" / project
     cat = proj / "artifacts" / "catalog"
@@ -440,7 +449,7 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
 
 
 def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
-    """Tier-B proxy: load the build, run the stat pipeline (cold/warm), 1st page."""
+    """Tier-B proxy: self-heal, load the build, run the stat pipeline (cold/warm), 1st page."""
     from tallyman_core.paths import (  # noqa: PLC0415
         entry_build_dir,
         entry_expanded_build_dir,
@@ -448,6 +457,7 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         project_dir,
     )
     from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
     build_dir = entry_build_dir(project, content_hash)
@@ -457,6 +467,15 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
+    # Mirror the live companion: ensure_session calls cached_result_expr before
+    # Buckaroo replays the build via /load_expr (buckaroo_lifecycle.py), repopulating
+    # the baked snapshot a #73+ from_catalog build reads so the replay below isn't an
+    # empty read. A pre-#73 corpus instead embeds a parent result.parquet this can't
+    # heal — rebuild it (scripts/rebuild_parking_catalog.py); see the module docstring.
+    t0 = time.monotonic()
+    cached_result_expr(project, content_hash)
+    heal_s = round(time.monotonic() - t0, 2)
+
     t0 = time.monotonic()
     expr = xorq_loading.load_expr_build_dir(str(expanded))
     load_s = round(time.monotonic() - t0, 2)
@@ -486,6 +505,7 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         "entry": content_hash,
         "rows": meta["rows"],
         "cols": len(meta["columns"]),
+        "heal_s": heal_s,
         "load_s": load_s,
         "cold_stats_s": cold_stats_s,
         "warm_stats_s": warm_stats_s,
@@ -581,20 +601,20 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
         "",
         "## Page load — Tier B proxy (load build + summary stats + 1st page)",
         "",
-        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache | "
+        "| entry | rows | cols | heal s | load s | cold stats s | warm stats s | 1st page s | stat cache | "
         + " | ".join(h for _, h in _SPAN_COLUMNS) + " |",
-        "|" + "---|" * (8 + len(_SPAN_COLUMNS)),
+        "|" + "---|" * (9 + len(_SPAN_COLUMNS)),
     ]
     for r in loads:
         if "error" in r:
-            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} " + "|" * (7 + len(_SPAN_COLUMNS)))
+            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} " + "|" * (8 + len(_SPAN_COLUMNS)))
         else:
             cache = f"{r['stat_cache_kb']}KB ({r['stat_cache_files']})"
             spans = r.get("stat_spans")
             span_cells = " | ".join(_span_cell(spans, lbl) for lbl, _ in _SPAN_COLUMNS)
             L.append(
-                f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['load_s']} | {r['cold_stats_s']} "
-                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
+                f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['heal_s']} | {r['load_s']} "
+                f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
             )
 
     L += [

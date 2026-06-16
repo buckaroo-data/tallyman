@@ -32,6 +32,18 @@ from __future__ import annotations
 # text and is worth materialising once.
 _EXEMPT_READS = frozenset({"read_parquet", "read_delta"})
 
+
+def _should_cache_read(method_name: str) -> bool:
+    """True if a deferred file read should get a source-cache node injected.
+
+    Membership-based, not format-special-cased: every non-exempt reader
+    (``read_csv``, ``read_json``) is cached; columnar formats are exempt. Kept a
+    named predicate so the read_csv/read_json parity stays unit-testable — this
+    xorq has no ``deferred_read_json``, so the read_json path has no end-to-end
+    producer to build a fixture from.
+    """
+    return method_name not in _EXEMPT_READS
+
 _IN_MEMORY_MSG = (
     "expression reads in-memory data (read_in_memory / ibis.memtable). This "
     "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
@@ -116,7 +128,7 @@ def rewrite_for_build(expr, project: str):
     # `wrapped` memo breaks re-descent recursion: replace_nodes re-applies the
     # replacer to a fresh CachedNode's `parent` (graph_utils process_node), the
     # same Read — without the memo it would wrap it again, forever.
-    targets = {r for r in reads if r.method_name not in _EXEMPT_READS}
+    targets = {r for r in reads if _should_cache_read(r.method_name)}
     if targets:
         src_cache = xo.ParquetSnapshotCache.from_kwargs(source=xo.connect(), base_path=base)
         wrapped: dict = {}

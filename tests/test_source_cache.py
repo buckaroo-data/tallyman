@@ -94,3 +94,17 @@ expr = xo.memtable(pd.DataFrame({"a": [1, 2, 3]}))
         build_and_persist(project, code)
     assert "in-memory" in str(exc.value)
     assert "deferred_read_csv" in str(exc.value)
+
+
+def test_should_cache_read_treats_json_like_csv_not_exempt():
+    # read_csv and read_json both parse text and get a source-cache node; the
+    # columnar formats are exempt. The CSV build test above can't cover read_json
+    # (this xorq exposes no deferred_read_json), so lock the read_csv/read_json
+    # parity here — guarding against a regression that special-cases read_csv
+    # instead of caching every non-exempt reader.
+    from tallyman_xorq.source_cache import _should_cache_read
+
+    assert _should_cache_read("read_csv") is True
+    assert _should_cache_read("read_json") is True
+    assert _should_cache_read("read_parquet") is False
+    assert _should_cache_read("read_delta") is False

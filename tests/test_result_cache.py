@@ -406,3 +406,21 @@ def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_parquet
         _recipe_expr(project, h)  # not lru-cached: re-imports every call
     after = [m for m in sys.modules if m.startswith("tallyman_expr_")]
     assert len(after) == len(before), f"leaked {len(after) - len(before)} recipe modules"
+
+
+def test_worthiness_disagreement_falls_back_to_recompute(project, orders_parquet, monkeypatch):
+    # classify_build (serialized) and _is_worthy_expr (live) are meant to agree,
+    # but cached_result_expr guards a disagreement: if cache_worthy is True yet
+    # rewrite_for_build bakes no top-level CachedNode, it must return the
+    # recompute expression rather than dereference a cache that was never baked.
+    # Force the disagreement by pinning cache_worthy True over a cheap entry
+    # (which bakes no result cache) and assert the read does not raise.
+    import tallyman_xorq.result_cache as rc
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    monkeypatch.setattr(rc, "cache_worthy", lambda *a, **k: True)
+    rc.cached_result_expr.cache_clear()
+    expr = rc.cached_result_expr(project, h)  # must not raise
+    assert type(expr.op()).__name__ != "CachedNode"

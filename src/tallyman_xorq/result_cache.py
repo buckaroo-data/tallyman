@@ -35,13 +35,18 @@ import contextvars
 import functools
 import logging
 import re
+import shutil
 import sys
+import tempfile
+import threading
 import time
 from pathlib import Path
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
 perf_log = logging.getLogger("tallyman.perf")
+# #71 viewer result-read build prep logs its fall-back-to-recipe here.
+log = logging.getLogger("tallyman.result_cache")
 
 # Ops whose presence makes an expression worth caching: they require a
 # shuffle / sort / full materialisation rather than a streaming row-wise pass.
@@ -341,3 +346,115 @@ def ensure_result(project: str, content_hash: str) -> Path:
         else:
             cached_result_expr(project, content_hash).to_parquet(str(result_path))
     return result_path
+
+
+# Per-target locks so two concurrent loads of the same entry don't race on the
+# rmtree/build/marker sequence below. Mirrors portable._expand_lock; a bounded
+# number of entries are touched per process, so this never grows large.
+_result_build_locks_guard = threading.Lock()
+_result_build_locks: dict[str, threading.Lock] = {}
+
+
+def _result_build_lock(key: str) -> threading.Lock:
+    with _result_build_locks_guard:
+        return _result_build_locks.setdefault(key, threading.Lock())
+
+
+def ensure_result_build(project: str, content_hash: str) -> Path:
+    """Portable xorq build whose expression reads the entry's materialised result.
+
+    For a cache-worthy entry the recipe is an Aggregate/Join/Sort that re-runs
+    the full DAG on every ``count()`` and every paged ``LIMIT`` window. This
+    persists a tiny build whose expression is a ``deferred_read_parquet`` of the
+    cached result (``ensure_result`` guarantees the parquet is present first), so
+    the viewer pages over the materialised parquet instead of recomputing (#71).
+    Push-down still holds: a parquet scan pushes filters/limit/sort down too.
+
+    The build is portable (``${TALLYMAN_PROJECT_ROOT}`` placeholders), so the
+    caller expands it with ``ensure_expanded_build`` exactly like the recipe.
+
+    A sibling ``.complete`` marker, written last, gates reuse: a build
+    interrupted by a crash/OOM leaves a partial dir with no marker and is redone,
+    never served truncated. Entries are immutable and content-addressed, so the
+    build is always correct once written. The path is stable across restarts,
+    which keeps xorq's build-dir-keyed stat-cache lookups hitting.
+    """
+    import xorq.api as xo
+    from xorq.ibis_yaml.compiler import build_expr
+
+    from tallyman_core.paths import entry_result_build_dir, project_dir
+    from tallyman_xorq._git_state_guard import install_git_state_guard
+    from tallyman_xorq.portable import make_portable_inplace
+
+    target = entry_result_build_dir(project, content_hash)
+    marker = target.with_name(target.name + ".complete")
+    if marker.exists():
+        return target
+    with _result_build_lock(str(target)):
+        # Re-check under the lock: another thread may have finished building.
+        if marker.exists():
+            return target
+        # ensure_result must run before build_expr — the deferred read points at
+        # the parquet path, and the file has to exist when the viewer executes.
+        result_path = ensure_result(project, content_hash)
+        # git-provenance capture in xorq's compiler can SIGSEGV when forked from
+        # the long-lived server; make it best-effort, as build_and_persist does.
+        install_git_state_guard()
+        expr = xo.deferred_read_parquet(str(result_path))
+        if target.exists():
+            shutil.rmtree(target)
+        with tempfile.TemporaryDirectory(prefix="tallyman_result_build_") as tmp:
+            build_path = Path(build_expr(expr, builds_dir=Path(tmp)))
+            target.mkdir(parents=True)
+            for item in build_path.rglob("*"):
+                dest = target / item.relative_to(build_path)
+                if item.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(item.read_bytes())
+        # Rewrite project-root substrings to the portable placeholder so the
+        # caller can expand it on this host exactly like the recipe build.
+        make_portable_inplace(target, project_dir(project))
+        marker.write_text("")
+    return target
+
+
+def ensure_viewer_expanded_build(project: str, content_hash: str) -> Path:
+    """Expanded build dir to back a viewer session for an entry (#71).
+
+    Single source of truth for the recipe-vs-result-read choice the viewer
+    makes. For a cache-worthy entry (Aggregate/Join/Sort) it returns the
+    expanded ``deferred_read_parquet`` build of the materialised result, so
+    ``count()``/paging read the parquet instead of re-running the DAG; for a
+    cheap entry it returns the expanded recipe (recompute ≈ a parquet read, so
+    the indirection buys nothing). On any failure in result-build prep it falls
+    back to the recipe — a cache hiccup must not blank the detail page.
+
+    ``ensure_session`` (companion → real Buckaroo ``/load_expr``) and the Tier-B
+    perf proxy both call this so the path they exercise can't drift.
+    """
+    from tallyman_core.paths import (  # noqa: PLC0415
+        entry_build_dir,
+        entry_expanded_build_dir,
+        entry_result_expanded_build_dir,
+        project_dir,
+    )
+    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+
+    src_build = entry_build_dir(project, content_hash)
+    expanded_target = entry_expanded_build_dir(project, content_hash)
+    try:
+        if cache_worthy(project, content_hash):
+            src_build = ensure_result_build(project, content_hash)
+            expanded_target = entry_result_expanded_build_dir(project, content_hash)
+    except Exception as exc:  # noqa: BLE001 — never let cache prep break the viewer
+        log.warning(
+            "result-read build prep failed for %s: %s; serving recipe",
+            content_hash,
+            exc,
+        )
+        src_build = entry_build_dir(project, content_hash)
+        expanded_target = entry_expanded_build_dir(project, content_hash)
+
+    return ensure_expanded_build(src_build, project_dir(project), expanded_target)

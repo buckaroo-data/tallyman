@@ -86,6 +86,11 @@ ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
 # it is a regenerable cache, not an immutable artifact — the overlay omits it
 # rather than symlinking it.
 ENTRY_RESULT_FILENAME = "result.parquet"
+# A cache-worthy entry's viewer build: a deferred_read_parquet of the
+# materialised result, so count()/paging read the parquet instead of re-running
+# the Aggregate/Join/Sort recipe (#71). Portable, then expanded like the recipe.
+ENTRY_RESULT_BUILD_DIRNAME = ".xorq_result_build"
+ENTRY_RESULT_EXPANDED_BUILD_DIRNAME = ".xorq_result_build_expanded"
 
 # Canonical artifact-vs-cache partition of the per-entry names the overlay cares
 # about. The write-isolated perf overlay symlinks ENTRY_ARTIFACT_NAMES read-only
@@ -103,6 +108,8 @@ ENTRY_CACHE_NAMES = (
     ENTRY_STAT_CACHE_DIRNAME,
     ENTRY_EXPANDED_BUILD_DIRNAME,
     ENTRY_RESULT_FILENAME,
+    ENTRY_RESULT_BUILD_DIRNAME,
+    ENTRY_RESULT_EXPANDED_BUILD_DIRNAME,
 )
 
 
@@ -208,6 +215,16 @@ def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
 def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     """Stable expanded-build dir beside the entry (regenerated on demand)."""
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
+
+
+def entry_result_build_dir(project: str, content_hash: str) -> Path:
+    """Portable build of the entry's result-read expression (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_RESULT_BUILD_DIRNAME
+
+
+def entry_result_expanded_build_dir(project: str, content_hash: str) -> Path:
+    """Stable expanded result-read build dir beside the entry (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_RESULT_EXPANDED_BUILD_DIRNAME
 
 
 def compute_cache_dir(project: str) -> Path:

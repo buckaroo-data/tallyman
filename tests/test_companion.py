@@ -137,6 +137,69 @@ expr = t.order_by("order_id").select("order_id", "region", "price")
     assert not rp.exists()  # #90: no duplicate per-entry parquet written on read
 
 
+def test_api_data_cheap_entry_paginates_consistently_across_pages(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """#90: a cheap (unsorted) entry tiles consistently across pages.
+
+    Each page of a cheap entry is an independent re-execution of the recipe — no
+    baked snapshot is read (only Aggregate/Join/Sort entries bake one). So two
+    pages tile the result with no overlap and no gap only if the source scan
+    order is stable across executions. The old path sliced a single on-disk
+    result.parquet, stable by construction; serving off the expression relies on
+    the read being stable. Assert two pages equal the matching slices of a single
+    full read to lock that contract in.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("order_id", "region", "price")
+"""
+    h = build_and_persist(project, code, prompt="cheap").content_hash
+    assert not (entry_dir(project, h) / "result.parquet").exists()  # cheap: no snapshot
+
+    c = TestClient(fresh_companion_app)
+    full = [row["order_id"] for row in c.get(f"/{project}/api/data/{h}?offset=0&limit=200").json()["data"]]
+    page1 = [row["order_id"] for row in c.get(f"/{project}/api/data/{h}?offset=0&limit=50").json()["data"]]
+    page2 = [row["order_id"] for row in c.get(f"/{project}/api/data/{h}?offset=50&limit=50").json()["data"]]
+
+    assert len(full) == 200
+    # Separate re-executions agree on row order: each page is the matching slice
+    # of one full read, so the pages tile it with no overlap and no gap.
+    assert page1 == full[:50]
+    assert page2 == full[50:100]
+
+
+def test_api_data_missing_manifest_serves_page_without_500(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    """#90: a missing manifest must not 500 the row read.
+
+    The build dir is written before manifest.json (build.py creates the dir, then
+    writes the manifest after executing), so a half-built or pruned entry can pass
+    the build-dir check yet have no manifest. cached_result_expr needs none — only
+    ``total`` reads it — so the read must be guarded: serve the page with a
+    best-effort total rather than raising FileNotFoundError on the manifest read.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price")
+"""
+    h = build_and_persist(project, code, prompt="cols").content_hash
+    (entry_dir(project, h) / "manifest.json").unlink()  # half-built / pruned entry
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/data/{h}?offset=0&limit=10")
+    assert r.status_code == 200  # served off the expression, not the manifest
+    body = r.json()
+    assert len(body["data"]) == 10
+    assert set(body["data"][0]) == {"region", "price"}
+    assert body["total"] == 0  # no manifest → best-effort total, not a crash
+
+
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
 ):

@@ -44,6 +44,31 @@ def test_build_writes_entry(project: str, orders_parquet: Path):
     assert manifest["row_count"] == 4
 
 
+def test_migrate_drop_result_parquet_sweeps_legacy(project: str):
+    # The upgrade migration deletes any per-entry on-demand result.parquet and the
+    # dead #71 viewer-read build dirs, keeps the durable recipe, writes a marker,
+    # and is idempotent (marker-gated).
+    from tallyman_core.paths import catalog_dir
+    from tallyman_xorq.build import _MIGRATION_MARKER, migrate_drop_result_parquet
+
+    e1 = entry_dir(project, "aaaa")
+    e1.mkdir(parents=True)
+    (e1 / "result.parquet").write_bytes(b"old")
+    (e1 / "xorq_build").mkdir()  # durable recipe must survive
+    e2 = entry_dir(project, "bbbb")
+    (e2 / ".xorq_result_build").mkdir(parents=True)
+    (e2 / ".xorq_result_build_expanded").mkdir()
+
+    assert migrate_drop_result_parquet(project) == 3
+    assert not (e1 / "result.parquet").exists()
+    assert (e1 / "xorq_build").is_dir()  # recipe kept
+    assert not (e2 / ".xorq_result_build").exists()
+    assert not (e2 / ".xorq_result_build_expanded").exists()
+    assert (catalog_dir(project) / _MIGRATION_MARKER).exists()
+    # A second run is a no-op (marker present).
+    assert migrate_drop_result_parquet(project) == 0
+
+
 def test_build_records_admission_instrumentation(project: str, orders_parquet: Path, caplog):
     # #87: the build records the structural cache_worthy verdict alongside the
     # measured value-per-byte inputs (compile_seconds, execute_seconds, snapshot

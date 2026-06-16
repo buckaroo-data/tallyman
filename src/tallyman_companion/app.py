@@ -1137,12 +1137,16 @@ def create_app(
             raise HTTPException(400, str(exc))
         info = _set_alias(project, alias, res.content_hash, expect_exists=True)
         await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
-        return {
+        reply = {
             "hash": res.content_hash,
             "alias": alias,
             "version": info["version"],
             "row_count": res.row_count,
         }
+        # Surface the advisory nondeterminism lint, same as the MCP tool replies (#88).
+        if res.lint_warnings:
+            reply["lint_warnings"] = res.lint_warnings
+        return reply
 
     @app.put("/{project}/api/markdown/{cell_id}")
     async def put_markdown(project: str, cell_id: str, payload: dict):

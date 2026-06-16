@@ -265,7 +265,13 @@ def _nondeterminism_warnings(expr) -> list[str]:
                 types.append(op_cls)
         if not types:
             return []
-        found = {type(node).__name__ for node in expr.op().find(tuple(types))}
+        found = set()
+        for node in expr.op().find(tuple(types)):
+            # A seeded sample is reproducible run-to-run; only unseeded sampling
+            # is nondeterministic, so don't flag a sample that carries a seed.
+            if type(node).__name__ == "Sample" and getattr(node, "seed", None) is not None:
+                continue
+            found.add(type(node).__name__)
     except Exception:
         return []
     pretty = sorted({_NONDETERMINISTIC_OPS[n] for n in found if n in _NONDETERMINISTIC_OPS})

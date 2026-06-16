@@ -64,12 +64,16 @@ def main() -> None:
         peak = max(peak, rss)
         now = time.monotonic()
         if now - last_log > 15:
-            sys.stderr.write(f"[watchdog t={now - t0:.0f}s] tree RSS={rss / 1024**3:.2f}GB peak={peak / 1024**3:.2f}GB\n")
+            sys.stderr.write(
+                f"[watchdog t={now - t0:.0f}s] tree RSS={rss / 1024**3:.2f}GB peak={peak / 1024**3:.2f}GB\n"
+            )
             sys.stderr.flush()
             last_log = now
         if rss > cap:
             killed = True
-            sys.stderr.write(f"\n!! WATCHDOG KILL: tree RSS {rss / 1024**3:.1f}GB > cap {cap_gb}GB at t={now - t0:.0f}s\n")
+            sys.stderr.write(
+                f"\n!! WATCHDOG KILL: tree RSS {rss / 1024**3:.1f}GB > cap {cap_gb}GB at t={now - t0:.0f}s\n"
+            )
             sys.stderr.flush()
             for p in [mon, *mon.children(recursive=True)]:
                 try:
@@ -84,7 +88,8 @@ def main() -> None:
     except subprocess.TimeoutExpired:
         proc.kill()
     status = "KILLED" if killed else f"exit {proc.returncode}"
-    sys.stderr.write(f"\n=== watchdog: {status} peak={peak / 1024**3:.2f}GB elapsed={time.monotonic() - t0:.0f}s cap={cap_gb}GB ===\n")
+    peak_gb, elapsed = peak / 1024**3, time.monotonic() - t0
+    sys.stderr.write(f"\n=== watchdog: {status} peak={peak_gb:.2f}GB elapsed={elapsed:.0f}s cap={cap_gb}GB ===\n")
     sys.stderr.flush()
     sys.exit(137 if killed else (proc.returncode or 0))
 

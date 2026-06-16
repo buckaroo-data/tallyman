@@ -122,6 +122,7 @@ entries.jsonl                 # pointer list: untracked build dirs (bullpen reco
 compute_cache.jsonl           # pointer list: untracked compute-cache warm set
 chart_specs/<hash>.vl.json    # one Vega-Lite spec per entry
 display_configs/<hash>.json   # one Buckaroo/display config per entry
+prompts/<hash>.jsonl          # append-only authoring-prompt history per entry
 post_processing/<name>.py     # project-global functions (moved under the repo)
 stats/<name>.py               # project-global functions (moved under the repo)
 ```
@@ -129,19 +130,32 @@ stats/<name>.py               # project-global functions (moved under the repo)
 No YAML anywhere. The former `catalog.yaml` is gone; its residual pointer
 bookkeeping is `entries.jsonl` + `compute_cache.jsonl`.
 
+Because `git add -A` is allow-by-default, the `.gitignore` denylist alone does
+not keep the tracked tree honest — `assert_catalog_consistent`'s path allowlist
+(Module boundary, #52) does. (The `metadata/` `*.zip.metadata.yaml` sidecars and
+the `aliases/` symlink tree that `git add -A` would otherwise stage are xorq
+`catalog add` subprocess output; they stop being written once Cut A removes the
+subprocess, and a from-scratch rebuild never recreates them.)
+
 ### The recipe store (immutable)
 - `entries/<hash>.zip` archives an **allowlist** of the entry dir:
   `{expr.py, xorq_build/, schema.json, manifest.json}`. Allowlist, not
   "everything except," so a future derived artifact dropped in `entry_dir` can't
-  leak into the durable zip. Excludes `.xorq_build_expanded/` (fact 6) and
-  `result.parquet` (the untracked heavy result).
+  leak into the durable zip. Excludes `.xorq_build_expanded/` (fact 6),
+  `result.parquet` (the untracked heavy result), and `prompts.jsonl` — the last
+  is append-mutable (it grows on a re-run of an existing hash with no rebuild,
+  `build.py:335`), so a content-addressed zip member would churn the blob in git
+  history on every re-run; it becomes a tracked decomposition file instead (see
+  below).
 - Members stored under arcname `<hash>/<relpath>` (single top-level prefix, so a
   future restore can reuse it). **Named by the salted `content_hash`** when
   source-identity salt mode is on, not `build_path.name` — otherwise
   `_tracked_recipe_hashes` (zip names) diverges from `entries.jsonl` pointers.
 - **Deterministic archive** (`date_time=(1980,1,1,0,0,0)`,
-  `external_attr=0o644<<16`, sorted iteration, `ZIP_DEFLATED`) so the blob
-  doesn't churn on identical rebuilds.
+  `external_attr=0o644<<16`, sorted iteration, `ZIP_DEFLATED` at a pinned
+  `compresslevel`) so the blob doesn't churn on identical rebuilds. (Single
+  machine, so cross-zlib reproducibility is moot; pinning the level keeps the
+  blob byte-stable across same-machine rebuilds regardless of zlib defaults.)
 - **Drop the wheel + requirements.txt** xorq injected (~178KB → ~6KB per entry);
   nothing reads them, and the payoff is git *history* (every checkpoint re-stages
   the zip).
@@ -155,9 +169,10 @@ bookkeeping is `entries.jsonl` + `compute_cache.jsonl`.
   leaves a complete gitignored dir the next checkpoint picks up).
 
 ### The decomposition (mutable state → tracked files)
-The recipe is immutable; charts, styling, post-processing, stats, aliases, and
-the notebook are **mutable** — edited on an existing entry without rebuilding, so
-they must not live inside the content-addressed recipe zip. Today they round-trip
+The recipe is immutable; charts, styling, post-processing, stats, aliases, the
+notebook, and the per-entry authoring-prompt history are **mutable** — edited
+(or, for prompts, appended to) on an existing entry without rebuilding, so they
+must not live inside the content-addressed recipe zip. Today they round-trip
 through `catalog.yaml` (`capture_tallyman_state` reads live files into keys;
 `materialize` writes them back) only because `assert_consistency` forbade
 tracking extra files. With xorq gone:
@@ -176,6 +191,18 @@ tracking extra files. With xorq gone:
   reader off `read_tallyman_state` is `aliases.py` itself (verified).
 - `post_processing/` and `stats/` move from `artifacts/<name>` (outside the repo)
   to under `catalog/` so they can be tracked. Layout change, trivially a rebuild.
+- **Prompt history is a seventh tracked file, with a different origin.** Unlike
+  the six above it never round-tripped through `catalog.yaml` — it has always
+  been a loose `entry_dir/prompts.jsonl` (written by `build.py:35`; read back by
+  the entry-detail API at `app.py:580` → the React "N prompts seen for this hash"
+  disclosure). Because `entries/*/` is now gitignored, that loose file would be
+  lost on `reset_to`/clone-restore, and `manifest.json` preserves only the
+  *first* build's prompt — so the re-run history the disclosure exists to show
+  would be gone. Relocate the `build.py` writer and the `read_prompts` reader
+  from `entry_dir` to a tracked root-level `prompts/<hash>.jsonl` (mirroring
+  `chart_specs/`). Layout change, trivially a rebuild. `capture`/`materialize`
+  do not touch it — it was never in `catalog.yaml`, so the six-section deletion
+  above is unaffected.
 
 Atomic reset is preserved: `git reset --hard <step>` restores all tracked files
 at once regardless of how many — spreading state across files doesn't weaken it.
@@ -190,8 +217,12 @@ absent from `xorq.expr.api`. Add a tallyman datafusion connect shim in
 `tallyman_xorq` (`Backend(); do_connect(None)`; returns the identical `Backend`),
 with a determinism-equivalence test (the shim-built `ParquetSnapshotCache` must
 produce byte-identical content-addressed snapshots, since source-cache keys feed
-content-addressing). Sites: `source_cache.py`, `io.py`, `build.py:419`,
-`result_cache.py`, `post_processing.py`, `summary_stats.py`, `app.py`, `diff.py`.
+content-addressing). Sites (8 runtime imports): `source_cache.py`, `io.py`,
+`build.py:419`, `result_cache.py`, `post_processing.py`, `summary_stats.py`,
+`app.py`, `diff.py`. The 9th grep hit, `tallyman_mcp/server.py:219`, is the
+codegen-guidance docstring teaching recipe authors the `import xorq.api as xo`
+namespace — it is *not* an executed import; left as-is per D4 (the recipe
+authoring surface is a separate follow-up).
 
 Definition of done is **not** a `sys.modules` assertion (user recipes keep
 `import xorq.api`, D4). It is: (a) monkeypatch-`subprocess.run`-to-raise guard
@@ -208,13 +239,17 @@ over a full cycle, and (b) a static grep that `src/` has no
   the dir is complete. Rewrite the `#48` "not durable" log accordingly.
 - **D3 — archive scope:** the recipe allowlist `{expr.py, xorq_build/,
   schema.json, manifest.json}` as one immutable zip (fixes the wrong-artifact
-  durability gap from fact 2).
+  durability gap from fact 2). `prompts.jsonl` is deliberately *not* a member: it
+  is append-mutable, runtime-read provenance, so it joins the decomposition as a
+  tracked `prompts/<hash>.jsonl` rather than churning the content-addressed blob.
 - **D4 — recipe imports:** keep user recipes on `import xorq.api as xo`;
   catalog-free guarantee scoped to `src/`. Real recipes call `xo.connect()`/
   `xo.desc`, so switching the authoring surface needs its own codegen-validation
   pass and is a separate follow-up.
-- **Decomposition scope:** all six mutable sections (charts, display,
-  post-processing, stats, aliases, notebook) become tracked files; `catalog.yaml`
+- **Decomposition scope:** all six `catalog.yaml`-smuggled mutable sections
+  (charts, display, post-processing, stats, aliases, notebook) become tracked
+  files, plus a seventh — the per-entry prompt history, relocated from the
+  now-gitignored entry dir to a tracked `prompts/<hash>.jsonl`; `catalog.yaml`
   reduces to the two JSONL pointer files. One PR, ordered commits.
 - **Formats:** JSONL for list-shaped state (aliases, notebook cells, pointer
   lists); one pretty-printed JSON object per file for nested blobs (chart specs,
@@ -223,10 +258,13 @@ over a full cycle, and (b) a static grep that `src/` has no
 ## Module boundary
 
 - **`tallyman_core/catalog.py` (new — the store):** `write_recipe_zip` /
-  zip-an-entry-dir, `tracked_recipe_hashes`, `assert_catalog_consistent` (#52),
-  the `entries.jsonl`/`compute_cache.jsonl` pointer bookkeeping, the bullpen
-  reconciliation (`prune_entries`/`restore_from_bullpen`), and the `.gitignore`/
-  tracked-surface definition.
+  zip-an-entry-dir, `tracked_recipe_hashes`, `assert_catalog_consistent` (#52 —
+  enforces the tracked surface as a path **allowlist** (deny-by-default): every
+  `git ls-files` path must fnmatch the tracked-surface set or it raises, so a
+  stray dir that `git add -A` would otherwise stage is rejected instead of
+  committed silently), the `entries.jsonl`/`compute_cache.jsonl` pointer
+  bookkeeping, the bullpen reconciliation (`prune_entries`/`restore_from_bullpen`),
+  and the `.gitignore`/tracked-surface definition.
 - **`catalog_state.py` (stays — the versioning engine):** `_project_lock`,
   `ensure_catalog_repo`, `checkpoint_catalog` (capture pointers → zip pending via
   `catalog.py` → `git add -A` → commit → tag), `reset_to`, `list_revisions`,
@@ -243,7 +281,7 @@ over a full cycle, and (b) a static grep that `src/` has no
 
 | # | Risk | Sev | Status / mitigation |
 |---|---|---|---|
-| 1 | Stage build dirs / `result.parquet` into git | High | Retired by `.gitignore` (`entries/*/` etc.) + `git add -A`. Regression test asserts no build-dir file is tracked. |
+| 1 | `git add -A` is allow-by-default; a `.gitignore` denylist silently tracks any unlisted artifact (build dirs, `result.parquet`, future strays) | High | `.gitignore` (`entries/*/` etc.) covers today's heavy artifacts, but the durable guard is `assert_catalog_consistent` enforcing the tracked surface as a path **allowlist** (deny-by-default). Regression test asserts no build-dir file — and no unlisted path — is tracked. |
 | 2 | `sys.modules`-based "dropped" assertion is unsatisfiable (recipes load `xorq.api`) | High | Definition of done = subprocess guard + `src/` static grep, not `sys.modules`. |
 | 3 | Naive `xorq.api`→`xorq.expr.api` swap breaks no-arg `xo.connect()` | High | Datafusion connect shim + determinism-equivalence test. |
 | 4 | `test_catalog_xorq_integration.py` imports `xorq.catalog.catalog.Catalog` | High | Rewrite in the fix commits: drop `_open_xorq_catalog`/alias-symlink tests; keep the `git ls-files` durability guards. |
@@ -261,16 +299,23 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
 1. **Failing-first commit.** `test_*_uses_no_subprocess` (build/alias paths,
    monkeypatch `subprocess.run`), `test_zip_staged_not_committed_until_checkpoint`,
    `test_n_builds_track_n_zips` (#48 blind spot), `test_salt_zip_named_by_salted_hash`,
-   `test_build_dir_files_not_staged`, `test_failed_build_no_orphan_pointer`. Confirm
+   `test_build_dir_files_not_staged`, `test_failed_build_no_orphan_pointer`,
+   `test_prompt_history_survives_reset` (re-run appends a prompt, checkpoint,
+   `reset_to`, assert all prompts present — fails today because the loose
+   `entry_dir/prompts.jsonl` is gitignored), `test_unlisted_path_not_tracked`
+   (stage a stray file, assert `assert_catalog_consistent` raises). Confirm
    `run_git` is posix_spawn (it is) before relying on the monkeypatch.
 2. **Native recipe store** — `tallyman_core/catalog.py` `write_recipe_zip`;
    `build.py` persists the complete dir + cleans up on failure; delete
    `xorq_catalog.py`.
 3. **Checkpoint owns zipping** — `.gitignore`; `checkpoint_catalog` zips pending +
-   `git add -A`; `prune_entries`/consistency move into `catalog.py`.
+   `git add -A`; `prune_entries`/consistency move into `catalog.py`, with
+   `assert_catalog_consistent` extended to enforce the tracked-path allowlist.
 4. **Decompose `catalog.yaml`** — aliases → `aliases.jsonl`; charts/display/pp/stats
    tracked directly; notebook → `notebook.jsonl`; pointers → `entries.jsonl` +
-   `compute_cache.jsonl`; delete `capture`/`materialize` for the six sections; move
+   `compute_cache.jsonl`; delete `capture`/`materialize` for the six sections;
+   relocate the `prompts.jsonl` writer/reader (`build.py`, `read_prompts`,
+   `app.py`) from `entry_dir` to tracked `prompts/<hash>.jsonl`; move
    `post_processing/`+`stats/` under the repo.
 5. **Cut B** — narrow catalog-free imports + connect shim across the 8 modules.
 6. **Test-cleanup commit** — rewrite/delete the xorq-coupled integration tests;

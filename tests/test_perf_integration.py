@@ -404,19 +404,14 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
 
 def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     """Tier-B proxy: load the build, run the stat pipeline (cold/warm), 1st page."""
-    from tallyman_core.paths import (  # noqa: PLC0415
-        entry_build_dir,
-        entry_expanded_build_dir,
-        entry_stat_cache_dir,
-        project_dir,
-    )
-    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+    from tallyman_core.paths import entry_stat_cache_dir  # noqa: PLC0415
+    from tallyman_xorq.result_cache import ensure_viewer_expanded_build  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
-    build_dir = entry_build_dir(project, content_hash)
-    expanded = ensure_expanded_build(
-        build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash)
-    )
+    # Same recipe-vs-result-read choice the companion's ensure_session makes
+    # (#71), so the proxy pages over what Buckaroo would actually be served:
+    # a cache-worthy entry reads its materialised result.parquet, not the recipe.
+    expanded = ensure_viewer_expanded_build(project, content_hash)
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)

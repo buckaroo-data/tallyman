@@ -29,11 +29,14 @@ there's no TTL because entries are permanent history, not expiring scratch.
 from __future__ import annotations
 
 import functools
+import logging
 import re
 import shutil
 import tempfile
 import threading
 from pathlib import Path
+
+log = logging.getLogger("tallyman.result_cache")
 
 # Ops whose presence makes an expression worth caching: they require a
 # shuffle / sort / full materialisation rather than a streaming row-wise pass.
@@ -249,3 +252,43 @@ def ensure_result_build(project: str, content_hash: str) -> Path:
         make_portable_inplace(target, project_dir(project))
         marker.write_text("")
     return target
+
+
+def ensure_viewer_expanded_build(project: str, content_hash: str) -> Path:
+    """Expanded build dir to back a viewer session for an entry (#71).
+
+    Single source of truth for the recipe-vs-result-read choice the viewer
+    makes. For a cache-worthy entry (Aggregate/Join/Sort) it returns the
+    expanded ``deferred_read_parquet`` build of the materialised result, so
+    ``count()``/paging read the parquet instead of re-running the DAG; for a
+    cheap entry it returns the expanded recipe (recompute ≈ a parquet read, so
+    the indirection buys nothing). On any failure in result-build prep it falls
+    back to the recipe — a cache hiccup must not blank the detail page.
+
+    ``ensure_session`` (companion → real Buckaroo ``/load_expr``) and the Tier-B
+    perf proxy both call this so the path they exercise can't drift.
+    """
+    from tallyman_core.paths import (  # noqa: PLC0415
+        entry_build_dir,
+        entry_expanded_build_dir,
+        entry_result_expanded_build_dir,
+        project_dir,
+    )
+    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+
+    src_build = entry_build_dir(project, content_hash)
+    expanded_target = entry_expanded_build_dir(project, content_hash)
+    try:
+        if cache_worthy(project, content_hash):
+            src_build = ensure_result_build(project, content_hash)
+            expanded_target = entry_result_expanded_build_dir(project, content_hash)
+    except Exception as exc:  # noqa: BLE001 — never let cache prep break the viewer
+        log.warning(
+            "result-read build prep failed for %s: %s; serving recipe",
+            content_hash,
+            exc,
+        )
+        src_build = entry_build_dir(project, content_hash)
+        expanded_target = entry_expanded_build_dir(project, content_hash)
+
+    return ensure_expanded_build(src_build, project_dir(project), expanded_target)

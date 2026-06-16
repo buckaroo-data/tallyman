@@ -78,6 +78,7 @@ from tallyman_core.paths import (
     ENTRY_ARTIFACT_NAMES,
     ENTRY_BUILD_DIRNAME,
     ENTRY_CACHE_NAMES,
+    ENTRY_MANIFEST_FILENAME,
     ENTRY_RESULT_FILENAME,
 )
 
@@ -199,13 +200,20 @@ def _real_projects_root() -> Path:
 
 
 def _entries_with_build(project_dir: Path) -> list[str]:
+    """Built entries, keyed on ``xorq_build/`` + ``manifest.json``.
+
+    Not ``result.parquet``: #73 stopped writing it at build time (it is a
+    regenerable cache now, not an artifact), so a corpus built on that branch has
+    none. ``manifest.json`` is written by both the pre- and post-#73 build, so it
+    is the stable existence marker that keeps discovery working across both eras.
+    """
     base = project_dir / "artifacts" / "catalog" / "entries"
     if not base.is_dir():
         return []
     return sorted(
         child.name
         for child in base.iterdir()
-        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_RESULT_FILENAME).exists()
+        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_MANIFEST_FILENAME).exists()
     )
 
 
@@ -264,12 +272,23 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
 
 
 def _entry_rows(real_dir: Path, h: str) -> int:
-    """Row count of an entry's result.parquet via parquet metadata (no full read)."""
+    """Row count of an entry, from ``manifest.json`` (#73-safe).
+
+    Both build eras write ``row_count`` to the manifest, so it works whether or
+    not ``result.parquet`` exists (a #73 build writes none). Falls back to
+    parquet metadata only when the manifest lacks the count.
+    """
+    entry = real_dir / "artifacts" / "catalog" / "entries" / h
+    try:
+        rc = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text()).get("row_count")
+        if isinstance(rc, int):
+            return rc
+    except (OSError, json.JSONDecodeError):
+        pass
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    p = real_dir / "artifacts" / "catalog" / "entries" / h / ENTRY_RESULT_FILENAME
     try:
-        return pq.ParquetFile(str(p)).metadata.num_rows
+        return pq.ParquetFile(str(entry / ENTRY_RESULT_FILENAME)).metadata.num_rows
     except Exception:
         return 0
 

@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import markdown as md_lib
-import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -80,29 +79,6 @@ def _render_markdown(text: str) -> str:
     if not text or not text.strip():
         return ""
     return md_lib.markdown(text, extensions=["fenced_code", "tables"])
-
-
-def _read_head_rows(path: Path, n: int, pf: pq.ParquetFile | None = None) -> pa.Table:
-    """Read at most the first ``n`` rows of a parquet file as an arrow Table.
-
-    Uses ``iter_batches`` to stop as soon as enough rows have been collected,
-    so a 200-row read against a multi-million-row parquet doesn't materialise
-    the whole file. Returns the concatenated batches sliced to exactly ``n``.
-    """
-    if pf is None:
-        pf = pq.ParquetFile(path)
-    if n <= 0:
-        return pf.schema_arrow.empty_table()
-    collected: list = []
-    rows_so_far = 0
-    for batch in pf.iter_batches(batch_size=min(n, 10_000)):
-        collected.append(batch)
-        rows_so_far += batch.num_rows
-        if rows_so_far >= n:
-            break
-    if not collected:
-        return pf.schema_arrow.empty_table()
-    return pa.Table.from_batches(collected).slice(0, n)
 
 
 def _dir_size(path: Path) -> int:
@@ -522,22 +498,20 @@ def create_app(
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
         from tallyman_core.paths import entry_build_dir  # noqa: PLC0415
-        from tallyman_xorq.result_cache import ensure_result  # noqa: PLC0415
 
         if not entry_build_dir(project, content_hash).is_dir():
             raise HTTPException(404, "no entry")
-        # #73: cheap entries write no result.parquet at build; ensure_result
-        # materialises one on demand (expensive → result_cache snapshot, cheap →
-        # regenerated in place) so this paginated read always has a parquet.
-        result_path = ensure_result(project, content_hash)
-        pf = pq.ParquetFile(result_path)
-        total = pf.metadata.num_rows
-        needed = offset + limit if limit > 0 else 0
-        if needed > 0 and total > 0:
-            table = _read_head_rows(result_path, min(needed, total), pf=pf)
-            df = table.slice(offset, limit).to_pandas()
-        else:
-            df = pf.schema_arrow.empty_table().to_pandas()
+        # #90: serve the page off the entry's expression. cached_result_expr
+        # already hands back the result as a live single-backend expression, so
+        # the window pushes down (expensive → windowed read of the baked snapshot,
+        # cheap → limit pushed through to the source read) and nothing is written.
+        # The old path called ensure_result, materialising the entry's entire
+        # result to disk to serve one page. total is the manifest's row_count
+        # (recorded at build; api_entry_detail reads it the same way), so no file
+        # is needed to populate it.
+        manifest = json.loads((entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME).read_text())
+        total = manifest.get("row_count") or 0
+        df = cached_result_expr(project, content_hash).limit(limit, offset=offset).execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,

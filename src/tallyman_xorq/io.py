@@ -76,23 +76,37 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
 
     Because the child's build serialises the parent's source reads (cheap) or a
     read of the parent's baked snapshot (expensive) rather than a path to the
-    parent entry, the inter-entry catalog DAG
-    (``tallyman_xorq.lineage.catalog_parents``) no longer recovers a parent edge
-    from this. Cross-entry lineage is deferred to a future semantic-dependency
-    mechanism — see #73.
+    parent entry, the inter-entry edge no longer survives in the child's
+    ``expr.yaml``. Instead this resolves the parent's build-time content hash and
+    records it (with the original ``ref`` and ``follow`` read-intent) via
+    ``parent_capture.note_parent``; ``build_and_persist`` persists it into
+    ``manifest.parents`` so ``tallyman_xorq.lineage.catalog_parents`` recovers the
+    DAG edge (#84).
 
     Args:
         alias_or_hash: An alias (e.g. "shoe_sales") or a content hash. Aliases
             resolve to their *current* latest hash.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_xorq.result_cache import _resolve_noncyclic_hash, cached_result_expr
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
-    content_hash = alias_or_hash if entry_dir(proj, alias_or_hash).exists() else get_alias(proj, alias_or_hash)
+    # An argument that names an existing entry dir is a literal hash (a pin);
+    # otherwise it is an alias to follow.
+    is_hash = entry_dir(proj, alias_or_hash).exists()
+    content_hash = alias_or_hash if is_hash else get_alias(proj, alias_or_hash)
     if content_hash is None or not entry_dir(proj, content_hash).exists():
         raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
     # A recipe that reads from_catalog of its own (now-current) alias would
     # resolve to itself and recurse forever; step back to the build-time parent (#74).
     content_hash = _resolve_noncyclic_hash(proj, alias_or_hash, content_hash)
+    # Record the cross-entry edge for the manifest DAG (#84), but only for the
+    # entry under construction: composing a parent reconstructs its recipe, which
+    # re-runs that parent's own from_catalog calls. Those resolve with
+    # _RECONSTRUCTING non-empty, so gating on it keeps grandparents out of the
+    # child's direct-parent list.
+    if not _RECONSTRUCTING.get():
+        from tallyman_xorq import parent_capture as pc
+
+        pc.note_parent(content_hash, ref=alias_or_hash, follow=not is_hash)
     return cached_result_expr(proj, content_hash)

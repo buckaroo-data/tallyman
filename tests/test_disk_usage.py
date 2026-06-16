@@ -27,6 +27,25 @@ def test_disk_usage_counts_diff_cache(fresh_companion_app, project, orders_parqu
     assert d["total"] == d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"]
 
 
+def test_disk_usage_counts_compute_cache(fresh_companion_app, project, orders_parquet):
+    # #87 / #74 follow-up: baked result snapshots and source-read caches live in
+    # the per-project compute_cache/, which the endpoint omitted — so the
+    # headline total under-reported the cache #74 introduced (and the byte
+    # denominator the cost rubric needs went uncounted). Count it.
+    from tallyman_core.paths import compute_cache_dir
+
+    _write(compute_cache_dir(project) / "result_cache" / "snap.parquet", b"z" * 4096)
+
+    d = TestClient(fresh_companion_app).get(f"/{project}/api/disk_usage").json()
+
+    assert d["compute_cache"] >= 4096
+    assert "compute_cache" in d["formatted"]
+    # It folds into the headline total alongside the other cache buckets.
+    assert d["total"] == (
+        d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"] + d["compute_cache"]
+    )
+
+
 def test_disk_usage_coalesces_repeated_walks(fresh_companion_app, project, orders_parquet, monkeypatch):
     # The pill is refetched on every page mount and every new_entry SSE event,
     # across tabs. Within the TTL those bursts must share one filesystem walk

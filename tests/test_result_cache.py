@@ -173,6 +173,44 @@ def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parq
     assert type(cached_result_expr(project, h).op()).__name__ != "CachedNode"
 
 
+def test_cold_read_logs_path_and_wall_time(project, orders_parquet, monkeypatch, caplog):
+    # #87: each cold cached_result_expr read is tagged on tallyman.perf with the
+    # #74 path it took (baked-read / cheap-recompute / evicted-self-heal) plus
+    # wall-clock, so a Join-descendant that is structurally worthy but cost-cheap
+    # is visible from the read path, not just lifecycle counts.
+    import logging
+
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+    catalog_create("proj", _project_code(project))
+    proj_h = _hash_of(project)
+
+    def perf_tags(call):
+        cached_result_expr.cache_clear()  # force a cold read (the LRU memoises warm)
+        caplog.clear()
+        with caplog.at_level(logging.DEBUG, logger="tallyman.perf"):
+            call()
+        return [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+
+    # Expensive entry with a live baked snapshot → baked-read.
+    msgs = perf_tags(lambda: cached_result_expr(project, agg_h))
+    assert any("baked-read" in m and agg_h in m for m in msgs)
+
+    # Cheap entry → cheap-recompute.
+    msgs = perf_tags(lambda: cached_result_expr(project, proj_h))
+    assert any("cheap-recompute" in m and proj_h in m for m in msgs)
+
+    # An evicted snapshot self-heals (recompute once, then read) on the next read.
+    p = baked_snapshot_path(project, agg_h)
+    assert p is not None and p.exists()
+    p.unlink()
+    msgs = perf_tags(lambda: cached_result_expr(project, agg_h))
+    assert any("evicted-self-heal" in m and agg_h in m for m in msgs)
+
+
 def test_multi_parent_from_catalog_shares_one_backend(project, orders_parquet, monkeypatch):
     # #75: combining two from_catalog parents in one expression must resolve to a
     # single backend. #73's expression-level from_catalog loaded each parent into

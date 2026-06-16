@@ -5,19 +5,17 @@
   Aggregate, Field, ...), edges connect them.
 
 - **Catalog lineage**: which *catalog entries* depend on which other catalog
-  entries. Derived from the absolute paths that an entry's `xorq_build/expr.yaml`
-  references in its `read_kwargs.hash_path` values: if any of those paths points
-  at another entry's `result.parquet`, that other entry is a parent.
+  entries. Read from `manifest.parents` — the resolved `from_catalog` edges
+  ({hash, ref, follow}) recorded at build time (#84).
 
-V0 only emitted catalog edges when user code read another entry's
-`result.parquet` directly. As of #73, `from_catalog()` composes the parent's
+V0 derived catalog edges by matching a parent `result.parquet` path in the
+child's `expr.yaml`. As of #73, `from_catalog()` composes the parent's
 *expression* into the child (the parent's own source reads, wrapped in a cache
-node) instead of reading a `result.parquet` path, so `catalog_parents` finds no
-parent reference and the catalog DAG is a forest of single-node trees. Recovering
-cross-entry edges is deferred to a future semantic-dependency mechanism (depend
-on the *concept* a parent computes, not its materialised hash) — see #73. The
-path-matching below is retained for any entry that still reads a result.parquet
-path directly (e.g. legacy builds).
+node) instead of reading a `result.parquet` path, so no path survives to match
+and the catalog DAG went dark. #84 restores it: `from_catalog` resolves the
+parent's content hash at build time and records it in `manifest.parents`, which
+`catalog_parents` now reads. The path-matching below is retained as a fallback
+for pre-#74 builds that still reference a parent `result.parquet` directly.
 """
 
 from __future__ import annotations
@@ -25,7 +23,7 @@ from __future__ import annotations
 import json
 import re
 
-from tallyman_core import ENTRY_MANIFEST_FILENAME, entries_dir, entry_build_dir
+from tallyman_core import ENTRY_MANIFEST_FILENAME, entries_dir, entry_build_dir, entry_dir
 from tallyman_xorq.portable import PLACEHOLDER
 
 # Cache-machinery node types injected by the rewrite-then-build step (#73):
@@ -112,15 +110,32 @@ def read_data_sources(project: str, content_hash: str) -> list[str]:
 
 
 def catalog_parents(project: str, content_hash: str) -> list[str]:
-    """Hashes of any catalog entries whose result.parquet is referenced as a source."""
-    sources = read_data_sources(project, content_hash)
+    """Content hashes of the catalog entries this entry was built from.
+
+    Reads ``manifest.parents`` — the resolved ``from_catalog`` edges recorded at
+    build time (#84). Falls back to matching a parent ``result.parquet`` path in
+    the entry's ``expr.yaml`` for pre-#74 builds, whose recipes read the parent's
+    materialised result directly and never recorded a manifest parent.
+    """
     parents: list[str] = []
+    seen: set[str] = set()
+
+    manifest_p = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+    if manifest_p.exists():
+        meta = json.loads(manifest_p.read_text())
+        for parent in meta.get("parents") or []:
+            h = parent.get("hash")
+            if h and h != content_hash and h not in seen:
+                seen.add(h)
+                parents.append(h)
+
     # The portable form references PLACEHOLDER paths like
     # ${TALLYMAN_PROJECT_ROOT}/artifacts/catalog/entries/<hash>/result.parquet.
     rel_re = re.compile(rf"^{re.escape(PLACEHOLDER)}/artifacts/catalog/entries/([0-9a-f]+)/result\.parquet$")
-    for src in sources:
+    for src in read_data_sources(project, content_hash):
         m = rel_re.match(src)
-        if m and m.group(1) != content_hash:
+        if m and m.group(1) != content_hash and m.group(1) not in seen:
+            seen.add(m.group(1))
             parents.append(m.group(1))
     return parents
 

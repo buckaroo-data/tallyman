@@ -558,18 +558,13 @@ def test_prune_retires_to_bullpen_not_delete(project):
     cc = paths.compute_cache_dir(project)
     cc.mkdir(parents=True)
     (cc / "warm.parquet").write_bytes(b"w")
-    rcd = paths.result_cache_dir(project)
-    rcd.mkdir(parents=True)
-    (rcd / "res.parquet").write_bytes(b"q")
 
-    cs.write_tallyman_state(project, entry_hashes=[], result_cache=[], compute_cache=[])
+    cs.write_tallyman_state(project, entry_hashes=[], compute_cache=[])
     assert cs.prune_entries(project) == 1
-    assert cs.prune_result_cache(project) == 1
     assert cs.prune_compute_cache(project) == 1
 
     bp = paths.bullpen_dir(project)
     assert (bp / "entries" / "aaaa" / "result.parquet").read_bytes() == b"r"
-    assert (bp / "result_cache" / "res.parquet").read_bytes() == b"q"
     assert (bp / "compute_cache" / "warm.parquet").read_bytes() == b"w"
     assert not paths.entry_dir(project, "aaaa").exists()  # live tree is cold
 

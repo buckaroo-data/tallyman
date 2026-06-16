@@ -5,14 +5,17 @@
   Aggregate, Field, ...), edges connect them.
 
 - **Catalog lineage**: which *catalog entries* depend on which other catalog
-  entries. Derived from the absolute paths that an entry's `xorq_build/expr.yaml`
-  references in its `read_kwargs.hash_path` values: if any of those paths points
-  at another entry's `result.parquet`, that other entry is a parent.
+  entries. Read from `manifest.parents` — the resolved `from_catalog` edges
+  ({hash, ref, follow}) recorded at build time (#84).
 
-V0 only emits catalog edges when user code uses `tallyman_xorq.io.from_catalog()`
-(or otherwise reads from another entry's `result.parquet`). Without those
-cross-references the catalog DAG is a forest of single-node trees rooted at
-each entry's data source.
+V0 derived catalog edges by matching a parent `result.parquet` path in the
+child's `expr.yaml`. As of #73, `from_catalog()` composes the parent's
+*expression* into the child (the parent's own source reads, wrapped in a cache
+node) instead of reading a `result.parquet` path, so no path survives to match
+and the catalog DAG went dark. #84 restores it: `from_catalog` resolves the
+parent's content hash at build time and records it in `manifest.parents`, which
+`catalog_parents` now reads. The path-matching below is retained as a fallback
+for pre-#74 builds that still reference a parent `result.parquet` directly.
 """
 
 from __future__ import annotations
@@ -20,17 +23,73 @@ from __future__ import annotations
 import json
 import re
 
-from tallyman_core import ENTRY_MANIFEST_FILENAME, entries_dir, entry_build_dir
+from tallyman_core import ENTRY_MANIFEST_FILENAME, entries_dir, entry_build_dir, entry_dir
 from tallyman_xorq.portable import PLACEHOLDER
+
+# Cache-machinery node types injected by the rewrite-then-build step (#73):
+# source-read caches and the baked result cache wrap logical ops in a
+# CachedNode (+ a RemoteTable for the cross-backend hop). They are an
+# implementation detail of materialisation, not part of the user's logical
+# pipeline, so the internal-lineage view contracts them out.
+_LINEAGE_HIDDEN_TYPES = {"CachedNode", "RemoteTable"}
+
+
+def _strip_cache_nodes(lineage: dict) -> dict:
+    """Contract cache/remote nodes out of an internal-lineage graph.
+
+    Drops every ``CachedNode`` / ``RemoteTable`` node and re-links across it
+    (a parent of a dropped node connects to the dropped node's surviving
+    descendants), so the displayed DAG shows logical ops only. Edges are
+    parent→child.
+    """
+    nodes = lineage.get("nodes", [])
+    drop = {n["id"] for n in nodes if n.get("type") in _LINEAGE_HIDDEN_TYPES}
+    if not drop:
+        return lineage
+
+    children: dict[str, list[str]] = {}
+    for a, b in lineage.get("edges", []):
+        children.setdefault(a, []).append(b)
+
+    def survivors_below(nid: str, seen: set[str]) -> list[str]:
+        out: list[str] = []
+        for child in children.get(nid, []):
+            if child in seen:
+                continue
+            seen.add(child)
+            out.extend(survivors_below(child, seen) if child in drop else [child])
+        return out
+
+    kept = [n for n in nodes if n["id"] not in drop]
+    new_edges: list[list[str]] = []
+    seen_pairs: set[tuple[str, str]] = set()
+    for a, b in lineage.get("edges", []):
+        if a in drop:
+            continue  # a's surviving ancestors re-link to b's survivors
+        targets = [b] if b not in drop else survivors_below(b, set())
+        for target in targets:
+            if (a, target) not in seen_pairs:
+                seen_pairs.add((a, target))
+                new_edges.append([a, target])
+
+    root = lineage.get("root")
+    if root in drop:
+        below = survivors_below(root, set())
+        root = below[0] if below else (kept[0]["id"] if kept else None)
+    return {"nodes": kept, "edges": new_edges, "root": root}
 
 
 def read_internal_lineage(project: str, content_hash: str) -> dict:
-    """Return the per-entry expression DAG as recorded by xorq."""
+    """Return the per-entry expression DAG as recorded by xorq.
+
+    The cache/remote nodes injected by the rewrite-then-build step (#73) are
+    contracted out so the view shows the author's logical pipeline.
+    """
     meta_path = entry_build_dir(project, content_hash) / "expr_metadata.json"
     if not meta_path.exists():
         return {"nodes": [], "edges": [], "root": None}
     meta = json.loads(meta_path.read_text())
-    return meta.get("lineage", {"nodes": [], "edges": [], "root": None})
+    return _strip_cache_nodes(meta.get("lineage", {"nodes": [], "edges": [], "root": None}))
 
 
 _HASH_PATH_RE = re.compile(r"hash_path\s*\n\s*-\s+([^\n]+)")
@@ -51,15 +110,32 @@ def read_data_sources(project: str, content_hash: str) -> list[str]:
 
 
 def catalog_parents(project: str, content_hash: str) -> list[str]:
-    """Hashes of any catalog entries whose result.parquet is referenced as a source."""
-    sources = read_data_sources(project, content_hash)
+    """Content hashes of the catalog entries this entry was built from.
+
+    Reads ``manifest.parents`` — the resolved ``from_catalog`` edges recorded at
+    build time (#84). Falls back to matching a parent ``result.parquet`` path in
+    the entry's ``expr.yaml`` for pre-#74 builds, whose recipes read the parent's
+    materialised result directly and never recorded a manifest parent.
+    """
     parents: list[str] = []
+    seen: set[str] = set()
+
+    manifest_p = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+    if manifest_p.exists():
+        meta = json.loads(manifest_p.read_text())
+        for parent in meta.get("parents") or []:
+            h = parent.get("hash")
+            if h and h != content_hash and h not in seen:
+                seen.add(h)
+                parents.append(h)
+
     # The portable form references PLACEHOLDER paths like
     # ${TALLYMAN_PROJECT_ROOT}/artifacts/catalog/entries/<hash>/result.parquet.
     rel_re = re.compile(rf"^{re.escape(PLACEHOLDER)}/artifacts/catalog/entries/([0-9a-f]+)/result\.parquet$")
-    for src in sources:
+    for src in read_data_sources(project, content_hash):
         m = rel_re.match(src)
-        if m and m.group(1) != content_hash:
+        if m and m.group(1) != content_hash and m.group(1) not in seen:
+            seen.add(m.group(1))
             parents.append(m.group(1))
     return parents
 

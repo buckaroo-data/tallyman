@@ -43,6 +43,22 @@ expr = t.select("region", "price")
 """
 
 
+def _chain_parent_code(project: str) -> str:  # Aggregate → expensive → baked snapshot
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
+"""
+
+
+def _chain_child_code(parent: str) -> str:  # cheap child chaining off an expensive parent
+    return f"""
+from tallyman_xorq.io import from_catalog
+t = from_catalog({parent!r})
+expr = t.mutate(total2=t.total * 2)
+"""
+
+
 # ---------------------------------------------------------------------------
 # unit: session map only
 # ---------------------------------------------------------------------------
@@ -330,6 +346,65 @@ def test_unit_ensure_session_cache_worthy_serves_result_read(project: str, order
     assert classify_build(recipe)["worthy"] is True
     # And the posted build is expanded (no placeholder), like the recipe path.
     assert "${TALLYMAN_PROJECT_ROOT}" not in (posted / "expr.yaml").read_text()
+
+
+def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, orders_parquet, monkeypatch):
+    """ensure_session must materialise an entry's baked snapshot before POSTing
+    to ``/load_expr``, so the buckaroo grid isn't empty on a cold compute cache.
+
+    The build buckaroo replays embeds a *bare* read of an expensive parent's
+    snapshot (a ``from_catalog`` chain — #75 strips the parent ``CachedNode`` to
+    keep the composed expression on one backend). On a cold cache (fresh clone /
+    not-yet-warmed entry) that read resolves to zero files, so the grid renders
+    empty — the same zero-row symptom as the unexpanded-build_dir case above, a
+    different cause. ensure_session must self-heal it first
+    (``cached_result_expr`` repopulates the snapshot), mirroring
+    ``ensure_result``'s heal for the paginated REST read.
+    """
+    import shutil
+
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_mcp.server import catalog_create
+    from tallyman_xorq.build import list_entries
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _chain_parent_code(project))  # expensive parent (Aggregate)
+    catalog_create("chain", _chain_child_code("agg"))  # from_catalog child off it
+    child_h = list_entries(project)[0]["content_hash"]  # most-recent build == chain
+
+    # Cold start, as a fresh clone / not-yet-warmed entry has: evict every baked
+    # snapshot and clear the reconstruction lru the in-process build warmed.
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "sess-cold-heal"}
+
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
+
+    mgr.ensure_session(child_h, project)
+
+    # The heal must populate the snapshot the *build replay* reads — the path
+    # buckaroo's /load_expr resolves — not merely some snapshot, so reload the
+    # build the same way (load_entry replays it too) and assert it serves real
+    # rows rather than the empty grid the bare snapshot read yields cold. (The
+    # snapshot key embeds the build path, so this holds when build and read share
+    # a project root, i.e. the same-machine cold cache; see the PR for the
+    # cross-machine clone caveat.)
+    from tallyman_xorq.build import load_entry  # noqa: PLC0415
+
+    assert len(load_entry(project, child_h).execute()) > 0
 
 
 # ---------------------------------------------------------------------------

@@ -10,7 +10,6 @@ import time
 from pathlib import Path
 
 import markdown as md_lib
-import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -82,29 +81,6 @@ def _render_markdown(text: str) -> str:
     return md_lib.markdown(text, extensions=["fenced_code", "tables"])
 
 
-def _read_head_rows(path: Path, n: int, pf: pq.ParquetFile | None = None) -> pa.Table:
-    """Read at most the first ``n`` rows of a parquet file as an arrow Table.
-
-    Uses ``iter_batches`` to stop as soon as enough rows have been collected,
-    so a 200-row read against a multi-million-row parquet doesn't materialise
-    the whole file. Returns the concatenated batches sliced to exactly ``n``.
-    """
-    if pf is None:
-        pf = pq.ParquetFile(path)
-    if n <= 0:
-        return pf.schema_arrow.empty_table()
-    collected: list = []
-    rows_so_far = 0
-    for batch in pf.iter_batches(batch_size=min(n, 10_000)):
-        collected.append(batch)
-        rows_so_far += batch.num_rows
-        if rows_so_far >= n:
-            break
-    if not collected:
-        return pf.schema_arrow.empty_table()
-    return pa.Table.from_batches(collected).slice(0, n)
-
-
 def _dir_size(path: Path) -> int:
     """Total bytes of all files under path, using os.walk for speed."""
     total = 0
@@ -156,17 +132,19 @@ def _compute_disk_usage(project: str) -> dict:
     """Walk a project's on-disk footprint and return the disk_usage payload.
 
     Covers raw input data, each entry's result.parquet / xorq_build /
-    .buckaroo_stat_cache, and the two project-level caches added in #12 — the
-    xorq ParquetSnapshotCache (result_cache/) and the per-pair Buckaroo diff
-    stat cache (diff_stat_cache/), either of which can dwarf the rest.
+    .buckaroo_stat_cache, the per-project compute cache (compute_cache/, where
+    #74's baked result snapshots and source-read caches live), and the per-pair
+    Buckaroo diff stat cache (diff_stat_cache/), which can dwarf the rest. (The
+    retired result_cache/ dir is gone as of #73 — baked results moved to the
+    compute cache, which this counted nowhere until #87.)
 
     This is the expensive path; callers should rate-limit it via the
     api_disk_usage TTL cache rather than invoking per request.
     """
+    from tallyman_core.paths import compute_cache_dir as _compute_cache_dir
     from tallyman_core.paths import data_dir as _data_dir
     from tallyman_core.paths import diff_stat_cache_root as _diff_stat_cache_root
     from tallyman_core.paths import entries_dir as _entries_dir
-    from tallyman_core.paths import result_cache_dir as _result_cache_dir
 
     # raw input files
     data = _dir_size(_data_dir(project))
@@ -190,18 +168,22 @@ def _compute_disk_usage(project: str) -> dict:
             if c.is_dir():
                 cache += _dir_size(c)
 
-    # Project-level caches (#12), previously uncounted. _dir_size returns 0 for
-    # a dir that doesn't exist yet, so no existence guard needed.
-    result_cache = _dir_size(_result_cache_dir(project))
+    # Per-project compute cache (#74 baked snapshots + source-read caches),
+    # uncounted until #87 — the #74 disk-usage follow-up. Content-addressed and
+    # shared across entries, so it's a single project-level walk, not per-entry.
+    compute_cache = _dir_size(_compute_cache_dir(project))
+
+    # Project-level diff stat cache (#12), previously uncounted. _dir_size
+    # returns 0 for a dir that doesn't exist yet, so no existence guard needed.
     diff_cache = _dir_size(_diff_stat_cache_root(project))
 
-    total = data + results + builds + cache + result_cache + diff_cache
+    total = data + results + builds + cache + compute_cache + diff_cache
     return {
         "data": data,
         "results": results,
         "builds": builds,
         "cache": cache,
-        "result_cache": result_cache,
+        "compute_cache": compute_cache,
         "diff_cache": diff_cache,
         "total": total,
         "formatted": {
@@ -209,7 +191,7 @@ def _compute_disk_usage(project: str) -> dict:
             "results": _fmt_bytes(results),
             "builds": _fmt_bytes(builds),
             "cache": _fmt_bytes(cache),
-            "result_cache": _fmt_bytes(result_cache),
+            "compute_cache": _fmt_bytes(compute_cache),
             "diff_cache": _fmt_bytes(diff_cache),
             "total": _fmt_bytes(total),
         },
@@ -309,6 +291,17 @@ def create_app(
             _sap(project)
         except (FileNotFoundError, ValueError):
             pass
+
+    # #73 upgrade migration: drop the old per-entry build-time result.parquet
+    # once. Runs at construction (before any lazy ensure_result regenerates one)
+    # and is guarded by a per-project marker, so it's a no-op on later starts.
+    if seed and not read_only:
+        try:
+            from tallyman_xorq.build import migrate_drop_result_parquet
+
+            migrate_drop_result_parquet(seed)
+        except Exception:  # best-effort; cleanup must never block startup
+            log.warning("result.parquet migration failed for %s", seed, exc_info=True)
 
     app = FastAPI(title="tallyman companion")
     if STATIC_DIR.exists():
@@ -514,18 +507,26 @@ def create_app(
         _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
-        entry = entry_dir(project, content_hash)
-        result_path = entry / ENTRY_RESULT_FILENAME
-        if not result_path.exists():
-            raise HTTPException(404, "no result.parquet")
-        pf = pq.ParquetFile(result_path)
-        total = pf.metadata.num_rows
-        needed = offset + limit if limit > 0 else 0
-        if needed > 0 and total > 0:
-            table = _read_head_rows(result_path, min(needed, total), pf=pf)
-            df = table.slice(offset, limit).to_pandas()
-        else:
-            df = pf.schema_arrow.empty_table().to_pandas()
+        from tallyman_core.paths import entry_build_dir  # noqa: PLC0415
+
+        if not entry_build_dir(project, content_hash).is_dir():
+            raise HTTPException(404, "no entry")
+        # #90: serve the page off the entry's expression. cached_result_expr
+        # already hands back the result as a live single-backend expression, so
+        # the window pushes down (expensive → windowed read of the baked snapshot,
+        # cheap → limit pushed through to the source read) and nothing is written.
+        # The old path called ensure_result, materialising the entry's entire
+        # result to disk to serve one page. total is the manifest's row_count
+        # (recorded at build; api_entry_detail reads it the same way), so no file
+        # is needed to populate it. The manifest is written after the build dir
+        # exists (build.py), so guard the read: a half-built or pruned entry still
+        # serves its page off the expression with a best-effort total of 0 rather
+        # than 500ing on a missing manifest — cached_result_expr needs none.
+        manifest_path = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+        total = 0
+        if manifest_path.exists():
+            total = json.loads(manifest_path.read_text()).get("row_count") or 0
+        df = cached_result_expr(project, content_hash).limit(limit, offset=offset).execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,
@@ -603,8 +604,9 @@ def create_app(
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
-        result_path = entry / ENTRY_RESULT_FILENAME
-        total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
+        # #73: row count comes from the manifest, not a result.parquet (cheap
+        # entries no longer write one at build time).
+        total_rows = (manifest or {}).get("row_count", 0)
 
         return {
             "project": project,
@@ -729,9 +731,8 @@ def create_app(
                 if (entry / ENTRY_MANIFEST_FILENAME).exists():
                     entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
                     schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                result_path = entry / ENTRY_RESULT_FILENAME
-                if result_path.exists():
-                    total_rows = pq.ParquetFile(result_path).metadata.num_rows
+                    # #73: row count from the manifest, not a result.parquet.
+                    total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
@@ -815,9 +816,7 @@ def create_app(
             if keys:
                 session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
                 try:
-                    build_path, overrides = _build_compare_expr(
-                        project, a_hash, b_hash, tuple(keys)
-                    )
+                    build_path, overrides = _build_compare_expr(project, a_hash, b_hash, tuple(keys))
                     if buckaroo.diff_session_is_loaded(session_id):
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url

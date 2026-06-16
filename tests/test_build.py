@@ -17,6 +17,14 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
+def _cheap_code(parquet_path: Path) -> str:  # parquet read + projection → cheap, bakes nothing
+    return f"""
+import xorq.api as xo
+t = xo.deferred_read_parquet({str(parquet_path)!r})
+expr = t.select("region", "price")
+"""
+
+
 def test_build_writes_entry(project: str, orders_parquet: Path):
     code = _agg_code(orders_parquet)
     res = build_and_persist(project, code, prompt="region totals")
@@ -24,12 +32,57 @@ def test_build_writes_entry(project: str, orders_parquet: Path):
     assert res.execute_seconds >= 0.0
     target = entry_dir(project, res.content_hash)
     assert target.is_dir()
-    for child in ("manifest.json", "result.parquet", "schema.json", "expr.py"):
+    # #73: no build-time result.parquet — an expensive entry's rows live in its
+    # baked cache, a cheap entry's in nothing. The durable per-entry artifacts
+    # are the recipe, manifest, schema, and source.
+    for child in ("manifest.json", "schema.json", "expr.py", "xorq_build"):
         assert (target / child).exists(), child
+    assert not (target / "result.parquet").exists()
     manifest = json.loads((target / "manifest.json").read_text())
     assert manifest["content_hash"] == res.content_hash
     assert manifest["prompt"] == "region totals"
     assert manifest["row_count"] == 4
+
+
+def test_build_records_admission_instrumentation(project: str, orders_parquet: Path, caplog):
+    # #87: the build records the structural cache_worthy verdict alongside the
+    # measured value-per-byte inputs (compile_seconds, execute_seconds, snapshot
+    # bytes), so the structural-vs-measured cache decision (#30) is decidable
+    # from data rather than first principles. An expensive (Aggregate) entry is
+    # structurally worthy and bakes a snapshot, and the decision is logged on the
+    # tallyman.perf namespace with both verdicts side by side.
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="tallyman.perf"):
+        res = build_and_persist(project, _agg_code(orders_parquet))
+
+    m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
+    assert m["compile_seconds"] is not None and m["compile_seconds"] >= 0.0
+    assert m["execute_seconds"] >= 0.0
+    assert m["cache_worthy"] is True
+    assert "Aggregate" in m["cache_worthy_why"]
+    assert m["cache_bytes"] is not None and m["cache_bytes"] > 0
+    # Mirrored on the BuildResult for in-process callers.
+    assert res.cache_worthy is True
+    assert res.compile_seconds is not None and res.compile_seconds >= 0.0
+    assert res.cache_bytes is not None and res.cache_bytes > 0
+    # The admission decision is logged once, on the perf namespace.
+    perf = [r for r in caplog.records if r.name == "tallyman.perf"]
+    assert any("admission" in r.getMessage() and res.content_hash in r.getMessage() for r in perf)
+
+
+def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_parquet: Path):
+    # A cheap (projection) entry is structurally not worthy and bakes no
+    # snapshot, so cache_bytes is absent — it materialises nothing to size. The
+    # compile/structural verdict is still recorded for the shadow comparison.
+    res = build_and_persist(project, _cheap_code(orders_parquet))
+    m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
+    assert m["cache_worthy"] is False
+    assert "cheap" in m["cache_worthy_why"]
+    assert m["cache_bytes"] is None
+    assert m["compile_seconds"] is not None
+    assert res.cache_worthy is False
+    assert res.cache_bytes is None
 
 
 def test_build_idempotent_same_code(project: str, orders_parquet: Path):

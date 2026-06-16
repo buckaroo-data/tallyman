@@ -512,6 +512,22 @@ class BuckarooManager:
         build_dir = entry_build_dir(project, content_hash)
         if not build_dir.is_dir():
             return None
+        # Materialise the entry's baked snapshot before buckaroo replays the
+        # build via /load_expr. A from_catalog chain off an expensive parent
+        # embeds a *bare* read of the parent's snapshot (#75 strips the parent
+        # CachedNode to keep the composed expression on one backend), so on a
+        # cold compute cache — a fresh clone, or an entry the startup warmup
+        # didn't reach — the replay reads zero rows and the grid renders empty.
+        # cached_result_expr repopulates it (idempotent; lru-cached, so a warmed
+        # entry is ~free), mirroring ensure_result's heal for the paginated read.
+        # Done before the lock: a cold entry's recompute mustn't block other
+        # sessions, and a warm one is a cheap cache hit.
+        try:
+            from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+            cached_result_expr(project, content_hash)
+        except Exception:
+            log.debug("snapshot self-heal before /load_expr failed for %s", content_hash, exc_info=True)
         with self._session_lock:
             cached = self._sessions.get(content_hash)
             if cached:

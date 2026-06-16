@@ -3,7 +3,7 @@ from __future__ import annotations
 from fastapi.testclient import TestClient
 
 import tallyman_companion.app as app_mod
-from tallyman_core.paths import catalog_dir, result_cache_dir
+from tallyman_core.paths import catalog_dir
 
 
 def _write(path, blob: bytes) -> None:
@@ -11,20 +11,39 @@ def _write(path, blob: bytes) -> None:
     path.write_bytes(blob)
 
 
-def test_disk_usage_counts_result_cache_and_diff_cache(fresh_companion_app, project, orders_parquet):
-    # Two project-level caches added in #12 that the endpoint omitted: xorq's
-    # ParquetSnapshotCache (result_cache/) and the per-pair Buckaroo diff stat
-    # cache (diff_stat_cache/). Both can be the largest item on disk.
-    _write(result_cache_dir(project) / "snap.parquet", b"x" * 4096)
+def test_disk_usage_counts_diff_cache(fresh_companion_app, project, orders_parquet):
+    # The per-pair Buckaroo diff stat cache (diff_stat_cache/, #12) was omitted
+    # by the endpoint and can be the largest item on disk. (The retired
+    # result_cache/ dir is gone as of #73 — baked results live in the compute
+    # cache, counted under builds/entries.)
     _write(catalog_dir(project) / "diff_stat_cache" / "aaaaaaaaaaaa-bbbbbbbbbbbb" / "stats.arrow", b"y" * 2048)
 
     d = TestClient(fresh_companion_app).get(f"/{project}/api/disk_usage").json()
 
-    assert d["result_cache"] >= 4096
     assert d["diff_cache"] >= 2048
-    assert "result_cache" in d["formatted"] and "diff_cache" in d["formatted"]
-    # Both fold into the headline total.
-    assert d["total"] == d["data"] + d["results"] + d["builds"] + d["cache"] + d["result_cache"] + d["diff_cache"]
+    assert "diff_cache" in d["formatted"]
+    assert "result_cache" not in d and "result_cache" not in d["formatted"]
+    # It folds into the headline total.
+    assert d["total"] == d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"]
+
+
+def test_disk_usage_counts_compute_cache(fresh_companion_app, project, orders_parquet):
+    # #87 / #74 follow-up: baked result snapshots and source-read caches live in
+    # the per-project compute_cache/, which the endpoint omitted — so the
+    # headline total under-reported the cache #74 introduced (and the byte
+    # denominator the cost rubric needs went uncounted). Count it.
+    from tallyman_core.paths import compute_cache_dir
+
+    _write(compute_cache_dir(project) / "result_cache" / "snap.parquet", b"z" * 4096)
+
+    d = TestClient(fresh_companion_app).get(f"/{project}/api/disk_usage").json()
+
+    assert d["compute_cache"] >= 4096
+    assert "compute_cache" in d["formatted"]
+    # It folds into the headline total alongside the other cache buckets.
+    assert d["total"] == (
+        d["data"] + d["results"] + d["builds"] + d["cache"] + d["diff_cache"] + d["compute_cache"]
+    )
 
 
 def test_disk_usage_coalesces_repeated_walks(fresh_companion_app, project, orders_parquet, monkeypatch):

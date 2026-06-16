@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import logging
 from pathlib import Path
 
 import pandas as pd
@@ -26,6 +27,8 @@ from buckaroo.compare import (
 )
 
 from tallyman_core.paths import ENTRY_RESULT_FILENAME, ENTRY_SCHEMA_FILENAME
+
+log = logging.getLogger(__name__)
 
 __all__ = [
     "code_diff",
@@ -88,6 +91,29 @@ def schema_diff(a_schema: dict, b_schema: dict) -> dict:
     }
 
 
+def _ensure_entry_parquet(entry: Path) -> Path:
+    """Return *entry*'s ``result.parquet`` path, materialising it on demand (#73).
+
+    Entries no longer write a build-time ``result.parquet``; the parquet-backed
+    diff backends still want a file. Derive ``(project, hash)`` from the entry
+    dir layout (``<project>/artifacts/catalog/entries/<hash>``) and regenerate
+    via ``ensure_result``. Returns the (possibly still-absent) path either way —
+    callers guard on ``.exists()``.
+    """
+    pq_path = entry / ENTRY_RESULT_FILENAME
+    if not pq_path.exists() and (entry / "xorq_build").is_dir():
+        from tallyman_xorq.result_cache import ensure_result
+
+        try:
+            ensure_result(entry.parents[3].name, entry.name)
+        except Exception:
+            # The diff side that needed this file degrades to empty (callers
+            # guard on .exists()); log so a genuine materialisation failure is
+            # diagnosable rather than silently masked.
+            log.debug("ensure_result failed materialising %s", entry, exc_info=True)
+    return pq_path
+
+
 def full_diff(
     a_entry: Path,
     b_entry: Path,
@@ -116,18 +142,20 @@ def full_diff(
     a_schema = json.loads(a_sj.read_text()) if a_sj.exists() else {}
     b_schema = json.loads(b_sj.read_text()) if b_sj.exists() else {}
 
-    a_pq = a_entry / ENTRY_RESULT_FILENAME
-    b_pq = b_entry / ENTRY_RESULT_FILENAME
-
+    # #73: entries no longer carry a build-time result.parquet. Only the
+    # parquet-backed branches below need a file, so materialise lazily via
+    # ensure_result — the common xorq-with-expressions diff composes the passed
+    # cache-resolving expressions and must not regenerate two parquets it never
+    # reads.
     if backend == "xorq":
         # Prefer the passed expressions (each carries its own cache node);
-        # fall back to reading result.parquet only when no expr is supplied.
+        # fall back to materialising + reading result.parquet only when no expr
+        # is supplied.
         if a_expr is not None and b_expr is not None:
             a_src, b_src = a_expr, b_expr
-        elif a_pq.exists() and b_pq.exists():
-            a_src, b_src = a_pq, b_pq
         else:
-            a_src = b_src = None
+            a_pq, b_pq = _ensure_entry_parquet(a_entry), _ensure_entry_parquet(b_entry)
+            a_src, b_src = (a_pq, b_pq) if a_pq.exists() and b_pq.exists() else (None, None)
         if a_src is not None:
             stats = stats_diff_xorq(a_src, b_src)
             head = head_diff_xorq(a_src, b_src)
@@ -137,12 +165,14 @@ def full_diff(
     elif backend == "polars":
         import polars as pl
 
+        a_pq, b_pq = _ensure_entry_parquet(a_entry), _ensure_entry_parquet(b_entry)
         a_df_pl = pl.scan_parquet(a_pq).collect() if a_pq.exists() else pl.DataFrame()
         b_df_pl = pl.scan_parquet(b_pq).collect() if b_pq.exists() else pl.DataFrame()
         stats = stats_diff_polars(a_df_pl, b_df_pl)
         head = head_diff_polars(a_pq, b_pq) if a_pq.exists() and b_pq.exists() else {}
         keyed = key_diff_polars(a_df_pl, b_df_pl)
     else:
+        a_pq, b_pq = _ensure_entry_parquet(a_entry), _ensure_entry_parquet(b_entry)
         a_df = pq.read_table(a_pq).to_pandas() if a_pq.exists() else pd.DataFrame()
         b_df = pq.read_table(b_pq).to_pandas() if b_pq.exists() else pd.DataFrame()
         stats = stats_diff(a_df, b_df)

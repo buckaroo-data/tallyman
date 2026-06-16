@@ -86,6 +86,22 @@ def version_of_hash(project: str, content_hash: str) -> tuple[str, int] | None:
     return None
 
 
+def previous_version(project: str, content_hash: str) -> str | None:
+    """The hash one revision earlier in this entry's alias history, or None.
+
+    None when the entry is a lineage root (version 1) or appears in no history.
+    """
+    info = version_of_hash(project, content_hash)
+    if not info:
+        return None
+    name, version = info
+    if version <= 1:
+        return None
+    hist = history_for(project, name)
+    idx = version - 2  # version is 1-based; the parent is the entry before it
+    return hist[idx] if 0 <= idx < len(hist) else None
+
+
 def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool | None = None) -> dict:
     """Point `name` at `content_hash` and append to history.
 

@@ -78,6 +78,7 @@ import pytest
 from tests.test_perf_integration import (
     MB,
     _build_overlay,
+    _entry_rows,
     _load_aliases,
     _resolve_corpus_or_skip,
     measure_pageload,
@@ -129,21 +130,14 @@ def _require_browser_or_skip():
 
 
 def _largest_entry(real_dir: Path, hashes: list[str]) -> str:
-    """The built entry with the biggest ``result.parquet`` (symlink target size).
+    """The built entry with the most rows (from manifest.json, #73-safe).
 
     The default single-entry calibration target: the big dataset is where the
-    backend dominates and the proxy's faithfulness actually matters.
+    backend dominates and the proxy's faithfulness actually matters. Ranks by
+    manifest ``row_count`` rather than ``result.parquet`` bytes, which a #73
+    build never writes.
     """
-    entries = real_dir / "artifacts" / "catalog" / "entries"
-
-    def size(h: str) -> int:
-        p = entries / h / "result.parquet"
-        try:
-            return p.stat().st_size  # follows the symlink to the real bytes
-        except OSError:
-            return 0
-
-    return max(hashes, key=size)
+    return max(hashes, key=lambda h: _entry_rows(real_dir, h))
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +174,35 @@ def _read_backend_spans(text: str, session_id: str) -> dict[str, float]:
             continue
         spans[m["label"]] = spans.get(m["label"], 0.0) + float(m["secs"])
     return spans
+
+
+def _read_first_backend_spans(text: str) -> dict[str, float]:
+    """Backend spans for the *first* session id seen in *text* — the cold POST.
+
+    When ``ensure_session`` returns None (its 10s cap tripped) we never learn the
+    session id, but the server runs the ``/load_expr`` to completion and logs the
+    firstpull spans under one id. With only the cold load issued so far, the
+    first session in the slice is that capped cold POST, so its
+    ``firstpull.load_expr`` is the true (uncapped) backend cost.
+    """
+    for line in text.splitlines():
+        m = _FIRSTPULL_RE.search(line)
+        if m and m["label"] != "firstpull.ws_first_payload":
+            return _read_backend_spans(text, m["session"])
+    return {}
+
+
+def _evict_session(mgr, content_hash: str) -> None:
+    """Drop the in-memory cached session so the next ensure_session re-POSTs.
+
+    ``ensure_session`` caches the session id for the Buckaroo lifetime, so a
+    second call returns it instantly (the same-lifetime re-view). To measure the
+    server-restart warm path — a fresh ``/load_expr`` against the now-populated
+    on-disk stat cache — evict first, mirroring what a restart does to the
+    in-memory map (``start()`` resets ``_sessions``).
+    """
+    with mgr._session_lock:
+        mgr._sessions.pop(content_hash, None)
 
 
 # ---------------------------------------------------------------------------
@@ -220,13 +243,14 @@ def _time_grid_render(browser, base_url: str, session_id: str) -> dict:
 def _load_expr(mgr, project: str, content_hash: str) -> str:
     """POST ``/load_expr`` with the companion's exact payload, long timeout.
 
+    The **cap-fallback** path: ``measure_tier_a`` drives the production
+    ``ensure_session`` (10s cap) for the headline numbers; this is only used when
+    that cap trips (``ensure_session`` returned None) to obtain a renderable —
+    now-warm — session so the grid still paints and the calibration completes.
     Mirrors ``buckaroo_lifecycle.ensure_session``'s payload (expanded build dir,
-    ``project_root`` = artifacts dir, on-disk ``cache_storage_path``) so the
-    backend work is identical to production — but issues the POST directly with
-    ``LOAD_EXPR_TIMEOUT_S`` instead of ensure_session's 10s cap, which a cold
-    parking-dataset stat compute exceeds (#34). Keep the payload in sync with
-    ensure_session. Buckaroo mints a fresh session id per POST, so calling this
-    twice gives two live sessions over the same on-disk cache (cold then warm).
+    ``project_root`` = artifacts dir, on-disk ``cache_storage_path``) but issues
+    the POST directly with ``LOAD_EXPR_TIMEOUT_S`` instead of the 10s cap. Keep
+    the payload in sync with ensure_session.
     """
     import httpx  # noqa: PLC0415
 
@@ -254,12 +278,22 @@ def _load_expr(mgr, project: str, content_hash: str) -> str:
 
 
 def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
-    """Backend (``/load_expr``) + render (Playwright) for one entry.
+    """Production ``ensure_session`` backend + render (Playwright) for one entry.
 
-    Cold then warm: the first ``/load_expr`` hits an empty overlay cache; the
-    warm pass re-POSTs a fresh session against the now-populated on-disk stat
-    cache (the path a Buckaroo restart takes), so a warm ≈ cold backend means
-    the cache is unused. Each session is rendered in its own page.
+    Drives the **exact** companion path a first entry-detail hit takes —
+    ``BuckarooManager.ensure_session`` → ``/load_expr`` *with the production 10s
+    cap* (#34) — not a hand-rolled long-timeout POST. The headline is whether a
+    cold open returns a usable session within that cap: a None is the live
+    failure that drops the user to the pandas preview. The server runs the load
+    to completion regardless, so the true (uncapped) backend cost is recovered
+    from the buckaroo#926 ``firstpull.load_expr`` span even when the cap trips.
+
+    Cold then two warms. Cold is a genuine empty-overlay-cache ``ensure_session``.
+    ``warm_cached`` re-calls without eviction (the same-lifetime re-view — an
+    in-memory map hit, ~0ms, the path a second detail view takes). ``warm_reload``
+    evicts then re-calls: a fresh ``/load_expr`` against the now-populated on-disk
+    stat cache, the path a Buckaroo restart takes — so warm_reload ≈ cold means
+    the on-disk cache is unused.
 
     Resource sampling targets the **Buckaroo subprocess tree** (``mgr.proc.pid``
     and its children), not this driver process — the stat compute runs server-
@@ -274,35 +308,60 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
     log_path = _server_log_path()
     log_offset = log_path.stat().st_size if log_path.exists() else 0
 
-    # Cold: genuine empty-cache first /load_expr.
+    # Cold: production ensure_session against the empty overlay cache (10s cap).
     t0 = time.monotonic()
-    session_cold = _load_expr(mgr, project, content_hash)
+    session_cold = mgr.ensure_session(content_hash, project)
     backend_cold_s = round(time.monotonic() - t0, 2)
+    cold_capped = session_cold is None
+    if cold_capped:
+        # The cap tripped: the server still finished, so a plain uncapped POST
+        # mints a renderable (now-warm) session to confirm the grid paints. Its
+        # wall time is NOT the cold cost — that comes from the load_expr span.
+        session_cold = _load_expr(mgr, project, content_hash)
     render_cold = _time_grid_render(browser, mgr.base_url, session_cold)
 
-    # Warm: re-POST against the now-populated on-disk stat cache.
+    # Warm A — same-lifetime re-view: ensure_session returns the cached id.
     t0 = time.monotonic()
-    session_warm = _load_expr(mgr, project, content_hash)
+    mgr.ensure_session(content_hash, project)
+    warm_cached_s = round(time.monotonic() - t0, 3)
+
+    # Warm B — server-restart path: evict, then re-POST against the on-disk cache.
+    _evict_session(mgr, content_hash)
+    t0 = time.monotonic()
+    session_warm = mgr.ensure_session(content_hash, project)
     backend_warm_s = round(time.monotonic() - t0, 2)
+    if session_warm is None:  # warm capped too (unexpected) — fall back to render-only
+        session_warm = _load_expr(mgr, project, content_hash)
     render_warm = _time_grid_render(browser, mgr.base_url, session_warm)
     sampler.stop()
 
-    # buckaroo#926 server-side breakdown for the cold /load_expr, keyed by session.
+    # buckaroo#926 server-side breakdown for the cold /load_expr. When the cap
+    # tripped we don't have the cold session id, so take the first session's
+    # spans (the capped cold POST, logged on server-side completion).
     appended = ""
     if log_path.exists():
         with log_path.open() as f:
             f.seek(log_offset)
             appended = f.read()
-    backend_spans = _read_backend_spans(appended, session_cold)
+    backend_spans = _read_first_backend_spans(appended) if cold_capped else _read_backend_spans(appended, session_cold)
+    true_backend_cold = backend_spans.get("firstpull.load_expr")
 
     total_cold_s = round(backend_cold_s + render_cold["grid_s"], 2)
     return {
         "entry": content_hash,
+        # Production wall: ensure_session's capped /load_expr (≈10s if it tripped).
         "backend_cold_s": backend_cold_s,
+        # Whether production would have served a live session or fallen back.
+        "cold_capped": cold_capped,
+        # Uncapped server-side truth from the #926 span (present even when capped).
+        "true_backend_cold_s": round(true_backend_cold, 2) if true_backend_cold is not None else None,
         "render_cold_s": render_cold["grid_s"],
         "total_cold_s": total_cold_s,
         # The deliverable: fraction of the cold user-wait the proxy can see.
         "backend_ratio": round(backend_cold_s / total_cold_s, 3) if total_cold_s else None,
+        # Same-lifetime re-view (in-memory session cache hit).
+        "warm_cached_s": warm_cached_s,
+        # Server-restart re-load against the on-disk stat cache.
         "backend_warm_s": backend_warm_s,
         "render_warm_s": render_warm["grid_s"],
         "fcp_ms": render_cold["fcp_ms"],
@@ -334,30 +393,37 @@ def _render_report(project: str, rows: list[dict], aliases: dict[str, str]) -> s
         "",
         f"project `{project}` · {len(rows)} entr{'y' if len(rows) == 1 else 'ies'}",
         "",
-        "Ground truth: real Buckaroo subprocess + Chromium, to "
-        "`.df-viewer .ag-cell` first-visible. `backend` is the `/load_expr` "
-        "(xorq load + stat pipeline) cost; `render` is the WS + first-page + "
-        "ag-grid paint the Tier-B proxy cannot see. `ratio = backend / total` "
-        "is the fraction of the cold user-wait the proxy observes.",
+        "Ground truth: real Buckaroo subprocess (driven through the companion's "
+        "production `ensure_session` → `/load_expr`, **10s cap**) + Chromium, to "
+        "`.df-viewer .ag-cell` first-visible. `backend cold` is the capped "
+        "`ensure_session` wall — `cold ok` says whether it returned a live "
+        "session (✓) or the cap tripped (CAPPED → production falls back to the "
+        "pandas preview, #34); `true backend` is the uncapped server-side cost "
+        "from the #926 span. `render` is the WS + first-page + ag-grid paint the "
+        "Tier-B proxy cannot see. `warm cached` is a same-lifetime re-view "
+        "(in-memory session hit); `backend warm` is a server-restart re-load "
+        "against the on-disk stat cache.",
         "",
         "## Calibration (Tier A ground truth vs Tier B proxy)",
         "",
-        "| entry | backend cold s | render cold s | total cold s | ratio | "
-        "Tier B backend cold s | backend warm s | render warm s |",
-        "|---|---|---|---|---|---|---|---|",
+        "| entry | cold ok | backend cold s | true backend s | render cold s | total cold s | ratio | "
+        "Tier B backend cold s | warm cached s | backend warm s | render warm s |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         a = r["tier_a"]
         if "error" in a:
-            L.append(f"| {label(r['entry'])} | ERROR: {a['error']} |||||||")
+            L.append(f"| {label(r['entry'])} | ERROR: {a['error']} ||||||||||")
             continue
         b = r.get("tier_b", {})
         tier_b_backend = "—" if "error" in b else round(b.get("load_s", 0) + b.get("cold_stats_s", 0), 2)
         ratio = "—" if a["backend_ratio"] is None else f"{a['backend_ratio']:.0%}"
+        cold_ok = "CAPPED" if a.get("cold_capped") else "✓"
+        true_backend = "—" if a.get("true_backend_cold_s") is None else a["true_backend_cold_s"]
         L.append(
-            f"| {label(r['entry'])} | {a['backend_cold_s']} | {a['render_cold_s']} "
-            f"| {a['total_cold_s']} | {ratio} | {tier_b_backend} "
-            f"| {a['backend_warm_s']} | {a['render_warm_s']} |"
+            f"| {label(r['entry'])} | {cold_ok} | {a['backend_cold_s']} | {true_backend} "
+            f"| {a['render_cold_s']} | {a['total_cold_s']} | {ratio} | {tier_b_backend} "
+            f"| {a['warm_cached_s']} | {a['backend_warm_s']} | {a['render_warm_s']} |"
         )
 
     L += [

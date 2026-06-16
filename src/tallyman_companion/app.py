@@ -508,9 +508,14 @@ def create_app(
         # The old path called ensure_result, materialising the entry's entire
         # result to disk to serve one page. total is the manifest's row_count
         # (recorded at build; api_entry_detail reads it the same way), so no file
-        # is needed to populate it.
-        manifest = json.loads((entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME).read_text())
-        total = manifest.get("row_count") or 0
+        # is needed to populate it. The manifest is written after the build dir
+        # exists (build.py), so guard the read: a half-built or pruned entry still
+        # serves its page off the expression with a best-effort total of 0 rather
+        # than 500ing on a missing manifest — cached_result_expr needs none.
+        manifest_path = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+        total = 0
+        if manifest_path.exists():
+            total = json.loads(manifest_path.read_text()).get("row_count") or 0
         df = cached_result_expr(project, content_hash).limit(limit, offset=offset).execute()
         return {
             "data": json.loads(df.to_json(orient="records")),

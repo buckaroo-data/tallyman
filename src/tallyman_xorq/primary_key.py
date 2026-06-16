@@ -60,17 +60,9 @@ def _write_cached(project: str, content_hash: str, keys: list[str]) -> None:
 
 def _parent_hash(project: str, content_hash: str) -> str | None:
     """The previous version of the alias this entry is the current version of."""
-    from tallyman_core.aliases import history_for, version_of_hash
+    from tallyman_core.aliases import previous_version
 
-    info = version_of_hash(project, content_hash)
-    if not info:
-        return None
-    alias, version = info
-    if version <= 1:
-        return None
-    hist = history_for(project, alias)
-    idx = version - 2  # version is 1-based; parent is the entry before it
-    return hist[idx] if 0 <= idx < len(hist) else None
+    return previous_version(project, content_hash)
 
 
 def resolve_primary_key(

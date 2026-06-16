@@ -31,6 +31,7 @@ there's no TTL because entries are permanent history, not expiring scratch.
 
 from __future__ import annotations
 
+import contextvars
 import functools
 import re
 from pathlib import Path
@@ -93,6 +94,46 @@ def cache_worthy(project: str, content_hash: str) -> bool:
     return classify_build(entry_build_dir(project, content_hash))["worthy"]
 
 
+# Entries currently being reconstructed by cached_result_expr, on this call
+# stack. ``from_catalog`` consults it to step a self-referential recipe (a
+# revise-in-place that chains off its own alias) back to the build-time parent
+# before it recurses without bound — the #74 ~50GB RSS spike that locked the box.
+# A set suffices: resolution walks alias history, not this stack's order.
+_RECONSTRUCTING: contextvars.ContextVar[frozenset] = contextvars.ContextVar("_reconstructing", default=frozenset())
+
+# Hard ceiling on reconstruction nesting. Cycle resolution already guarantees
+# termination; this only fires on a cycle the resolver fails to break, turning a
+# machine-locking memory blowup into a fast, clear error instead.
+_MAX_RECON_DEPTH = 64
+
+
+def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> str:
+    """The hash ``from_catalog`` should load, stepped out of any reconstruction cycle.
+
+    ``from_catalog(alias)`` resolves an alias to its *live* head. When an entry's
+    recipe reads ``from_catalog`` of the alias it is itself the head of (the
+    chaining pattern ``catalog_revise`` documents), reconstructing it re-resolves
+    to itself and recurses forever (#74). At build time that ``from_catalog``
+    meant the *previous* revision — the alias is repointed only after the build —
+    so we recover the build-time binding by walking back through alias history to
+    the nearest revision not already under reconstruction on this stack.
+    """
+    from tallyman_core.aliases import previous_version
+
+    active = _RECONSTRUCTING.get()
+    while (project, content_hash) in active:
+        parent = previous_version(project, content_hash)
+        if parent is None:
+            from tallyman_xorq.build import BuildError
+
+            raise BuildError(
+                f"from_catalog({requested!r}) in {project!r} resolves to an entry that "
+                "reconstructs itself with no prior revision to fall back to"
+            )
+        content_hash = parent
+    return content_hash
+
+
 # The recipe variable name build_and_persist binds and persists into expr.py.
 _RECIPE_VAR = "expr"
 
@@ -111,8 +152,21 @@ def _recipe_expr(project: str, content_hash: str):
     from tallyman_xorq.build import BuildError, _import_script
     from tallyman_xorq.portable import PLACEHOLDER
 
+    active = _RECONSTRUCTING.get()
+    if len(active) >= _MAX_RECON_DEPTH:
+        raise BuildError(
+            f"from_catalog reconstruction nested past {_MAX_RECON_DEPTH} levels "
+            f"(at {content_hash} in {project!r}) — aborting a runaway recipe cycle"
+        )
+
     code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
-    module, tmp = _import_script(code)
+    # Mark this entry in-flight for the duration of the recipe exec, so any
+    # from_catalog the recipe issues can step back out of a self-reference (#74).
+    token = _RECONSTRUCTING.set(active | {(project, content_hash)})
+    try:
+        module, tmp = _import_script(code)
+    finally:
+        _RECONSTRUCTING.reset(token)
     try:
         expr = getattr(module, _RECIPE_VAR, None)
         if expr is None:

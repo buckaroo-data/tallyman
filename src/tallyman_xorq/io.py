@@ -86,10 +86,13 @@ def from_catalog(alias_or_hash: str, project: str | None = None):
             resolve to their *current* latest hash.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_xorq.result_cache import cached_result_expr
+    from tallyman_xorq.result_cache import _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
     content_hash = alias_or_hash if entry_dir(proj, alias_or_hash).exists() else get_alias(proj, alias_or_hash)
     if content_hash is None or not entry_dir(proj, content_hash).exists():
         raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
+    # A recipe that reads from_catalog of its own (now-current) alias would
+    # resolve to itself and recurse forever; step back to the build-time parent (#74).
+    content_hash = _resolve_noncyclic_hash(proj, alias_or_hash, content_hash)
     return cached_result_expr(proj, content_hash)

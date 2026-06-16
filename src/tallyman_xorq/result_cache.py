@@ -34,6 +34,7 @@ from __future__ import annotations
 import contextvars
 import functools
 import re
+import sys
 from pathlib import Path
 
 # Ops whose presence makes an expression worth caching: they require a
@@ -173,6 +174,13 @@ def _recipe_expr(project: str, content_hash: str):
             raise BuildError(f"recipe for {content_hash} in {project!r} binds no {_RECIPE_VAR!r}")
         return expr
     finally:
+        # _import_script registers the recipe module in sys.modules (needed
+        # during exec, e.g. for dataclass annotation resolution). Reconstruction
+        # runs on every cold read since #73, so drop that registration to avoid
+        # an unbounded sys.modules leak of recipe modules and the expression
+        # graphs they pin. The returned expr still holds the module object (and
+        # any UDF __globals__) while in use; only the name->module mapping goes.
+        sys.modules.pop(getattr(module, "__name__", "") or "", None)
         try:
             tmp.unlink()
         except OSError:

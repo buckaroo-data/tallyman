@@ -462,3 +462,16 @@ def test_worthiness_disagreement_falls_back_to_recompute(project, orders_parquet
     rc.cached_result_expr.cache_clear()
     expr = rc.cached_result_expr(project, h)  # must not raise
     assert type(expr.op()).__name__ != "CachedNode"
+
+
+def test_ensure_result_is_removed():
+    # The on-demand result.parquet writer is deleted entirely: every consumer
+    # now reads cached_result_expr (cheap recompute / expensive baked snapshot),
+    # so nothing materialises a per-entry result.parquet on demand. The #102
+    # viewer-from-result.parquet build helpers go with it — the viewer pages over
+    # the baked snapshot (expensive) or recomputes (cheap), never a result.parquet.
+    import tallyman_xorq.result_cache as rc
+
+    assert not hasattr(rc, "ensure_result")
+    assert not hasattr(rc, "ensure_result_build")
+    assert not hasattr(rc, "ensure_viewer_expanded_build")

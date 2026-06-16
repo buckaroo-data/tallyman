@@ -348,6 +348,47 @@ def test_unit_ensure_session_cache_worthy_serves_result_read(project: str, order
     assert "${TALLYMAN_PROJECT_ROOT}" not in (posted / "expr.yaml").read_text()
 
 
+def test_unit_ensure_session_cache_worthy_serves_recipe_no_result_parquet(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """With the on-demand result.parquet layer gone, ensure_session serves the
+    entry's recipe build dir to Buckaroo for every entry. A cache-worthy entry's
+    recipe replays onto its baked snapshot (a read, not a recompute), so no
+    per-entry result.parquet is materialised for the viewer.
+    """
+    from tallyman_xorq.result_cache import cache_worthy, classify_build
+
+    res = build_and_persist(project, _code(project))  # group_by.aggregate → worthy
+    assert cache_worthy(project, res.content_hash) is True
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "s"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+    mgr.ensure_session(res.content_hash, project)
+
+    posted = Path(captured["json"]["build_dir"])
+    assert posted.is_dir(), posted
+    # The posted build is the (expanded) recipe — still the expensive aggregate.
+    assert classify_build(posted)["worthy"] is True, classify_build(posted)
+    # No on-demand result.parquet was materialised for the viewer.
+    assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
+
+
 def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, orders_parquet, monkeypatch):
     """ensure_session must materialise an entry's baked snapshot before POSTing
     to ``/load_expr``, so the buckaroo grid isn't empty on a cold compute cache.

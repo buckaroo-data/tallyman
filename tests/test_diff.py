@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 import pyarrow.parquet as pq
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_mcp.server import catalog_create, catalog_diff, catalog_revise
@@ -388,6 +389,23 @@ def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders
         b_expr=cached_result_expr(project, b.content_hash),
     )
     assert diff["keyed"] is not None
+    assert not (a_dir / "result.parquet").exists()
+    assert not (b_dir / "result.parquet").exists()
+
+
+def test_full_diff_requires_exprs(project: str, orders_parquet: Path):
+    # full_diff is xorq-only: it composes the two passed cache-resolving
+    # expressions. With the on-demand result.parquet writer gone there is no
+    # file to fall back to, so calling it without a_expr/b_expr must raise a
+    # clear error rather than silently materialising two parquets.
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_dir, b_dir = entry_dir(project, a.content_hash), entry_dir(project, b.content_hash)
+    with pytest.raises(ValueError):
+        full_diff(a_dir, b_dir)  # no a_expr/b_expr
     assert not (a_dir / "result.parquet").exists()
     assert not (b_dir / "result.parquet").exists()
 

@@ -275,8 +275,23 @@ over a full cycle, and (b) a static grep that `src/` has no
   the dir is complete. Rewrite the `#48` "not durable" log accordingly.
 - **D3 — archive scope:** the recipe allowlist `{expr.py, xorq_build/,
   schema.json, manifest.json}` as one immutable zip (fixes the wrong-artifact
-  durability gap from fact 2). `prompts.jsonl` is deliberately *not* a member: it
-  is append-mutable, runtime-read provenance, so it joins the decomposition as a
+  durability gap from fact 2). **`expr.py` is durable, not regenerated from
+  `xorq_build/`.** The `from_catalog` chaining path re-execs it so a cheap entry's
+  recompute expression roots on the *shared* in-process backend and two entries
+  `union`/`join` on one backend (#75). Reconstructing the way xorq's own catalog
+  does — `load_expr` per entry — gives each its *own* backend and raises
+  `Multiple backends found` (verified: two `load_expr` results won't `union`; two
+  re-exec'd sources do). xorq never hits this because its catalog runs one entry at
+  a time and never composes; tallyman's chaining is the feature that needs the
+  shared backend. Two source-regeneration routes were tested and rejected: xorq's
+  decompiler is ibis's generic one and drops the read path (emits non-compiling,
+  path-less source); `expr.unbind()` composes but likewise strips the read path and
+  can't execute without re-registering each source by name. Both reimplement — more
+  fragilely — what the one already-written `expr.py` (`build.py:367`) gives for
+  free, so it stays. (Expensive entries don't actually need it for data — they read
+  a baked snapshot and use `expr.py` only to *locate* it — but the cheap-entry
+  recompute case does.) `prompts.jsonl` is deliberately *not* a member: it is
+  append-mutable, runtime-read provenance, so it joins the decomposition as a
   tracked `prompts/<hash>.jsonl` rather than churning the content-addressed blob.
 - **D4 — recipe imports:** keep user recipes on `import xorq.api as xo`;
   catalog-free guarantee scoped to `src/`. Real recipes call `xo.connect()`/

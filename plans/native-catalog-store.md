@@ -125,6 +125,8 @@ display_configs/<hash>.json   # one Buckaroo/display config per entry
 prompts/<hash>.jsonl          # append-only authoring-prompt history per entry
 post_processing/<name>.py     # project-global functions (moved under the repo)
 stats/<name>.py               # project-global functions (moved under the repo)
+pyproject.toml                # per-repo env spec — the reproducibility unit
+uv.lock                       # pinned lock; recreate one venv per repo to rebuild
 ```
 
 No YAML anywhere. The former `catalog.yaml` is gone; its residual pointer
@@ -161,15 +163,17 @@ subprocess, and a from-scratch rebuild never recreates them.)
   mechanism — `WheelPackager`/`PackagedBuilder`/`PackagedRunner`
   (`xorq/ibis_yaml/packager.py`) bundle a built wheel + pinned `requirements.txt` so
   `xorq run` can re-execute an entry in its *own* isolated `uv` env. tallyman does
-  not use that path: it pins the whole environment once (`xorq==0.3.26` + `uv.lock`)
-  and runs every expression in one shared `.venv` via in-process
-  `build_expr`/`load_expr` (`build.py:317`), never a per-expression `uv` env — that
-  per-entry env is the slow, expensive thing tallyman deliberately avoids. The
-  in-process build output (`xorq_build/`) never held the wheel anyway (the
-  `build_expr` file set is `expr.yaml`/SQL/`deferred_reads.yaml`/`profiles.yaml`); only
-  the catalog zip did, and nothing reads it back (fact 1). So the drop forfeits
-  xorq's per-entry env reconstruction — **unused here** — not tallyman's
-  reproducibility, which rides on the pinned project env. Separately: because the zip
+  not use that path: it builds every expression in-process via
+  `build_expr`/`load_expr` (`build.py:317`), and captures reproducibility at
+  **catalog-repo granularity** — a single tracked `pyproject.toml` + `uv.lock` (see
+  Tracked tree), one venv per project, recreated to rebuild the corpus. A
+  per-expression `uv` env is the slow, expensive thing tallyman avoids; per-expression
+  venvs are a bridge to cross later if ever wanted. The in-process build output
+  (`xorq_build/`) never held the wheel anyway (the `build_expr` file set is
+  `expr.yaml`/SQL/`deferred_reads.yaml`/`profiles.yaml`); only the catalog zip did,
+  and nothing reads it back (fact 1). So the drop forfeits xorq's per-entry env
+  reconstruction — **unused here** — not tallyman's reproducibility, which is the
+  tracked per-repo lock. Separately: because the zip
   is deterministic and content-addressed, git stores each blob once and a
   `git add -A` over an unchanged zip is a no-op that adds no history — so the saving
   is a smaller durable blob and working tree per entry, not avoided per-checkpoint
@@ -364,7 +368,10 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
 
 ## Scope boundaries / deferred
 
-- No `pyproject.toml` change (fact 5). No merge/sync surface (fact 4). No xorq
+- No change to *tallyman's own* `pyproject.toml`/xorq pin (fact 5 — `xorq.catalog`
+  can't be narrowed out of the single wheel). The `pyproject.toml` + `uv.lock` added
+  to the tracked tree are a *separate*, per-catalog-repo env lock (the reproducibility
+  unit), not a change to tallyman's deps. No merge/sync surface (fact 4). No xorq
   `assert_consistency`/`BuildZip`/`test_zip` contract in the native store (fact 1).
 - No clone-restore / reconstruct-from-zip implementation; D3 keeps the zip *able*
   to support it (whole recipe + `<hash>/` prefix).
@@ -374,11 +381,14 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
 
 ## Open / not yet grilled
 
-- **Rebuild operational path.** What you actually run to rebuild a corpus
-  (re-execute stored `expr.py` via `build_and_persist` in a loop vs re-drive the
-  MCP/codegen session) and whether a `tallyman rebuild` affordance is warranted —
-  `first-project` is ~119MB, `parking_ticket_analysis_1m` ~10 entries, so a
-  from-scratch rebuild is minutes-to-tens-of-minutes per large project. Needs a CLI
-  check before settling.
+- **Rebuild operational path.** The *env* half is settled: recreate the project's
+  one venv from the tracked `uv.lock`, then rebuild every expression in it (one venv
+  per catalog repo, not per expression). Still open: what you actually run to
+  re-execute (re-run stored `expr.py` via `build_and_persist` in a loop vs re-drive
+  the MCP/codegen session), whether a `tallyman rebuild` affordance is warranted
+  (`first-project` ~119MB, `parking_ticket_analysis_1m` ~10 entries → minutes-to-tens
+  per large project), and **when `pyproject.toml`/`uv.lock` get snapshotted/refreshed**
+  (snapshot from the active env at genesis, plus a refresh when a recipe needs a new
+  dep). Needs a CLI check before settling.
 - Genesis baseline behavior post-decomposition; exact `.gitignore`; final
   failing-first test list once the above is settled.

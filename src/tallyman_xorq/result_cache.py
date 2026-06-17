@@ -230,6 +230,46 @@ def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
 
 
 @functools.lru_cache(maxsize=256)
+def _resolve_result_plan(project: str, content_hash: str):
+    """The expensive, memoisable half of ``cached_result_expr``: reconstruct the
+    recipe and decide how the entry's result is read. Returns either
+    ``("recompute", expr)`` for a cheap/fallback entry, or ``("baked", baked, path)``
+    for an expensive entry whose snapshot ``cached_result_expr`` re-checks on every
+    call (so a snapshot evicted *after* a warm read still self-heals rather than
+    returning a dangling ``deferred_read_parquet``).
+    """
+    t0 = time.monotonic()
+
+    def _cold(tag):
+        perf_log.debug(
+            "cached_result_expr cold read %s: path=%s wall_ms=%.1f",
+            content_hash,
+            tag,
+            (time.monotonic() - t0) * 1000,
+        )
+
+    raw = _recipe_expr(project, content_hash)
+    if not cache_worthy(project, content_hash):
+        _cold("cheap-recompute")
+        return ("recompute", raw)
+
+    # Expensive: locate the baked snapshot via the same rewrite the build used.
+    # rewrite_for_build wraps the expression in a ParquetSnapshotCache whose
+    # structural key matches the file baked at build time, so storage/calc_key
+    # give its on-disk path without re-executing.
+    from tallyman_xorq.source_cache import rewrite_for_build
+
+    baked = rewrite_for_build(raw, project)
+    path = _cached_node_path(baked)
+    if path is None:
+        # classify_build (serialized) and _is_worthy_expr (live) disagreed — fall
+        # back to recompute rather than dereference a cache that wasn't baked.
+        _cold("worthy-recompute-fallback")
+        return ("recompute", raw)
+    _cold("baked-read")
+    return ("baked", baked, path)
+
+
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as a single-backend expression on the default backend.
 
@@ -263,42 +303,29 @@ def cached_result_expr(project: str, content_hash: str):
     one via ``worthy-recompute-fallback`` (its ``rewrite_for_build`` returns the
     expression uncached under salt, so there is no snapshot to dereference). Both
     are single-backend recompute expressions — content-honest, no parquet.
+
+    The expensive reconstruction is memoised in ``_resolve_result_plan``; the
+    snapshot's on-disk presence is re-checked HERE on every call, so an expensive
+    entry whose snapshot is evicted *after* a warm read self-heals on the next
+    read instead of handing back a stale ``deferred_read_parquet`` (which would
+    ``ValueError: At least one path is required`` at execute time). The
+    perf-namespace cold-read tag (#87) is emitted from the memoised half, so it
+    still fires once per genuine reconstruct.
     """
     from xorq.expr.api import deferred_read_parquet
 
-    # This function is LRU-memoised, so its body runs only on a miss: every line
-    # below is a cold read. Tag each return with the #74 path it took and the
-    # reconstruct wall-clock (#82's lever) on the perf namespace (#87), so a
-    # Join-descendant that is structurally worthy but cost-cheap shows up on the
-    # read path, not just in lifecycle counts.
-    t0 = time.monotonic()
-
-    def _read(expr, tag):
-        perf_log.debug(
-            "cached_result_expr cold read %s: path=%s wall_ms=%.1f",
-            content_hash,
-            tag,
-            (time.monotonic() - t0) * 1000,
-        )
-        return expr
-
-    raw = _recipe_expr(project, content_hash)
-    if not cache_worthy(project, content_hash):
-        return _read(raw, "cheap-recompute")
-
-    # Expensive: locate the baked snapshot via the same rewrite the build used,
-    # then read it as a bare parquet. rewrite_for_build wraps the expression in a
-    # ParquetSnapshotCache whose structural key matches the file baked at build
-    # time, so storage/calc_key give its on-disk path without re-executing.
-    from tallyman_xorq.source_cache import rewrite_for_build
-
-    baked = rewrite_for_build(raw, project)
-    path = _cached_node_path(baked)
-    if path is None:
-        # classify_build (serialized) and _is_worthy_expr (live) disagreed — fall
-        # back to recompute rather than dereference a cache that wasn't baked.
-        return _read(raw, "worthy-recompute-fallback")
+    plan = _resolve_result_plan(project, content_hash)
+    if plan[0] == "recompute":
+        return plan[1]
+    _, baked, path = plan
     if not path.exists():
         baked.count().execute()  # evicted snapshot: repopulate once, then read
-        return _read(deferred_read_parquet(str(path)), "evicted-self-heal")
-    return _read(deferred_read_parquet(str(path)), "baked-read")
+        perf_log.debug("cached_result_expr self-heal %s: evicted-self-heal", content_hash)
+    return deferred_read_parquet(str(path))
+
+
+# Existing callers clear the result-expr memo via cached_result_expr.cache_clear()
+# (companion app, conftest, cache tests); the memo now lives on the plan resolver,
+# so re-expose its cache controls on the public name.
+cached_result_expr.cache_clear = _resolve_result_plan.cache_clear
+cached_result_expr.cache_info = _resolve_result_plan.cache_info

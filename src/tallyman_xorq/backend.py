@@ -9,9 +9,10 @@ module instead.
 The naive narrowing ``xorq.expr.api.connect`` is *not* a drop-in: that is ibis's
 ``connect(resource, **kwargs)`` (a different function requiring a positional
 arg), not this no-arg datafusion factory — so a swap to it would resolve the
-symbol and then fail at call time or build the wrong backend. The
-determinism-equivalence is pinned by
-``test_native_catalog_store.py::test_connect_shim_snapshot_is_byte_identical``.
+symbol and then fail at call time or build the wrong backend. The equivalence is
+pinned by ``test_native_catalog_store.py::test_connect_shim_matches_xorq_api_connect``
+(key + data equivalence, not raw bytes — datafusion's group-by output order isn't
+deterministic).
 """
 
 from __future__ import annotations

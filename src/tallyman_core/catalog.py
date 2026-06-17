@@ -204,14 +204,17 @@ def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
        (``entries/<hash>.zip``) must equal the tallyman *pointers*
        (``entry_hashes``), so a pointer with no durable recipe — or a recipe
        with no pointer — fails loudly instead of returning a masked divergence.
-    3. **Sidecar hash-reference integrity**: every decomposed file keyed by
-       content hash (``aliases.jsonl`` latest+history, ``chart_specs/<hash>``,
+    3. **Sidecar hash-reference integrity**: every durable, content-addressed
+       sidecar that can dangle into a wrong-data or build-failure path
+       (``aliases.jsonl`` latest+history, ``chart_specs/<hash>``,
        ``display_configs/<hash>``) must name a hash in the durable recipe set.
        Guard 2 only pairs recipes with pointers; without this a committed step
        whose alias/chart/display points at a hash with no recipe would reset
        clean and report OK — and a dangling alias head later blows up the
-       self-chaining ``from_catalog`` build. (Notebook cells key on alias *name*,
-       not hash, so they are deliberately out of scope here.)
+       self-chaining ``from_catalog`` build. Two other hash/name-keyed surfaces
+       are deliberately out of scope: notebook cells key on alias *name* not hash,
+       and ``prompts/<hash>.jsonl`` is append-only provenance that is inert when
+       orphaned (read only for an entry the UI is already showing).
 
     Takes *pointers* as an argument (rather than reading ``catalog_state``) to
     keep the call direction one-way and acyclic.

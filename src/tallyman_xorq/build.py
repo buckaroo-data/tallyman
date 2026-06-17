@@ -428,7 +428,7 @@ def build_and_persist(
                     )
 
             target.mkdir(parents=True, exist_ok=True)
-            created_target = True  # reached only past the target.exists() early-return
+            created_target = True  # past the complete-entry early-return; safe to rmtree on failure
 
             # Move xorq's build directory contents (expr.yaml + deps) under the entry.
             xorq_build_dir = entry_build_dir(project, content_hash)
@@ -461,16 +461,32 @@ def build_and_persist(
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
+            # Classify before executing (reads the serialized build, no eval): the
+            # verdict selects the execution strategy below and is reused for the #87
+            # admission instrumentation after the temp dir is gone.
+            from tallyman_xorq.result_cache import _cached_node_path, classify_build  # noqa: PLC0415
+
+            verdict = classify_build(xorq_build_dir)
+            cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
+
             # Execute (#73). A worthy entry's build carries a baked result-cache
             # node (rewrite_for_build), so executing materialises it once into the
             # compute cache — and every later loader (the Buckaroo viewer, diffs,
-            # from_catalog) reads that cached result instead of re-running the DAG.
-            # A cheap entry materialises nothing: this is a pushdown count() over a
-            # columnar source plus a schema read, no parquet written.
+            # from_catalog) reads that cached result instead of re-running the DAG;
+            # baking evaluates every row, so count() there both validates and counts.
+            # A cheap entry materialises nothing, so count() alone is satisfied from
+            # source metadata and PRUNES the row projection — a failing cast /
+            # arithmetic / UDF would never evaluate at build, committing + aliasing a
+            # broken entry that throws only on the first materialising read. Stream
+            # the full result and discard it to force row-level evaluation at author
+            # time (constant memory; the one pass also yields the exact row count).
             t0 = time.monotonic()
             try:
                 arrow_schema = loaded.schema().to_pyarrow()
-                row_count = int(loaded.count().execute())
+                if cache_worthy_v:
+                    row_count = int(loaded.count().execute())
+                else:
+                    row_count = sum(batch.num_rows for batch in loaded.to_pyarrow_batches())
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
@@ -484,19 +500,14 @@ def build_and_persist(
         }
         atomic_write_text(entry_schema_path(project, content_hash), json.dumps(schema_doc, indent=2))
 
-        # Cache-admission instrumentation (#87): record the structural verdict and
-        # the measured value-per-byte inputs side by side, so #30's structural→
-        # measured flip is decidable from data. classify_build's verdict is what
-        # cache_worthy already computes (and throws away); compile_seconds times the
+        # Cache-admission instrumentation (#87): record the structural verdict
+        # (computed above, before execute, since it now also selects the execution
+        # strategy) alongside the measured value-per-byte inputs, so #30's
+        # structural→measured flip is decidable from data. compile_seconds times the
         # author DAG's expr->backend-plan step (the dominant per-view cost per #30),
         # separate from execute; cache_bytes is the baked snapshot size (None for a
         # cheap entry that bakes nothing). loaded is the build_path expression whose
         # execute just baked the snapshot, so its CachedNode names that exact file.
-        from tallyman_xorq.result_cache import _cached_node_path, classify_build
-
-        verdict = classify_build(xorq_build_dir)
-        cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
-
         compile_seconds: float | None = None
         try:
             from xorq.expr.api import to_sql
@@ -541,10 +552,12 @@ def build_and_persist(
         )
         write_manifest(target, manifest)
     except Exception:
-        # No partial entry dir survives a failed build: every population step
-        # is covered, not just the load_expr/execute paths that had ad-hoc
-        # cleanup before (D1/L4). The target.exists() early-return guarantees
-        # we created this dir, so removing it can't clobber a prior entry.
+        # No partial entry dir survives a failed build: every population step is
+        # covered, not just the load_expr/execute paths that had ad-hoc cleanup
+        # before (D1/L4). created_target is set once we pass the complete-entry
+        # (manifest-bearing) early-return, so the dir we remove is either one this
+        # call made or a manifest-less mid-build leftover — never a complete,
+        # durable entry, which always early-returns before created_target is set.
         if created_target:
             shutil.rmtree(target, ignore_errors=True)
         raise

@@ -525,3 +525,96 @@ def test_checkpoint_skips_manifestless_entry_dir(project):
     assert pointers == catalog.tracked_recipe_hashes(project)  # pointer set == durable recipe set
     catalog.assert_catalog_consistent(project, pointers)  # must not raise
     cs.reset_to(project, step)  # must not raise
+
+
+# ---------------------------------------------------------------------------
+# Cut A — the guard validates every decomposed hash-reference, not just
+# entries.jsonl ↔ entries/*.zip (M1/L1)
+# ---------------------------------------------------------------------------
+
+
+def test_consistency_guard_surfaces_dangling_alias_hash(project, orders_parquet):
+    """A committed ``aliases.jsonl`` whose latest/history hash names no durable
+    recipe must fail the consistency guard, not reset clean (M1). A dangling
+    alias head later blows up the self-chaining ``from_catalog`` build, so
+    ``reset_to`` must refuse to restore the step rather than mask the divergence."""
+    from tallyman_core import aliases as al
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    al.set_alias(project, "ghost", "ffffffffffff", expect_exists=False)  # no such entry
+    cs.checkpoint_catalog(project, "dangling alias")
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == {res.content_hash}  # the real entry's pointer/recipe agree (guard 2 passes)
+    with pytest.raises(RuntimeError, match="ffffffffffff"):
+        catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_consistency_guard_surfaces_dangling_alias_history_hash(project, orders_parquet):
+    """The alias check covers history, not only the latest head — a revised alias
+    whose *older* version's recipe is missing is just as dangling (M1: 'at minimum
+    cover aliases.jsonl history')."""
+    from tallyman_core import aliases as al
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    al.set_alias(project, "regions", "ffffffffffff", expect_exists=False)  # v1: no recipe
+    al.set_alias(project, "regions", res.content_hash)  # v2: real head; history = [ffff…, res]
+    cs.checkpoint_catalog(project, "alias with a dangling history entry")
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    with pytest.raises(RuntimeError, match="ffffffffffff"):
+        catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_consistency_guard_surfaces_orphan_chart_hash(project, orders_parquet):
+    """A committed ``chart_specs/<hash>.vl.json`` whose hash names no durable
+    recipe must fail the guard (L1) — the guard validates every content-addressed
+    sidecar against the live recipe set, not just the recipe↔pointer pair."""
+    from tallyman_core import charts
+
+    cs.genesis(project)
+    build_and_persist(project, _agg_code(orders_parquet))
+    charts.set_chart(project, "ffffffffffff", {"mark": "bar"})  # no such entry
+    cs.checkpoint_catalog(project, "orphan chart")
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    with pytest.raises(RuntimeError, match="ffffffffffff"):
+        catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_consistency_guard_surfaces_orphan_display_config_hash(project, orders_parquet):
+    """A committed ``display_configs/<hash>.json`` whose hash names no durable
+    recipe must fail the guard (L1), the display-config twin of the orphan-chart
+    case."""
+    from tallyman_core import display_configs as dc
+
+    cs.genesis(project)
+    build_and_persist(project, _agg_code(orders_parquet))
+    dc.set_display_config(project, "ffffffffffff", {"pinned_rows": [1]})  # no such entry
+    cs.checkpoint_catalog(project, "orphan display config")
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    with pytest.raises(RuntimeError, match="ffffffffffff"):
+        catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_failed_build_after_copy_leaves_no_orphan_dir(project, orders_parquet, monkeypatch):
+    """A build that fails AFTER the entry dir is populated but past the
+    load_expr/execute paths (here: ``make_portable_inplace``) must also leave no
+    orphan entry dir (L4). The D1 'no partial dirs' invariant covers every
+    population step, not just the two that had ad-hoc ``rmtree`` cleanup."""
+    import tallyman_xorq.build as build_mod
+
+    cs.genesis(project)
+
+    def _boom(*a, **k):
+        raise RuntimeError("induced failure after the entry dir was populated")
+
+    monkeypatch.setattr(build_mod, "make_portable_inplace", _boom)
+    with pytest.raises(Exception):
+        build_and_persist(project, _agg_code(orders_parquet))
+    # No monkeypatch.undo(): it would also revert isolated_home's TALLYMAN_HOME
+    # setenv (same monkeypatch instance), pointing entries_dir at the real home
+    # and making this check vacuous. monkeypatch auto-reverts at teardown.
+
+    ed = paths.entries_dir(project)
+    leftover = [c.name for c in ed.iterdir() if c.is_dir()] if ed.exists() else []
+    assert not leftover, f"failed build left orphan entry dir(s): {leftover}"

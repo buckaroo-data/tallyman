@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -110,6 +111,18 @@ def test_remove_alias_from_cells(project: str):
     aliases = [c["alias"] for c in notebook.load(project)["cells"]]
     assert "drop_me" not in aliases
     assert "keep_me" in aliases
+
+
+def test_load_raises_on_malformed_line(project: str):
+    """A malformed JSONL line fails loudly (matching ``aliases._read`` /
+    ``read_prompts``) rather than being silently dropped (L6). A silent skip plus
+    the next ``_save`` would make the loss permanent; with atomic ``_save`` the
+    only source of a torn line is genuine corruption, which must surface."""
+    notebook.append(project, "a", markdown="hi")
+    p = notebook._path(project)
+    p.write_text(p.read_text() + "{not json}\n")
+    with pytest.raises(json.JSONDecodeError):
+        notebook.load(project)
 
 
 # ---------------------------------------------------------------------------

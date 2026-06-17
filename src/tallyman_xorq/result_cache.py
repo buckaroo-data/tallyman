@@ -13,10 +13,10 @@ reading a cached parquet:
     math (the citibike column-reorder/derive case) — materialise nothing (#73).
     Recompute ≈ re-reading a columnar source (pushdown), so a stored copy would
     burn work and storage for ~no savings; a non-parquet source's parse is
-    already cached at the read (see ``tallyman_xorq.source_cache``).  Reads of a
-    cheap entry recompute the expression directly. ``ensure_result`` still
-    materialises a ``result.parquet`` on demand for the few callers that need a
-    parquet *path* (downloads, promote-diff, post-processing).
+    already cached (see ``tallyman_xorq.source_cache``).  Reads of a cheap entry
+    recompute the expression directly — no per-entry ``result.parquet`` is ever
+    written, on demand or otherwise. Every consumer (the viewer, paginated
+    reads, diffs, post-processing) reads ``cached_result_expr``.
 
 Why ``ParquetSnapshotCache`` over the other xorq caches: parquet storage is
 what the DuckDB keyed diff and the Buckaroo viewer stream from and is
@@ -35,18 +35,13 @@ import contextvars
 import functools
 import logging
 import re
-import shutil
 import sys
-import tempfile
-import threading
 import time
 from pathlib import Path
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
 perf_log = logging.getLogger("tallyman.perf")
-# #71 viewer result-read build prep logs its fall-back-to-recipe here.
-log = logging.getLogger("tallyman.result_cache")
 
 # Ops whose presence makes an expression worth caching: they require a
 # shuffle / sort / full materialisation rather than a streaming row-wise pass.
@@ -219,8 +214,8 @@ def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
     Mirrors ``cached_result_expr``'s derivation — re-import the recipe, rewrite
     it for build, read the top-level ``CachedNode``'s storage path — so it names
     the very file a cold read returns. None for a cheap entry (bakes nothing), a
-    worthiness disagreement, or salt mode (reads route through ``result.parquet``,
-    not a snapshot). The build uses it to size the snapshot (#87, the
+    worthiness disagreement, or salt mode (bakes no cache — see
+    ``rewrite_for_build``). The build uses it to size the snapshot (#87, the
     value-per-byte denominator); other callers use it to find the snapshot
     without reconstructing the read expression.
     """
@@ -262,13 +257,14 @@ def cached_result_expr(project: str, content_hash: str):
     Bounded LRU so the cache can't grow without limit; entries are
     content-addressed, so an evicted hash rebuilds an identical expression.
 
-    salt source-identity mode skips baked caches (path-only snapshot keys would
-    collide across salted entries — see ``rewrite_for_build``), so reads route
-    through the content-honest in-place ``result.parquet`` instead.
+    salt source-identity mode bakes no cache (path-only snapshot keys would
+    collide across salted entries — see ``rewrite_for_build``), so a salted entry
+    falls through to recompute: a cheap one via ``cheap-recompute``, an expensive
+    one via ``worthy-recompute-fallback`` (its ``rewrite_for_build`` returns the
+    expression uncached under salt, so there is no snapshot to dereference). Both
+    are single-backend recompute expressions — content-honest, no parquet.
     """
     import xorq.api as xo
-
-    from tallyman_xorq import source_identity as si
 
     # This function is LRU-memoised, so its body runs only on a miss: every line
     # below is a cold read. Tag each return with the #74 path it took and the
@@ -285,9 +281,6 @@ def cached_result_expr(project: str, content_hash: str):
             (time.monotonic() - t0) * 1000,
         )
         return expr
-
-    if si.mode() == "salt":
-        return _read(xo.deferred_read_parquet(str(ensure_result(project, content_hash))), "salt-result-parquet")
 
     raw = _recipe_expr(project, content_hash)
     if not cache_worthy(project, content_hash):
@@ -309,152 +302,3 @@ def cached_result_expr(project: str, content_hash: str):
         baked.count().execute()  # evicted snapshot: repopulate once, then read
         return _read(xo.deferred_read_parquet(str(path)), "evicted-self-heal")
     return _read(xo.deferred_read_parquet(str(path)), "baked-read")
-
-
-def ensure_result(project: str, content_hash: str) -> Path:
-    """Return a guaranteed-present ``result.parquet`` path for the entry's result.
-
-    On-demand materialisation for the callers that need a parquet *path* rather
-    than an expression — downloads, promote-diff, post-processing. Writes the
-    result in place if absent (#73), and a deleted one self-heals on the next call.
-
-    Reconstructs through ``cached_result_expr`` (the recipe path), not
-    ``load_entry`` (the serialized build). An entry that ``from_catalog``s an
-    expensive parent serialises a *bare* ``deferred_read_parquet`` of the
-    parent's baked snapshot — #75 strips the parent's ``CachedNode`` so the
-    composed expression stays on one backend — with no recipe or source embedded
-    to recompute from. On a cold compute cache (fresh clone / write-isolated
-    overlay) ``load_entry`` resolves that read to zero files and raises
-    ``ValueError: At least one path is required`` (#73/#74). Re-running the recipe
-    re-resolves ``from_catalog`` and recomputes the parent, so an evicted snapshot
-    anywhere in the chain self-heals (``cached_result_expr`` repopulates it).
-
-    salt source-identity mode is the exception: there ``cached_result_expr``
-    routes its reads back through ``ensure_result`` (path-only snapshot keys would
-    collide across salted entries — see ``rewrite_for_build``), so we load the
-    serialized build here instead, to avoid recursing into ourselves.
-    """
-    from tallyman_core.paths import entry_result_path
-    from tallyman_xorq import source_identity as si
-
-    result_path = entry_result_path(project, content_hash)
-    if not result_path.exists():
-        if si.mode() == "salt":
-            from tallyman_xorq.build import load_entry
-
-            load_entry(project, content_hash).to_parquet(str(result_path))
-        else:
-            cached_result_expr(project, content_hash).to_parquet(str(result_path))
-    return result_path
-
-
-# Per-target locks so two concurrent loads of the same entry don't race on the
-# rmtree/build/marker sequence below. Mirrors portable._expand_lock; a bounded
-# number of entries are touched per process, so this never grows large.
-_result_build_locks_guard = threading.Lock()
-_result_build_locks: dict[str, threading.Lock] = {}
-
-
-def _result_build_lock(key: str) -> threading.Lock:
-    with _result_build_locks_guard:
-        return _result_build_locks.setdefault(key, threading.Lock())
-
-
-def ensure_result_build(project: str, content_hash: str) -> Path:
-    """Portable xorq build whose expression reads the entry's materialised result.
-
-    For a cache-worthy entry the recipe is an Aggregate/Join/Sort that re-runs
-    the full DAG on every ``count()`` and every paged ``LIMIT`` window. This
-    persists a tiny build whose expression is a ``deferred_read_parquet`` of the
-    cached result (``ensure_result`` guarantees the parquet is present first), so
-    the viewer pages over the materialised parquet instead of recomputing (#71).
-    Push-down still holds: a parquet scan pushes filters/limit/sort down too.
-
-    The build is portable (``${TALLYMAN_PROJECT_ROOT}`` placeholders), so the
-    caller expands it with ``ensure_expanded_build`` exactly like the recipe.
-
-    A sibling ``.complete`` marker, written last, gates reuse: a build
-    interrupted by a crash/OOM leaves a partial dir with no marker and is redone,
-    never served truncated. Entries are immutable and content-addressed, so the
-    build is always correct once written. The path is stable across restarts,
-    which keeps xorq's build-dir-keyed stat-cache lookups hitting.
-    """
-    import xorq.api as xo
-    from xorq.ibis_yaml.compiler import build_expr
-
-    from tallyman_core.paths import entry_result_build_dir, project_dir
-    from tallyman_xorq._git_state_guard import install_git_state_guard
-    from tallyman_xorq.portable import make_portable_inplace
-
-    target = entry_result_build_dir(project, content_hash)
-    marker = target.with_name(target.name + ".complete")
-    if marker.exists():
-        return target
-    with _result_build_lock(str(target)):
-        # Re-check under the lock: another thread may have finished building.
-        if marker.exists():
-            return target
-        # ensure_result must run before build_expr — the deferred read points at
-        # the parquet path, and the file has to exist when the viewer executes.
-        result_path = ensure_result(project, content_hash)
-        # git-provenance capture in xorq's compiler can SIGSEGV when forked from
-        # the long-lived server; make it best-effort, as build_and_persist does.
-        install_git_state_guard()
-        expr = xo.deferred_read_parquet(str(result_path))
-        if target.exists():
-            shutil.rmtree(target)
-        with tempfile.TemporaryDirectory(prefix="tallyman_result_build_") as tmp:
-            build_path = Path(build_expr(expr, builds_dir=Path(tmp)))
-            target.mkdir(parents=True)
-            for item in build_path.rglob("*"):
-                dest = target / item.relative_to(build_path)
-                if item.is_dir():
-                    dest.mkdir(parents=True, exist_ok=True)
-                else:
-                    dest.parent.mkdir(parents=True, exist_ok=True)
-                    dest.write_bytes(item.read_bytes())
-        # Rewrite project-root substrings to the portable placeholder so the
-        # caller can expand it on this host exactly like the recipe build.
-        make_portable_inplace(target, project_dir(project))
-        marker.write_text("")
-    return target
-
-
-def ensure_viewer_expanded_build(project: str, content_hash: str) -> Path:
-    """Expanded build dir to back a viewer session for an entry (#71).
-
-    Single source of truth for the recipe-vs-result-read choice the viewer
-    makes. For a cache-worthy entry (Aggregate/Join/Sort) it returns the
-    expanded ``deferred_read_parquet`` build of the materialised result, so
-    ``count()``/paging read the parquet instead of re-running the DAG; for a
-    cheap entry it returns the expanded recipe (recompute ≈ a parquet read, so
-    the indirection buys nothing). On any failure in result-build prep it falls
-    back to the recipe — a cache hiccup must not blank the detail page.
-
-    ``ensure_session`` (companion → real Buckaroo ``/load_expr``) and the Tier-B
-    perf proxy both call this so the path they exercise can't drift.
-    """
-    from tallyman_core.paths import (  # noqa: PLC0415
-        entry_build_dir,
-        entry_expanded_build_dir,
-        entry_result_expanded_build_dir,
-        project_dir,
-    )
-    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
-
-    src_build = entry_build_dir(project, content_hash)
-    expanded_target = entry_expanded_build_dir(project, content_hash)
-    try:
-        if cache_worthy(project, content_hash):
-            src_build = ensure_result_build(project, content_hash)
-            expanded_target = entry_result_expanded_build_dir(project, content_hash)
-    except Exception as exc:  # noqa: BLE001 — never let cache prep break the viewer
-        log.warning(
-            "result-read build prep failed for %s: %s; serving recipe",
-            content_hash,
-            exc,
-        )
-        src_build = entry_build_dir(project, content_hash)
-        expanded_target = entry_expanded_build_dir(project, content_hash)
-
-    return ensure_expanded_build(src_build, project_dir(project), expanded_target)

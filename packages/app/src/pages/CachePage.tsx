@@ -21,7 +21,7 @@ export function CachePage() {
 
   const handleDelete = async (hash: string) => {
     if (!project) return;
-    if (!confirm(`Delete result.parquet for ${hash.slice(0, 12)}?\n\nThe entry, code and alias stay — it re-materialises on next run.`)) return;
+    if (!confirm(`Delete the cached snapshot for ${hash.slice(0, 12)}?\n\nThe entry, code and alias stay — it re-bakes on next view.`)) return;
     setDeleting((s) => new Set(s).add(hash));
     try {
       await api.deleteResultCache(project, hash);
@@ -33,24 +33,24 @@ export function CachePage() {
     }
   };
 
-  const materialised = entries.length;
+  const cached = entries.length;
 
   return (
     <main style={{ overflow: "auto" }}>
       <div className="cache-pane">
         <div className="cache-summary">
-          <strong>Parquet result cache</strong>
+          <strong>Cached result snapshots</strong>
           <span className="meta">
-            {materialised} materialised &middot;{" "}
+            {cached} cached &middot;{" "}
             <span>{totalFormatted}</span> on disk
           </span>
           <span className="meta cache-note">
-            Deleting frees the parquet only — code, build and stat cache stay; the entry re-materialises on next run.
+            Deleting frees the snapshot only — code, build and stat cache stay; the entry re-bakes on next view.
           </span>
         </div>
 
         {entries.length === 0 ? (
-          <div className="nb-empty">no materialised result.parquets</div>
+          <div className="nb-empty">no cached result snapshots</div>
         ) : (
           <table className="data-table cache-table">
             <thead>

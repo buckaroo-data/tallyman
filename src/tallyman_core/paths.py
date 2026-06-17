@@ -79,18 +79,10 @@ ENTRY_SCHEMA_FILENAME = "schema.json"
 # first hit is honestly cold; production deletes them to recompute.
 ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
 ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
-# result.parquet is no longer written at build (#73): an expensive entry's rows
-# live in its baked result cache (under the per-project compute_cache), and a
-# cheap entry materialises nothing. ensure_result regenerates this on demand for
-# callers that need a parquet path (downloads, promote-diff, post-processing), so
-# it is a regenerable cache, not an immutable artifact — the overlay omits it
-# rather than symlinking it.
-ENTRY_RESULT_FILENAME = "result.parquet"
-# A cache-worthy entry's viewer build: a deferred_read_parquet of the
-# materialised result, so count()/paging read the parquet instead of re-running
-# the Aggregate/Join/Sort recipe (#71). Portable, then expanded like the recipe.
-ENTRY_RESULT_BUILD_DIRNAME = ".xorq_result_build"
-ENTRY_RESULT_EXPANDED_BUILD_DIRNAME = ".xorq_result_build_expanded"
+# No per-entry result.parquet exists: an expensive entry's rows live in its baked
+# result cache (under the per-project compute_cache), a cheap entry recomputes on
+# read. The single materialised copy is the xorq .cache() snapshot — nothing
+# writes a <entry>/result.parquet, at build time or on demand (#73 + follow-up).
 
 # Canonical artifact-vs-cache partition of the per-entry names the overlay cares
 # about. The write-isolated perf overlay symlinks ENTRY_ARTIFACT_NAMES read-only
@@ -107,9 +99,6 @@ ENTRY_ARTIFACT_NAMES = (
 ENTRY_CACHE_NAMES = (
     ENTRY_STAT_CACHE_DIRNAME,
     ENTRY_EXPANDED_BUILD_DIRNAME,
-    ENTRY_RESULT_FILENAME,
-    ENTRY_RESULT_BUILD_DIRNAME,
-    ENTRY_RESULT_EXPANDED_BUILD_DIRNAME,
 )
 
 
@@ -192,11 +181,6 @@ def entry_build_dir(project: str, content_hash: str) -> Path:
     return entry_dir(project, content_hash) / ENTRY_BUILD_DIRNAME
 
 
-def entry_result_path(project: str, content_hash: str) -> Path:
-    """The entry's materialised ``result.parquet``."""
-    return entry_dir(project, content_hash) / ENTRY_RESULT_FILENAME
-
-
 def entry_manifest_path(project: str, content_hash: str) -> Path:
     """The entry's ``manifest.json``."""
     return entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
@@ -215,16 +199,6 @@ def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
 def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     """Stable expanded-build dir beside the entry (regenerated on demand)."""
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
-
-
-def entry_result_build_dir(project: str, content_hash: str) -> Path:
-    """Portable build of the entry's result-read expression (regenerated on demand)."""
-    return entry_dir(project, content_hash) / ENTRY_RESULT_BUILD_DIRNAME
-
-
-def entry_result_expanded_build_dir(project: str, content_hash: str) -> Path:
-    """Stable expanded result-read build dir beside the entry (regenerated on demand)."""
-    return entry_dir(project, content_hash) / ENTRY_RESULT_EXPANDED_BUILD_DIRNAME
 
 
 def compute_cache_dir(project: str) -> Path:

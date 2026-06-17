@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 from tallyman_core.paths import catalog_dir, entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
-from tallyman_xorq.result_cache import cache_worthy, classify_build, ensure_result
+from tallyman_xorq.result_cache import cache_worthy, classify_build
 
 
 def _agg_code(project: str) -> str:  # Aggregate → expensive → cache-worthy
@@ -115,9 +115,11 @@ def test_classifier_skips_cheap_caches_expensive(project, orders_parquet, monkey
     assert "cheap" in classify_build(entry_dir(project, proj_h) / "xorq_build")["why"]
 
 
-def test_cheap_entry_writes_no_result_parquet_at_build(project, orders_parquet, monkeypatch):
-    # #73: a cheap entry materialises nothing at build — no result.parquet, and
-    # nothing under the (retired) result_cache dir.
+def test_cheap_entry_writes_no_result_parquet(project, orders_parquet, monkeypatch):
+    # A cheap entry materialises nothing — no result.parquet, ever (not at build,
+    # not on read), and nothing under the (retired) result_cache dir.
+    from tallyman_xorq.result_cache import cached_result_expr
+
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("proj", _project_code(project))
     h = _hash_of(project)
@@ -125,11 +127,10 @@ def test_cheap_entry_writes_no_result_parquet_at_build(project, orders_parquet, 
     assert not rp.exists()
     # The result_cache/ dir was retired in #73 and must never be re-created.
     assert not (catalog_dir(project) / "result_cache").exists()
-    # ensure_result regenerates it on demand, in place, and a deleted one self-heals.
-    out = ensure_result(project, h)
-    assert out == rp and out.exists()
-    out.unlink()
-    assert ensure_result(project, h).exists()
+    # Reading the entry recomputes the recipe — still no result.parquet on disk.
+    df = cached_result_expr(project, h).execute()
+    assert len(df) > 0
+    assert not rp.exists()
 
 
 def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
@@ -156,11 +157,9 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     assert type(ce.op()).__name__ == "Read"
     assert len(ce._find_backends()[0]) == 1
     assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
-    # ensure_result still hands back a parquet path on demand, self-healing.
-    out = ensure_result(project, h)
-    assert out.exists()
-    out.unlink()
-    assert ensure_result(project, h).exists()
+    # Reading executes against the baked snapshot; no per-entry result.parquet.
+    assert len(ce.execute()) > 0
+    assert not (entry_dir(project, h) / "result.parquet").exists()
 
 
 def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parquet, monkeypatch):
@@ -297,14 +296,21 @@ def test_expensive_from_catalog_mix_shares_one_backend(project, orders_parquet, 
     ibis.union(fp, fc)._find_backend()  # must not raise
 
 
-def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_diff_route_survives_cold_cache(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # The diff route composes both entries' cache-resolving expressions; on a cold
+    # compute cache it must recompute/self-heal rather than blank the diff (there
+    # is no per-entry result.parquet to evict any more — the cache is the snapshot).
+    import shutil
+
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq.result_cache import cached_result_expr
+
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("proj", _project_code(project))
     catalog_revise("proj", _project_code(project).replace('select("region", "price")', 'select("region")'))
-    # evict the older version's parquet — previously this blanked the diff
-    older = entry_dir(project, list_entries(project)[-1]["content_hash"]) / "result.parquet"
-    if older.exists():
-        older.unlink()
+    # Cold cache: wipe the compute cache and clear the reconstruction lru.
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/diff_data/proj/1/2")
     assert r.status_code == 200
@@ -312,9 +318,9 @@ def test_diff_route_survives_evicted_parquet(fresh_companion_app, project, order
     assert "stats" in diff or "keyed" in diff
 
 
-def test_ensure_result_self_heals_expensive_parent_chain_on_cold_cache(project, orders_parquet, monkeypatch):
-    """#73/#74: materialising an entry that ``from_catalog``s an expensive parent
-    must self-heal an evicted parent snapshot, not error.
+def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(project, orders_parquet, monkeypatch):
+    """#73/#74: reading an entry that ``from_catalog``s an expensive parent must
+    self-heal an evicted parent snapshot, not error.
 
     An expensive parent bakes its result into the per-project compute cache; a
     child that chains off it serialises a *bare* ``deferred_read_parquet`` of
@@ -322,15 +328,13 @@ def test_ensure_result_self_heals_expensive_parent_chain_on_cold_cache(project, 
     parent's ``CachedNode`` so the composed expression stays on one backend). On
     a cold compute cache (fresh clone / write-isolated overlay) that read
     resolves to zero files and ``load_entry`` raises ``ValueError: At least one
-    path is required``. ``ensure_result`` must instead reconstruct via the recipe
-    — re-resolving ``from_catalog`` and recomputing the parent — the way
-    ``cached_result_expr`` already self-heals.
+    path is required``. ``cached_result_expr`` instead reconstructs via the recipe
+    — re-resolving ``from_catalog`` and recomputing the parent — so the read
+    self-heals.
     """
     import shutil
 
-    import pyarrow.parquet as pq
-
-    from tallyman_core.paths import compute_cache_dir, entry_result_path
+    from tallyman_core.paths import compute_cache_dir
     from tallyman_xorq.result_cache import cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -347,15 +351,12 @@ def test_ensure_result_self_heals_expensive_parent_chain_on_cold_cache(project, 
     # fresh process would not carry (the perf overlay where this surfaced is cold).
     shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
     cached_result_expr.cache_clear()
-    rp = entry_result_path(project, child_h)
-    if rp.exists():
-        rp.unlink()
 
-    out = ensure_result(project, child_h)  # pre-fix: ValueError "At least one path is required"
-    assert pq.ParquetFile(out).metadata.num_rows == expected_rows
+    df = cached_result_expr(project, child_h).execute()  # pre-fix: ValueError "At least one path is required"
+    assert len(df) == expected_rows
 
 
-def test_ensure_result_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_parquet, monkeypatch):
+def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_parquet, monkeypatch):
     """#73/#75: a multi-parent entry joining two expensive ``from_catalog`` parents
     must self-heal *both* evicted parent snapshots on a cold cache.
 
@@ -363,14 +364,12 @@ def test_ensure_result_self_heals_multi_parent_expensive_join_on_cold_cache(proj
     The child is itself expensive (Join), so its build is a top-level
     ``CachedNode`` whose parent joins two *bare* snapshot reads. On a cold cache
     the child's cache node recomputes — but the two parent reads dangle (both
-    snapshots evicted) → ``ValueError: At least one path is required``. The fix
+    snapshots evicted) → ``ValueError: At least one path is required``. The read
     reconstructs via the recipe, recomputing each parent in turn.
     """
     import shutil
 
-    import pyarrow.parquet as pq
-
-    from tallyman_core.paths import compute_cache_dir, entry_result_path
+    from tallyman_core.paths import compute_cache_dir
     from tallyman_xorq.result_cache import cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -386,12 +385,9 @@ def test_ensure_result_self_heals_multi_parent_expensive_join_on_cold_cache(proj
     # warmed — so every snapshot in the chain must self-heal from the recipe.
     shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
     cached_result_expr.cache_clear()
-    rp = entry_result_path(project, child_h)
-    if rp.exists():
-        rp.unlink()
 
-    out = ensure_result(project, child_h)  # pre-fix: ValueError "At least one path is required"
-    assert pq.ParquetFile(out).metadata.num_rows == expected_rows
+    df = cached_result_expr(project, child_h).execute()  # pre-fix: ValueError "At least one path is required"
+    assert len(df) == expected_rows
 
 
 def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):
@@ -462,3 +458,16 @@ def test_worthiness_disagreement_falls_back_to_recompute(project, orders_parquet
     rc.cached_result_expr.cache_clear()
     expr = rc.cached_result_expr(project, h)  # must not raise
     assert type(expr.op()).__name__ != "CachedNode"
+
+
+def test_ensure_result_is_removed():
+    # The on-demand result.parquet writer is deleted entirely: every consumer
+    # now reads cached_result_expr (cheap recompute / expensive baked snapshot),
+    # so nothing materialises a per-entry result.parquet on demand. The #102
+    # viewer-from-result.parquet build helpers go with it — the viewer pages over
+    # the baked snapshot (expensive) or recomputes (cheap), never a result.parquet.
+    import tallyman_xorq.result_cache as rc
+
+    assert not hasattr(rc, "ensure_result")
+    assert not hasattr(rc, "ensure_result_build")
+    assert not hasattr(rc, "ensure_viewer_expanded_build")

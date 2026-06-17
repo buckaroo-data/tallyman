@@ -561,20 +561,32 @@ def build_and_persist(
     )
 
 
-_MIGRATION_MARKER = ".migrated_no_build_result_parquet"
+# Bumped so an install that already ran the #73 marker re-runs the sweep once
+# to clear any on-demand parquet / #71 viewer-read build dirs written since.
+_MIGRATION_MARKER = ".migrated_no_ondemand_result_parquet"
+
+# Per-entry paths the retired on-demand result.parquet layer (and the #71
+# viewer-read build that fed off it) left behind. All dead now — every read
+# resolves through cached_result_expr — so sweep them on upgrade.
+_LEGACY_RESULT_NAMES = ("result.parquet", ".xorq_result_build", ".xorq_result_build_expanded")
 
 
 def migrate_drop_result_parquet(project: str) -> int:
-    """#73 upgrade migration: delete every per-entry build-time result.parquet.
+    """Upgrade migration: delete every per-entry on-demand ``result.parquet`` and
+    the #71 viewer-read build dirs that fed off it.
 
-    Safe — ``xorq_build/`` is the durable recipe. After this, an expensive
-    entry's result lives in its baked cache (rebuilt entries) or repopulates
-    lazily on first view, and a cheap entry recomputes trivially via
-    ``ensure_result`` on demand. Runs once per project (guarded by a marker in
-    the catalog dir so it doesn't churn lazily-regenerated caches on restart),
-    is idempotent and best-effort, and returns the count deleted.
+    Safe — ``xorq_build/`` is the durable recipe and an expensive entry's rows
+    live in its baked ``.cache()`` snapshot. After this every read resolves
+    through ``cached_result_expr`` (cheap recompute / baked snapshot); nothing
+    re-creates these files. Sweeps the pre-#73 build-time parquet and any
+    on-demand parquet / result-read build written since. Runs once per project
+    (guarded by a marker in the catalog dir so it doesn't churn regenerated
+    caches on restart), is idempotent and best-effort, and returns the count
+    of paths removed.
     """
-    from tallyman_core.paths import ENTRY_RESULT_FILENAME, catalog_dir
+    import shutil
+
+    from tallyman_core.paths import catalog_dir
 
     marker = catalog_dir(project) / _MIGRATION_MARKER
     if marker.exists():
@@ -583,11 +595,15 @@ def migrate_drop_result_parquet(project: str) -> int:
     deleted = 0
     if base.is_dir():
         for child in base.iterdir():
-            rp = child / ENTRY_RESULT_FILENAME
-            if rp.is_file():
+            for name in _LEGACY_RESULT_NAMES:
+                p = child / name
                 try:
-                    rp.unlink()
-                    deleted += 1
+                    if p.is_file():
+                        p.unlink()
+                        deleted += 1
+                    elif p.is_dir():
+                        shutil.rmtree(p)
+                        deleted += 1
                 except OSError:
                     pass
     try:

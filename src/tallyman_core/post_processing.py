@@ -209,9 +209,10 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     """Execute a ``process(expr)`` function against a catalog entry's result.
 
     Resolves *entry_name_or_hash* as an alias first, then as a raw content
-    hash. Materialises the entry's result (``ensure_result``), execs *source*
-    in a restricted namespace, calls ``process(table)``, executes the result,
-    and returns a preview dict.
+    hash. Reads the entry's result via ``cached_result_expr`` (a cheap entry
+    recomputes, an expensive one reads its baked snapshot — the same expression
+    the viewer executes), execs *source* in a restricted namespace, calls
+    ``process(table)``, executes the result, and returns a preview dict.
 
     Returns::
 
@@ -227,7 +228,7 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     """
     from tallyman_core.aliases import get_alias  # avoid circular at module level
     from tallyman_core.paths import entry_build_dir
-    from tallyman_xorq.result_cache import ensure_result
+    from tallyman_xorq.result_cache import cached_result_expr
 
     # Resolve alias → hash, or treat as bare hash.
     content_hash = get_alias(project, entry_name_or_hash) or entry_name_or_hash
@@ -235,18 +236,17 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
         raise PostProcessingRunError(
             f"no catalog entry found for {entry_name_or_hash!r} (resolved hash: {content_hash})"
         )
-    # #73: cheap entries write no result.parquet at build; ensure_result
-    # materialises one on demand (in place for cheap, result_cache for expensive).
-    parquet_path = ensure_result(project, content_hash)
 
     try:
-        import pyarrow.parquet as pq  # noqa: PLC0415
         import xorq.api as xo  # noqa: PLC0415
     except ImportError as exc:
         raise PostProcessingRunError(f"missing dependency: {exc}") from None
 
-    table = pq.read_table(parquet_path)
-    ibis_table = xo.memtable(table.to_pandas(), name="_post_processing_run")
+    # Read the entry's result the same way the viewer's api_data does: a cheap
+    # entry recomputes, an expensive one reads its baked snapshot, and an evicted
+    # snapshot self-heals — all inside cached_result_expr. No result.parquet.
+    df = cached_result_expr(project, content_hash).execute()
+    ibis_table = xo.memtable(df, name="_post_processing_run")
 
     # Exec the source and extract process().
     ns: dict = {}

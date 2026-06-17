@@ -113,7 +113,7 @@ def test_api_data_expensive_entry_paginates_without_per_entry_parquet(
 
     An expensive entry (Sort) bakes its result into the result_cache snapshot but
     writes no per-entry result.parquet. Paginating must read that snapshot through
-    the expression, not ensure_result a second on-disk copy under the entry.
+    the expression, not materialise a second on-disk copy under the entry.
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""

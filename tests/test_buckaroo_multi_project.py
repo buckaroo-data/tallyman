@@ -79,13 +79,12 @@ def test_session_file_lives_at_global_location(isolated_home: Path):
     """The on-disk session map is one file under ``~/.tallyman/``, not under
     any specific project's catalog. Schema includes the project per hash so
     a restart-reload knows which parquet to find."""
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_build_dir
 
     ensure_project("alpha")
-    # Minimal entry so the prune check on _load_session_file lets the
-    # session through (entry_dir/result.parquet must exist).
-    (entry_dir("alpha", "abc")).mkdir(parents=True, exist_ok=True)
-    (entry_dir("alpha", "abc") / "result.parquet").write_bytes(b"placeholder")
+    # Minimal built entry so the prune check on _load_session_file lets the
+    # session through (_entry_exists keys on the xorq_build/ dir now).
+    entry_build_dir("alpha", "abc").mkdir(parents=True, exist_ok=True)
 
     mgr = BuckarooManager()
     mgr._sessions["abc"] = {"session_id": "sess-1", "project": "alpha"}
@@ -105,18 +104,16 @@ def test_session_file_lives_at_global_location(isolated_home: Path):
     assert mgr2._sessions["abc"]["project"] == "alpha"
 
 
-def test_startup_prunes_entries_for_missing_parquets(isolated_home: Path):
-    """If a session entry points at a project/hash whose parquet no longer
-    exists on disk, the manager drops it on load. Defensive against catalog
-    cleanup or project deletion happening behind our back."""
+def test_startup_prunes_entries_for_missing_builds(isolated_home: Path):
+    """If a session entry points at a project/hash whose build no longer exists
+    on disk, the manager drops it on load. Defensive against catalog cleanup or
+    project deletion happening behind our back."""
     ensure_project("alpha")
-    # Write a session file with one valid entry (parquet exists) and one stale
+    # Write a session file with one valid entry (build exists) and one stale
     # entry (no such project at all).
-    from tallyman_core.paths import entry_dir
+    from tallyman_core.paths import entry_build_dir
 
-    valid_dir = entry_dir("alpha", "valid_hash")
-    valid_dir.mkdir(parents=True, exist_ok=True)
-    (valid_dir / "result.parquet").write_text("not really parquet, just exists")
+    entry_build_dir("alpha", "valid_hash").mkdir(parents=True, exist_ok=True)
 
     sessions_path = buckaroo_sessions_path()
     sessions_path.parent.mkdir(parents=True, exist_ok=True)

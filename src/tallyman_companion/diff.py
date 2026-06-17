@@ -9,8 +9,8 @@ Two entry points:
 
   build_diff_expr(a_hash, b_hash, keys)
       Convenience wrapper used as the internal expr.py rebuild path for
-      promoted diff entries.  Resolves the active project, ensures both
-      source parquets exist, and delegates to build_compare_expr.
+      promoted diff entries.  Resolves the active project, composes both
+      entries' cache-resolving expressions, and delegates to build_compare_expr.
 """
 
 from __future__ import annotations
@@ -214,19 +214,17 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
 def build_diff_expr(a_hash: str, b_hash: str, keys: list[str]) -> Any:
     """Build the comparison expression for a promoted diff entry.
 
-    Loads both source entries' result parquets via the active project and
-    delegates to build_compare_expr.  Project resolves via the active-project
-    file (same mechanism as other catalog-aware code).
+    Composes both source entries' cache-resolving expressions (a cheap entry
+    recomputes, an expensive one reads its baked snapshot) and delegates to
+    build_compare_expr.  Both sides root on the default backend, so the join
+    stays single-backend.  Project resolves via the active-project file (same
+    mechanism as other catalog-aware code).
     """
-    import xorq.api as xo
-
     from tallyman_core.paths import resolve_project
-    from tallyman_xorq.result_cache import ensure_result
+    from tallyman_xorq.result_cache import cached_result_expr
 
     project = resolve_project()
-    a_path = ensure_result(project, a_hash)
-    b_path = ensure_result(project, b_hash)
-    a_expr = xo.deferred_read_parquet(str(a_path))
-    b_expr = xo.deferred_read_parquet(str(b_path))
+    a_expr = cached_result_expr(project, a_hash)
+    b_expr = cached_result_expr(project, b_hash)
     expr, _ = build_compare_expr(a_expr, b_expr, keys)
     return expr

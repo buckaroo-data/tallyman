@@ -42,6 +42,18 @@ The rebuild is IN-PLACE: it reads every recipe into memory, wipes the catalog
 metadata (keeping ``data/``), re-execs, and checkpoints. Destructive to the
 catalog bookkeeping (recipes are regenerated); the single-user no-migration rule
 permits it. Use ``--dry-run`` first.
+
+Known limitation — build-time alias revision. A recipe chains a parent by ALIAS
+with no version pin (``from_catalog("habitual_speeder_stats")``), so when that
+alias was revised *after* a child was built and the revision changed the parent's
+schema, the rebuild re-points the alias at its FINAL latest revision and the
+child can fail to find a column the older revision had. The exact build-time
+parent hash is recorded in ``manifest.parents`` (#84); pinning cross-alias refs
+to it (rewriting the ref to the build-time parent hash, like the literal-hash
+path already does) would close this — the next step for deeply-revised corpora.
+Validated end-to-end on `first-project` (4 entries, alias chain) and the native
+round-trip test; a 15-entry corpus with schema-evolving alias revisions
+(`parking_ticket_analysis_1m`) reaches this limit.
 """
 
 from __future__ import annotations
@@ -70,15 +82,34 @@ class OldCatalog:
     prompts: dict[str, list[dict]] = field(default_factory=dict)  # old_hash -> [{prompt, at}, ...]
     post_processing: dict[str, str] = field(default_factory=dict)  # name -> source
     stats: dict[str, str] = field(default_factory=dict)  # name -> source
+    notebook_cells: list[dict] = field(default_factory=list)  # [{cell_id, alias, markdown}, ...]
 
 
 def read_old_catalog(project: str) -> OldCatalog:
-    """Read the pre-rebuild catalog. Tolerates both the native (``aliases.jsonl``)
-    and the old (``aliases.json`` + ``alias_history.json``) alias stores."""
+    """Read the pre-rebuild catalog across all three layouts this project has seen:
+
+    * native (#52+): ``aliases.jsonl`` + ``chart_specs/`` files + ``prompts/`` +
+      relocated ``post_processing`` / ``stats`` .py;
+    * aliases.json-era: ``aliases.json`` + ``alias_history.json`` + ``chart_specs/``
+      + ``artifacts/{post_processing,stats}``;
+    * catalog.yaml-era (most of the real corpus): everything embedded in
+      ``catalog.yaml`` — ``alias_map`` / ``alias_history`` / ``charts`` /
+      ``post_processing`` / ``stats`` / ``notebook`` — with no decomposed files.
+
+    Each section reads from its decomposed file if present, else falls back to
+    ``catalog.yaml``.
+    """
     from tallyman_core.paths import catalog_dir  # noqa: PLC0415
 
     cat = catalog_dir(project)
     oc = OldCatalog()
+
+    cy = cat / "catalog.yaml"
+    ydata: dict = {}
+    if cy.is_file():
+        import yaml  # noqa: PLC0415
+
+        ydata = yaml.safe_load(cy.read_text()) or {}
 
     entries = cat / "entries"
     if entries.is_dir():
@@ -102,14 +133,15 @@ def read_old_catalog(project: str) -> OldCatalog:
                 rec = json.loads(line)
                 oc.aliases[rec["alias"]] = rec["latest"]
                 oc.history[rec["alias"]] = rec.get("history", [])
-    else:
-        aj = cat / "aliases.json"
-        if aj.is_file():
-            oc.aliases = json.loads(aj.read_text())
+    elif (cat / "aliases.json").is_file():
+        oc.aliases = json.loads((cat / "aliases.json").read_text())
         ah = cat / "alias_history.json"
-        if ah.is_file():
-            oc.history = json.loads(ah.read_text())
-        # an alias with no recorded history defaults to its single current hash
+        oc.history = json.loads(ah.read_text()) if ah.is_file() else {}
+        for name, h in oc.aliases.items():  # default a historyless alias to its current hash
+            oc.history.setdefault(name, [h])
+    else:  # catalog.yaml-era: aliases embedded as alias_map / alias_history
+        oc.aliases = dict(ydata.get("alias_map", {}) or {})
+        oc.history = {k: list(v) for k, v in (ydata.get("alias_history", {}) or {}).items()}
         for name, h in oc.aliases.items():
             oc.history.setdefault(name, [h])
 
@@ -117,29 +149,69 @@ def read_old_catalog(project: str) -> OldCatalog:
     if cs.is_dir():
         for f in cs.glob("*.vl.json"):
             oc.charts[f.name[: -len(".vl.json")]] = f.read_text()
+    if not oc.charts:  # catalog.yaml-era: charts as [{content_hash, spec}]
+        for rec in ydata.get("charts", []) or []:
+            oc.charts[rec["content_hash"]] = json.dumps(rec["spec"])
 
-    # post_processing / stats: old layout under artifacts/, native under the repo
+    # post_processing / stats: decomposed .py (old artifacts/ layout or native under
+    # the repo), else the catalog.yaml-embedded [{name, source}] lists.
     for holder, dest in (("post_processing", oc.post_processing), ("stats", oc.stats)):
         for base in (cat / holder, cat.parent / holder):
             if base.is_dir():
                 for f in base.glob("*.py"):
                     dest.setdefault(f.stem, f.read_text())
+        if not dest:
+            for rec in ydata.get(holder, []) or []:
+                dest[rec["name"]] = rec["source"]
+
+    # notebook cells (alias-keyed, so no hash remap): native notebook.jsonl else
+    # the catalog.yaml-embedded {cells: [...]}.
+    nb_jsonl = cat / "notebook.jsonl"
+    if nb_jsonl.is_file():
+        oc.notebook_cells = [json.loads(x) for x in nb_jsonl.read_text().splitlines() if x.strip()]
+    else:
+        oc.notebook_cells = list((ydata.get("notebook", {}) or {}).get("cells", []) or [])
     return oc
 
 
-def parse_deps(expr_text: str, aliases: dict[str, str], known: set[str]) -> set[str]:
-    """The set of old hashes this recipe depends on (alias refs resolved to their
-    current hash, literal hash refs taken as-is), restricted to entries we have."""
+def parse_deps(
+    expr_text: str,
+    self_hash: str,
+    aliases: dict[str, str],
+    history: dict[str, list[str]],
+    known: set[str],
+) -> set[str]:
+    """The old hashes this recipe depends on, as the build resolved them.
+
+    A literal hash ref is itself. An alias ref resolves to the alias's *build-time*
+    target: if this entry is a revision of that alias (the documented self-chaining
+    revise — ``from_catalog`` of one's own alias, #74), the dependency is the
+    PREVIOUS revision in the alias history, not the current latest (which would be
+    this very entry, a false self-cycle); otherwise it is the alias's current hash.
+    """
     out: set[str] = set()
     for ref in _FROM_CAT_RE.findall(expr_text):
-        out.add(aliases.get(ref, ref))
+        if ref in aliases:
+            hist = history.get(ref, [])
+            if self_hash in hist:
+                i = hist.index(self_hash)
+                dep = hist[i - 1] if i > 0 else None  # build-time parent = the prior revision
+            else:
+                dep = aliases[ref]  # a cross-alias chain resolves to the current latest
+        else:
+            dep = ref  # literal hash pin
+        if dep:
+            out.add(dep)
     return out & known
 
 
-def toposort(recipes: dict[str, str], aliases: dict[str, str]) -> list[str]:
+def toposort(
+    recipes: dict[str, str], aliases: dict[str, str], history: dict[str, list[str]] | None = None
+) -> list[str]:
     """Dependency order (parents before children) over the from_catalog graph."""
+    history = history or {}
     known = set(recipes)
-    dmap = {h: parse_deps(t, aliases, known) for h, t in recipes.items()}
+    dmap = {h: parse_deps(t, h, aliases, history, known) for h, t in recipes.items()}
     order: list[str] = []
     placed: set[str] = set()
     while len(placed) < len(recipes):
@@ -186,7 +258,7 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
     oc = read_old_catalog(project)
     if not oc.recipes:
         raise RuntimeError(f"no rebuildable entries (expr.py + manifest.json) found in project {project!r}")
-    order = toposort(oc.recipes, oc.aliases)
+    order = toposort(oc.recipes, oc.aliases, oc.history)
     log(
         f"project {project!r}: {len(oc.recipes)} entries, {len(oc.aliases)} aliases, "
         f"{len(oc.charts)} charts, {len(oc.post_processing)} post-processing, {len(oc.stats)} stats"
@@ -202,12 +274,24 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
     ensure_project(project)
     set_active_project(project)  # recipes resolve project_path/from_catalog against the active project
     catalog_state.genesis(project)
+    # The catalog just changed under the process-global result-expr memo; a stale
+    # plan would make a from_catalog child re-exec against the pre-wipe parent.
+    # (A fresh-process CLI run has an empty memo; an in-process rebuild does not.)
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
-    # alias whose CURRENT target is this old hash -> must be set right after it
-    # builds so a child's from_catalog(alias) resolves at build time.
-    cur_alias_for: dict[str, list[str]] = {}
-    for name, h in oc.aliases.items():
-        cur_alias_for.setdefault(h, []).append(name)
+    cached_result_expr.cache_clear()
+
+    # Re-point an alias at each of its revisions AS that revision is rebuilt
+    # (topo order replays history oldest-first), so a later self-chaining revise
+    # resolves from_catalog(alias) to its build-time parent, and a cross-alias
+    # child resolves to the latest-built revision. Keyed on history membership,
+    # not just the final target.
+    revises_at: dict[str, list[str]] = {}
+    for name, hist in oc.history.items():
+        for h in hist:
+            revises_at.setdefault(h, []).append(name)
+        if oc.aliases.get(name) not in hist and name in oc.aliases:
+            revises_at.setdefault(oc.aliases[name], []).append(name)  # latest absent from history
 
     # The persisted recipe is portable: build.py rewrites the data path to a
     # ${TALLYMAN_PROJECT_ROOT} placeholder. Expand it back so the re-exec reads
@@ -225,7 +309,7 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
         remap[old_hash] = res.content_hash
         tag = "" if res.content_hash == old_hash else f"  (rehashed -> {res.content_hash})"
         log(f"  built {old_hash}{tag}")
-        for name in cur_alias_for.get(old_hash, []):
+        for name in revises_at.get(old_hash, []):
             al.set_alias(project, name, res.content_hash)
         if len(prompts) > 1:  # build wrote only the first; carry the rest
             p = prompts_path(project, res.content_hash)
@@ -256,6 +340,14 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
             write_stat(project, name, src)
         except Exception as e:  # noqa: BLE001
             log(f"  WARN stat {name!r} failed re-validation: {e}")
+
+    # notebook cells are alias-keyed (no hash remap); re-append in order.
+    from tallyman_core import notebook  # noqa: PLC0415
+
+    for cell in oc.notebook_cells:
+        alias = cell.get("alias")
+        if alias:
+            notebook.append(project, alias, markdown=cell.get("markdown"))
 
     step = catalog_state.checkpoint_catalog(project, "rebuild into native catalog format")
     log(f"  checkpoint -> step {step}")

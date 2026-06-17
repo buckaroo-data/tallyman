@@ -394,3 +394,42 @@ def test_display_config_survives_reset(project, orders_parquet):
     assert dc.get_display_config(project, h) is None
     cs.reset_to(project, 2)
     assert dc.get_display_config(project, h) == {"pinned_rows": [1, 2]}
+
+
+def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
+    """End to end: after building an entry and touching every decomposed section,
+    the git-tracked tree is *exactly* the native decomposed surface — no
+    catalog.yaml, no build dirs, no xorq metadata/symlinks. Pins the whole cut."""
+    from tallyman_core import aliases as al
+    from tallyman_core import charts, notebook
+    from tallyman_core import display_configs as dc
+    from tallyman_core import post_processing as pp
+    from tallyman_core import summary_stats as ss
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    h = res.content_hash
+    al.set_alias(project, "by_region", h, expect_exists=False)
+    charts.set_chart(project, h, {"mark": "bar"})
+    dc.set_display_config(project, h, {"pinned_rows": [1]})
+    pp.write_post_processing(project, "pp1", "def process(expr):\n    return expr\n")
+    ss.write_stat(project, "st1", "def compute(col):\n    return col.count()\n")
+    notebook.append(project, "by_region", markdown="hello")
+    cs.checkpoint_catalog(project, "create")
+
+    rc, out, _ = cs.run_git(["ls-files"], cwd=paths.catalog_dir(project))
+    tracked = set(out.split())
+    assert tracked == {
+        ".gitignore",
+        "aliases.jsonl",
+        "notebook.jsonl",
+        "entries.jsonl",
+        "compute_cache.jsonl",
+        f"entries/{h}.zip",
+        f"chart_specs/{h}.vl.json",
+        f"display_configs/{h}.json",
+        "post_processing/pp1.py",
+        "stats/st1.py",
+        f"prompts/{h}.jsonl",
+    }, tracked
+    assert "catalog.yaml" not in tracked and not any("/xorq_build/" in t for t in tracked)

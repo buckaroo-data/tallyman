@@ -1,7 +1,45 @@
 # Plan: native `tallyman_core.catalog` — drop xorq's catalog package
 
-Status: proposed (2026-06-16). Refined through a parallel code investigation and
-a grilling pass; the decisions below are settled unless marked open.
+Status: **implemented** (2026-06-16) on `plan/native-catalog-store`. Refined
+through a parallel code investigation and a grilling pass; the decisions below
+are settled unless marked open.
+
+## Implementation notes (deviations from the plan as written)
+
+The cut landed as: `1a` failing-first markers → native recipe store + checkpoint
+owns the zip → catalog.yaml decomposition → Cut B → doc/dead-code sweep →
+verify. Where reality diverged from the plan text:
+
+- **Plan commits 2 and 3 merged.** The recipe store (`write_recipe_zip`) is inert
+  until the checkpoint calls it, and `reset_to`'s consistency check needs both
+  halves, so splitting them would leave `reset_to` transiently broken. Landed as
+  one coherent "Cut A" commit.
+- **Line numbers were uniformly stale** (~+60 in `build.py`, e.g. the registration
+  swallow is :539-541 not :477-478, the re-run prompt append is :396 not :335).
+  Re-derived against the post-#104 tree before writing any test.
+- **#104 already removed `result.parquet`.** The zip allowlist's "exclude
+  result.parquet" is now about a stray that no longer naturally appears; the real
+  heavy exclusion is `.xorq_build_expanded/`. The dead `migrate_drop_result_parquet`
+  marker is gitignored (`.migrated_*`).
+- **Several planned "failing-first" 1a tests were green today** (the merged #48
+  fix already registers every entry; the salted-zip naming already works via the
+  `entry_name` copytree; checkpoint used an explicit `git add catalog.yaml`).
+  Per the TDD rule they shipped with their fix commit as guards, not in 1a.
+- **Cut B — `diff.py` is a phantom site.** Neither `diff.py` imports `xorq.api`;
+  the real `xo.build_expr` site is `app.py._build_compare_expr`. And
+  `post_processing.py`/`summary_stats.py` keep the full `import xorq.api` bind in
+  `_restricted_globals` — that is the user-authored exec surface (D4), like
+  recipes; only their `xo.memtable` uses were narrowed.
+- **Connect-shim test asserts key + data equivalence, not byte-identical.** The
+  baked snapshot parquet is *not* byte-deterministic even for one backend
+  (datafusion's group-by output order varies), so the meaningful equivalence is
+  the content-addressed snapshot *key* + the *data*, not raw bytes.
+- **Corpus rebuild deferred.** Eight on-disk projects under
+  `~/.tallyman-notebooks` are still old-format (`catalog.yaml` + xorq zips with
+  `metadata/` sidecars); they need rebuilding (the single-user rule permits it),
+  but the rebuild *mechanism* is the open item below, so it was not auto-run.
+  End-to-end verification ran on a fresh project instead
+  (`test_tracked_tree_is_the_decomposed_surface`).
 
 ## Problem
 

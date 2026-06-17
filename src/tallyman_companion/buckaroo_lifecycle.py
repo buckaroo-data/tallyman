@@ -486,12 +486,14 @@ class BuckarooManager:
 
         Posts an expanded xorq build dir to Buckaroo's ``/load_expr`` endpoint so
         the session is backed by an xorq expression (push-down sort/search
-        against the underlying backend). For a cheap entry that build is the
-        entry's recipe (``xorq_build/``); for a cache-worthy entry it's a read of
-        the materialised ``result.parquet`` (#71) so count()/paging don't re-run
-        the Aggregate/Join/Sort — push-down still holds on a parquet scan.
+        against the underlying backend). The posted build is always the entry's
+        expanded recipe (``xorq_build/``): a cheap entry recomputes on read
+        (push-down over a columnar source), and a cache-worthy entry's recipe
+        replays onto its baked ``.cache()`` snapshot — a read of the snapshot, not
+        a re-run of the Aggregate/Join/Sort. No per-entry ``result.parquet`` is
+        read any more; the #71 result-read build that served one was removed.
 
-        ``project`` names the project that owns the parquet. Sessions cache
+        ``project`` names the project that owns the entry. Sessions cache
         across projects via content hash (globally unique), so a second call
         for the same hash from a different project returns the existing
         session — the bytes are the same by definition.

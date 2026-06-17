@@ -378,6 +378,10 @@ All new failing tests bundle into one commit, seen red on CI, before the fixes.
 - No on-disk migration; rebuild the corpus.
 - Recipe authoring-surface switch (D4) is a separate, codegen-validated follow-up.
 - Collapsing `entry_hashes` into `git ls-files` is a separate look.
+- Runtime per-project venv isolation (build each project *inside* its own venv,
+  recreated from the tracked lock, instead of the shared in-process env) is a larger
+  architecture change — tracked in #106. This plan settles the reproducibility
+  *record* (the tracked `pyproject.toml` + `uv.lock`) only; the in-process build stays.
 
 ## Open / not yet grilled
 

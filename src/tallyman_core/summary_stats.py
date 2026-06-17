@@ -151,11 +151,11 @@ def validate_stat_source(name: str, source: str) -> None:
         raise StatSourceError(f"compute() must take exactly one parameter, got {len(params)}")
 
     try:
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as e:
         raise StatSourceError(f"xorq is not installed: {e}") from None
 
-    table = xo.memtable({"a": [1, 2, 3]}, name="_stat_dry_run")
+    table = memtable({"a": [1, 2, 3]}, name="_stat_dry_run")
     col = table["a"]
     try:
         result = compute(col)

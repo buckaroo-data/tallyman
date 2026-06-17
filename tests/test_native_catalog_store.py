@@ -313,6 +313,47 @@ def test_back_then_forward_restores_recipe(project, orders_parquet):
 
 
 # ---------------------------------------------------------------------------
+# Cut B — the catalog-free datafusion connect shim
+# ---------------------------------------------------------------------------
+
+
+def test_connect_shim_matches_xorq_api_connect(project, orders_parquet, monkeypatch):
+    """The catalog-free connect shim is equivalent to xorq.api.connect(): it
+    builds the same datafusion backend, so a ParquetSnapshotCache(source=shim)
+    derives the SAME content-addressed snapshot key and bakes the SAME result
+    data. A naive swap to xorq.expr.api.connect (ibis's connect(resource,
+    **kwargs)) would resolve the symbol then build the wrong backend or fail at
+    call time (Risk #3) — this is the central Cut-B correctness claim.
+
+    Not raw-byte equality: datafusion's group-by output order (and parquet
+    metadata) isn't deterministic, so even one backend re-baking the same expr
+    yields different bytes. The content-addressed *key* and the *data* are what
+    must match.
+    """
+    import pandas as pd
+    import xorq.api as xo
+
+    from tallyman_xorq.result_cache import _cached_node_path, _recipe_expr
+    from tallyman_xorq.source_cache import rewrite_for_build
+
+    res = build_and_persist(project, _agg_code(orders_parquet))  # bakes via the shim
+    raw = _recipe_expr(project, res.content_hash)
+    shim_path = _cached_node_path(rewrite_for_build(raw, project))
+    assert shim_path is not None and shim_path.exists(), "the shim must bake a real snapshot"
+    shim_df = pd.read_parquet(shim_path).sort_values("region").reset_index(drop=True)
+
+    # rewrite_for_build does `from tallyman_xorq.backend import connect` at call
+    # time, so patching the shim's source reroutes the next derive/bake.
+    monkeypatch.setattr("tallyman_xorq.backend.connect", xo.connect)
+    api_expr = rewrite_for_build(raw, project)
+    assert _cached_node_path(api_expr) == shim_path, "shim and xorq.api.connect must share the snapshot key"
+    shim_path.unlink()  # evict, then re-bake via xorq.api.connect
+    api_expr.count().execute()
+    api_df = pd.read_parquet(shim_path).sort_values("region").reset_index(drop=True)
+    pd.testing.assert_frame_equal(shim_df, api_df)
+
+
+# ---------------------------------------------------------------------------
 # Decomposition — mutable state is tracked files that roll back with git reset
 # ---------------------------------------------------------------------------
 

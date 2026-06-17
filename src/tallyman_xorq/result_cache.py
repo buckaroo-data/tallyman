@@ -264,7 +264,7 @@ def cached_result_expr(project: str, content_hash: str):
     expression uncached under salt, so there is no snapshot to dereference). Both
     are single-backend recompute expressions — content-honest, no parquet.
     """
-    import xorq.api as xo
+    from xorq.expr.api import deferred_read_parquet
 
     # This function is LRU-memoised, so its body runs only on a miss: every line
     # below is a cold read. Tag each return with the #74 path it took and the
@@ -300,5 +300,5 @@ def cached_result_expr(project: str, content_hash: str):
         return _read(raw, "worthy-recompute-fallback")
     if not path.exists():
         baked.count().execute()  # evicted snapshot: repopulate once, then read
-        return _read(xo.deferred_read_parquet(str(path)), "evicted-self-heal")
-    return _read(xo.deferred_read_parquet(str(path)), "baked-read")
+        return _read(deferred_read_parquet(str(path)), "evicted-self-heal")
+    return _read(deferred_read_parquet(str(path)), "baked-read")

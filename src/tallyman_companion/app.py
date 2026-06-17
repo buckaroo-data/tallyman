@@ -202,7 +202,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     """
     import tempfile
 
-    import xorq.api as xo
+    from xorq.ibis_yaml.compiler import build_expr
 
     a = cached_result_expr(project, a_hash)
     b = cached_result_expr(project, b_hash)
@@ -211,7 +211,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
 
     builds_dir = Path(tempfile.gettempdir()) / "tallyman_diff_builds"
     builds_dir.mkdir(parents=True, exist_ok=True)
-    build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
+    build_path = Path(build_expr(expr, builds_dir=str(builds_dir)))
 
     return build_path, overrides
 

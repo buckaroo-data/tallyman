@@ -44,6 +44,7 @@ def _should_cache_read(method_name: str) -> bool:
     """
     return method_name not in _EXEMPT_READS
 
+
 _IN_MEMORY_MSG = (
     "expression reads in-memory data (read_in_memory / ibis.memtable). This "
     "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
@@ -106,13 +107,14 @@ def rewrite_for_build(expr, project: str):
     path-only snapshot keys would collide across salted entries with identical
     paths but different content. In-memory rejection still applies.
     """
-    import xorq.api as xo
     import xorq.vendor.ibis.expr.operations as ops
+    from xorq.caching import ParquetSnapshotCache
     from xorq.common.utils.graph_utils import replace_nodes, walk_nodes
     from xorq.expr.relations import Read
 
     from tallyman_core.paths import compute_cache_dir
     from tallyman_xorq import source_identity as si
+    from tallyman_xorq.backend import connect
 
     reads = walk_nodes(Read, expr)
     if walk_nodes(ops.InMemoryTable, expr) or any(r.method_name == "read_in_memory" for r in reads):
@@ -130,7 +132,7 @@ def rewrite_for_build(expr, project: str):
     # same Read — without the memo it would wrap it again, forever.
     targets = {r for r in reads if _should_cache_read(r.method_name)}
     if targets:
-        src_cache = xo.ParquetSnapshotCache.from_kwargs(source=xo.connect(), base_path=base)
+        src_cache = ParquetSnapshotCache.from_kwargs(source=connect(), base_path=base)
         wrapped: dict = {}
 
         def replacer(node, kwargs):
@@ -148,9 +150,7 @@ def rewrite_for_build(expr, project: str):
     # relative_path keeps baked results inspectable apart from source parses
     # under the same compute-cache root.
     if _is_worthy_expr(expr):
-        result_cache = xo.ParquetSnapshotCache.from_kwargs(
-            source=xo.connect(), base_path=base, relative_path="result_cache"
-        )
+        result_cache = ParquetSnapshotCache.from_kwargs(source=connect(), base_path=base, relative_path="result_cache")
         expr = expr.cache(cache=result_cache)
 
     return expr

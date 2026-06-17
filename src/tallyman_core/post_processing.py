@@ -151,7 +151,7 @@ def validate_post_processing_source(name: str, source: str) -> None:
         raise PostProcessingSourceError(f"process() must take exactly one parameter, got {len(params)}")
 
     try:
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as e:
         raise PostProcessingSourceError(f"xorq is not installed: {e}") from None
 
@@ -160,7 +160,7 @@ def validate_post_processing_source(name: str, source: str) -> None:
     # 1-row single-column dry-run (like stats use) wouldn't exercise
     # the common shape. Three rows × two cols is small enough that any
     # ``process`` that runs at all will return quickly.
-    table = xo.memtable(
+    table = memtable(
         {"a": [1, 2, 3], "b": ["x", "y", "z"]},
         name="_post_processing_dry_run",
     )
@@ -238,7 +238,7 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
         )
 
     try:
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as exc:
         raise PostProcessingRunError(f"missing dependency: {exc}") from None
 
@@ -246,7 +246,7 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     # entry recomputes, an expensive one reads its baked snapshot, and an evicted
     # snapshot self-heals — all inside cached_result_expr. No result.parquet.
     df = cached_result_expr(project, content_hash).execute()
-    ibis_table = xo.memtable(df, name="_post_processing_run")
+    ibis_table = memtable(df, name="_post_processing_run")
 
     # Exec the source and extract process().
     ns: dict = {}

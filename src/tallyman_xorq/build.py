@@ -493,10 +493,10 @@ def build_and_persist(
 
     compile_seconds: float | None = None
     try:
-        import xorq.api as xo
+        from xorq.expr.api import to_sql
 
         t_compile = time.monotonic()
-        xo.to_sql(author_expr)
+        to_sql(author_expr)
         compile_seconds = round(time.monotonic() - t_compile, 3)
     except Exception:
         # Best-effort: a DAG xorq can't render to SQL must not break the build.

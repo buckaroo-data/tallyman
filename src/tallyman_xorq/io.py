@@ -46,7 +46,7 @@ def from_project(rel_path: str, project: str | None = None):
     for build_and_persist to mix into the entry hash; `off` is the plain
     path read.
     """
-    import xorq.api as xo
+    from xorq.expr.api import deferred_read_parquet
 
     from tallyman_xorq import source_identity as si
 
@@ -57,7 +57,7 @@ def from_project(rel_path: str, project: str | None = None):
         si.note_source(rel_path, digest)
         if si.mode() == "cas":
             path = si.ensure_cas_path(proj, path, digest)
-    return xo.deferred_read_parquet(str(path))
+    return deferred_read_parquet(str(path))
 
 
 def from_catalog(alias_or_hash: str, project: str | None = None):

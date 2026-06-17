@@ -96,48 +96,11 @@ def test_run_git_returns_code_out_err(project):
     assert ".git" in out
 
 
-# ---------------------------------------------------------------------------
-# Invariant 3 — non-destructive materialize (G3)
-# ---------------------------------------------------------------------------
-
-
-def test_capture_materialize_roundtrip(project):
-    pp.write_post_processing(project, "pp1", PP_SRC)
-    ss.write_stat(project, "st1", ST_SRC)
-    charts.set_chart(project, "deadbeef", SPEC)
-    notebook.append(project, "alias1", markdown="hello")
-
-    state = cs.capture_tallyman_state(project)
-    assert any(e["name"] == "pp1" for e in state["post_processing"])
-    assert any(e["name"] == "st1" for e in state["stats"])
-    assert any(c["content_hash"] == "deadbeef" for c in state["charts"])
-    assert state["notebook"]["cells"][0]["alias"] == "alias1"
-
-    # Drift the on-disk tree, then materialize back from catalog.yaml.
-    pp.write_post_processing(project, "pp2_added_later", PP_SRC)
-    charts.set_chart(project, "cafef00d", SPEC)
-    cs.materialize(project)
-
-    names = {e["name"] for e in pp.list_post_processings(project)}
-    assert names == {"pp1"}  # pp2 reconciled away
-    assert charts.list_charts(project) == ["deadbeef"]  # cafef00d gone
-    assert {c["alias"] for c in notebook.load(project)["cells"]} == {"alias1"}
-
-
-def test_materialize_absent_key_preserves_files(project):
-    """A key absent from catalog.yaml means 'not recorded' — never wipe it."""
-    pp.write_post_processing(project, "legacy", PP_SRC)
-    # catalog.yaml has no post_processing key written.
-    cs.materialize(project)
-    assert any(e["name"] == "legacy" for e in pp.list_post_processings(project))
-
-
-def test_materialize_present_empty_clears(project):
-    """A present-but-empty list is a deliberate 'none at this step'."""
-    pp.write_post_processing(project, "doomed", PP_SRC)
-    cs.write_tallyman_state(project, post_processing=[])
-    cs.materialize(project)
-    assert pp.list_post_processings(project) == []
+# Invariant 3 (non-destructive materialize) is retired by the native store: the
+# six mutable sections are tracked files now, restored by `git reset --hard`
+# directly, so there is no capture/materialize catalog.yaml round-trip. The
+# survives-reset behavior is covered by test_reset_roundtrip_over_every_kind
+# (below) and test_native_catalog_store.py's per-section reset tests.
 
 
 # ---------------------------------------------------------------------------
@@ -468,11 +431,9 @@ def test_cross_process_checkpoint(project, isolated_home):
 
 
 def test_catalog_repo_branch_is_main(project, monkeypatch):
-    """xorq's catalog layer hardcodes its branch as `main`; a plain `git init`
-    inherits init.defaultBranch (master on a stock machine and on CI), after
-    which `xorq catalog add` fails forever with "refs/heads/main does not
-    exist" — silently, because registration is best-effort. The repo branch
-    must be pinned, not inherited from host config."""
+    """The catalog repo pins its branch to `main` rather than inheriting the
+    host's init.defaultBranch (master on a stock machine and on CI), so the
+    repo's layout is deterministic and independent of host git config."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     cs.ensure_catalog_repo(project)
@@ -579,6 +540,7 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
 
     ed = paths.entry_dir(project, "bbbb")
     ed.mkdir(parents=True)
+    (ed / "manifest.json").write_text("{}")  # a complete entry — capture only records manifest-bearing dirs
     (ed / "result.parquet").write_bytes(b"big")
     _stage_recipe_zip(project, "bbbb")  # durable recipe, so the step's two views agree (#52)
     cc = paths.compute_cache_dir(project)
@@ -607,70 +569,33 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
     pointer names an entry whose durable xorq recipe (entries/<hash>.zip) was
     never committed (#52).
 
-    This is the shape any interrupted or failed best-effort ``xorq catalog add``
-    leaves behind: the build dir + the ``entry_hashes`` pointer land, but the
-    content-addressed recipe never reaches git. On a forward reset
-    ``restore_from_bullpen`` copies the build dir back, so the tallyman view
-    claims an entry the durable xorq catalog cannot reproduce — its only copy is
-    the evictable bullpen dir. The two views of "what entries exist" disagree;
-    reset must surface that divergence, not mask it and return success."""
+    Defense-in-depth: the normal capture path no longer *creates* this divergence
+    — a manifest-less mid-build dir is not recorded as a pointer (see
+    test_native_catalog_store.py::test_checkpoint_skips_manifestless_entry_dir).
+    But should a committed step's ``entry_hashes`` pointer name an entry whose
+    durable recipe zip is absent anyway (manual corruption, or a future code path
+    that bypasses the capture filter), reset must still surface the divergence —
+    the consistency guard is the backstop — not mask it and return success. So
+    inject the divergent step directly rather than via capture."""
     cs.ensure_catalog_repo(project)
     s0 = cs.checkpoint_catalog(project, "baseline")  # no entries yet
 
-    # A build dir + pointer whose recipe zip was never committed (failed add).
-    paths.entry_dir(project, "deadbeef").mkdir(parents=True)
-    s1 = cs.checkpoint_catalog(project, "entry whose recipe never reached git")
+    # Commit a step whose pointer has no durable recipe zip, bypassing the
+    # capture manifest-filter (which would otherwise drop the bogus pointer).
+    cs.write_tallyman_state(project, entry_hashes=["deadbeef"])
+    cd = paths.catalog_dir(project)
+    cs.run_git(["add", "-A"], cwd=cd)
+    cs.run_git([*cs._GIT_ID, "commit", "-m", "pointer whose recipe never reached git", "--allow-empty"], cwd=cd)
+    cs.run_git(["tag", "-f", "step-001"], cwd=cd)
 
-    cs.reset_to(project, s0)  # evict deadbeef to the bullpen
+    cs.reset_to(project, s0)  # move away from the divergent step
     with pytest.raises(RuntimeError, match="deadbeef"):
-        cs.reset_to(project, s1)  # forward: bullpen restores the dir, recipe is gone
+        cs.reset_to(project, 1)  # restoring it must surface the pointer-without-recipe divergence
 
 
-# ---------------------------------------------------------------------------
-# xorq catalog coexistence — genesis must not break `xorq catalog add`
-# ---------------------------------------------------------------------------
-
-
-def test_capture_seeds_xorq_keys(project):
-    """xorq's CatalogYaml.contents indexes `entries`/`aliases` directly, with
-    no defaulting for dict-shaped files (only the legacy list form gets
-    defaults) — so a catalog.yaml born from genesis/capture must carry both
-    keys, or every `xorq catalog add` fails (Error: 'aliases') and
-    registration silently no-ops. xorq round-trips unknown keys, so seeding
-    its two keys is the whole coexistence contract."""
-    import yaml as _yaml
-
-    cs.capture_tallyman_state(project)
-    raw = _yaml.safe_load((paths.catalog_dir(project) / "catalog.yaml").read_text())
-    assert raw.get("entries") == []
-    assert raw.get("aliases") == []
-
-
-def test_write_tallyman_state_rejects_unrepresentable_values(project):
-    """write_tallyman_state must never produce a catalog.yaml that safe_load
-    cannot read back. The reader (_read_raw) is yaml.safe_load, while the
-    writer's full Dumper happily emits python-object tags for a stray Path —
-    one such write bricks every later read: checkpoint, materialize, and prune
-    all degrade to log warnings until the file is hand-repaired. The write must
-    fail loudly instead, before the tmp-file replace, leaving the previous
-    catalog.yaml intact."""
-    import yaml as _yaml
-
-    cs.write_tallyman_state(project, charts=[])  # a good file exists first
-    bad_spec = {"content_hash": "x", "spec": {"path": Path("/tmp/x")}}
-    with pytest.raises(_yaml.YAMLError):
-        cs.write_tallyman_state(project, charts=[bad_spec])
-    assert cs.read_tallyman_state(project)["charts"] == []  # previous file untouched
-
-
-@pytest.mark.integration
-def test_xorq_catalog_add_registers_after_genesis(project, orders_parquet):
-    """End to end: genesis (branch-pinned, xorq-keyed catalog.yaml) then a
-    build — the best-effort xorq registration must actually land, leaving the
-    build zip tracked in the catalog repo at entries/<hash>.zip."""
-    assert cs.genesis(project) == 0
-    res = build_and_persist(project, _agg_code(orders_parquet))
-    zip_path = paths.catalog_dir(project) / "entries" / f"{res.content_hash}.zip"
-    assert zip_path.exists(), "xorq catalog add did not register the build"
-    tracked = _git(project, "ls-files", "entries")
-    assert f"entries/{res.content_hash}.zip" in tracked.split()
+# The xorq-catalog-coexistence section (catalog.yaml entries/aliases seeding,
+# write_tallyman_state yaml-safety, and the best-effort xorq-add-after-genesis
+# durability) is retired with the subprocess. The native store's
+# zip-at-checkpoint durability is covered by
+# test_native_catalog_store.py::test_zip_staged_not_committed_until_checkpoint
+# and test_n_builds_track_n_zips.

@@ -164,14 +164,14 @@ def test_validate_project_name_rejects(name: str):
 def test_ensure_project_creates_artifacts_layout(isolated_home: Path):
     p = ensure_project("alpha")
     assert p == project_dir("alpha")
-    # New tree: artifacts/ holds everything the system produces.
+    # New tree: artifacts/ holds everything the system produces. post_processing
+    # and stats moved under the catalog repo so the native store tracks them.
     assert (p / "artifacts" / "catalog" / "entries").is_dir()
-    assert (p / "artifacts" / "post_processing").is_dir()
-    assert (p / "artifacts" / "stats").is_dir()
+    assert (p / "artifacts" / "catalog" / "post_processing").is_dir()
+    assert (p / "artifacts" / "catalog" / "stats").is_dir()
     assert (p / "artifacts" / "exports").is_dir()
-    # Inputs and document stay at project root.
+    # Inputs stay at project root.
     assert (p / "data").is_dir()
-    assert (p / "notebooks").is_dir()
 
 
 def test_ensure_project_validates_name(isolated_home: Path):
@@ -192,11 +192,11 @@ def test_path_helpers_under_artifacts(isolated_home: Path):
     assert catalog_dir("alpha") == p / "artifacts" / "catalog"
     assert entries_dir("alpha") == p / "artifacts" / "catalog" / "entries"
     assert entry_dir("alpha", "abc123") == entries_dir("alpha") / "abc123"
-    assert post_processing_dir("alpha") == p / "artifacts" / "post_processing"
-    assert stats_dir("alpha") == p / "artifacts" / "stats"
+    assert post_processing_dir("alpha") == p / "artifacts" / "catalog" / "post_processing"
+    assert stats_dir("alpha") == p / "artifacts" / "catalog" / "stats"
     assert exports_dir("alpha") == p / "artifacts" / "exports"
     assert errors_path("alpha") == p / "artifacts" / "errors.jsonl"
-    # data/ and notebooks/ stay at project root.
+    # data/ stays at project root.
     assert data_dir("alpha") == p / "data"
 
 

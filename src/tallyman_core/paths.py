@@ -7,14 +7,19 @@ Layout (per-project):
     ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
-        │   ├── catalog/entries/<hash>/    # the xorq catalog git repo
-        │   │                              # (alias bookkeeping is catalog.yaml keys, not files)
-        │   ├── post_processing/<name>.py
-        │   ├── stats/<name>.py
+        │   ├── catalog/               # the native catalog git repo
+        │   │   ├── entries/<hash>.zip     # immutable recipe (one blob per entry)
+        │   │   ├── entries/<hash>/        # untracked build dir (gitignored)
+        │   │   ├── aliases.jsonl          # tracked alias bookkeeping
+        │   │   ├── notebook.jsonl         # tracked notebook cells
+        │   │   ├── chart_specs/<hash>.vl.json
+        │   │   ├── display_configs/<hash>.json
+        │   │   ├── post_processing/<name>.py , stats/<name>.py
+        │   │   ├── prompts/<hash>.jsonl
+        │   │   └── entries.jsonl , compute_cache.jsonl   # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
-        ├── data/                      # input parquets (fixtures or user)
-        └── notebooks/notebook.json
+        └── data/                      # input parquets (fixtures or user)
 
 The active project lives in a single one-line file at
 ``~/.tallyman/active_project``. ``resolve_project()`` reads it on every
@@ -238,11 +243,24 @@ def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
 
 
 def post_processing_dir(project: str) -> Path:
-    return artifacts_dir(project) / "post_processing"
+    # Under the catalog repo (was artifacts/) so the native store tracks the
+    # scripts directly instead of round-tripping them through catalog.yaml.
+    return catalog_dir(project) / "post_processing"
 
 
 def stats_dir(project: str) -> Path:
-    return artifacts_dir(project) / "stats"
+    return catalog_dir(project) / "stats"
+
+
+def prompts_dir(project: str) -> Path:
+    return catalog_dir(project) / "prompts"
+
+
+def prompts_path(project: str, content_hash: str) -> Path:
+    """Tracked per-entry authoring-prompt history (was a loose
+    ``entries/<hash>/prompts.jsonl``, lost on a clone now that build dirs are
+    gitignored)."""
+    return prompts_dir(project) / f"{content_hash}.jsonl"
 
 
 def display_dir(project: str) -> Path:
@@ -325,28 +343,6 @@ def resolve_project(explicit: str | None = None) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# xorq catalog repo path (per-project)
-# ---------------------------------------------------------------------------
-
-
-def catalog_repo_path() -> Path:
-    """Path the xorq CLI uses for its ``catalog`` git repo.
-
-    Lives at ``<project>/artifacts/catalog/`` — same dir as the tallyman
-    catalog entries. ``xorq catalog init`` writes a ``.git/`` alongside
-    them.
-
-    ``TALLYMAN_CATALOG_REPO`` env overrides for tests or external repos.
-    """
-    override = os.environ.get("TALLYMAN_CATALOG_REPO")
-    if override:
-        return Path(override)
-    project = resolve_project()
-    if project is None:
-        raise RuntimeError("catalog_repo_path called with no active project")
-    return catalog_dir(project)
-
 
 # ---------------------------------------------------------------------------
 # Project lifecycle
@@ -369,7 +365,6 @@ def ensure_project(project: str) -> Path:
         display_dir(project),
         exports_dir(project),
         data_dir(project),
-        notebooks_dir(project),
     ):
         d.mkdir(parents=True, exist_ok=True)
     return p

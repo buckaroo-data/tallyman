@@ -108,7 +108,6 @@ def test_api_projects_new_creates_and_switches(isolated_home: Path):
     # Layout was created.
     p = isolated_home / "projects" / "fresh"
     assert (p / "artifacts" / "catalog" / "entries").is_dir()
-    assert (p / "notebooks").is_dir()
     # Fixture default off — no orders.parquet.
     assert not (p / "data" / "orders.parquet").exists()
 

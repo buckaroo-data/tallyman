@@ -110,6 +110,45 @@ def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_parque
     assert res.cache_bytes is None
 
 
+def test_cheap_build_validates_row_projection(project: str):
+    # A cheap entry (pure projection — no Aggregate/Join/Sort/window/UDF) must
+    # still evaluate its row-level projection at build time. count() is satisfied
+    # from source metadata and prunes the projection, so a failing row-level op
+    # (here a cast of an out-of-range date string) never runs unless the build
+    # forces a full evaluation. Without it the broken entry commits + aliases as a
+    # successful build and throws only on the first materialising read — silent
+    # broken state at the head of an alias chain (pack01 finding). A worthy entry
+    # escapes this because its result-cache node materialises on execute.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tallyman_core.paths import data_dir
+
+    p = data_dir(project) / "bad_dates.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # month 20 is out of range — datafusion's date32 cast rejects it at row-eval
+    # time, but count() prunes the cast so it never runs at build unless forced.
+    pq.write_table(pa.table({"d": ["2020-01-01", "2020-20-07", "2021-12-31"]}), p)
+
+    def _cast_code(parquet: Path) -> str:
+        return f"""
+import xorq.api as xo
+t = xo.deferred_read_parquet({str(parquet)!r})
+expr = t.mutate(dd=t.d.cast("date"))
+"""
+
+    with pytest.raises(BuildError):
+        build_and_persist(project, _cast_code(p))
+
+    # The streaming validation is also the cheap path's row-count source, so a
+    # valid cheap projection must still build and report the right count.
+    good = data_dir(project) / "good_dates.parquet"
+    pq.write_table(pa.table({"d": ["2020-01-01", "2021-12-31"]}), good)
+    res = build_and_persist(project, _cast_code(good))
+    assert res.cache_worthy is False  # pure projection — the cheap path under test
+    assert res.row_count == 2
+
+
 def test_build_idempotent_same_code(project: str, orders_parquet: Path):
     code = _agg_code(orders_parquet)
     a = build_and_persist(project, code, prompt="first")

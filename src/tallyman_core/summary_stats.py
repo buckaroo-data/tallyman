@@ -26,6 +26,7 @@ import inspect
 import re
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import stats_dir as _stats_dir
 
 # Mirrors the allowlist in ``buckaroo/server/xorq_loading.py``. Keeping
@@ -151,11 +152,11 @@ def validate_stat_source(name: str, source: str) -> None:
         raise StatSourceError(f"compute() must take exactly one parameter, got {len(params)}")
 
     try:
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as e:
         raise StatSourceError(f"xorq is not installed: {e}") from None
 
-    table = xo.memtable({"a": [1, 2, 3]}, name="_stat_dry_run")
+    table = memtable({"a": [1, 2, 3]}, name="_stat_dry_run")
     col = table["a"]
     try:
         result = compute(col)
@@ -180,8 +181,7 @@ def write_stat(project: str, name: str, source: str) -> Path:
     d = stats_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{name}.py"
-    path.write_text(source if source.endswith("\n") else source + "\n")
-    return path
+    return atomic_write_text(path, source if source.endswith("\n") else source + "\n")
 
 
 def remove_stat(project: str, name: str) -> Path | None:

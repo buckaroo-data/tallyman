@@ -202,7 +202,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     """
     import tempfile
 
-    import xorq.api as xo
+    from xorq.ibis_yaml.compiler import build_expr
 
     a = cached_result_expr(project, a_hash)
     b = cached_result_expr(project, b_hash)
@@ -211,7 +211,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
 
     builds_dir = Path(tempfile.gettempdir()) / "tallyman_diff_builds"
     builds_dir.mkdir(parents=True, exist_ok=True)
-    build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
+    build_path = Path(build_expr(expr, builds_dir=str(builds_dir)))
 
     return build_path, overrides
 
@@ -569,7 +569,7 @@ def create_app(
             for i, h in enumerate(hist_hashes, start=1):
                 forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
 
-        prompt_history = read_prompts(entry)
+        prompt_history = read_prompts(project, content_hash)
         chart_spec = get_chart(project, content_hash)
 
         build_artifacts: list[dict] = []
@@ -1099,12 +1099,13 @@ def create_app(
             p.unlink()
         except OSError as exc:
             raise HTTPException(500, str(exc))
-        # Drop the read-path memo so the snapshot actually self-heals on next read.
-        # A warm cached_result_expr holds a deferred_read of the file just unlinked;
-        # left in place, the next viewer read (api_data) — and ensure_session's
-        # pre-/load_expr heal — would dereference a missing file instead of
-        # re-baking. lru_cache has no per-key eviction, and a full clear is cheap
-        # for an admin delete: entries are content-addressed, so warm exprs simply
+        # Defense-in-depth, not load-bearing for correctness: since ee0a90a,
+        # cached_result_expr is a thin non-memoised wrapper that re-checks
+        # path.exists() and self-heals on every read, so the next viewer read
+        # (api_data) / ensure_session heal re-bakes the evicted snapshot even with a
+        # warm memo left in place (proven by
+        # test_cached_result_expr_self_heals_after_warm_then_evict). We still clear
+        # it because it's cheap for an admin delete: content-addressed entries just
         # re-reconstruct (and the evicted one re-bakes) on the next read.
         cached_result_expr.cache_clear()
         return {"ok": True, "hash": content_hash}

@@ -5,14 +5,13 @@ Aliases are mutable handles that name a sequence of content hashes:
     alias_map:      {alias: latest_hash}
     alias_history:  {alias: [hash_v1, hash_v2, ...]}   # oldest first
 
-Both live as tallyman-owned keys in the catalog's ``catalog.yaml`` (read and
-written through ``catalog_state``), not as separate files. catalog.yaml is the
-versioned state carrier the catalog git repo tracks, so alias state clones and
-versions with the catalog and ``reset_to``'s ``git reset`` rolls it back for
-free — a sidecar store would have to be reconciled separately, and committing
-one *inside* the repo broke xorq's ``assert_consistency`` (#48). xorq keeps its
-own ``aliases`` key + alias symlinks in the same file; these tallyman keys sit
-alongside, and xorq round-trips them untouched.
+Both live in a tracked ``aliases.jsonl`` in the catalog repo — one line per
+alias, ``{"alias", "latest", "history": [...]}``. The native store tracks the
+file directly, so alias state clones and versions with the catalog and
+``reset_to``'s ``git reset`` rolls it back with the rest of the tree (no
+separate reconcile). Before the native cut this had to be smuggled into
+catalog.yaml keys, because committing a separate file inside the (then xorq)
+catalog repo broke its ``assert_consistency`` (#48); that constraint is gone.
 
 Identity is the content hash; the alias is a *name* for a concept that may
 evolve. The latest hash is always the current best answer; older hashes
@@ -21,8 +20,10 @@ remain in the catalog as forensic artifacts.
 
 from __future__ import annotations
 
-from tallyman_core import xorq_catalog as _xcat
-from tallyman_core.paths import ensure_project
+import json
+
+from tallyman_core.fsutil import atomic_write_text
+from tallyman_core.paths import catalog_dir, ensure_project
 
 
 class AliasExists(ValueError):
@@ -33,24 +34,44 @@ class AliasNotFound(KeyError):
     pass
 
 
+def _aliases_file(project: str):
+    return catalog_dir(project) / "aliases.jsonl"
+
+
 def _read(project: str) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Read the alias map + history out of catalog.yaml.
+    """Read the alias map + history out of the tracked ``aliases.jsonl``.
 
-    Lazy import: ``aliases`` is imported very early in ``tallyman_core``'s
-    package init (before ``catalog_state``'s transitive deps), so resolving
-    ``catalog_state`` at call time keeps that ordering clean.
+    One line per alias: ``{"alias", "latest", "history": [...]}``. The native
+    store tracks this file directly, so ``reset_to``'s ``git reset`` rolls alias
+    state back with the rest of the tree (no separate reconcile).
     """
-    from tallyman_core import catalog_state as cs
-
-    state = cs.read_tallyman_state(project)
-    return state["alias_map"], state["alias_history"]
+    p = _aliases_file(project)
+    alias_map: dict[str, str] = {}
+    history: dict[str, list[str]] = {}
+    if p.exists():
+        for line in p.read_text().splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            alias_map[rec["alias"]] = rec["latest"]
+            history[rec["alias"]] = rec.get("history", [])
+    return alias_map, history
 
 
 def _write(project: str, aliases: dict[str, str], history: dict[str, list[str]]) -> None:
-    """Persist the alias map + history into catalog.yaml (preserving xorq's keys)."""
-    from tallyman_core import catalog_state as cs
-
-    cs.write_tallyman_state(project, alias_map=aliases, alias_history=history)
+    """Persist the alias map + history to ``aliases.jsonl`` (sorted for a stable
+    diff; an empty map removes the file)."""
+    ensure_project(project)
+    p = _aliases_file(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if not aliases:
+        p.unlink(missing_ok=True)
+        return
+    body = "".join(
+        json.dumps({"alias": name, "latest": aliases[name], "history": history.get(name, [])}) + "\n"
+        for name in sorted(aliases)
+    )
+    atomic_write_text(p, body)
 
 
 def load_aliases(project: str) -> dict[str, str]:
@@ -126,8 +147,6 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
 
     _write(project, aliases, history)
 
-    _xcat.add_alias(project, content_hash, alias=name)
-
     return {
         "name": name,
         "hash": content_hash,
@@ -152,4 +171,3 @@ def remove_alias(project: str, name: str) -> None:
     aliases.pop(name, None)
     history.pop(name, None)
     _write(project, aliases, history)
-    _xcat.remove_alias(project, name)

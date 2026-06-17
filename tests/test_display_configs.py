@@ -64,41 +64,9 @@ def test_remove_display_config(project: str):
     assert get_display_config(project, "a") is None
 
 
-# ---------------------------------------------------------------------------
-# catalog_state capture / materialize round-trip
-# ---------------------------------------------------------------------------
-
-
-def test_display_configs_captured_in_catalog_state(project: str):
-    from tallyman_core.catalog_state import capture_tallyman_state, read_tallyman_state
-
-    set_display_config(project, "abc123", SAMPLE_CONFIG)
-    capture_tallyman_state(project)
-    state = read_tallyman_state(project)
-    hashes = [c["content_hash"] for c in state["display_configs"]]
-    assert "abc123" in hashes
-
-
-def test_display_configs_materialize_round_trip(project: str):
-    from tallyman_core.catalog_state import capture_tallyman_state, materialize
-
-    set_display_config(project, "abc123", SAMPLE_CONFIG)
-    capture_tallyman_state(project)
-    remove_display_config(project, "abc123")
-    assert get_display_config(project, "abc123") is None
-    materialize(project)
-    restored = get_display_config(project, "abc123")
-    assert restored is not None
-    assert restored["diff_provenance"]["source_alias"] == "sales"
-
-
-def test_display_configs_materialize_removes_unrecorded(project: str):
-    from tallyman_core.catalog_state import materialize, write_tallyman_state
-
-    set_display_config(project, "orphan", SAMPLE_CONFIG)
-    write_tallyman_state(project, display_configs=[])
-    materialize(project)
-    assert get_display_config(project, "orphan") is None
+# The native store tracks display_configs/<hash>.json directly, so the old
+# capture/materialize catalog.yaml round-trip is gone; survives-reset coverage
+# now lives in test_native_catalog_store.py::test_display_config_survives_reset.
 
 
 # ---------------------------------------------------------------------------

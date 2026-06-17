@@ -18,3 +18,6 @@ catalog/
 projects/
 # cache lab measurement reports (tests/test_cache_lab.py)
 tests/cache_lab_reports/
+# Claude Code local tooling state + agent worktrees (multi-GB; never commit)
+.claude/
+.claude-worktrees/

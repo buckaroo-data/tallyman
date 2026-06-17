@@ -3,12 +3,19 @@
 - **Status:** Accepted (2026-06-18 — default flipped `off` → `cas` in #86, with
   `cp --reflink=auto` on Linux and `.cas` GC wired into `reset_to`; supersedes
   the 2026-06-10 Proposed draft below. See the reconstruction caveat under
-  Consequences.)
+  Consequences.) Reconciled with PR #74 (merged 2026-06-16) and PRs #103/#104
+  (merged 2026-06-17): #104 removed the on-demand `result.parquet`, so
+  `from_catalog` composes the parent via `cached_result_expr` and
+  recompute-on-cold-read is now the default for every cheap and salt entry —
+  which strengthened the case for `cas` before the flip landed.
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),
   `src/tallyman_xorq/io.py` (`from_project`), `src/tallyman_xorq/build.py`
-  (`build_and_persist`), `src/tallyman_core/manifest.py` (`sources` map)
+  (`build_and_persist`, source-digest collect at build.py:355-360),
+  `src/tallyman_core/manifest.py` (`sources` map at manifest.py:53; the #84
+  `parents` edge sits alongside it via the same collector pattern,
+  `parent_capture.py`)
 - **Related ADR:** `plans/adr-result-cache-cost-rubric.md` (relies on
   `content_hash` being a content-stable cache key)
 - **Evidence:** `tests/test_cache_lab.py` (marker `cache_lab`), reports under
@@ -31,7 +38,7 @@ disproved both halves:
   than stat-fragility: identity is *blind to data changes*. The cache lab's
   `test_append_invalidates` shows it — append rows to `trips.parquet`,
   rebuild the same code, get the same `content_hash`, and the build-time
-  dedup (`build.py:286`) returns the stale entry's result.
+  dedup (`build.py:410`, `if target.exists()`) returns the stale entry's result.
 
 Path-only identity means: an in-place content change is invisible (stale
 results served under the old hash — the dangerous direction); a
@@ -62,9 +69,14 @@ new digest → new path → new hash. Every xorq-level key derived from the
 expression — the build hash, `ParquetSnapshotCache` keys, anything future —
 becomes content-honest with no further guards.
 
-`from_catalog` is unchanged: it already reads
-`entries/<content_hash>/result.parquet`, so the parent's identity is in the
-path by construction.
+`from_catalog` no longer reads a parent `result.parquet` (that read existed when
+this ADR was drafted; #74 replaced it with parent-expression composition and #104
+removed the on-demand parquet outright). It now resolves the parent's
+`content_hash` and composes the parent via `cached_result_expr` (io.py:63),
+recording the resolved `{hash, ref, follow}` in `manifest.parents` (#84). The
+parent's identity is carried by that recorded content hash, not a path — which is
+exactly the content-honest identity this ADR establishes for source reads, applied
+to entry reads.
 
 Implemented behind `TALLYMAN_SOURCE_IDENTITY=off|cas|salt` (default `off`)
 so the cache lab can benchmark strategies; accepting this ADR means
@@ -73,9 +85,12 @@ PR #74 (merged 2026-06-16) raised the stakes from "should we" to "we must":
 it reconstructs an entry on every cold read (`cached_result_expr` re-runs a
 cheap entry's recipe, self-heals an expensive entry's evicted snapshot), and
 under `off` that cold read pulls the *current* source bytes, so an in-place
-edit is served under the entry's old `content_hash`. cas is the only mode that
-keeps reconstruction faithful, so it is now a prerequisite for the reactive
-layer, not a tuning choice (see `plans/adr-reactive-catalog-recalc.md`).
+edit is served under the entry's old `content_hash`. PR #104 widened the surface:
+with the on-demand `result.parquet` gone, recompute-on-cold-read is now the
+default for *every* cheap and salt entry, so the drift hazard is no longer
+confined to expensive evictions. cas is the only mode that keeps reconstruction
+faithful, so it is now a prerequisite for the reactive layer, not a tuning choice
+(see `plans/adr-reactive-catalog-recalc.md`).
 
 ## Measured behavior (cache lab, 150k-row matrix)
 
@@ -89,8 +104,9 @@ layer, not a tuning choice (see `plans/adr-reactive-catalog-recalc.md`).
 | build overhead (memo hit / new content)   | —                  | +13ms / +110ms per 71MB | same |
 
 "Self-heal faithful" is load-bearing for the result-cache ADR: its
-budget/eviction loop assumes an evicted `result.parquet` recomputes to what
-was evicted. Under `cas` the clone is a snapshot of the bytes the entry was
+budget/eviction loop assumes an evicted cached result recomputes to what was
+evicted (post-#104 that cached result is the baked `.cache()` snapshot, not a
+`result.parquet`). Under `cas` the clone is a snapshot of the bytes the entry was
 built from, so regeneration is faithful even after the user edits the
 source in place; under `off`/`salt` regeneration silently absorbs the new
 data under the old identity.
@@ -107,11 +123,14 @@ data under the old identity.
   because it fixes only the entry *name* while every xorq-level key stays
   path-only: the lab demonstrated two salted entries (same code and path,
   different data) colliding on one `ParquetSnapshotCache` key, with the new
-  entry serving the old entry's rows. `result_cache.py` now routes salt-mode
-  reads around that cache, but the collision class survives for any future
-  xorq-key surface, and self-heal stays unfaithful. The implementation is
-  kept in-tree behind the env switch so the lab can re-compare; delete it
-  when `cas` is made the default.
+  entry serving the old entry's rows. Salt bakes no snapshot (`rewrite_for_build`
+  skips the cache under salt); post-#104 a salted entry no longer routes around an
+  in-place `result.parquet` — that path was deleted — it simply recomputes through
+  `cached_result_expr` (cheap-recompute / worthy-recompute-fallback,
+  result_cache.py:300). The collision class survives for any future xorq-key
+  surface, and self-heal stays unfaithful. The implementation is kept in-tree
+  behind the env switch so the lab can re-compare; delete it when `cas` is made
+  the default.
 - **Stat-based identity (mtime/size/inode) / `ModificationTimeStrategy`.**
   Unreachable for *identity*: the build hash is computed in a hardwired
   `SnapshotStrategy().normalization_context()` (`provenance_utils.py:24`), so no
@@ -145,9 +164,10 @@ data under the old identity.
   flipping the default: add `cp --reflink=auto` on Linux and document the
   copy fallback.
 - `.cas/` accumulates one clone per content version. Manifests now record
-  each entry's `{rel_path: digest}` map (`manifest.py`), so GC is "delete
+  each entry's `{rel_path: digest}` map (`manifest.py:53`), so GC is "delete
   digests unreferenced by any live entry"; wire it into reset/bullpen
-  maintenance.
+  maintenance — which post-#103 lives in the native store (`tallyman_core/catalog.py`),
+  so the GC hook belongs there.
 - Builds embed `data/.cas/<digest>.parquet` paths; UI provenance should
   display the human name from the manifest `sources` map.
 - Cross-machine identity (absolute path prefix in the hash) remains broken

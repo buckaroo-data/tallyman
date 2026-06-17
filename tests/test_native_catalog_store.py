@@ -433,3 +433,95 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
         f"prompts/{h}.jsonl",
     }, tracked
     assert "catalog.yaml" not in tracked and not any("/xorq_build/" in t for t in tracked)
+
+
+# ---------------------------------------------------------------------------
+# tracked-surface integrity (bug-hunt regressions)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "rel",
+    [
+        "post_processing/sub/leak.py",
+        "chart_specs/deep/leak.vl.json",
+        "prompts/_disabled/leak.jsonl",
+        "stats/nested/leak.py",
+        "display_configs/nested/leak.json",
+    ],
+)
+def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_parquet, rel):
+    """A stray nested *under* an allowlisted dir prefix must be rejected.
+
+    ``fnmatch``'s ``*`` spans ``/``, so ``post_processing/sub/leak.py`` wrongly
+    matched the ``post_processing/*.py`` pattern and slipped past the
+    deny-by-default guard (none of these paths are gitignored either). The
+    allowlist must be path-segment-aware.
+    """
+    cs.genesis(project)
+    build_and_persist(project, _agg_code(orders_parquet))
+    cs.checkpoint_catalog(project, "create")
+    cd = paths.catalog_dir(project)
+    p = cd / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text("LEAK\n")
+    cs.run_git(["add", "-A"], cwd=cd)
+    _, out, _ = cs.run_git(["ls-files"], cwd=cd)
+    assert rel in out.split()  # `git add -A` staged it (not gitignored)
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    with pytest.raises(RuntimeError, match="outside the allowed surface"):
+        catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_legit_disabled_subdir_member_still_passes(project, orders_parquet):
+    """The segment-aware allowlist must not over-reject the legitimate two-level
+    members it already tracks (``post_processing/_disabled/*.py``, &c.)."""
+    cs.genesis(project)
+    build_and_persist(project, _agg_code(orders_parquet))
+    cs.checkpoint_catalog(project, "create")
+    cd = paths.catalog_dir(project)
+    for rel in ("post_processing/_disabled/old.py", "stats/_disabled/old.py"):
+        p = cd / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("def process(t):\n    return t\n")
+    cs.run_git(["add", "-A"], cwd=cd)
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    catalog.assert_catalog_consistent(project, pointers)  # must NOT raise
+
+
+def test_interrupted_atomic_write_tmp_not_committed(project, orders_parquet):
+    """A ``*.tmp`` left by a crash mid atomic-write (``aliases._write`` /
+    ``write_recipe_zip``) must never be staged by the checkpoint's ``git add -A``,
+    so it cannot durably wedge a later ``reset_to`` via the tracked-surface
+    allowlist."""
+    from tallyman_core import aliases as al
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    al.set_alias(project, "regions", res.content_hash)
+    cs.checkpoint_catalog(project, "cp1")
+    cd = paths.catalog_dir(project)
+    # Simulate a crash between tmp.write_text and tmp.replace in aliases._write.
+    (cd / "aliases.jsonl.tmp").write_text('{"alias":"x","latest":"d","history":["d"]}\n')
+    s2 = cs.checkpoint_catalog(project, "cp2")  # nothing consumes the .tmp
+    _, out, _ = cs.run_git(["ls-files"], cwd=cd)
+    assert "aliases.jsonl.tmp" not in out.split(), "interrupted atomic-write .tmp committed by `git add -A`"
+    cs.reset_to(project, s2)  # the committed step must remain reset-able
+
+
+def test_checkpoint_skips_manifestless_entry_dir(project):
+    """A checkpoint firing during the mid-build window (entry dir with
+    ``expr.py`` + ``schema.json`` but no ``manifest.json``) must not commit a
+    pointer it has no durable recipe zip for; the committed step must remain
+    ``reset_to``-able. ``capture_tallyman_state`` must apply the same manifest
+    filter ``zip_pending_entries`` already uses."""
+    cs.genesis(project)
+    ed = paths.entry_dir(project, "deadbeef0001")
+    ed.mkdir(parents=True)
+    (ed / "expr.py").write_text("expr = 1\n")
+    (ed / "schema.json").write_text("{}")  # NO manifest.json — a mid-build dir
+    step = cs.checkpoint_catalog(project, "checkpoint over a manifest-less mid-build dir")
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == catalog.tracked_recipe_hashes(project)  # pointer set == durable recipe set
+    catalog.assert_catalog_consistent(project, pointers)  # must not raise
+    cs.reset_to(project, step)  # must not raise

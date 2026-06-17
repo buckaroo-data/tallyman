@@ -471,3 +471,32 @@ def test_ensure_result_is_removed():
     assert not hasattr(rc, "ensure_result")
     assert not hasattr(rc, "ensure_result_build")
     assert not hasattr(rc, "ensure_viewer_expanded_build")
+
+
+def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
+    """An expensive entry's baked snapshot evicted *after* a warm read must still
+    self-heal on the next read, not dangle on a stale ``deferred_read_parquet``.
+
+    ``cached_result_expr`` memoised the snapshot existence check, so once an
+    expensive entry was warm in the LRU, evicting its snapshot left the cached
+    expression pointing at a now-missing path — the next ``.execute()`` raised
+    ``ValueError: At least one path is required``. The existence check + self-heal
+    must run on every call, not only on a cold LRU miss.
+    """
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+
+    # Warm the LRU via a real read, exactly as the public from_catalog API does.
+    expected = len(cached_result_expr(project, agg_h).execute())
+
+    # Evict the baked snapshot while the LRU stays WARM (no cache_clear).
+    p = baked_snapshot_path(project, agg_h)
+    assert p is not None and p.exists()
+    p.unlink()
+
+    # Re-read the SAME entry: must self-heal, not dangle on the stale deferred read.
+    df = cached_result_expr(project, agg_h).execute()
+    assert len(df) == expected

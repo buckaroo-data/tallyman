@@ -21,7 +21,6 @@ remain in the catalog as forensic artifacts.
 
 from __future__ import annotations
 
-from tallyman_core import xorq_catalog as _xcat
 from tallyman_core.paths import ensure_project
 
 
@@ -126,8 +125,6 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
 
     _write(project, aliases, history)
 
-    _xcat.add_alias(project, content_hash, alias=name)
-
     return {
         "name": name,
         "hash": content_hash,
@@ -152,4 +149,3 @@ def remove_alias(project: str, name: str) -> None:
     aliases.pop(name, None)
     history.pop(name, None)
     _write(project, aliases, history)
-    _xcat.remove_alias(project, name)

@@ -4,6 +4,7 @@ import importlib.util
 import json
 import logging
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -60,9 +61,10 @@ class BuildResult:
     row_count: int
     execute_seconds: float
     schema: dict
-    # Whether the entry's recipe landed in the xorq catalog git repo. None on the
-    # re-run path (entry already on disk, registration not re-attempted); True/False
-    # on a fresh build. False means the recipe is NOT durable — see #48.
+    # Whether the complete entry dir was persisted to disk (D2). None on the
+    # re-run path (entry already on disk); True on a fresh build. Durability —
+    # committing the recipe zip — is the next checkpoint's job, which always
+    # succeeds because the dir is complete, so there is no False case anymore.
     catalog_registered: bool | None = None
     # Advisory build-time lints (#88): execution-nondeterministic ops whose result
     # varies run-to-run under one content_hash. Empty when the recipe is clean.
@@ -437,6 +439,7 @@ def build_and_persist(
             cache_dir.mkdir(parents=True, exist_ok=True)
             loaded = load_expr(build_path, cache_dir=cache_dir)
         except Exception as exc:
+            shutil.rmtree(target, ignore_errors=True)  # no orphan dir → no orphan pointer (D1)
             hint = _ibis_import_hint(str(exc), code)
             raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
@@ -451,6 +454,7 @@ def build_and_persist(
             arrow_schema = loaded.schema().to_pyarrow()
             row_count = int(loaded.count().execute())
         except Exception as exc:
+            shutil.rmtree(target, ignore_errors=True)  # no orphan dir → no orphan pointer (D1)
             hint = _ibis_import_hint(str(exc), code)
             raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
         execute_seconds = round(time.monotonic() - t0, 3)
@@ -527,24 +531,12 @@ def build_and_persist(
     except OSError:
         pass
 
-    # Best-effort by design (a missing/misconfigured catalog repo must not break
-    # the build), but the outcome is surfaced on the result instead of swallowed:
-    # a failed add means the recipe never reached git and is not durable (#48).
-    catalog_registered: bool | None = None
-    cause = ""
-    try:
-        from tallyman_core.xorq_catalog import add_entry as _xcat_add
-
-        catalog_registered = _xcat_add(project, xorq_build_dir, entry_name=content_hash)
-    except Exception as exc:
-        catalog_registered = False
-        cause = f" ({exc})"
-    if catalog_registered is False:
-        logging.getLogger(__name__).error(
-            "xorq catalog add failed for %s%s — entry recipe is not durable in the catalog repo (#48)",
-            content_hash,
-            cause,
-        )
+    # The complete entry dir (recipe + manifest + schema) is now persisted on
+    # disk. catalog_registered reports that local fact — "entry dir persisted" —
+    # not durability: committing the content-addressed recipe zip is the next
+    # checkpoint's job, which always succeeds because the dir is complete (D2).
+    # No subprocess, no out-of-lock writer, no silent #48 no-op.
+    catalog_registered = True
 
     return BuildResult(
         content_hash=content_hash,

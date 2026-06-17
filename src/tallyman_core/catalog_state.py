@@ -48,7 +48,7 @@ from pathlib import Path
 
 import yaml
 
-from tallyman_core import charts, notebook
+from tallyman_core import catalog, charts, notebook
 from tallyman_core import display_configs as dc
 from tallyman_core import post_processing as pp
 from tallyman_core import summary_stats as ss
@@ -68,10 +68,6 @@ log = logging.getLogger(__name__)
 
 # git-level identity flags, so commits work without a global git config.
 _GIT_ID = ["-c", "user.email=tallyman@local", "-c", "user.name=tallyman"]
-# Only catalog.yaml is git-tracked in the catalog repo. Alias bookkeeping is
-# carried as catalog.yaml keys, not separate files — tracking those alongside
-# xorq's managed set made its assert_consistency reject the repo (#48).
-_TRACKED = ("catalog.yaml",)
 _STEP_RE = re.compile(r"^step-(\d+)$")
 # Refs and labels are operator input that ends up as git arguments. A plain
 # tag-shaped name only: no leading dash (option injection), no revision
@@ -356,12 +352,15 @@ def ensure_catalog_repo(project: str) -> bool:
     """
     cd = catalog_dir(project)
     cd.mkdir(parents=True, exist_ok=True)
-    if (cd / ".git").exists():
-        return True
-    rc, _, err = run_git(["init", "-q", "-b", "main"], cwd=cd)
-    if rc != 0:
-        log.warning("catalog git init failed in %s: %s", cd, err)
-        return False
+    if not (cd / ".git").exists():
+        rc, _, err = run_git(["init", "-q", "-b", "main"], cwd=cd)
+        if rc != 0:
+            log.warning("catalog git init failed in %s: %s", cd, err)
+            return False
+    # The native store's .gitignore keeps the heavy/derived artifacts out of the
+    # checkpoint's `git add -A`; the allowlist consistency guard is the durable
+    # backstop. Idempotent, so existing repos pick it up too.
+    catalog.write_gitignore(project)
     return True
 
 
@@ -390,9 +389,12 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
     with _project_lock(project):
         ensure_catalog_repo(project)
         capture_tallyman_state(project)
-        existing = [f for f in _TRACKED if (cd / f).exists()]
-        if existing:
-            run_git(["add", *existing], cwd=cd)
+        # The checkpoint is the sole zip writer and sole git transaction: zip any
+        # complete entry dir lacking a tracked recipe, then stage the whole
+        # tracked surface. A committed pointer always has its recipe in the same
+        # commit; the .gitignore + allowlist keep `git add -A` honest.
+        catalog.zip_pending_entries(project)
+        run_git(["add", "-A"], cwd=cd)
         if step is None:
             tags = _step_tags(project)
             step = tags[-1] + 1 if tags else 0
@@ -422,44 +424,6 @@ def _resolve_tag(project: str, tag: str) -> str:
     return out
 
 
-def _tracked_recipe_hashes(project: str) -> set[str]:
-    """Hashes of the git-tracked ``entries/<hash>.zip`` recipes.
-
-    The durable, content-addressed xorq artifact set — what survives a clone or
-    a ``git reset`` — as opposed to the untracked ``entries/<hash>/`` build dirs
-    the bullpen reconciles. Sourced from ``git ls-files`` so it reflects the
-    committed tree, not whatever the working dir happens to hold.
-    """
-    rc, out, _ = run_git(["ls-files", "entries"], cwd=catalog_dir(project))
-    if rc != 0:
-        return set()
-    return {line[len("entries/") : -len(".zip")] for line in out.split() if line.endswith(".zip")}
-
-
-def _assert_catalog_consistent(project: str) -> None:
-    """The two views of "what entries exist" must agree after a reset.
-
-    ``git reset --hard`` restores the durable xorq recipe set
-    (``entries/<hash>.zip``); the bullpen restores the untracked build dirs
-    against the ``entry_hashes`` pointers. They are reconciled by different
-    mechanisms that never see each other, so a pointer whose recipe was never
-    committed (any interrupted or failed best-effort ``xorq catalog add``) comes
-    back from the bullpen as a build-dir copy while the recipe it should recompute
-    from does not exist. Surface that divergence instead of returning a catalog
-    whose two views silently disagree and reporting success (#52).
-    """
-    pointers = set(read_tallyman_state(project)["entry_hashes"])
-    tracked = _tracked_recipe_hashes(project)
-    if tracked != pointers:
-        missing = sorted(pointers - tracked)  # pointer present, no durable recipe
-        orphan = sorted(tracked - pointers)  # durable recipe, no pointer
-        raise RuntimeError(
-            "catalog inconsistent after reset: the git-tracked xorq recipe set and the "
-            f"tallyman entry_hashes pointers disagree (pointers with no durable recipe: "
-            f"{missing}; tracked recipes with no pointer: {orphan})"
-        )
-
-
 def reset_to(project: str, ref: int | str) -> None:
     """Restore the catalog to a step/label: git reset --hard, materialize the
     derived files, then reconcile the untracked artifacts to the recorded
@@ -478,7 +442,7 @@ def reset_to(project: str, ref: int | str) -> None:
         prune_entries(project)
         prune_compute_cache(project)
         restore_from_bullpen(project)
-        _assert_catalog_consistent(project)
+        catalog.assert_catalog_consistent(project, set(read_tallyman_state(project)["entry_hashes"]))
 
 
 def genesis(project: str) -> int | None:

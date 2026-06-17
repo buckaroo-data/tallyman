@@ -27,6 +27,7 @@ import inspect
 import re
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import post_processing_dir as _post_processing_dir
 
 # Mirrors the allowlist in ``buckaroo/server/xorq_loading.py``. Keeping
@@ -151,7 +152,7 @@ def validate_post_processing_source(name: str, source: str) -> None:
         raise PostProcessingSourceError(f"process() must take exactly one parameter, got {len(params)}")
 
     try:
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as e:
         raise PostProcessingSourceError(f"xorq is not installed: {e}") from None
 
@@ -160,7 +161,7 @@ def validate_post_processing_source(name: str, source: str) -> None:
     # 1-row single-column dry-run (like stats use) wouldn't exercise
     # the common shape. Three rows × two cols is small enough that any
     # ``process`` that runs at all will return quickly.
-    table = xo.memtable(
+    table = memtable(
         {"a": [1, 2, 3], "b": ["x", "y", "z"]},
         name="_post_processing_dry_run",
     )
@@ -197,8 +198,7 @@ def write_post_processing(project: str, name: str, source: str) -> Path:
     d = post_processing_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{name}.py"
-    path.write_text(source if source.endswith("\n") else source + "\n")
-    return path
+    return atomic_write_text(path, source if source.endswith("\n") else source + "\n")
 
 
 class PostProcessingRunError(ValueError):
@@ -209,9 +209,10 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     """Execute a ``process(expr)`` function against a catalog entry's result.
 
     Resolves *entry_name_or_hash* as an alias first, then as a raw content
-    hash. Loads ``result.parquet`` for that entry, execs *source* in a
-    restricted namespace, calls ``process(table)``, executes the result, and
-    returns a preview dict.
+    hash. Reads the entry's result via ``cached_result_expr`` (a cheap entry
+    recomputes, an expensive one reads its baked snapshot — the same expression
+    the viewer executes), execs *source* in a restricted namespace, calls
+    ``process(table)``, executes the result, and returns a preview dict.
 
     Returns::
 
@@ -226,24 +227,26 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
     as the tool's ``{"error": ...}`` response.
     """
     from tallyman_core.aliases import get_alias  # avoid circular at module level
-    from tallyman_core.paths import entry_result_path
+    from tallyman_core.paths import entry_build_dir
+    from tallyman_xorq.result_cache import cached_result_expr
 
     # Resolve alias → hash, or treat as bare hash.
     content_hash = get_alias(project, entry_name_or_hash) or entry_name_or_hash
-    parquet_path = entry_result_path(project, content_hash)
-    if not parquet_path.exists():
+    if not entry_build_dir(project, content_hash).is_dir():
         raise PostProcessingRunError(
-            f"no result.parquet found for entry {entry_name_or_hash!r} (resolved hash: {content_hash})"
+            f"no catalog entry found for {entry_name_or_hash!r} (resolved hash: {content_hash})"
         )
 
     try:
-        import pyarrow.parquet as pq  # noqa: PLC0415
-        import xorq.api as xo  # noqa: PLC0415
+        from xorq.expr.api import memtable  # noqa: PLC0415
     except ImportError as exc:
         raise PostProcessingRunError(f"missing dependency: {exc}") from None
 
-    table = pq.read_table(parquet_path)
-    ibis_table = xo.memtable(table.to_pandas(), name="_post_processing_run")
+    # Read the entry's result the same way the viewer's api_data does: a cheap
+    # entry recomputes, an expensive one reads its baked snapshot, and an evicted
+    # snapshot self-heals — all inside cached_result_expr. No result.parquet.
+    df = cached_result_expr(project, content_hash).execute()
+    ibis_table = memtable(df, name="_post_processing_run")
 
     # Exec the source and extract process().
     ns: dict = {}

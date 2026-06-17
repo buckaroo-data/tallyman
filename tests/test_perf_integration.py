@@ -16,14 +16,19 @@ what a user actually waits for when opening a large catalog entry:
 What this PR measures, against the **existing on-disk corpus** (reuse, don't
 rebuild), each across a cold/warm cache axis:
 
-1. **Execution time** — ``load_entry`` then ``to_parquet`` per entry.
+1. **Execution time** — ``cached_result_expr`` (#73's reconstruct-on-read path)
+   then ``to_parquet`` per entry.
 2. **Page load (Tier B proxy)** — the dominant user-visible cost behind #34's
-   10s ``/load_expr`` timeout: load the xorq expr + compute the summary stats,
-   then serve the first row page (the ``infinite_request`` 0-300 window).
-3. **Diff stat path** — #45's 27s-on-first-open: ``diff_keys`` → the
-   ``build_compare_expr`` outer-join → the same stat pipeline, over the
-   consecutive revision pairs in the corpus's alias history (``catalog.yaml``'s
-   ``alias_history`` key, or a legacy ``alias_history.json``).
+   10s ``/load_expr`` timeout: self-heal the baked snapshot the build reads
+   (``cached_result_expr``, as the live ``ensure_session`` does — the ``heal s``
+   column), load the xorq expr + compute the summary stats, then serve the first
+   row page (the ``infinite_request`` 0-300 window). A pre-#73 corpus whose
+   builds read a parent ``result.parquet`` won't heal (rebuild it); see #73.
+3. **Diff stat path** — #45's diff: ``diff_keys`` → ``build_compare_expr``
+   outer-join → the same stat pipeline, over consecutive revision pairs. Capped
+   to small **aggregated** aliases by result row count (``DIFF_MAX_ROWS``,
+   default 1M): the raw multi-million-row aliases hit the grouped-exact-nunique
+   blowup (#46, 10GB+/minutes per pair), so only aggregated pairs are measured.
 
 Cold/warm semantics. Every measurement runs against an **overlay home**: the
 real entries, source ``data``, and catalog bookkeeping are symlinked read-only,
@@ -45,8 +50,7 @@ consolidation work, which this harness will read once it lands.
 Deferred to follow-ups: Tier A Playwright; the full-vs-truncated corpus variants
 (needs the Stage 1 ``scripts/rebuild_parking_catalog.py`` rebuild on
 ``perf/parking-catalog-rebuild`` to land and a ``head(1M)`` raw-source truncate);
-the Tier-A/Tier-B calibration ratio; promoting #45's diff time to a regression
-gate once baselined.
+the Tier-A/Tier-B calibration ratio.
 
 Local-only, marker-gated (``perf``), and skipped when the corpus is absent, so
 it never runs on CI. Run it explicitly:
@@ -64,8 +68,11 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import logging
 import os
+import re
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import psutil
@@ -75,7 +82,7 @@ from tallyman_core.paths import (
     ENTRY_ARTIFACT_NAMES,
     ENTRY_BUILD_DIRNAME,
     ENTRY_CACHE_NAMES,
-    ENTRY_RESULT_FILENAME,
+    ENTRY_MANIFEST_FILENAME,
 )
 
 pytestmark = pytest.mark.perf
@@ -92,7 +99,25 @@ _ENTRY_LINK_NAMES = ENTRY_ARTIFACT_NAMES
 assert set(_ENTRY_LINK_NAMES).isdisjoint(ENTRY_CACHE_NAMES)  # no artifact is also a cache
 # Catalog bookkeeping the read paths need; the caches are deliberately omitted so
 # the overlay starts cold.
-_CATALOG_LINK_NAMES = ("aliases.json", "alias_history.json", "catalog.yaml", "aliases", "chart_specs", "metadata")
+_CATALOG_LINK_NAMES = (
+    # native decomposed surface (#52+)
+    "aliases.jsonl",
+    "notebook.jsonl",
+    "entries.jsonl",
+    "compute_cache.jsonl",
+    "prompts",
+    "post_processing",
+    "stats",
+    "display_configs",
+    "chart_specs",
+    # legacy xorq-catalog layout — _link skips whichever are absent, so a native
+    # corpus links the files above and an old one links these.
+    "aliases.json",
+    "alias_history.json",
+    "catalog.yaml",
+    "aliases",
+    "metadata",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -119,6 +144,72 @@ MB = pr.MB
 
 
 # ---------------------------------------------------------------------------
+# buckaroo #926 perf spans (BUCKAROO_PERF) — in-process capture
+# ---------------------------------------------------------------------------
+
+# buckaroo#926 instruments the stat pipeline: with perf on, each timed block
+# emits one `perf span=<label> secs=<n>` line on the `buckaroo.perf` logger
+# (stat.xorq.total / materialize / batch_aggregate, …). Tier B runs that
+# pipeline in-process, so we enable it around the cold stat run and collect
+# the lines — turning the single `cold stats s` number into a where-the-time-
+# goes breakdown. No-op on a buckaroo without #926.
+_PERF_SPAN_RE = re.compile(r"perf span=(?P<label>\S+) secs=(?P<secs>[\d.]+)")
+
+
+@contextmanager
+def _capture_perf_spans():
+    """Enable buckaroo's #926 perf spans and collect them for the block.
+
+    Yields a dict that, once the block exits, maps span label -> summed
+    seconds for every `perf span=` line emitted while it ran. Restores the
+    prior enabled state and detaches the handler afterwards; a buckaroo
+    without the `perf_log` module (pre-#926) degrades to an empty dict.
+    """
+    spans: dict[str, float] = {}
+    try:
+        from buckaroo.pluggable_analysis_framework import perf_log  # noqa: PLC0415
+    except ImportError:
+        yield spans
+        return
+
+    lines: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            lines.append(record.getMessage())
+
+    logger = logging.getLogger("buckaroo.perf")
+    handler = _Collect()
+    logger.addHandler(handler)  # added before enable() so _ensure_logging adds no stderr handler
+    was_enabled = perf_log.enabled()
+    perf_log.enable()
+    try:
+        yield spans
+    finally:
+        if not was_enabled:
+            perf_log.disable()
+        logger.removeHandler(handler)
+        for line in lines:
+            m = _PERF_SPAN_RE.search(line)
+            if m:
+                spans[m["label"]] = spans.get(m["label"], 0.0) + float(m["secs"])
+
+
+# Each captured #926 span gets its own report column (label -> header).
+_SPAN_COLUMNS = [
+    ("stat.xorq.total", "stat total s"),
+    ("stat.xorq.materialize", "materialize s"),
+    ("stat.xorq.batch_aggregate", "batch_agg s"),
+    ("firstpull.summary_stats", "summary_stats s"),
+]
+
+
+def _span_cell(spans: dict | None, label: str) -> str:
+    v = (spans or {}).get(label)
+    return f"{v:.2f}" if v is not None else "—"
+
+
+# ---------------------------------------------------------------------------
 # corpus discovery + safe overlay
 # ---------------------------------------------------------------------------
 
@@ -130,13 +221,20 @@ def _real_projects_root() -> Path:
 
 
 def _entries_with_build(project_dir: Path) -> list[str]:
+    """Built entries, keyed on ``xorq_build/`` + ``manifest.json``.
+
+    Not ``result.parquet``: #73 stopped writing it at build time (it is a
+    regenerable cache now, not an artifact), so a corpus built on that branch has
+    none. ``manifest.json`` is written by both the pre- and post-#73 build, so it
+    is the stable existence marker that keeps discovery working across both eras.
+    """
     base = project_dir / "artifacts" / "catalog" / "entries"
     if not base.is_dir():
         return []
     return sorted(
         child.name
         for child in base.iterdir()
-        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_RESULT_FILENAME).exists()
+        if (child / ENTRY_BUILD_DIRNAME).is_dir() and (child / ENTRY_MANIFEST_FILENAME).exists()
     )
 
 
@@ -169,20 +267,38 @@ def _resolve_corpus_or_skip() -> tuple[str, Path, list[str]]:
 
 
 def _load_aliases(real_dir: Path) -> dict[str, str]:
-    p = real_dir / "artifacts" / "catalog" / "aliases.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+    """Alias -> latest hash, from the native ``aliases.jsonl`` or legacy ``aliases.json``."""
+    catalog = real_dir / "artifacts" / "catalog"
+    jsonl = catalog / "aliases.jsonl"
+    if jsonl.exists():
+        out: dict[str, str] = {}
+        for line in jsonl.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[rec["alias"]] = rec["latest"]
+        return out
+    legacy = catalog / "aliases.json"
+    return json.loads(legacy.read_text()) if legacy.exists() else {}
 
 
 def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
     """Alias revision chains, from whichever store the corpus uses.
 
-    Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
-    through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
-    them as the ``alias_history`` key in ``catalog.yaml`` (#57 moved alias
-    bookkeeping off separate files). Read the legacy file if present, else fall
-    back to the catalog.yaml key.
+    Native (#52+) keeps them as the ``history`` key per line of ``aliases.jsonl``.
+    Pre-#57 catalogs kept them in ``alias_history.json``; a corpus rebuilt through
+    the old ``scripts/rebuild_parking_catalog.py`` carries them as the
+    ``alias_history`` key in ``catalog.yaml``. Read native first, then the legacy
+    forms.
     """
     catalog = real_dir / "artifacts" / "catalog"
+    jsonl = catalog / "aliases.jsonl"
+    if jsonl.exists():
+        out: dict[str, list[str]] = {}
+        for line in jsonl.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[rec["alias"]] = rec.get("history", [])
+        return out
     legacy = catalog / "alias_history.json"
     if legacy.exists():
         return json.loads(legacy.read_text())
@@ -195,17 +311,52 @@ def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
     return {}
 
 
-def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
-    """Consecutive (alias, prev_hash, cur_hash) revisions with both sides built.
+def _entry_rows(real_dir: Path, h: str) -> int:
+    """Row count of an entry, from ``manifest.json``.
 
-    This is the revision-pair definition #45 cares about: re-opening an entry's
-    diff against its immediate predecessor.
+    Both build eras write ``row_count`` to the manifest, so this works without a
+    materialised ``result.parquet`` (no entry writes one any more). Returns 0 if
+    the manifest somehow lacks the count.
+    """
+    entry = real_dir / "artifacts" / "catalog" / "entries" / h
+    try:
+        rc = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text()).get("row_count")
+        if isinstance(rc, int):
+            return rc
+    except (OSError, json.JSONDecodeError):
+        pass
+    return 0
+
+
+# Diffing the raw aliases triggers the #46 grouped-exact-nunique blowup (10GB+ /
+# minutes per pair). Cap the diff step to genuinely *aggregated* results by row
+# count — low enough to exclude the raw scans (1M/side on the truncated corpus,
+# 23.9M on the full one) and the high-card by-plate aggregate, keeping the
+# day-aggregated aliases. Override with TALLYMAN_PERF_DIFF_MAX_ROWS.
+DIFF_MAX_ROWS = int(os.environ.get("TALLYMAN_PERF_DIFF_MAX_ROWS", 100_000))
+
+
+def _diff_pairs(real_dir: Path, built: set[str]) -> list[tuple[str, str, str]]:
+    """Consecutive (alias, prev, cur) revision pairs with both sides built.
+
+    Capped at ``DIFF_MAX_ROWS`` by result row count — the #45 diff path computes
+    exact per-column nunique, so the big raw aliases (camera_*, 23.9M rows) blow
+    up (#46). Restricting to small aggregated results (tickets_per_day &c.) keeps
+    the measurement usable. Dropped pairs are logged, never silently skipped.
     """
     pairs: list[tuple[str, str, str]] = []
+    dropped: list[tuple[str, int]] = []
     for alias, history in _load_alias_history(real_dir).items():
         for prev, cur in zip(history, history[1:]):
-            if prev in built and cur in built:
-                pairs.append((alias, prev, cur))
+            if prev not in built or cur not in built:
+                continue
+            rows = max(_entry_rows(real_dir, prev), _entry_rows(real_dir, cur))
+            (dropped.append((alias, rows)) if rows > DIFF_MAX_ROWS else pairs.append((alias, prev, cur)))
+    if dropped:
+        print(
+            f"\ndiff: skipped {len(dropped)} pair(s) over {DIFF_MAX_ROWS:,} rows (#46 nunique blowup): "
+            + ", ".join(f"{a} ({r:,})" for a, r in dropped)
+        )
     return pairs
 
 
@@ -217,16 +368,22 @@ def _link(src: Path, dst: Path) -> None:
 def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
     """Construct a write-isolated overlay of *project* under *overlay_home*.
 
-    Big, immutable artifacts (``xorq_build``, ``result.parquet``, the source
-    ``data``, catalog bookkeeping, project-authored stats) are symlinked so no
-    bytes are copied; the per-project caches are left empty so the first hit is
-    honestly cold. Anything an entry writes lands in the writable overlay dir,
-    so the user's real catalog is never mutated. Returns *overlay_home*.
+    The immutable per-entry artifacts (``xorq_build`` + ``manifest.json`` +
+    ``schema.json``, i.e. ``ENTRY_ARTIFACT_NAMES``, plus the recipe ``expr.py``),
+    the source ``data``, catalog bookkeeping and project-authored stats are
+    symlinked so no bytes are copied; the per-entry/per-project caches are left
+    empty so the first hit is honestly cold. No per-entry ``result.parquet``
+    exists to mirror — an expensive entry's rows live in its baked snapshot under
+    the (deliberately unmirrored) compute cache, and a cheap entry recomputes —
+    so the read path is honestly cold either way. Anything an entry writes lands
+    in the writable overlay dir, so the user's real catalog is never mutated.
+    Returns *overlay_home*.
 
     *Every* built entry is mirrored, not just the measured subset — entries
-    chain (``from_catalog(parent_hash)``), so a measured entry's build can read
-    a parent entry's ``result.parquet``; omitting parents breaks the path
-    resolution at execute time.
+    chain (``from_catalog(parent_hash)``), and post-#73 a measured entry's build
+    reads its parent's baked ``result_cache`` snapshot (or re-runs the parent's
+    recipe via ``cached_result_expr``), not a parent ``result.parquet``; omitting
+    parents breaks that resolution at execute time.
     """
     proj = overlay_home / "projects" / project
     cat = proj / "artifacts" / "catalog"
@@ -246,6 +403,11 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
         overlay_entry.mkdir()
         for name in _ENTRY_LINK_NAMES:
             _link(real_entry / name, overlay_entry / name)
+        # #73: cached_result_expr reconstructs an entry by re-importing its
+        # recipe (expr.py) onto the default backend, so the read path now needs
+        # expr.py in the overlay too — pre-#73 it resolved via xorq_build /
+        # result.parquet only. (Belongs in paths.ENTRY_ARTIFACT_NAMES proper.)
+        _link(real_entry / "expr.py", overlay_entry / "expr.py")
     return overlay_home
 
 
@@ -274,21 +436,33 @@ def _stats_dataflow(xorq_loading, expr, cache_dir: Path):
 
 
 def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
-    """``load_entry`` → ``to_parquet``, cold then warm (compute cache)."""
+    """``cached_result_expr`` → ``to_parquet``, cold then warm (compute cache).
+
+    #73 materialises an entry by reconstructing it on the default backend
+    (``cached_result_expr``): a cheap entry recomputes from source, an expensive
+    one reads its baked snapshot, and an entry that ``from_catalog``s an
+    expensive parent self-heals an evicted parent snapshot by re-running the
+    recipe. ``load_entry`` (replaying the serialized build) can't do that last
+    case — its *bare* read of the parent's snapshot dangles on a cold compute
+    cache ("At least one path is required") — so it is not the path a reader
+    (post-processing / promote-diff / viewer via ``cached_result_expr``) takes.
+    Cold = first reconstruct + self-heal + execute; warm = re-execute against the
+    warmed snapshot (reconstruction is memoised).
+    """
     import pyarrow.parquet as pq  # noqa: PLC0415
 
-    from tallyman_xorq.build import load_entry  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     out = scratch / f"exec_{content_hash}.parquet"
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
     t0 = time.monotonic()
-    load_entry(project, content_hash).to_parquet(str(out))
+    cached_result_expr(project, content_hash).to_parquet(str(out))
     cold_s = round(time.monotonic() - t0, 2)
     rows = pq.ParquetFile(str(out)).metadata.num_rows
 
     t0 = time.monotonic()
-    load_entry(project, content_hash).to_parquet(str(out))
+    cached_result_expr(project, content_hash).to_parquet(str(out))
     warm_s = round(time.monotonic() - t0, 2)
     sampler.stop()
 
@@ -298,15 +472,15 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
         "cold_s": cold_s,
         "warm_s": warm_s,
         "peak_mb": round(sampler.peak() / MB),
-        # Each timing issues exactly one load + one execute; the headline number
-        # is attributable to that fixed count (#59's count-over-wall premise).
+        # Each timing issues exactly one reconstruct + one execute; the headline
+        # number is attributable to that fixed count (#59's count-over-wall premise).
         "loads": 1,
         "executes": 1,
     }
 
 
 def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
-    """Tier-B proxy: load the build, run the stat pipeline (cold/warm), 1st page."""
+    """Tier-B proxy: self-heal, load the build, run the stat pipeline (cold/warm), 1st page."""
     from tallyman_core.paths import (  # noqa: PLC0415
         entry_build_dir,
         entry_expanded_build_dir,
@@ -314,21 +488,33 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         project_dir,
     )
     from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
+    # ensure_session serves Buckaroo the entry's recipe build dir; page over the
+    # same expanded recipe so the proxy exercises what Buckaroo is actually given
+    # (an expensive entry's recipe replays onto its baked snapshot — a read).
     build_dir = entry_build_dir(project, content_hash)
-    expanded = ensure_expanded_build(
-        build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash)
-    )
+    expanded = ensure_expanded_build(build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash))
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
+    # Mirror the live companion: ensure_session calls cached_result_expr before
+    # Buckaroo replays the build via /load_expr (buckaroo_lifecycle.py), repopulating
+    # the baked snapshot a #73+ from_catalog build reads so the replay below isn't an
+    # empty read. A pre-#73 corpus instead embeds a parent result.parquet this can't
+    # heal — rebuild it (scripts/rebuild_parking_catalog.py); see the module docstring.
+    t0 = time.monotonic()
+    cached_result_expr(project, content_hash)
+    heal_s = round(time.monotonic() - t0, 2)
+
     t0 = time.monotonic()
     expr = xorq_loading.load_expr_build_dir(str(expanded))
     load_s = round(time.monotonic() - t0, 2)
 
     t0 = time.monotonic()
-    _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
+    with _capture_perf_spans() as stat_spans:
+        _df, meta = _stats_dataflow(xorq_loading, expr, stat_cache)
     cold_stats_s = round(time.monotonic() - t0, 2)
     cache_kb, cache_files = pr._dir_kb_and_files(stat_cache)
 
@@ -351,6 +537,7 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         "entry": content_hash,
         "rows": meta["rows"],
         "cols": len(meta["columns"]),
+        "heal_s": heal_s,
         "load_s": load_s,
         "cold_stats_s": cold_stats_s,
         "warm_stats_s": warm_stats_s,
@@ -358,6 +545,8 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
         "first_page_kb": len(parquet_bytes) // 1024,
         "stat_cache_kb": cache_kb,
         "stat_cache_files": cache_files,
+        # buckaroo#926 cold-stat span breakdown (empty without BUCKAROO_PERF/#926).
+        "stat_spans": stat_spans,
         "peak_mb": round(sampler.peak() / MB),
         # One build load + (cold) one stat run; warm adds one load + one stat run
         # that should hit the on-disk cache rather than recompute.
@@ -367,7 +556,11 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
 
 
 def measure_diff(project: str, alias: str, a_hash: str, b_hash: str, scratch: Path) -> dict:
-    """#45's diff stat path: key resolution → compare expr → stat pipeline."""
+    """#45's diff stat path: key resolution → compare expr → stat pipeline.
+
+    Only invoked for pairs under ``DIFF_MAX_ROWS`` (see ``_diff_pairs``) so the
+    exact-nunique cost stays bounded.
+    """
     from tallyman_companion.diff import build_compare_expr  # noqa: PLC0415
     from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
     from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
@@ -425,7 +618,7 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
     L = ["# tallyman Tier-B perf integration report", "", f"project `{project}` · {len(hashes)} entries", ""]
 
     L += [
-        "## Execution (`load_entry` → `to_parquet`)",
+        "## Execution (`cached_result_expr` → `to_parquet`)",
         "",
         "| entry | rows | cold s | warm s | peak MB |",
         "|---|---|---|---|---|",
@@ -440,26 +633,32 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
         "",
         "## Page load — Tier B proxy (load build + summary stats + 1st page)",
         "",
-        "| entry | rows | cols | load s | cold stats s | warm stats s | 1st page s | stat cache |",
-        "|---|---|---|---|---|---|---|---|",
+        "| entry | rows | cols | heal s | load s | cold stats s | warm stats s | 1st page s | stat cache | "
+        + " | ".join(h for _, h in _SPAN_COLUMNS)
+        + " |",
+        "|" + "---|" * (9 + len(_SPAN_COLUMNS)),
     ]
     for r in loads:
         if "error" in r:
-            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} |||||||")
+            L.append(f"| {label(r['entry'])} | ERROR: {r['error']} " + "|" * (8 + len(_SPAN_COLUMNS)))
         else:
             cache = f"{r['stat_cache_kb']}KB ({r['stat_cache_files']})"
+            spans = r.get("stat_spans")
+            span_cells = " | ".join(_span_cell(spans, lbl) for lbl, _ in _SPAN_COLUMNS)
             L.append(
-                f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['load_s']} | {r['cold_stats_s']} "
-                f"| {r['warm_stats_s']} | {r['first_page_s']} | {cache} |"
+                f"| {label(r['entry'])} | {r['rows']:,} | {r['cols']} | {r['heal_s']} | {r['load_s']} "
+                f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['first_page_s']} | {cache} | {span_cells} |"
             )
 
     L += [
         "",
-        "## Diff stat path (revision pairs, #45)",
+        f"## Diff stat path (aggregated revision pairs, #45; ≤ {DIFF_MAX_ROWS:,} rows)",
         "",
         "| pair | keys | rows | cols | keys s | cold stats s | warm stats s | peak MB |",
         "|---|---|---|---|---|---|---|---|",
     ]
+    if not diffs:
+        L.append("| (no aggregated revision pairs under the row cap) | | | | | | | |")
     for r in diffs:
         if "error" in r:
             L.append(f"| {r['pair']} | ERROR: {r['error']} |||||||")
@@ -468,6 +667,7 @@ def _render_report(project: str, hashes: list[str], execs, loads, diffs, aliases
                 f"| {r['pair']} | {r['keys']} | {r['rows']:,} | {r['cols']} | {r['keys_s']} "
                 f"| {r['cold_stats_s']} | {r['warm_stats_s']} | {r['peak_mb']} |"
             )
+
     L.append("")
     return "\n".join(L)
 
@@ -531,8 +731,7 @@ def test_perf_integration_report(corpus, tmp_path_factory):
     _emit_report(_render_report(project, hashes, execs, loads, diffs, aliases))
 
     # Report-only: assert every measurement produced a row and at least one
-    # succeeded end to end. No wall-clock threshold yet (#45's diff time is the
-    # obvious first gate once baselined).
+    # succeeded end to end. No wall-clock threshold.
     assert len(execs) == len(hashes) and len(loads) == len(hashes)
     assert any("error" not in r for r in execs), "no execute measurement succeeded"
     assert any("error" not in r for r in loads), "no page-load measurement succeeded"

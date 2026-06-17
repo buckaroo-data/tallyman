@@ -17,6 +17,14 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
+def _cheap_code(parquet_path: Path) -> str:  # parquet read + projection → cheap, bakes nothing
+    return f"""
+import xorq.api as xo
+t = xo.deferred_read_parquet({str(parquet_path)!r})
+expr = t.select("region", "price")
+"""
+
+
 def test_build_writes_entry(project: str, orders_parquet: Path):
     code = _agg_code(orders_parquet)
     res = build_and_persist(project, code, prompt="region totals")
@@ -24,12 +32,121 @@ def test_build_writes_entry(project: str, orders_parquet: Path):
     assert res.execute_seconds >= 0.0
     target = entry_dir(project, res.content_hash)
     assert target.is_dir()
-    for child in ("manifest.json", "result.parquet", "schema.json", "expr.py"):
+    # #73: no build-time result.parquet — an expensive entry's rows live in its
+    # baked cache, a cheap entry's in nothing. The durable per-entry artifacts
+    # are the recipe, manifest, schema, and source.
+    for child in ("manifest.json", "schema.json", "expr.py", "xorq_build"):
         assert (target / child).exists(), child
+    assert not (target / "result.parquet").exists()
     manifest = json.loads((target / "manifest.json").read_text())
     assert manifest["content_hash"] == res.content_hash
     assert manifest["prompt"] == "region totals"
     assert manifest["row_count"] == 4
+
+
+def test_migrate_drop_result_parquet_sweeps_legacy(project: str):
+    # The upgrade migration deletes any per-entry on-demand result.parquet and the
+    # dead #71 viewer-read build dirs, keeps the durable recipe, writes a marker,
+    # and is idempotent (marker-gated).
+    from tallyman_core.paths import catalog_dir
+    from tallyman_xorq.build import _MIGRATION_MARKER, migrate_drop_result_parquet
+
+    e1 = entry_dir(project, "aaaa")
+    e1.mkdir(parents=True)
+    (e1 / "result.parquet").write_bytes(b"old")
+    (e1 / "xorq_build").mkdir()  # durable recipe must survive
+    e2 = entry_dir(project, "bbbb")
+    (e2 / ".xorq_result_build").mkdir(parents=True)
+    (e2 / ".xorq_result_build_expanded").mkdir()
+
+    assert migrate_drop_result_parquet(project) == 3
+    assert not (e1 / "result.parquet").exists()
+    assert (e1 / "xorq_build").is_dir()  # recipe kept
+    assert not (e2 / ".xorq_result_build").exists()
+    assert not (e2 / ".xorq_result_build_expanded").exists()
+    assert (catalog_dir(project) / _MIGRATION_MARKER).exists()
+    # A second run is a no-op (marker present).
+    assert migrate_drop_result_parquet(project) == 0
+
+
+def test_build_records_admission_instrumentation(project: str, orders_parquet: Path, caplog):
+    # #87: the build records the structural cache_worthy verdict alongside the
+    # measured value-per-byte inputs (compile_seconds, execute_seconds, snapshot
+    # bytes), so the structural-vs-measured cache decision (#30) is decidable
+    # from data rather than first principles. An expensive (Aggregate) entry is
+    # structurally worthy and bakes a snapshot, and the decision is logged on the
+    # tallyman.perf namespace with both verdicts side by side.
+    import logging
+
+    with caplog.at_level(logging.INFO, logger="tallyman.perf"):
+        res = build_and_persist(project, _agg_code(orders_parquet))
+
+    m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
+    assert m["compile_seconds"] is not None and m["compile_seconds"] >= 0.0
+    assert m["execute_seconds"] >= 0.0
+    assert m["cache_worthy"] is True
+    assert "Aggregate" in m["cache_worthy_why"]
+    assert m["cache_bytes"] is not None and m["cache_bytes"] > 0
+    # Mirrored on the BuildResult for in-process callers.
+    assert res.cache_worthy is True
+    assert res.compile_seconds is not None and res.compile_seconds >= 0.0
+    assert res.cache_bytes is not None and res.cache_bytes > 0
+    # The admission decision is logged once, on the perf namespace.
+    perf = [r for r in caplog.records if r.name == "tallyman.perf"]
+    assert any("admission" in r.getMessage() and res.content_hash in r.getMessage() for r in perf)
+
+
+def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_parquet: Path):
+    # A cheap (projection) entry is structurally not worthy and bakes no
+    # snapshot, so cache_bytes is absent — it materialises nothing to size. The
+    # compile/structural verdict is still recorded for the shadow comparison.
+    res = build_and_persist(project, _cheap_code(orders_parquet))
+    m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
+    assert m["cache_worthy"] is False
+    assert "cheap" in m["cache_worthy_why"]
+    assert m["cache_bytes"] is None
+    assert m["compile_seconds"] is not None
+    assert res.cache_worthy is False
+    assert res.cache_bytes is None
+
+
+def test_cheap_build_validates_row_projection(project: str):
+    # A cheap entry (pure projection — no Aggregate/Join/Sort/window/UDF) must
+    # still evaluate its row-level projection at build time. count() is satisfied
+    # from source metadata and prunes the projection, so a failing row-level op
+    # (here a cast of an out-of-range date string) never runs unless the build
+    # forces a full evaluation. Without it the broken entry commits + aliases as a
+    # successful build and throws only on the first materialising read — silent
+    # broken state at the head of an alias chain (pack01 finding). A worthy entry
+    # escapes this because its result-cache node materialises on execute.
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tallyman_core.paths import data_dir
+
+    p = data_dir(project) / "bad_dates.parquet"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    # month 20 is out of range — datafusion's date32 cast rejects it at row-eval
+    # time, but count() prunes the cast so it never runs at build unless forced.
+    pq.write_table(pa.table({"d": ["2020-01-01", "2020-20-07", "2021-12-31"]}), p)
+
+    def _cast_code(parquet: Path) -> str:
+        return f"""
+import xorq.api as xo
+t = xo.deferred_read_parquet({str(parquet)!r})
+expr = t.mutate(dd=t.d.cast("date"))
+"""
+
+    with pytest.raises(BuildError):
+        build_and_persist(project, _cast_code(p))
+
+    # The streaming validation is also the cheap path's row-count source, so a
+    # valid cheap projection must still build and report the right count.
+    good = data_dir(project) / "good_dates.parquet"
+    pq.write_table(pa.table({"d": ["2020-01-01", "2021-12-31"]}), good)
+    res = build_and_persist(project, _cast_code(good))
+    assert res.cache_worthy is False  # pure projection — the cheap path under test
+    assert res.row_count == 2
 
 
 def test_build_idempotent_same_code(project: str, orders_parquet: Path):
@@ -150,3 +267,68 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
     with pytest.raises(BuildError, match="xorq.api"):
         build_and_persist(project, code)
+
+
+# ---------------------------------------------------------------------------
+# Nondeterminism lint (#88). Execution-nondeterministic ops (now / random /
+# uuid / sample) make an entry's result vary run-to-run under one structural
+# content_hash; #74's recompute-on-cold-read then serves different bytes than
+# were built, and the hash never notices. build_and_persist surfaces an
+# advisory lint, not a hard stop.
+# ---------------------------------------------------------------------------
+
+
+def _nondeterministic_code(parquet_path: Path) -> str:
+    return f"""
+import xorq.api as xo
+import xorq.vendor.ibis as ibis
+t = xo.deferred_read_parquet({str(parquet_path)!r})
+expr = t.mutate(built_at=ibis.now())
+"""
+
+
+def test_build_lints_nondeterministic_now(project: str, orders_parquet: Path):
+    res = build_and_persist(project, _nondeterministic_code(orders_parquet))
+    joined = " ".join(res.lint_warnings)
+    assert res.lint_warnings, "expected a nondeterminism lint warning"
+    assert "now()" in joined
+    assert "#88" in joined
+
+
+def test_build_no_lint_for_deterministic_recipe(project: str, orders_parquet: Path):
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    assert res.lint_warnings == []
+
+
+def test_nondeterminism_warnings_lists_friendly_ops():
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    expr = t.mutate(r=ibis.random(), n=ibis.now())
+    joined = " ".join(_nondeterminism_warnings(expr))
+    assert "random()" in joined
+    assert "now()" in joined
+
+
+def test_nondeterminism_warnings_empty_for_deterministic():
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    expr = t.mutate(y=t.x + 1)
+    assert _nondeterminism_warnings(expr) == []
+
+
+def test_nondeterminism_warnings_skips_seeded_sample():
+    # A seeded sample is reproducible run-to-run, so it must not be flagged;
+    # the lint's "seed the sample" advice would otherwise contradict itself (#88).
+    import xorq.vendor.ibis as ibis
+
+    from tallyman_xorq.build import _nondeterminism_warnings
+
+    t = ibis.table({"x": "int64"}, name="t")
+    assert _nondeterminism_warnings(t.sample(0.5)) != []
+    assert _nondeterminism_warnings(t.sample(0.5, seed=42)) == []

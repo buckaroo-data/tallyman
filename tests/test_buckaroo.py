@@ -35,6 +35,22 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
+def _chain_parent_code(project: str) -> str:  # Aggregate → expensive → baked snapshot
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
+"""
+
+
+def _chain_child_code(parent: str) -> str:  # cheap child chaining off an expensive parent
+    return f"""
+from tallyman_xorq.io import from_catalog
+t = from_catalog({parent!r})
+expr = t.mutate(total2=t.total * 2)
+"""
+
+
 # ---------------------------------------------------------------------------
 # unit: session map only
 # ---------------------------------------------------------------------------
@@ -279,6 +295,106 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
 
+def test_unit_ensure_session_cache_worthy_serves_recipe_no_result_parquet(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """With the on-demand result.parquet layer gone, ensure_session serves the
+    entry's recipe build dir to Buckaroo for every entry. A cache-worthy entry's
+    recipe replays onto its baked snapshot (a read, not a recompute), so no
+    per-entry result.parquet is materialised for the viewer.
+    """
+    from tallyman_xorq.result_cache import cache_worthy, classify_build
+
+    res = build_and_persist(project, _code(project))  # group_by.aggregate → worthy
+    assert cache_worthy(project, res.content_hash) is True
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "s"}
+
+    def fake_post(url, json=None, timeout=None):
+        captured["json"] = json
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+    mgr.ensure_session(res.content_hash, project)
+
+    posted = Path(captured["json"]["build_dir"])
+    assert posted.is_dir(), posted
+    # The posted build is the (expanded) recipe — still the expensive aggregate.
+    assert classify_build(posted)["worthy"] is True, classify_build(posted)
+    # No on-demand result.parquet was materialised for the viewer.
+    assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
+
+
+def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, orders_parquet, monkeypatch):
+    """ensure_session must materialise an entry's baked snapshot before POSTing
+    to ``/load_expr``, so the buckaroo grid isn't empty on a cold compute cache.
+
+    The build buckaroo replays embeds a *bare* read of an expensive parent's
+    snapshot (a ``from_catalog`` chain — #75 strips the parent ``CachedNode`` to
+    keep the composed expression on one backend). On a cold cache (fresh clone /
+    not-yet-warmed entry) that read resolves to zero files, so the grid renders
+    empty — the same zero-row symptom as the unexpanded-build_dir case above, a
+    different cause. ensure_session must self-heal it first
+    (``cached_result_expr`` repopulates the snapshot), the same heal the
+    paginated REST read (api_data) relies on.
+    """
+    import shutil
+
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_mcp.server import catalog_create
+    from tallyman_xorq.build import list_entries
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _chain_parent_code(project))  # expensive parent (Aggregate)
+    catalog_create("chain", _chain_child_code("agg"))  # from_catalog child off it
+    child_h = list_entries(project)[0]["content_hash"]  # most-recent build == chain
+
+    # Cold start, as a fresh clone / not-yet-warmed entry has: evict every baked
+    # snapshot and clear the reconstruction lru the in-process build warmed.
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    class _Resp:
+        status_code = 200
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return {"session": "sess-cold-heal"}
+
+    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
+
+    mgr.ensure_session(child_h, project)
+
+    # The heal must populate the snapshot the *build replay* reads — the path
+    # buckaroo's /load_expr resolves — not merely some snapshot, so reload the
+    # build the same way (load_entry replays it too) and assert it serves real
+    # rows rather than the empty grid the bare snapshot read yields cold. (The
+    # snapshot key embeds the build path, so this holds when build and read share
+    # a project root, i.e. the same-machine cold cache; see the PR for the
+    # cross-machine clone caveat.)
+    from tallyman_xorq.build import load_entry  # noqa: PLC0415
+
+    assert len(load_entry(project, child_h).execute()) > 0
+
+
 # ---------------------------------------------------------------------------
 # stress: tmp-dir lifecycle, concurrency
 # ---------------------------------------------------------------------------
@@ -412,7 +528,8 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
 
 def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path, monkeypatch):
     """N threads racing on the same content_hash must produce exactly one
-    /load_expr POST and one tmp dir — the session_lock serialises."""
+    /load_expr POST and one tmp dir — the session_lock serialises.
+    """
     res = build_and_persist(project, _code(project))
 
     mgr = BuckarooManager()
@@ -456,9 +573,11 @@ def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path
 
 def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
     """Threads racing on N distinct content_hashes each get their own
-    /load_expr POST + tmp dir; no cross-talk through the session_lock."""
+    /load_expr POST + tmp dir; no cross-talk through the session_lock.
+    """
     hashes = [
-        build_and_persist(project, _code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash for i in range(5)
+        build_and_persist(project, _code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash
+        for i in range(5)
     ]
 
     mgr = BuckarooManager()

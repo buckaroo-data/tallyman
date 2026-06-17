@@ -7,14 +7,19 @@ Layout (per-project):
     ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
-        │   ├── catalog/entries/<hash>/    # the xorq catalog git repo
-        │   │                              # (alias bookkeeping is catalog.yaml keys, not files)
-        │   ├── post_processing/<name>.py
-        │   ├── stats/<name>.py
+        │   ├── catalog/               # the native catalog git repo
+        │   │   ├── entries/<hash>.zip     # immutable recipe (one blob per entry)
+        │   │   ├── entries/<hash>/        # untracked build dir (gitignored)
+        │   │   ├── aliases.jsonl          # tracked alias bookkeeping
+        │   │   ├── notebook.jsonl         # tracked notebook cells
+        │   │   ├── chart_specs/<hash>.vl.json
+        │   │   ├── display_configs/<hash>.json
+        │   │   ├── post_processing/<name>.py , stats/<name>.py
+        │   │   ├── prompts/<hash>.jsonl
+        │   │   └── entries.jsonl , compute_cache.jsonl   # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
-        ├── data/                      # input parquets (fixtures or user)
-        └── notebooks/notebook.json
+        └── data/                      # input parquets (fixtures or user)
 
 The active project lives in a single one-line file at
 ``~/.tallyman/active_project``. ``resolve_project()`` reads it on every
@@ -72,7 +77,6 @@ ENTRIES_DIRNAME = "entries"
 # Per-entry artifacts: immutable build outputs. Safe to symlink read-only into a
 # write-isolated overlay (the perf harness) because nothing rewrites them.
 ENTRY_BUILD_DIRNAME = "xorq_build"
-ENTRY_RESULT_FILENAME = "result.parquet"
 ENTRY_MANIFEST_FILENAME = "manifest.json"
 ENTRY_SCHEMA_FILENAME = "schema.json"
 
@@ -80,6 +84,10 @@ ENTRY_SCHEMA_FILENAME = "schema.json"
 # first hit is honestly cold; production deletes them to recompute.
 ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
 ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
+# No per-entry result.parquet exists: an expensive entry's rows live in its baked
+# result cache (under the per-project compute_cache), a cheap entry recomputes on
+# read. The single materialised copy is the xorq .cache() snapshot — nothing
+# writes a <entry>/result.parquet, at build time or on demand (#73 + follow-up).
 
 # Canonical artifact-vs-cache partition of the per-entry names the overlay cares
 # about. The write-isolated perf overlay symlinks ENTRY_ARTIFACT_NAMES read-only
@@ -90,7 +98,6 @@ ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
 # real per-entry files but aren't on the overlay read path, so they're neither.)
 ENTRY_ARTIFACT_NAMES = (
     ENTRY_BUILD_DIRNAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_MANIFEST_FILENAME,
     ENTRY_SCHEMA_FILENAME,
 )
@@ -179,11 +186,6 @@ def entry_build_dir(project: str, content_hash: str) -> Path:
     return entry_dir(project, content_hash) / ENTRY_BUILD_DIRNAME
 
 
-def entry_result_path(project: str, content_hash: str) -> Path:
-    """The entry's materialised ``result.parquet``."""
-    return entry_dir(project, content_hash) / ENTRY_RESULT_FILENAME
-
-
 def entry_manifest_path(project: str, content_hash: str) -> Path:
     """The entry's ``manifest.json``."""
     return entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
@@ -202,16 +204,6 @@ def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
 def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     """Stable expanded-build dir beside the entry (regenerated on demand)."""
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
-
-
-def result_cache_dir(project: str) -> Path:
-    """Root for xorq's ParquetSnapshotCache of catalog-entry results.
-
-    Materialised results are content-addressed parquet files written here by
-    xorq, not the per-entry result.parquet — so a deleted cache file simply
-    recomputes on next access.
-    """
-    return catalog_dir(project) / "result_cache"
 
 
 def compute_cache_dir(project: str) -> Path:
@@ -251,11 +243,24 @@ def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
 
 
 def post_processing_dir(project: str) -> Path:
-    return artifacts_dir(project) / "post_processing"
+    # Under the catalog repo (was artifacts/) so the native store tracks the
+    # scripts directly instead of round-tripping them through catalog.yaml.
+    return catalog_dir(project) / "post_processing"
 
 
 def stats_dir(project: str) -> Path:
-    return artifacts_dir(project) / "stats"
+    return catalog_dir(project) / "stats"
+
+
+def prompts_dir(project: str) -> Path:
+    return catalog_dir(project) / "prompts"
+
+
+def prompts_path(project: str, content_hash: str) -> Path:
+    """Tracked per-entry authoring-prompt history (was a loose
+    ``entries/<hash>/prompts.jsonl``, lost on a clone now that build dirs are
+    gitignored)."""
+    return prompts_dir(project) / f"{content_hash}.jsonl"
 
 
 def display_dir(project: str) -> Path:
@@ -338,28 +343,6 @@ def resolve_project(explicit: str | None = None) -> str | None:
     return None
 
 
-# ---------------------------------------------------------------------------
-# xorq catalog repo path (per-project)
-# ---------------------------------------------------------------------------
-
-
-def catalog_repo_path() -> Path:
-    """Path the xorq CLI uses for its ``catalog`` git repo.
-
-    Lives at ``<project>/artifacts/catalog/`` — same dir as the tallyman
-    catalog entries. ``xorq catalog init`` writes a ``.git/`` alongside
-    them.
-
-    ``TALLYMAN_CATALOG_REPO`` env overrides for tests or external repos.
-    """
-    override = os.environ.get("TALLYMAN_CATALOG_REPO")
-    if override:
-        return Path(override)
-    project = resolve_project()
-    if project is None:
-        raise RuntimeError("catalog_repo_path called with no active project")
-    return catalog_dir(project)
-
 
 # ---------------------------------------------------------------------------
 # Project lifecycle
@@ -382,7 +365,6 @@ def ensure_project(project: str) -> Path:
         display_dir(project),
         exports_dir(project),
         data_dir(project),
-        notebooks_dir(project),
     ):
         d.mkdir(parents=True, exist_ok=True)
     return p

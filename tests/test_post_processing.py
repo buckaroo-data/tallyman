@@ -167,6 +167,14 @@ def _agg_code(project: str) -> str:
     )
 
 
+def _cheap_code(project: str) -> str:  # parquet read + projection → cheap, bakes no snapshot
+    return (
+        "from tallyman_xorq.io import from_project\n"
+        f"t = from_project('orders.parquet', project={project!r})\n"
+        "expr = t.select('region', 'price')\n"
+    )
+
+
 def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch):
     """run_post_processing resolves an alias and returns filtered rows."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -227,3 +235,44 @@ def test_run_post_processing_unknown_entry_returns_error(project: str, monkeypat
 
     resp = catalog_run_post_processing("def process(expr):\n    return expr\n", "no_such_entry")
     assert "error" in resp
+
+
+def test_run_post_processing_writes_no_result_parquet(project: str, orders_parquet, monkeypatch):
+    """Post-processing reads the entry's cache-resolving expression, not an
+    on-demand ``result.parquet``. A cheap entry recomputes and an expensive one
+    reads its baked snapshot — neither materialises a per-entry parquet on disk
+    (the on-demand layer #73 began retiring is gone).
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core import entry_dir
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
+
+    noop = "def process(expr):\n    return expr\n"
+    for alias, code in (("cheap_pp", _cheap_code(project)), ("agg_pp", _agg_code(project))):
+        out = catalog_create(alias, code)
+        assert "error" not in out, out
+        h = out["hash"]
+        resp = catalog_run_post_processing(code=noop, entry=alias)
+        assert "error" not in resp, resp
+        assert resp["row_count"] > 0
+        assert not (entry_dir(project, h) / "result.parquet").exists()
+
+
+def test_run_post_processing_under_salt_writes_no_result_parquet(project: str, orders_parquet, monkeypatch):
+    """salt source-identity mode used to route reads through an on-demand
+    ``result.parquet`` (path-only snapshot keys collide across salted entries).
+    With the on-demand layer gone, a salted entry recomputes through the same
+    cheap/expensive path as off-mode and writes no per-entry parquet.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "salt")
+    from tallyman_core import entry_dir
+    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
+
+    out = catalog_create("salted_pp", _agg_code(project))
+    assert "error" not in out, out
+    h = out["hash"]
+    resp = catalog_run_post_processing(code="def process(expr):\n    return expr\n", entry="salted_pp")
+    assert "error" not in resp, resp
+    assert resp["row_count"] > 0
+    assert not (entry_dir(project, h) / "result.parquet").exists()

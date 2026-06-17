@@ -25,7 +25,7 @@ export function VegaChart({ spec, dataHash, project, className = "chart-panel" }
             ?.values?.[0]?.geometry != null;
 
         if (!hasInlineGeo) {
-          const r = await fetch(`/${project}/api/data/${dataHash}`);
+          const r = await fetch(`/${project}/api/data/${dataHash}?limit=100000`);
           if (!r.ok) throw new Error(`GET /api/data failed: ${r.status}`);
           const { data } = await r.json();
           resolvedSpec.data = { values: data };

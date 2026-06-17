@@ -27,6 +27,15 @@ expr = f.group_by("region").aggregate(n=f.count())
 """
 
 
+def _nondeterministic(project: str) -> str:
+    return f"""
+from tallyman_xorq.io import from_project
+import xorq.vendor.ibis as ibis
+t = from_project("orders.parquet", project={project!r})
+expr = t.mutate(built_at=ibis.now())
+"""
+
+
 def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
@@ -43,6 +52,19 @@ def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parque
     # Alias points at V2; V1 is in forensic history.
     assert get_alias(project, "shoe_sales") == body["hash"]
     assert history_for(project, "shoe_sales") == [v1_hash, body["hash"]]
+
+
+def test_put_code_surfaces_nondeterminism_lint(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    # An execution-nondeterministic recipe (now()) builds fine, but the PUT
+    # /api/code reply must carry the advisory lint so the SPA can show it (#88).
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg(project))
+    c = TestClient(fresh_companion_app)
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _nondeterministic(project)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert "lint_warnings" in body
+    assert any("now()" in w for w in body["lint_warnings"])
 
 
 def test_put_code_missing_alias_404(fresh_companion_app, project: str):

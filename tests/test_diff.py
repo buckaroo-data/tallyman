@@ -5,6 +5,7 @@ from pathlib import Path
 import pandas as pd
 import polars as pl
 import pyarrow.parquet as pq
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_mcp.server import catalog_create, catalog_diff, catalog_revise
@@ -117,13 +118,18 @@ def test_key_diff_detects_unique_numeric_key():
 
 
 def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
+    from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    from tallyman_core import entry_dir
-
-    diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash))
+    diff = full_diff(
+        entry_dir(project, a.content_hash),
+        entry_dir(project, b.content_hash),
+        a_expr=cached_result_expr(project, a.content_hash),
+        b_expr=cached_result_expr(project, b.content_hash),
+    )
     assert "highlight" in diff["code"]
     assert diff["schema"]["row_count"]["before"] == 4
     assert "stats" in diff
@@ -271,28 +277,17 @@ def test_key_diff_polars_detects_unique_numeric_key():
     assert d["only_after"] == 3
 
 
-def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path):
+def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path, tmp_path: Path):
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     res = build_and_persist(project, _agg_code(project))
-    from tallyman_core import entry_dir
-
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    pq_path = tmp_path / "agg.parquet"
+    cached_result_expr(project, res.content_hash).to_parquet(str(pq_path))
     d = head_diff_polars(pq_path, pq_path, n=2)
     assert d["n"] == 2
     assert d["a_total"] == d["b_total"]
     assert "<table" in d["before"]
-
-
-def test_full_diff_polars_backend(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
-    from tallyman_xorq import build_and_persist
-
-    a = build_and_persist(project, _agg_code(project))
-    b = build_and_persist(project, _filter_code(project))
-    diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="polars")
-    assert diff["keyed"] is not None
-    assert "stats" in diff
 
 
 # ---------------------------------------------------------------------------
@@ -300,12 +295,13 @@ def test_full_diff_polars_backend(project: str, orders_parquet: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
+def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path, tmp_path: Path):
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     res = build_and_persist(project, _agg_code(project))
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    pq_path = tmp_path / "agg.parquet"
+    cached_result_expr(project, res.content_hash).to_parquet(str(pq_path))
     pd_result = {
         r["name"]: r
         for r in stats_diff(
@@ -322,26 +318,27 @@ def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path):
             assert abs(pd_result[col]["before"]["numeric"]["sum"] - xq_result[col]["before"]["numeric"]["sum"]) < 1e-6
 
 
-def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
+def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path, tmp_path: Path):
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     res = build_and_persist(project, _agg_code(project))
-    pq_path = entry_dir(project, res.content_hash) / "result.parquet"
+    pq_path = tmp_path / "agg.parquet"
+    cached_result_expr(project, res.content_hash).to_parquet(str(pq_path))
     d = head_diff_xorq(pq_path, pq_path, n=3)
     assert d["n"] == 3
     assert "<table" in d["before"]
 
 
 def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
-    from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    a_pq = entry_dir(project, a.content_hash) / "result.parquet"
-    b_pq = entry_dir(project, b.content_hash) / "result.parquet"
-    d = key_diff_xorq(a_pq, b_pq)
+    a_src = cached_result_expr(project, a.content_hash)
+    b_src = cached_result_expr(project, b.content_hash)
+    d = key_diff_xorq(a_src, b_src)
     assert d is not None
     assert "region" in d["keys"]
     # All 4 regions have boots so both sides have the same keys; the diff
@@ -355,13 +352,60 @@ def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
 def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
     from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    diff = full_diff(entry_dir(project, a.content_hash), entry_dir(project, b.content_hash), backend="xorq")
+    diff = full_diff(
+        entry_dir(project, a.content_hash),
+        entry_dir(project, b.content_hash),
+        a_expr=cached_result_expr(project, a.content_hash),
+        b_expr=cached_result_expr(project, b.content_hash),
+    )
     assert diff["keyed"] is not None
     assert diff["keyed"]["matched"] == 4
     assert "stats" in diff
+
+
+def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders_parquet: Path):
+    # #73: the wired diff path passes both entries' cache-resolving expressions,
+    # which compose at the expression level. full_diff must NOT eagerly
+    # materialise a result.parquet for either entry — those parquets are never
+    # read on this path and re-introduce exactly the build-time materialisation
+    # #73 removed.
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_dir, b_dir = entry_dir(project, a.content_hash), entry_dir(project, b.content_hash)
+    diff = full_diff(
+        a_dir,
+        b_dir,
+        a_expr=cached_result_expr(project, a.content_hash),
+        b_expr=cached_result_expr(project, b.content_hash),
+    )
+    assert diff["keyed"] is not None
+    assert not (a_dir / "result.parquet").exists()
+    assert not (b_dir / "result.parquet").exists()
+
+
+def test_full_diff_requires_exprs(project: str, orders_parquet: Path):
+    # full_diff is xorq-only: it composes the two passed cache-resolving
+    # expressions. With the on-demand result.parquet writer gone there is no
+    # file to fall back to, so calling it without a_expr/b_expr must raise a
+    # clear error rather than silently materialising two parquets.
+    from tallyman_core import entry_dir
+    from tallyman_xorq import build_and_persist
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    a_dir, b_dir = entry_dir(project, a.content_hash), entry_dir(project, b.content_hash)
+    with pytest.raises(ValueError):
+        full_diff(a_dir, b_dir)  # no a_expr/b_expr
+    assert not (a_dir / "result.parquet").exists()
+    assert not (b_dir / "result.parquet").exists()
 
 
 def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parquet: Path):
@@ -470,6 +514,50 @@ def test_build_compare_expr_type_changed_shared_column(tmp_path):
     assert "issue_date_v2" in cols  # b-side present
     assert "issue_date_eq" not in cols  # no ill-typed equality term
     assert "issue_date_eq" not in overrides
+
+
+def test_build_compare_expr_type_changed_key_column(tmp_path):
+    # Issue #68 (reopened after #69): #69 gated the non-key {col}_eq term, but
+    # the same string→date failure still aborts the diff through the *join key*.
+    # build_compare_expr joins on raw key equality (a_expr[k] == b_renamed[k])
+    # and coalesces the key — both type-sensitive. When the key keeps its name
+    # but changes dtype across revisions, xorq raises XorqTypeError and the whole
+    # diff pipeline aborts. Both sides of such a key are cast to a common type
+    # (string) for the join and coalesce so the comparison is well-typed.
+    import datetime as dt
+
+    import pyarrow as pa
+    import xorq.api as xo
+
+    from tallyman_companion.diff import build_compare_expr
+
+    a_tbl = pa.table(
+        {
+            "issue_date": pa.array(["2024-01-01", "2024-02-01"], pa.string()),
+            "amt": pa.array([10, 20], pa.int64()),
+        }
+    )
+    b_tbl = pa.table(
+        {
+            "issue_date": pa.array([dt.date(2024, 1, 1), dt.date(2024, 3, 1)], pa.date32()),
+            "amt": pa.array([15, 25], pa.int64()),
+        }
+    )
+    a_path = tmp_path / "a.parquet"
+    b_path = tmp_path / "b.parquet"
+    pq.write_table(a_tbl, a_path)
+    pq.write_table(b_tbl, b_path)
+
+    a_expr = xo.deferred_read_parquet(str(a_path))
+    b_expr = xo.deferred_read_parquet(str(b_path))
+
+    # Building and executing must not raise XorqTypeError on the type-changed key.
+    expr, _ = build_compare_expr(a_expr, b_expr, ["issue_date"])
+    assert "issue_date" in expr.schema().names
+    df = expr.execute()
+    # The string-cast date matches the string side: 2024-01-01 is shared,
+    # 2024-02-01 is a-only, 2024-03-01 is b-only — a well-formed outer join.
+    assert {"2024-01-01", "2024-02-01", "2024-03-01"} == {str(d) for d in df["issue_date"]}
 
 
 def test_diff_display_klasses_per_view():

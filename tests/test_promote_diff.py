@@ -172,6 +172,24 @@ def test_build_diff_expr_returns_ibis_expr(project: str, orders_parquet: Path):
     assert "membership" in expr.schema()
 
 
+def test_build_diff_expr_writes_no_result_parquet(project: str, orders_parquet: Path, monkeypatch):
+    """build_diff_expr composes the two entries' cache-resolving expressions
+    directly. It must not materialise an on-demand ``result.parquet`` for
+    either side — those parquets are the layer #73 began retiring and are never
+    read on this path.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_companion.diff import build_diff_expr
+    from tallyman_core import entry_dir
+
+    a = build_and_persist(project, _agg_code(project))
+    b = build_and_persist(project, _filter_code(project))
+    expr = build_diff_expr(a.content_hash, b.content_hash, keys=["region"])
+    assert "membership" in expr.schema()
+    assert not (entry_dir(project, a.content_hash) / "result.parquet").exists()
+    assert not (entry_dir(project, b.content_hash) / "result.parquet").exists()
+
+
 # ---------------------------------------------------------------------------
 # catalog_promote_diff MCP tool
 # ---------------------------------------------------------------------------

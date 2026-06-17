@@ -24,5 +24,4 @@ def test_manifest_optional_fields_default():
     assert m.row_count is None
     assert m.execute_seconds is None
     assert m.code_path == "expr.py"
-    assert m.result_path == "result.parquet"
     assert m.schema_path == "schema.json"

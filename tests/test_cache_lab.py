@@ -67,7 +67,7 @@ from tallyman_core import catalog_state as cs
 from tallyman_core import paths
 from tallyman_core.paths import data_dir, ensure_project, entry_dir, set_active_project
 from tallyman_xorq.build import build_and_persist, load_entry
-from tallyman_xorq.result_cache import cached_result_expr, ensure_result
+from tallyman_xorq.result_cache import cached_result_expr
 from tests.cache_lab_data import (
     N_STATIONS,
     capacity_frame,
@@ -211,18 +211,17 @@ def du(path: Path) -> int:
 
 
 def disk(project: str) -> dict:
-    entries = paths.entries_dir(project)
-    results = sum(f.stat().st_size for f in entries.rglob("result.parquet")) if entries.exists() else 0
+    # No per-entry result.parquet exists; the materialised copy of an expensive
+    # entry's rows is its baked snapshot under the compute cache, so that is the
+    # cache denominator now.
     data = du(paths.data_dir(project))
-    caches = results + du(paths.result_cache_dir(project)) + du(paths.compute_cache_dir(project))
+    compute_cache = du(paths.compute_cache_dir(project))
     return {
         "data_bytes": data,
-        "entry_result_bytes": results,
-        "entry_total_bytes": du(entries),
-        "result_cache_bytes": du(paths.result_cache_dir(project)),
-        "compute_cache_bytes": du(paths.compute_cache_dir(project)),
+        "entry_total_bytes": du(paths.entries_dir(project)),
+        "compute_cache_bytes": compute_cache,
         "bullpen_bytes": du(paths.bullpen_dir(project)),
-        "cache_to_data_ratio": round(caches / data, 3) if data else None,
+        "cache_to_data_ratio": round(compute_cache / data, 3) if data else None,
     }
 
 
@@ -237,37 +236,38 @@ def build(project: str, code: str) -> dict:
     t0 = time.monotonic()
     res = build_and_persist(project, code)
     wall = time.monotonic() - t0
-    rp = entry_dir(project, res.content_hash) / "result.parquet"
     return {
         "hash": res.content_hash,
         "rows": res.row_count,
         "wall_s": round(wall, 3),
         "execute_s": res.execute_seconds,
         "compile_proxy_s": round(wall - res.execute_seconds, 3),
-        "result_bytes": rp.stat().st_size if rp.exists() else 0,
+        # cache_bytes is the baked snapshot size (#87); 0 for a cheap entry that
+        # bakes no snapshot. (The retired per-entry result.parquet probe was here.)
+        "result_bytes": res.cache_bytes or 0,
     }
 
 
 def view_timings(project: str, content_hash: str) -> dict:
-    """Cold/warm view costs through the production read path."""
+    """Cold/warm view costs through the production read path (cached_result_expr).
+
+    cold: wipe the compute cache + clear the reconstruct lru, then execute — a
+    cheap entry recomputes from source, an expensive one recomputes and re-bakes
+    its snapshot. warm: a second execute reads the baked snapshot (expensive) or
+    recomputes again (cheap, which has no snapshot, so warm ≈ cold — itself a
+    meaningful result that validates the #73 "don't cache cheap" thesis).
+    """
+    shutil.rmtree(paths.compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
     t0 = time.monotonic()
-    p1 = ensure_result(project, content_hash)
+    cached_result_expr(project, content_hash).count().execute()
     cold = time.monotonic() - t0
     t0 = time.monotonic()
-    p2 = ensure_result(project, content_hash)
-    warm = time.monotonic() - t0
-    assert p1 == p2
-    t0 = time.monotonic()
-    pd.read_parquet(p1)
-    read = time.monotonic() - t0
-    t0 = time.monotonic()
     n = cached_result_expr(project, content_hash).count().execute()
-    expr_count = time.monotonic() - t0
+    warm = time.monotonic() - t0
     return {
         "view_cold_s": round(cold, 3),
         "view_warm_s": round(warm, 3),
-        "parquet_read_s": round(read, 3),
-        "cached_expr_count_s": round(expr_count, 3),
         "cached_expr_rows": int(n),
     }
 
@@ -275,9 +275,9 @@ def view_timings(project: str, content_hash: str) -> dict:
 def assert_stored_matches_recompute(project: str, content_hash: str, sort_keys: list[str], cols: list[str]):
     """Invariant for ANY strategy: what the cache serves == what recompute produces."""
     fresh = load_entry(project, content_hash).execute()
-    stored = pd.read_parquet(ensure_result(project, content_hash))
+    served = cached_result_expr(project, content_hash).execute()
     f = fresh[cols].sort_values(sort_keys).reset_index(drop=True)
-    s = stored[cols].sort_values(sort_keys).reset_index(drop=True)
+    s = served[cols].sort_values(sort_keys).reset_index(drop=True)
     pd.testing.assert_frame_equal(f, s, check_dtype=False, rtol=1e-5, atol=1e-8)
 
 
@@ -542,7 +542,7 @@ def test_treadmill(lab):
         lab.project, edits[-1]["hash"], sort_keys=["ride_id"], cols=["ride_id", "trip_minutes", "fare_estimate"]
     )
     # Pandas cross-check on one derived value: max fare for casual e-bike rides.
-    stored = pd.read_parquet(ensure_result(lab.project, edits[-1]["hash"]))
+    stored = cached_result_expr(lab.project, edits[-1]["hash"]).execute()
     casual_ebike = stored[(stored.member_casual == "casual") & (stored.rideable_type == "electric_bike")]
     expect = 1.50 + 0.36 * casual_ebike.trip_minutes
     assert np.allclose(casual_ebike.fare_estimate, expect, rtol=1e-9)
@@ -590,8 +590,8 @@ def test_touch_identity(lab):
         }
     )
     # Invariant either way: both entries hold the same logical result.
-    a = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
-    b = pd.read_parquet(ensure_result(lab.project, b2["hash"]))
+    a = cached_result_expr(lab.project, b1["hash"]).execute()
+    b = cached_result_expr(lab.project, b2["hash"]).execute()
     pd.testing.assert_frame_equal(
         a.sort_values(["start_station_name", "end_station_name"]).reset_index(drop=True),
         b.sort_values(["start_station_name", "end_station_name"]).reset_index(drop=True),
@@ -605,7 +605,7 @@ def test_append_invalidates(lab, staged_data):
     invariant for any strategy."""
     code = member_count_code(lab.project)
     b1 = build(lab.project, code)
-    n_before = pd.read_parquet(ensure_result(lab.project, b1["hash"]))["n"].sum()
+    n_before = cached_result_expr(lab.project, b1["hash"]).execute()["n"].sum()
 
     src = lab.data / "trips.parquet"
     extra = trips_frame(
@@ -614,7 +614,7 @@ def test_append_invalidates(lab, staged_data):
     pd.concat([pd.read_parquet(src), extra], ignore_index=True).to_parquet(src)
 
     b2 = build(lab.project, code)
-    n_after = pd.read_parquet(ensure_result(lab.project, b2["hash"]))["n"].sum()
+    n_after = cached_result_expr(lab.project, b2["hash"]).execute()["n"].sum()
     lab.record.update(
         {
             "hash_before": b1["hash"],
@@ -633,7 +633,7 @@ def test_stat_swap(lab):
     serves stale bytes; a content identity forks. Recorded, not asserted."""
     code = utilization_code(lab.project)
     b1 = build(lab.project, code)
-    stored_before = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
+    stored_before = cached_result_expr(lab.project, b1["hash"]).execute()
 
     cap_path = lab.data / "capacity.parquet"
     st_before = cap_path.stat()
@@ -665,7 +665,7 @@ def test_stat_swap(lab):
         merged = stored_before.merge(fresh, on="start_station_id", suffixes=("_stale", "_fresh"))
         lab.record["stale_rows_served"] = int((merged.capacity_stale != merged.capacity_fresh).sum())
     else:
-        fresh = pd.read_parquet(ensure_result(lab.project, b2["hash"]))
+        fresh = cached_result_expr(lab.project, b2["hash"]).execute()
         assert (
             fresh.sort_values("start_station_id").capacity.to_numpy()
             == swapped.sort_values("station_id").capacity.to_numpy()
@@ -681,20 +681,21 @@ def test_selfheal_after_edit(lab):
     the new bytes. Recorded, not asserted — it differentiates strategies."""
     code = od_matrix_code(lab.project)
     b1 = build(lab.project, code)
-    before = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
+    before = cached_result_expr(lab.project, b1["hash"]).execute()
 
     src = lab.data / "trips.parquet"
     df = pd.read_parquet(src)
     df.head(len(df) // 2).to_parquet(src)  # the user halves the file in place
 
-    rp = entry_dir(lab.project, b1["hash"]) / "result.parquet"
-    if rp.exists():
-        rp.unlink()
-    rc_dir = paths.result_cache_dir(lab.project)
-    if rc_dir.exists():
-        shutil.rmtree(rc_dir)
+    # No per-entry result.parquet exists; baked results + source parses live in
+    # the compute cache. Wipe it AND clear the reconstruct lru to evict every
+    # materialization and force a self-heal recompute from the build.
+    cc_dir = paths.compute_cache_dir(lab.project)
+    if cc_dir.exists():
+        shutil.rmtree(cc_dir)
+    cached_result_expr.cache_clear()
 
-    healed = pd.read_parquet(ensure_result(lab.project, b1["hash"]))
+    healed = cached_result_expr(lab.project, b1["hash"]).execute()
     lab.record.update(
         {
             "trips_before": int(before.n_trips.sum()),
@@ -725,7 +726,7 @@ def test_reset_roundtrip(lab):
     s2 = cs.checkpoint_catalog(lab.project, "lab: two treadmill edits")
     assert s2 is not None
 
-    base_df_before = pd.read_parquet(ensure_result(lab.project, base["hash"]))
+    base_df_before = cached_result_expr(lab.project, base["hash"]).execute()
     lab.record["disk_at_step2"] = disk(lab.project)
 
     cs.reset_to(lab.project, s1)
@@ -735,7 +736,7 @@ def test_reset_roundtrip(lab):
         not entry_dir(lab.project, e5["hash"]).exists(),
     ]
     assert entry_dir(lab.project, base["hash"]).exists(), "reset destroyed a baseline entry"
-    base_df_after = pd.read_parquet(ensure_result(lab.project, base["hash"]))
+    base_df_after = cached_result_expr(lab.project, base["hash"]).execute()
     pd.testing.assert_frame_equal(
         base_df_before.sort_values("start_station_id").reset_index(drop=True),
         base_df_after.sort_values("start_station_id").reset_index(drop=True),
@@ -750,27 +751,36 @@ def test_reset_roundtrip(lab):
     lab.record["disk_after_forward_reset"] = disk(lab.project)
     lab.record["edit_restored_on_forward_reset"] = entry_dir(lab.project, e5["hash"]).exists()
     if entry_dir(lab.project, e5["hash"]).exists():
-        p = ensure_result(lab.project, e5["hash"])
-        assert p.exists() and p.stat().st_size > 0
+        assert cached_result_expr(lab.project, e5["hash"]).count().execute() > 0
 
 
 def test_parent_regen(lab):
     """from_catalog chain identity across parent result regeneration — the
     interaction the two ADRs have to get right together. If the regenerated
-    parent parquet is not byte-identical, a content-keyed child forks; a
+    parent result is not byte-identical, a content-keyed child forks; a
     stat-keyed child forks regardless (new inode)."""
+    import tempfile
+
     parent = build(lab.project, cleaned_trips_code(lab.project))
     child_code = child_of_catalog_code(lab.project, parent["hash"])
     c1 = build(lab.project, child_code)
 
-    parent_rp = entry_dir(lab.project, parent["hash"]) / "result.parquet"
-    md5_before = md5_file(parent_rp)
-    parent_rp.unlink()
-    t0 = time.monotonic()
-    regenerated = ensure_result(lab.project, parent["hash"])
-    lab.record["parent_regen_s"] = round(time.monotonic() - t0, 3)
-    assert regenerated.exists()
-    lab.record["parent_regen_byte_identical"] = md5_file(regenerated) == md5_before
+    # The parent (cleaned_trips: filter+projection) is cheap, so it bakes no
+    # snapshot and recomputes on read — there is no per-entry result.parquet to
+    # delete. Materialise its result twice (clearing the reconstruct lru between)
+    # and record whether the regenerated bytes are stable run-to-run.
+    cached_result_expr.cache_clear()
+    with tempfile.TemporaryDirectory() as td:
+        first = Path(td) / "first.parquet"
+        t0 = time.monotonic()
+        cached_result_expr(lab.project, parent["hash"]).to_parquet(str(first))
+        lab.record["parent_regen_s"] = round(time.monotonic() - t0, 3)
+        assert first.exists()
+        md5_before = md5_file(first)
+        cached_result_expr.cache_clear()
+        second = Path(td) / "second.parquet"
+        cached_result_expr(lab.project, parent["hash"]).to_parquet(str(second))
+        lab.record["parent_regen_byte_identical"] = md5_file(second) == md5_before
 
     c2 = build(lab.project, child_code)
     lab.record.update(
@@ -808,7 +818,7 @@ def test_wide_compile(lab):
             "final_disk": disk(lab.project),
         }
     )
-    stored = pd.read_parquet(ensure_result(lab.project, b["hash"]))
+    stored = cached_result_expr(lab.project, b["hash"]).execute()
     assert stored[f"score_{CHAIN_DEPTH}"].notna().all()
     assert int(stored[[f"is_h{h:02d}" for h in range(24)]].sum(axis=1).max()) == 1
 
@@ -836,7 +846,7 @@ def test_heavy_execute(lab):
         & ((pairs.started_at_a - pairs.started_at_b).abs() < pd.Timedelta(seconds=180))
     ]
     expect = pairs.groupby("start_station_id").size()
-    stored = pd.read_parquet(ensure_result(lab.project, b["hash"])).set_index("sid")["near_collisions"]
+    stored = cached_result_expr(lab.project, b["hash"]).execute().set_index("sid")["near_collisions"]
     stored = stored[stored.index.isin(top)]
     pd.testing.assert_series_equal(stored.sort_index(), expect.sort_index(), check_names=False, check_dtype=False)
 

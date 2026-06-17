@@ -20,6 +20,7 @@ from tallyman_core.display_klasses import (
     write_display_klass,
 )
 from tallyman_core.errors import clear_errors, get_error, list_errors, record_error
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
 from tallyman_core.marimo_export import export_notebook_path, notebook_to_marimo
 from tallyman_core.notebook import CellNotFound
@@ -29,7 +30,6 @@ from tallyman_core.paths import (
     ENTRY_CACHE_NAMES,
     ENTRY_EXPANDED_BUILD_DIRNAME,
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_SCHEMA_FILENAME,
     ENTRY_STAT_CACHE_DIRNAME,
     artifacts_dir,
@@ -41,7 +41,6 @@ from tallyman_core.paths import (
     entry_dir,
     entry_expanded_build_dir,
     entry_manifest_path,
-    entry_result_path,
     entry_schema_path,
     entry_stat_cache_dir,
     errors_path,
@@ -95,6 +94,7 @@ __all__ = [
     "write_post_processing",
     "write_stat",
     "alias_for_hash",
+    "atomic_write_text",
     "artifacts_dir",
     "catalog_dir",
     "clear_errors",
@@ -103,7 +103,6 @@ __all__ = [
     "entries_dir",
     "entry_dir",
     "entry_build_dir",
-    "entry_result_path",
     "entry_manifest_path",
     "entry_schema_path",
     "entry_stat_cache_dir",
@@ -111,7 +110,6 @@ __all__ = [
     "ENTRY_ARTIFACT_NAMES",
     "ENTRY_CACHE_NAMES",
     "ENTRY_BUILD_DIRNAME",
-    "ENTRY_RESULT_FILENAME",
     "ENTRY_MANIFEST_FILENAME",
     "ENTRY_SCHEMA_FILENAME",
     "ENTRY_STAT_CACHE_DIRNAME",

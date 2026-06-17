@@ -488,7 +488,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
         rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool)
         _notify("build_failed", error_id=rec["id"], tool=tool)
         return {"error": str(exc), "error_id": rec["id"]}
-    return {
+    reply = {
         "_build": result,
         "hash": result.content_hash,
         "row_count": result.row_count,
@@ -497,6 +497,9 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
         "entry_path": str(result.entry_path),
         "url": _entry_url(project, result.content_hash),
     }
+    if result.lint_warnings:
+        reply["lint_warnings"] = result.lint_warnings
+    return reply
 
 
 @mcp.tool()
@@ -731,8 +734,9 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     if not a_dir.exists() or not b_dir.exists():
         return {"error": "one or both entries are missing on disk"}
 
-    # Diff the two entries' (cache-resolving) expressions — streaming xorq
-    # aggregates, and self-healing if a result.parquet was evicted.
+    # Diff the two entries' (cache-resolving) expressions — an expensive entry
+    # reads its baked result cache, a cheap one recomputes (#73); neither
+    # depends on a result.parquet existing.
     from tallyman_xorq.result_cache import cached_result_expr
 
     diff = full_diff(
@@ -740,7 +744,6 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
         b_dir,
         a_label=f"V{a_idx}",
         b_label=f"V{b_idx}",
-        backend="xorq",
         a_expr=cached_result_expr(project, a_hash),
         b_expr=cached_result_expr(project, b_hash),
     )
@@ -1112,8 +1115,9 @@ def catalog_run_post_processing(code: str, entry: str) -> dict:
 
     Use this to iterate on ``process(expr)`` code before committing it with
     ``catalog_add_post_processing``. The function is executed against the
-    entry's stored ``result.parquet`` — you see real output rows, not the
-    small dry-run memtable that ``catalog_add_post_processing`` validates
+    entry's result (read via ``cached_result_expr`` — a cheap entry recomputes,
+    an expensive one reads its baked snapshot) — you see real output rows, not
+    the small dry-run memtable that ``catalog_add_post_processing`` validates
     against.
 
     SANDBOX: same restricted namespace as ``catalog_add_post_processing`` —

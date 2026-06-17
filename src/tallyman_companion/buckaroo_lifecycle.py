@@ -51,19 +51,19 @@ import httpx
 from tallyman_core import (
     entry_build_dir,
     entry_expanded_build_dir,
-    entry_result_path,
     entry_stat_cache_dir,
 )
 from tallyman_core.paths import artifacts_dir, project_dir
 
 
-def _entry_parquet_exists(project: str, content_hash: str) -> bool:
-    """True if the project's catalog has an entry for *content_hash*.
+def _entry_exists(project: str, content_hash: str) -> bool:
+    """True if the project's catalog has a built entry for *content_hash*.
 
-    Used by ``_load_session_file`` to prune stale session entries whose
-    project / hash combination no longer maps to anything on disk.
+    The build dir is the entry's existence proof now (there is no on-demand
+    ``result.parquet``). Used by ``_load_session_file`` to prune stale session
+    entries whose project / hash combination no longer maps to a build on disk.
     """
-    return entry_result_path(project, content_hash).exists() or entry_build_dir(project, content_hash).is_dir()
+    return entry_build_dir(project, content_hash).is_dir()
 
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -356,7 +356,7 @@ class BuckarooManager:
             project = info.get("project")
             if not project:
                 continue
-            if not _entry_parquet_exists(project, h):
+            if not _entry_exists(project, h):
                 continue
             kept[h] = {"session_id": info["session_id"], "project": project}
         self._sessions = kept
@@ -484,12 +484,16 @@ class BuckarooManager:
     ) -> str | None:
         """Return a Buckaroo session_id for ``content_hash``, creating it if needed.
 
-        Posts the entry's ``xorq_build/`` dir to Buckaroo's ``/load_expr``
-        endpoint so the session is backed by the xorq expression (push-down
-        sort/search against the underlying backend), not by paging over the
-        materialised parquet.
+        Posts an expanded xorq build dir to Buckaroo's ``/load_expr`` endpoint so
+        the session is backed by an xorq expression (push-down sort/search
+        against the underlying backend). The posted build is always the entry's
+        expanded recipe (``xorq_build/``): a cheap entry recomputes on read
+        (push-down over a columnar source), and a cache-worthy entry's recipe
+        replays onto its baked ``.cache()`` snapshot — a read of the snapshot, not
+        a re-run of the Aggregate/Join/Sort. No per-entry ``result.parquet`` is
+        read any more; the #71 result-read build that served one was removed.
 
-        ``project`` names the project that owns the parquet. Sessions cache
+        ``project`` names the project that owns the entry. Sessions cache
         across projects via content hash (globally unique), so a second call
         for the same hash from a different project returns the existing
         session — the bytes are the same by definition.
@@ -511,6 +515,22 @@ class BuckarooManager:
         build_dir = entry_build_dir(project, content_hash)
         if not build_dir.is_dir():
             return None
+        # Materialise the entry's baked snapshot before buckaroo replays the
+        # build via /load_expr. A from_catalog chain off an expensive parent
+        # embeds a *bare* read of the parent's snapshot (#75 strips the parent
+        # CachedNode to keep the composed expression on one backend), so on a
+        # cold compute cache — a fresh clone, or an entry the startup warmup
+        # didn't reach — the replay reads zero rows and the grid renders empty.
+        # cached_result_expr repopulates it (idempotent; lru-cached, so a warmed
+        # entry is ~free), the same heal the paginated read (api_data) relies on.
+        # Done before the lock: a cold entry's recompute mustn't block other
+        # sessions, and a warm one is a cheap cache hit.
+        try:
+            from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
+
+            cached_result_expr(project, content_hash)
+        except Exception:
+            log.debug("snapshot self-heal before /load_expr failed for %s", content_hash, exc_info=True)
         with self._session_lock:
             cached = self._sessions.get(content_hash)
             if cached:

@@ -39,36 +39,35 @@ function EntryItem({
   return (
     <li className={isCurrent ? "current" : undefined}>
       <Link
+        className="entry-link"
         to={`/${project}/catalog/${e.content_hash}`}
         aria-current={isCurrent ? "page" : undefined}
         title={promptText}
       >
-        <span className="entry-main">
-          <span className="entry-name">
-            {e.alias ? (
-              <>
-                <span className="alias">{e.alias}</span>
-                {e.version != null && <span className="vchip">V{e.version}</span>}
-              </>
-            ) : (
-              <span className="hash">{e.content_hash}</span>
-            )}
-          </span>
-          <span className="meta-inline" title={`${e.row_count} rows · ${e.execute_seconds}s`}>
-            {fmtRows(e.row_count)} · {fmtSecs(e.execute_seconds)}
-          </span>
+        <span className="entry-name">
+          {e.alias ? (
+            <span className="alias">{e.alias}</span>
+          ) : (
+            <span className="hash">{e.content_hash}</span>
+          )}
         </span>
         {showPrompt && <span className="prompt">{promptText}</span>}
       </Link>
-      {e.alias && e.is_current && e.version_count > 1 && (
-        <Link
-          className="diff-link"
-          to={`/${project}/diff/${e.alias}`}
-          title={`Diff V${(e.version ?? 1) - 1} → V${e.version}`}
-        >
-          diff
-        </Link>
-      )}
+      <span className="entry-meta">
+        {e.alias && e.version != null && <span className="vchip">V{e.version}</span>}
+        <span className="meta-inline" title={`${e.row_count} rows · ${e.execute_seconds}s`}>
+          {fmtRows(e.row_count)} · {fmtSecs(e.execute_seconds)}
+        </span>
+        {e.alias && e.is_current && e.version_count > 1 && (
+          <Link
+            className="diff-link"
+            to={`/${project}/diff/${e.alias}`}
+            title={`Diff V${(e.version ?? 1) - 1} → V${e.version}`}
+          >
+            diff
+          </Link>
+        )}
+      </span>
     </li>
   );
 }

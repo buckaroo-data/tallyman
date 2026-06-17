@@ -10,8 +10,6 @@ import time
 from pathlib import Path
 
 import markdown as md_lib
-import pyarrow as pa
-import pyarrow.parquet as pq
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,19 +21,18 @@ from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
 from tallyman_core import (
     ENTRY_BUILD_DIRNAME,
     ENTRY_MANIFEST_FILENAME,
-    ENTRY_RESULT_FILENAME,
     ENTRY_SCHEMA_FILENAME,
     ENTRY_STAT_CACHE_DIRNAME,
     alias_for_hash,
     clear_errors,
     entry_dir,
-    entry_result_path,
     get_chart,
     get_error,
     history_for,
     list_errors,
     load_aliases,
     notebook,
+    read_manifest,
     resolve_project,
     version_of_hash,
 )
@@ -51,7 +48,7 @@ from tallyman_xorq import (
 )
 from tallyman_xorq.layout import layered_positions
 from tallyman_xorq.primary_key import diff_keys
-from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
 log = logging.getLogger("tallyman.companion")
 
@@ -80,29 +77,6 @@ def _render_markdown(text: str) -> str:
     if not text or not text.strip():
         return ""
     return md_lib.markdown(text, extensions=["fenced_code", "tables"])
-
-
-def _read_head_rows(path: Path, n: int, pf: pq.ParquetFile | None = None) -> pa.Table:
-    """Read at most the first ``n`` rows of a parquet file as an arrow Table.
-
-    Uses ``iter_batches`` to stop as soon as enough rows have been collected,
-    so a 200-row read against a multi-million-row parquet doesn't materialise
-    the whole file. Returns the concatenated batches sliced to exactly ``n``.
-    """
-    if pf is None:
-        pf = pq.ParquetFile(path)
-    if n <= 0:
-        return pf.schema_arrow.empty_table()
-    collected: list = []
-    rows_so_far = 0
-    for batch in pf.iter_batches(batch_size=min(n, 10_000)):
-        collected.append(batch)
-        rows_so_far += batch.num_rows
-        if rows_so_far >= n:
-            break
-    if not collected:
-        return pf.schema_arrow.empty_table()
-    return pa.Table.from_batches(collected).slice(0, n)
 
 
 def _dir_size(path: Path) -> int:
@@ -155,34 +129,31 @@ _DISK_USAGE_TTL = 3.0
 def _compute_disk_usage(project: str) -> dict:
     """Walk a project's on-disk footprint and return the disk_usage payload.
 
-    Covers raw input data, each entry's result.parquet / xorq_build /
-    .buckaroo_stat_cache, and the two project-level caches added in #12 — the
-    xorq ParquetSnapshotCache (result_cache/) and the per-pair Buckaroo diff
-    stat cache (diff_stat_cache/), either of which can dwarf the rest.
+    Covers raw input data, each entry's xorq_build / .buckaroo_stat_cache, the
+    per-project compute cache (compute_cache/, where the baked result snapshots
+    and source-read caches live — the single materialised copy of an entry's
+    rows since #73), and the per-pair Buckaroo diff stat cache (diff_stat_cache/),
+    which can dwarf the rest. No per-entry ``result.parquet`` is written any more,
+    so there is no separate "results" bucket — the baked snapshots it would have
+    counted are under compute_cache.
 
     This is the expensive path; callers should rate-limit it via the
     api_disk_usage TTL cache rather than invoking per request.
     """
+    from tallyman_core.paths import compute_cache_dir as _compute_cache_dir
     from tallyman_core.paths import data_dir as _data_dir
     from tallyman_core.paths import diff_stat_cache_root as _diff_stat_cache_root
     from tallyman_core.paths import entries_dir as _entries_dir
-    from tallyman_core.paths import result_cache_dir as _result_cache_dir
 
     # raw input files
     data = _dir_size(_data_dir(project))
 
     root = _entries_dir(project)
-    results = builds = cache = 0
+    builds = cache = 0
     if root.is_dir():
         for entry in root.iterdir():
             if not entry.is_dir():
                 continue
-            p = entry / ENTRY_RESULT_FILENAME
-            if p.exists():
-                try:
-                    results += p.stat().st_size
-                except OSError:
-                    pass
             b = entry / ENTRY_BUILD_DIRNAME
             if b.is_dir():
                 builds += _dir_size(b)
@@ -190,26 +161,28 @@ def _compute_disk_usage(project: str) -> dict:
             if c.is_dir():
                 cache += _dir_size(c)
 
-    # Project-level caches (#12), previously uncounted. _dir_size returns 0 for
-    # a dir that doesn't exist yet, so no existence guard needed.
-    result_cache = _dir_size(_result_cache_dir(project))
+    # Per-project compute cache (baked result snapshots + source-read caches),
+    # counted since #87. The baked snapshots are the single materialised copy of
+    # an entry's rows, so this subsumes the retired per-entry "results" bucket.
+    compute_cache = _dir_size(_compute_cache_dir(project))
+
+    # Project-level diff stat cache (#12). _dir_size returns 0 for a dir that
+    # doesn't exist yet, so no existence guard needed.
     diff_cache = _dir_size(_diff_stat_cache_root(project))
 
-    total = data + results + builds + cache + result_cache + diff_cache
+    total = data + builds + cache + compute_cache + diff_cache
     return {
         "data": data,
-        "results": results,
         "builds": builds,
         "cache": cache,
-        "result_cache": result_cache,
+        "compute_cache": compute_cache,
         "diff_cache": diff_cache,
         "total": total,
         "formatted": {
             "data": _fmt_bytes(data),
-            "results": _fmt_bytes(results),
             "builds": _fmt_bytes(builds),
             "cache": _fmt_bytes(cache),
-            "result_cache": _fmt_bytes(result_cache),
+            "compute_cache": _fmt_bytes(compute_cache),
             "diff_cache": _fmt_bytes(diff_cache),
             "total": _fmt_bytes(total),
         },
@@ -229,7 +202,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     """
     import tempfile
 
-    import xorq.api as xo
+    from xorq.ibis_yaml.compiler import build_expr
 
     a = cached_result_expr(project, a_hash)
     b = cached_result_expr(project, b_hash)
@@ -238,7 +211,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
 
     builds_dir = Path(tempfile.gettempdir()) / "tallyman_diff_builds"
     builds_dir.mkdir(parents=True, exist_ok=True)
-    build_path = Path(xo.build_expr(expr, builds_dir=str(builds_dir)))
+    build_path = Path(build_expr(expr, builds_dir=str(builds_dir)))
 
     return build_path, overrides
 
@@ -309,6 +282,18 @@ def create_app(
             _sap(project)
         except (FileNotFoundError, ValueError):
             pass
+
+    # Upgrade migration: sweep any per-entry result.parquet and #71 viewer-read
+    # build dirs once. The marker was bumped for this change, so an install that
+    # already ran the #73 sweep re-runs it once to clear anything written since.
+    # Guarded by a per-project marker, so it's a no-op on later starts.
+    if seed and not read_only:
+        try:
+            from tallyman_xorq.build import migrate_drop_result_parquet
+
+            migrate_drop_result_parquet(seed)
+        except Exception:  # best-effort; cleanup must never block startup
+            log.warning("result.parquet migration failed for %s", seed, exc_info=True)
 
     app = FastAPI(title="tallyman companion")
     if STATIC_DIR.exists():
@@ -514,18 +499,26 @@ def create_app(
         _require_hash(content_hash)
         if limit < 0:
             raise HTTPException(400, "limit must be >= 0")
-        entry = entry_dir(project, content_hash)
-        result_path = entry / ENTRY_RESULT_FILENAME
-        if not result_path.exists():
-            raise HTTPException(404, "no result.parquet")
-        pf = pq.ParquetFile(result_path)
-        total = pf.metadata.num_rows
-        needed = offset + limit if limit > 0 else 0
-        if needed > 0 and total > 0:
-            table = _read_head_rows(result_path, min(needed, total), pf=pf)
-            df = table.slice(offset, limit).to_pandas()
-        else:
-            df = pf.schema_arrow.empty_table().to_pandas()
+        from tallyman_core.paths import entry_build_dir  # noqa: PLC0415
+
+        if not entry_build_dir(project, content_hash).is_dir():
+            raise HTTPException(404, "no entry")
+        # #90: serve the page off the entry's expression. cached_result_expr
+        # already hands back the result as a live single-backend expression, so
+        # the window pushes down (expensive → windowed read of the baked snapshot,
+        # cheap → limit pushed through to the source read) and nothing is written.
+        # The old path called ensure_result, materialising the entry's entire
+        # result to disk to serve one page. total is the manifest's row_count
+        # (recorded at build; api_entry_detail reads it the same way), so no file
+        # is needed to populate it. The manifest is written after the build dir
+        # exists (build.py), so guard the read: a half-built or pruned entry still
+        # serves its page off the expression with a best-effort total of 0 rather
+        # than 500ing on a missing manifest — cached_result_expr needs none.
+        manifest_path = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
+        total = 0
+        if manifest_path.exists():
+            total = json.loads(manifest_path.read_text()).get("row_count") or 0
+        df = cached_result_expr(project, content_hash).limit(limit, offset=offset).execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,
@@ -576,7 +569,7 @@ def create_app(
             for i, h in enumerate(hist_hashes, start=1):
                 forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
 
-        prompt_history = read_prompts(entry)
+        prompt_history = read_prompts(project, content_hash)
         chart_spec = get_chart(project, content_hash)
 
         build_artifacts: list[dict] = []
@@ -603,8 +596,9 @@ def create_app(
         )
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
-        result_path = entry / ENTRY_RESULT_FILENAME
-        total_rows = pq.ParquetFile(result_path).metadata.num_rows if result_path.exists() else 0
+        # #73: row count comes from the manifest, not a result.parquet (cheap
+        # entries no longer write one at build time).
+        total_rows = (manifest or {}).get("row_count", 0)
 
         return {
             "project": project,
@@ -729,9 +723,8 @@ def create_app(
                 if (entry / ENTRY_MANIFEST_FILENAME).exists():
                     entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
                     schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                result_path = entry / ENTRY_RESULT_FILENAME
-                if result_path.exists():
-                    total_rows = pq.ParquetFile(result_path).metadata.num_rows
+                    # #73: row count from the manifest, not a result.parquet.
+                    total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
@@ -794,7 +787,6 @@ def create_app(
                 b_dir,
                 a_label=f"V{va}",
                 b_label=f"V{vb}",
-                backend="xorq",
                 a_expr=a_expr,
                 b_expr=b_expr,
                 keys=keys,
@@ -815,9 +807,7 @@ def create_app(
             if keys:
                 session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
                 try:
-                    build_path, overrides = _build_compare_expr(
-                        project, a_hash, b_hash, tuple(keys)
-                    )
+                    build_path, overrides = _build_compare_expr(project, a_hash, b_hash, tuple(keys))
                     if buckaroo.diff_session_is_loaded(session_id):
                         compare_session = session_id
                         buckaroo_ws_base_url = buckaroo.ws_base_url
@@ -1026,20 +1016,39 @@ def create_app(
             for entry in root.iterdir():
                 if not entry.is_dir():
                     continue
-                p = entry / ENTRY_RESULT_FILENAME
-                if not p.exists():
-                    continue
                 try:
-                    stat = p.stat()
-                    size = stat.st_size
-                    created = datetime.datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S")
-                except OSError:
+                    m = read_manifest(entry)
+                except Exception:
                     continue
                 content_hash = entry.name
+                # The page lists the baked snapshots that exist on disk right now —
+                # the rows the delete button can actually evict. cache_bytes (#87) is
+                # a cheap pre-filter: None for a cheap entry (bakes nothing), so skip
+                # it without deriving a path. For an expensive entry, resolve the
+                # snapshot and skip it when the file is gone — a delete unlinks the
+                # snapshot but leaves cache_bytes set, so keying the listing on
+                # cache_bytes alone showed a phantom row (stale size, freed bytes
+                # still in the total, a delete button that 404s) until the entry was
+                # next viewed and re-baked. Size from the live file so the figure
+                # tracks disk. baked_snapshot_path re-imports the recipe, but only
+                # for the (few) expensive entries the pre-filter lets through, and
+                # this admin page isn't on a hot path.
+                if m.cache_bytes is None:
+                    continue
                 try:
-                    row_count = pq.ParquetFile(p).metadata.num_rows
+                    snap = baked_snapshot_path(project, content_hash)
+                    if snap is None or not snap.exists():
+                        continue
+                    size = snap.stat().st_size
                 except Exception:
-                    row_count = 0
+                    continue
+                # created_at is an ISO-8601 UTC string; render it in the table's
+                # existing "%Y-%m-%d %H:%M:%S" shape (CachePage renders `created`
+                # verbatim) so the Created column is unchanged.
+                try:
+                    created = datetime.datetime.fromisoformat(m.created_at).strftime("%Y-%m-%d %H:%M:%S")
+                except (ValueError, TypeError):
+                    created = m.created_at or ""
                 alias = alias_for_hash(project, content_hash)
                 info = version_of_hash(project, content_hash)
                 version = info[1] if info else None
@@ -1047,25 +1056,20 @@ def create_app(
                 if not is_current and info is not None:
                     alias = info[0]
                     is_current = False
-                manifest_path = entry / ENTRY_MANIFEST_FILENAME
-                prompt = None
-                if manifest_path.exists():
-                    try:
-                        m = json.loads(manifest_path.read_text())
-                        prompt = m.get("prompt")
-                    except Exception:
-                        pass
                 entries.append(
                     {
                         "hash": content_hash,
                         "size": size,
                         "size_formatted": _fmt_bytes(size),
-                        "row_count": row_count,
+                        # row_count is int|None on the manifest, but CacheEntry
+                        # types it number and CachePage calls .toLocaleString()
+                        # with no null guard — coerce so a null can't reach JS.
+                        "row_count": int(m.row_count or 0),
                         "created": created,
                         "alias": alias,
                         "version": version,
                         "is_current": is_current,
-                        "prompt": prompt,
+                        "prompt": m.prompt,
                     }
                 )
         entries.sort(key=lambda e: -e["size"])
@@ -1085,13 +1089,25 @@ def create_app(
         # Reject a non-hex hash up front: a 400 reads truer than the
         # "already evicted" 404 below (see _require_hash).
         _require_hash(content_hash)
-        p = entry_result_path(project, content_hash)
-        if not p.exists():
-            raise HTTPException(404, "result.parquet not found")
+        # Evict the baked .cache() snapshot — the single materialised copy. None
+        # for a cheap entry (nothing to delete) or one already evicted; reading
+        # the entry's viewer page afterward self-heals (re-bakes) it.
+        p = baked_snapshot_path(project, content_hash)
+        if p is None or not p.exists():
+            raise HTTPException(404, "no baked snapshot for this entry")
         try:
             p.unlink()
         except OSError as exc:
             raise HTTPException(500, str(exc))
+        # Defense-in-depth, not load-bearing for correctness: since ee0a90a,
+        # cached_result_expr is a thin non-memoised wrapper that re-checks
+        # path.exists() and self-heals on every read, so the next viewer read
+        # (api_data) / ensure_session heal re-bakes the evicted snapshot even with a
+        # warm memo left in place (proven by
+        # test_cached_result_expr_self_heals_after_warm_then_evict). We still clear
+        # it because it's cheap for an admin delete: content-addressed entries just
+        # re-reconstruct (and the evicted one re-bakes) on the next read.
+        cached_result_expr.cache_clear()
         return {"ok": True, "hash": content_hash}
 
     @app.patch("/{project}/api/notebook")
@@ -1138,12 +1154,16 @@ def create_app(
             raise HTTPException(400, str(exc))
         info = _set_alias(project, alias, res.content_hash, expect_exists=True)
         await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
-        return {
+        reply = {
             "hash": res.content_hash,
             "alias": alias,
             "version": info["version"],
             "row_count": res.row_count,
         }
+        # Surface the advisory nondeterminism lint, same as the MCP tool replies (#88).
+        if res.lint_warnings:
+            reply["lint_warnings"] = res.lint_warnings
+        return reply
 
     @app.put("/{project}/api/markdown/{cell_id}")
     async def put_markdown(project: str, cell_id: str, payload: dict):

@@ -9,8 +9,8 @@ Two entry points:
 
   build_diff_expr(a_hash, b_hash, keys)
       Convenience wrapper used as the internal expr.py rebuild path for
-      promoted diff entries.  Resolves the active project, ensures both
-      source parquets exist, and delegates to build_compare_expr.
+      promoted diff entries.  Resolves the active project, composes both
+      entries' cache-resolving expressions, and delegates to build_compare_expr.
 """
 
 from __future__ import annotations
@@ -157,11 +157,22 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
     b_schema = b_expr.schema()
     a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)
 
+    # #68 (reopened after #69): a *key* column whose dtype changed across
+    # revisions to an incomparable type (issue_date string→date) would make the
+    # join predicate and the key coalesce compare incompatible dtypes and abort
+    # the whole diff. Cast both sides of such keys to string — a universally
+    # comparable type — for the join and coalesce, the same "never compare
+    # incompatible dtypes" invariant #69 established for the non-key _eq path.
+    recast_keys = {k for k in keys if not _is_comparable(a_schema[k], b_schema[k])}
+
+    def _key(expr: Any, k: str) -> Any:
+        return expr[k].cast("string") if k in recast_keys else expr[k]
+
     a_expr, b_expr = _align_backends(a_expr, b_expr)
     b_renamed = b_expr.rename({f"{c}_v2": c for c in b_non_keys})
-    joined = a_expr.outer_join(b_renamed, [a_expr[k] == b_renamed[k] for k in keys])
+    joined = a_expr.outer_join(b_renamed, [_key(a_expr, k) == _key(b_renamed, k) for k in keys])
 
-    sel: list = [ibis.coalesce(a_expr[k], b_renamed[k]).name(k) for k in keys]
+    sel: list = [ibis.coalesce(_key(a_expr, k), _key(b_renamed, k)).name(k) for k in keys]
     for col in a_non_keys:
         sel.append(joined[col])
         if col in b_non_keys:
@@ -203,19 +214,17 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
 def build_diff_expr(a_hash: str, b_hash: str, keys: list[str]) -> Any:
     """Build the comparison expression for a promoted diff entry.
 
-    Loads both source entries' result parquets via the active project and
-    delegates to build_compare_expr.  Project resolves via the active-project
-    file (same mechanism as other catalog-aware code).
+    Composes both source entries' cache-resolving expressions (a cheap entry
+    recomputes, an expensive one reads its baked snapshot) and delegates to
+    build_compare_expr.  Both sides root on the default backend, so the join
+    stays single-backend.  Project resolves via the active-project file (same
+    mechanism as other catalog-aware code).
     """
-    import xorq.api as xo
-
     from tallyman_core.paths import resolve_project
-    from tallyman_xorq.result_cache import ensure_result
+    from tallyman_xorq.result_cache import cached_result_expr
 
     project = resolve_project()
-    a_path = ensure_result(project, a_hash)
-    b_path = ensure_result(project, b_hash)
-    a_expr = xo.deferred_read_parquet(str(a_path))
-    b_expr = xo.deferred_read_parquet(str(b_path))
+    a_expr = cached_result_expr(project, a_hash)
+    b_expr = cached_result_expr(project, b_hash)
     expr, _ = build_compare_expr(a_expr, b_expr, keys)
     return expr

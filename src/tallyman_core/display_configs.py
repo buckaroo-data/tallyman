@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import catalog_dir
 
 
@@ -26,8 +27,7 @@ def set_display_config(project: str, content_hash: str, config: dict) -> Path:
     """Persist a display configuration for content_hash."""
     out = config_path(project, content_hash)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(config, indent=2))
-    return out
+    return atomic_write_text(out, json.dumps(config, indent=2))
 
 
 def get_display_config(project: str, content_hash: str) -> dict | None:

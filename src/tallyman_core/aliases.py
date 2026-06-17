@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import catalog_dir, ensure_project
 
 
@@ -70,9 +71,7 @@ def _write(project: str, aliases: dict[str, str], history: dict[str, list[str]])
         json.dumps({"alias": name, "latest": aliases[name], "history": history.get(name, [])}) + "\n"
         for name in sorted(aliases)
     )
-    tmp = p.with_name(p.name + ".tmp")
-    tmp.write_text(body)
-    tmp.replace(p)
+    atomic_write_text(p, body)
 
 
 def load_aliases(project: str) -> dict[str, str]:

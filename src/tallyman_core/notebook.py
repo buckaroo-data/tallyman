@@ -20,6 +20,7 @@ import json
 import uuid
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import catalog_dir, ensure_project
 
 
@@ -40,10 +41,11 @@ def load(project: str, name: str = "default") -> dict:
     for line in p.read_text().splitlines():
         if not line.strip():
             continue
-        try:
-            cells.append(json.loads(line))
-        except json.JSONDecodeError:
-            continue
+        # Fail loudly on a malformed line, matching aliases._read / read_prompts.
+        # _save is atomic (no torn writes), so a bad line is genuine corruption;
+        # silently dropping it here would let the next _save make the loss
+        # permanent. notebook.jsonl is git-tracked, so the fix is recoverable.
+        cells.append(json.loads(line))
     return {"cells": cells}
 
 
@@ -55,7 +57,7 @@ def _save(project: str, data: dict, name: str = "default") -> None:
     if not cells:
         p.unlink(missing_ok=True)  # an empty notebook is no file (a clean diff)
         return
-    p.write_text("".join(json.dumps(c) + "\n" for c in cells))
+    atomic_write_text(p, "".join(json.dumps(c) + "\n" for c in cells))
 
 
 def find_cell_by_alias(project: str, alias: str, name: str = "default") -> dict | None:

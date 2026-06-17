@@ -1099,12 +1099,13 @@ def create_app(
             p.unlink()
         except OSError as exc:
             raise HTTPException(500, str(exc))
-        # Drop the read-path memo so the snapshot actually self-heals on next read.
-        # A warm cached_result_expr holds a deferred_read of the file just unlinked;
-        # left in place, the next viewer read (api_data) — and ensure_session's
-        # pre-/load_expr heal — would dereference a missing file instead of
-        # re-baking. lru_cache has no per-key eviction, and a full clear is cheap
-        # for an admin delete: entries are content-addressed, so warm exprs simply
+        # Defense-in-depth, not load-bearing for correctness: since ee0a90a,
+        # cached_result_expr is a thin non-memoised wrapper that re-checks
+        # path.exists() and self-heals on every read, so the next viewer read
+        # (api_data) / ensure_session heal re-bakes the evicted snapshot even with a
+        # warm memo left in place (proven by
+        # test_cached_result_expr_self_heals_after_warm_then_evict). We still clear
+        # it because it's cheap for an admin delete: content-addressed entries just
         # re-reconstruct (and the evicted one re-bakes) on the next read.
         cached_result_expr.cache_clear()
         return {"ok": True, "hash": content_hash}

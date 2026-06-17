@@ -356,8 +356,10 @@ exception; scope the spy past the legitimate `cp -c` clone at
 `source_identity.py:111`); (b) `test_src_has_no_xorq_catalog_argv` — a static grep
 that `src/` has no `import xorq.catalog` / `from xorq.catalog` and no split-token
 `xorq … catalog … add` argv (skipping the `tallyman_mcp/server.py:219` codegen
-docstring); and (c) `test_connect_shim_snapshot_is_byte_identical` — the datafusion
-shim preserves byte-identical content-addressed snapshots.
+docstring); and (c) `test_connect_shim_matches_xorq_api_connect` — the datafusion
+shim derives the same content-addressed snapshot key and bakes the same data as
+`xo.connect()` (key + data equivalence, not byte-identical — datafusion's group-by
+output order isn't deterministic).
 
 ## Decisions (resolved in the grilling pass)
 
@@ -434,7 +436,7 @@ shim preserves byte-identical content-addressed snapshots.
 |---|---|---|---|
 | 1 | `git add -A` is allow-by-default; a `.gitignore` denylist silently tracks any unlisted artifact (build dirs, `result.parquet`, future strays) | High | `.gitignore` (`entries/*/` etc.) covers today's heavy artifacts, but the durable guard is `assert_catalog_consistent` enforcing the tracked surface as a path **allowlist** (deny-by-default). Regression test asserts no build-dir file — and no unlisted path — is tracked. |
 | 2 | `sys.modules`-based "dropped" assertion is unsatisfiable (recipes load `xorq.api`) | High | Definition of done = subprocess guard + `src/` static grep, not `sys.modules`. |
-| 3 | `xo.connect()` survives the `xorq.api`→`xorq.expr.api` swap as ibis's `connect(resource, …)` (present, not absent), so it fails at *call* time / builds the wrong backend rather than at import — easy to miss | High | Datafusion connect shim + `test_connect_shim_snapshot_is_byte_identical` (commit 1b) — was prose-only, now a named failing-first test. |
+| 3 | `xo.connect()` survives the `xorq.api`→`xorq.expr.api` swap as ibis's `connect(resource, …)` (present, not absent), so it fails at *call* time / builds the wrong backend rather than at import — easy to miss | High | Datafusion connect shim + `test_connect_shim_matches_xorq_api_connect` (commit 1b) — was prose-only, now a named test asserting key + data equivalence (not byte-identical; see Implementation notes). |
 | 4 | `test_catalog_xorq_integration.py` imports `xorq.catalog.catalog.Catalog` **at module level** (`:45` also imports the to-be-deleted `xorq_catalog`) | High | Delete/rewrite in the **step-2** commit (same one that deletes `xorq_catalog.py`), not step 6 — a module-level import of the deleted module collection-errors the whole suite from step 2 on. Drop `_open_xorq_catalog`/alias-symlink tests; keep the `git ls-files` durability guards. |
 | 5 | Salt-mode zip must be named by the salted hash | High | Name `entries/<salted_hash>.zip`; test under `TALLYMAN_SOURCE_IDENTITY=salt`. |
 | 6 | Commit timing inverts (inline → checkpoint); tests that build with no checkpoint and assert tracked fail | Med | `test_xorq_catalog_add_registers_after_genesis` is a **fix-induced break**, not failing-first: edit to checkpoint-then-assert in the step-6 cleanup commit. |
@@ -506,10 +508,12 @@ before relying on any `subprocess.run` monkeypatch.
      blind spot. Optionally add the contrapositive `test_two_load_expr_results_cannot_union`
      to pin why `expr.py` is load-bearing.
    - `test_recipe_zip_contains_expr_py` — assert `expr.py` is a zip member (D3).
-   - `test_connect_shim_snapshot_is_byte_identical` — the shim-built and
-     `xo.connect()`-built `ParquetSnapshotCache` must produce byte-identical
-     content-addressed snapshots (Cut B / Risk #3; the no-arg `xo.connect()` sites are
-     `src/tallyman_xorq/source_cache.py:133,152`). The central Cut-B correctness claim.
+   - `test_connect_shim_matches_xorq_api_connect` — the shim-built and
+     `xo.connect()`-built `ParquetSnapshotCache` must derive the same
+     content-addressed snapshot key and bake the same data (Cut B / Risk #3; the
+     no-arg `xo.connect()` sites are `src/tallyman_xorq/source_cache.py:133,152`).
+     Key + data equivalence, not byte-identical — datafusion's group-by order isn't
+     deterministic. The central Cut-B correctness claim.
    - `test_src_has_no_xorq_catalog_argv` — static grep over `src/` for
      `import xorq.catalog` / `from xorq.catalog` **and** the split-token catalog argv
      (`_xorq(project, "catalog", "add", …)` in `xorq_catalog.py:31`, so a literal
@@ -604,5 +608,8 @@ before relying on any `subprocess.run` monkeypatch.
   data), not just a structural roundtrip — xorq's `test_rebuild_produces_consistent_target`
   exists because a rebuild can match on schema/recipe/hash while silently returning
   wrong rows.
-- Genesis baseline behavior post-decomposition and the exact `.gitignore` contents.
-  (The failing-first list is now settled above as commits 1a/1b.)
+- Genesis baseline behavior post-decomposition. (The failing-first list is now
+  settled above as commits 1a/1b.) The `.gitignore` contents are no longer open:
+  they are concretely defined by `GITIGNORE_LINES` (`src/tallyman_core/catalog.py`)
+  and written by `write_gitignore`. The genuinely-open follow-up is the build-time
+  alias-revision limitation (#84).

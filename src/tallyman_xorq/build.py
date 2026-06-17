@@ -17,6 +17,7 @@ from pathlib import Path
 from tallyman_core import (
     ENTRY_MANIFEST_FILENAME,
     Manifest,
+    atomic_write_text,
     ensure_project,
     entries_dir,
     entry_build_dir,
@@ -50,8 +51,12 @@ def _append_prompt(project: str, content_hash: str, prompt: str | None) -> None:
     }
     p = prompts_path(project, content_hash)
     p.parent.mkdir(parents=True, exist_ok=True)
-    with p.open("a") as fh:
-        fh.write(json.dumps(record) + "\n")
+    # Atomic read-modify-write rather than an O_APPEND write: _append_prompt runs
+    # outside the project lock (only the checkpoint holds it), so the checkpoint's
+    # git add -A can fire mid-append from a separate process. tmp + replace makes
+    # prompts/<hash>.jsonl always whole — never a torn trailing line (C2).
+    existing = p.read_text() if p.exists() else ""
+    atomic_write_text(p, existing + json.dumps(record) + "\n")
 
 
 def read_prompts(project: str, content_hash: str) -> list[dict]:
@@ -383,157 +388,166 @@ def build_and_persist(
     except InMemoryReadError as exc:
         raise BuildError(str(exc)) from exc
 
-    # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
-    # things into our catalog layout afterwards.
-    with tempfile.TemporaryDirectory(prefix="tallyman_build_") as builds_str:
-        builds_dir = Path(builds_str)
-        try:
-            build_path = Path(build_expr(expr_obj, builds_dir=builds_dir))
-        except Exception as exc:
-            hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
-
-        content_hash = build_path.name
-        if si.mode() == "salt" and sources:
-            # xorq's hash is path-identity only; mixing the source digests in
-            # makes the entry hash content-sensitive (same shape, 12 hex).
-            content_hash = si.salted_hash(content_hash, sources)
-        target = entry_dir(project, content_hash)
-
-        if target.exists():
-            # Same content hash already on disk — nothing to do beyond return.
-            # Record this invocation's prompt as a re-run event.
-            manifest_path = entry_manifest_path(project, content_hash)
-            if manifest_path.exists():
-                meta = json.loads(manifest_path.read_text())
-                _append_prompt(project, content_hash, prompt)
-                return BuildResult(
-                    content_hash=content_hash,
-                    entry_path=target,
-                    row_count=meta.get("row_count", 0),
-                    execute_seconds=meta.get("execute_seconds", 0.0),
-                    schema=json.loads(entry_schema_path(project, content_hash).read_text()),
-                    lint_warnings=lint_warnings,
-                    compile_seconds=meta.get("compile_seconds"),
-                    cache_worthy=meta.get("cache_worthy"),
-                    cache_worthy_why=meta.get("cache_worthy_why"),
-                    cache_bytes=meta.get("cache_bytes"),
-                )
-
-        target.mkdir(parents=True, exist_ok=True)
-
-        # Move xorq's build directory contents (expr.yaml + deps) under the entry.
-        xorq_build_dir = entry_build_dir(project, content_hash)
-        xorq_build_dir.mkdir(exist_ok=True)
-        for item in build_path.rglob("*"):
-            dest = xorq_build_dir / item.relative_to(build_path)
-            if item.is_dir():
-                dest.mkdir(parents=True, exist_ok=True)
-            else:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                dest.write_bytes(item.read_bytes())
-
-        # Rewrite project-root substrings to a portable placeholder so the
-        # build is loadable on any machine with the same project laid out.
-        make_portable_inplace(xorq_build_dir, project_dir(project))
-
-        # Persist the user's source, also rewriting any project-root paths.
-        code_persisted = code.replace(str(project_dir(project)), "${TALLYMAN_PROJECT_ROOT}")
-        (target / "expr.py").write_text(code_persisted)
-
-        # Load + execute.
-        try:
-            # Per-project compute cache (not the global ~/.cache/xorq), so a
-            # reset can prune it to the revision's warm-set and a freshly added
-            # expression computes cold. See plans/adr-reset-to-revision.md.
-            cache_dir = compute_cache_dir(project)
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            loaded = load_expr(build_path, cache_dir=cache_dir)
-        except Exception as exc:
-            shutil.rmtree(target, ignore_errors=True)  # no orphan dir → no orphan pointer (D1)
-            hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
-
-        # Execute (#73). A worthy entry's build carries a baked result-cache
-        # node (rewrite_for_build), so executing materialises it once into the
-        # compute cache — and every later loader (the Buckaroo viewer, diffs,
-        # from_catalog) reads that cached result instead of re-running the DAG.
-        # A cheap entry materialises nothing: this is a pushdown count() over a
-        # columnar source plus a schema read, no parquet written.
-        t0 = time.monotonic()
-        try:
-            arrow_schema = loaded.schema().to_pyarrow()
-            row_count = int(loaded.count().execute())
-        except Exception as exc:
-            shutil.rmtree(target, ignore_errors=True)  # no orphan dir → no orphan pointer (D1)
-            hint = _ibis_import_hint(str(exc), code)
-            raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
-        execute_seconds = round(time.monotonic() - t0, 3)
-
-    # Schema + row count come from the expression directly (no result.parquet to
-    # read back); a worthy entry's rows are already materialised in its cache.
-    schema_doc = {
-        "fields": [{"name": f.name, "type": str(f.type)} for f in arrow_schema],
-        "row_count": row_count,
-    }
-    entry_schema_path(project, content_hash).write_text(json.dumps(schema_doc, indent=2))
-
-    # Cache-admission instrumentation (#87): record the structural verdict and
-    # the measured value-per-byte inputs side by side, so #30's structural→
-    # measured flip is decidable from data. classify_build's verdict is what
-    # cache_worthy already computes (and throws away); compile_seconds times the
-    # author DAG's expr->backend-plan step (the dominant per-view cost per #30),
-    # separate from execute; cache_bytes is the baked snapshot size (None for a
-    # cheap entry that bakes nothing). loaded is the build_path expression whose
-    # execute just baked the snapshot, so its CachedNode names that exact file.
-    from tallyman_xorq.result_cache import _cached_node_path, classify_build
-
-    verdict = classify_build(xorq_build_dir)
-    cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
-
-    compile_seconds: float | None = None
+    created_target = False
     try:
-        from xorq.expr.api import to_sql
+        # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
+        # things into our catalog layout afterwards.
+        with tempfile.TemporaryDirectory(prefix="tallyman_build_") as builds_str:
+            builds_dir = Path(builds_str)
+            try:
+                build_path = Path(build_expr(expr_obj, builds_dir=builds_dir))
+            except Exception as exc:
+                hint = _ibis_import_hint(str(exc), code)
+                raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
-        t_compile = time.monotonic()
-        to_sql(author_expr)
-        compile_seconds = round(time.monotonic() - t_compile, 3)
-    except Exception:
-        # Best-effort: a DAG xorq can't render to SQL must not break the build.
-        pass
+            content_hash = build_path.name
+            if si.mode() == "salt" and sources:
+                # xorq's hash is path-identity only; mixing the source digests in
+                # makes the entry hash content-sensitive (same shape, 12 hex).
+                content_hash = si.salted_hash(content_hash, sources)
+            target = entry_dir(project, content_hash)
 
-    cache_bytes: int | None = None
-    snap = _cached_node_path(loaded)
-    if snap is not None and snap.exists():
+            if target.exists():
+                # Same content hash already on disk — nothing to do beyond return.
+                # Record this invocation's prompt as a re-run event.
+                manifest_path = entry_manifest_path(project, content_hash)
+                if manifest_path.exists():
+                    meta = json.loads(manifest_path.read_text())
+                    _append_prompt(project, content_hash, prompt)
+                    return BuildResult(
+                        content_hash=content_hash,
+                        entry_path=target,
+                        row_count=meta.get("row_count", 0),
+                        execute_seconds=meta.get("execute_seconds", 0.0),
+                        schema=json.loads(entry_schema_path(project, content_hash).read_text()),
+                        lint_warnings=lint_warnings,
+                        compile_seconds=meta.get("compile_seconds"),
+                        cache_worthy=meta.get("cache_worthy"),
+                        cache_worthy_why=meta.get("cache_worthy_why"),
+                        cache_bytes=meta.get("cache_bytes"),
+                    )
+
+            target.mkdir(parents=True, exist_ok=True)
+            created_target = True  # reached only past the target.exists() early-return
+
+            # Move xorq's build directory contents (expr.yaml + deps) under the entry.
+            xorq_build_dir = entry_build_dir(project, content_hash)
+            xorq_build_dir.mkdir(exist_ok=True)
+            for item in build_path.rglob("*"):
+                dest = xorq_build_dir / item.relative_to(build_path)
+                if item.is_dir():
+                    dest.mkdir(parents=True, exist_ok=True)
+                else:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    dest.write_bytes(item.read_bytes())
+
+            # Rewrite project-root substrings to a portable placeholder so the
+            # build is loadable on any machine with the same project laid out.
+            make_portable_inplace(xorq_build_dir, project_dir(project))
+
+            # Persist the user's source, also rewriting any project-root paths.
+            code_persisted = code.replace(str(project_dir(project)), "${TALLYMAN_PROJECT_ROOT}")
+            (target / "expr.py").write_text(code_persisted)
+
+            # Load + execute.
+            try:
+                # Per-project compute cache (not the global ~/.cache/xorq), so a
+                # reset can prune it to the revision's warm-set and a freshly added
+                # expression computes cold. See plans/adr-reset-to-revision.md.
+                cache_dir = compute_cache_dir(project)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                loaded = load_expr(build_path, cache_dir=cache_dir)
+            except Exception as exc:
+                hint = _ibis_import_hint(str(exc), code)
+                raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
+
+            # Execute (#73). A worthy entry's build carries a baked result-cache
+            # node (rewrite_for_build), so executing materialises it once into the
+            # compute cache — and every later loader (the Buckaroo viewer, diffs,
+            # from_catalog) reads that cached result instead of re-running the DAG.
+            # A cheap entry materialises nothing: this is a pushdown count() over a
+            # columnar source plus a schema read, no parquet written.
+            t0 = time.monotonic()
+            try:
+                arrow_schema = loaded.schema().to_pyarrow()
+                row_count = int(loaded.count().execute())
+            except Exception as exc:
+                hint = _ibis_import_hint(str(exc), code)
+                raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
+            execute_seconds = round(time.monotonic() - t0, 3)
+
+        # Schema + row count come from the expression directly (no result.parquet to
+        # read back); a worthy entry's rows are already materialised in its cache.
+        schema_doc = {
+            "fields": [{"name": f.name, "type": str(f.type)} for f in arrow_schema],
+            "row_count": row_count,
+        }
+        atomic_write_text(entry_schema_path(project, content_hash), json.dumps(schema_doc, indent=2))
+
+        # Cache-admission instrumentation (#87): record the structural verdict and
+        # the measured value-per-byte inputs side by side, so #30's structural→
+        # measured flip is decidable from data. classify_build's verdict is what
+        # cache_worthy already computes (and throws away); compile_seconds times the
+        # author DAG's expr->backend-plan step (the dominant per-view cost per #30),
+        # separate from execute; cache_bytes is the baked snapshot size (None for a
+        # cheap entry that bakes nothing). loaded is the build_path expression whose
+        # execute just baked the snapshot, so its CachedNode names that exact file.
+        from tallyman_xorq.result_cache import _cached_node_path, classify_build
+
+        verdict = classify_build(xorq_build_dir)
+        cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
+
+        compile_seconds: float | None = None
         try:
-            cache_bytes = snap.stat().st_size
-        except OSError:
+            from xorq.expr.api import to_sql
+
+            t_compile = time.monotonic()
+            to_sql(author_expr)
+            compile_seconds = round(time.monotonic() - t_compile, 3)
+        except Exception:
+            # Best-effort: a DAG xorq can't render to SQL must not break the build.
             pass
 
-    perf_log.info(
-        "cache admission %s: structural worthy=%s (%s) | compile=%ss execute=%ss bytes=%s",
-        content_hash,
-        cache_worthy_v,
-        cache_worthy_why,
-        compile_seconds,
-        execute_seconds,
-        cache_bytes,
-    )
+        cache_bytes: int | None = None
+        snap = _cached_node_path(loaded)
+        if snap is not None and snap.exists():
+            try:
+                cache_bytes = snap.stat().st_size
+            except OSError:
+                pass
 
-    manifest = Manifest(
-        content_hash=content_hash,
-        project=project,
-        prompt=prompt,
-        row_count=row_count,
-        execute_seconds=execute_seconds,
-        compile_seconds=compile_seconds,
-        cache_worthy=cache_worthy_v,
-        cache_worthy_why=cache_worthy_why,
-        cache_bytes=cache_bytes,
-        sources=sources or None,
-        parents=parents or None,
-    )
-    write_manifest(target, manifest)
+        perf_log.info(
+            "cache admission %s: structural worthy=%s (%s) | compile=%ss execute=%ss bytes=%s",
+            content_hash,
+            cache_worthy_v,
+            cache_worthy_why,
+            compile_seconds,
+            execute_seconds,
+            cache_bytes,
+        )
+
+        manifest = Manifest(
+            content_hash=content_hash,
+            project=project,
+            prompt=prompt,
+            row_count=row_count,
+            execute_seconds=execute_seconds,
+            compile_seconds=compile_seconds,
+            cache_worthy=cache_worthy_v,
+            cache_worthy_why=cache_worthy_why,
+            cache_bytes=cache_bytes,
+            sources=sources or None,
+            parents=parents or None,
+        )
+        write_manifest(target, manifest)
+    except Exception:
+        # No partial entry dir survives a failed build: every population step
+        # is covered, not just the load_expr/execute paths that had ad-hoc
+        # cleanup before (D1/L4). The target.exists() early-return guarantees
+        # we created this dir, so removing it can't clobber a prior entry.
+        if created_target:
+            shutil.rmtree(target, ignore_errors=True)
+        raise
     _append_prompt(project, content_hash, prompt)
 
     # Best-effort: drop the temp script.

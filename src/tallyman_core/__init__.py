@@ -20,6 +20,7 @@ from tallyman_core.display_klasses import (
     write_display_klass,
 )
 from tallyman_core.errors import clear_errors, get_error, list_errors, record_error
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
 from tallyman_core.marimo_export import export_notebook_path, notebook_to_marimo
 from tallyman_core.notebook import CellNotFound
@@ -93,6 +94,7 @@ __all__ = [
     "write_post_processing",
     "write_stat",
     "alias_for_hash",
+    "atomic_write_text",
     "artifacts_dir",
     "catalog_dir",
     "clear_errors",

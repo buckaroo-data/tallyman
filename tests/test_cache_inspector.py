@@ -131,10 +131,12 @@ def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders
 
 def test_cache_delete_then_read_self_heals_warm_cache(fresh_companion_app, project, orders_parquet, monkeypatch):
     # Deleting a snapshot must self-heal on the next read even when the read path's
-    # cached_result_expr was already warm for that entry — the companion memoises a
-    # `deferred_read_parquet` of the snapshot, so without clearing that lru the next
-    # read dereferences the just-deleted file and 500s ("At least one path is
-    # required") instead of re-baking. The delete endpoint promises a self-heal.
+    # cached_result_expr was already warm for that entry. Since ee0a90a the read
+    # wrapper re-checks path.exists() on every call and self-heals regardless of the
+    # warm memo (see test_cached_result_expr_self_heals_after_warm_then_evict), so
+    # the delete endpoint's cache_clear() is now defense-in-depth, not what averts
+    # the "At least one path is required" 500. This pins the end-to-end promise
+    # through the endpoint.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_xorq.result_cache import cached_result_expr
 

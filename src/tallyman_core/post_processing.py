@@ -27,6 +27,7 @@ import inspect
 import re
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import post_processing_dir as _post_processing_dir
 
 # Mirrors the allowlist in ``buckaroo/server/xorq_loading.py``. Keeping
@@ -197,8 +198,7 @@ def write_post_processing(project: str, name: str, source: str) -> Path:
     d = post_processing_dir(project)
     d.mkdir(parents=True, exist_ok=True)
     path = d / f"{name}.py"
-    path.write_text(source if source.endswith("\n") else source + "\n")
-    return path
+    return atomic_write_text(path, source if source.endswith("\n") else source + "\n")
 
 
 class PostProcessingRunError(ValueError):

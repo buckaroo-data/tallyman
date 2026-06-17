@@ -230,7 +230,9 @@ def test_failed_build_no_orphan_pointer(project, orders_parquet, monkeypatch):
     monkeypatch.setattr(compiler, "load_expr", _boom_load)
     with pytest.raises(Exception):
         build_and_persist(project, _agg_code(orders_parquet))
-    monkeypatch.undo()
+    # No monkeypatch.undo(): it shares the instance that isolated_home used to set
+    # TALLYMAN_HOME, so undo() would point entries_dir at the real home and make
+    # this check vacuous. monkeypatch auto-reverts at teardown.
 
     ed = paths.entries_dir(project)
     leftover = [c.name for c in ed.iterdir() if c.is_dir()] if ed.exists() else []
@@ -618,3 +620,60 @@ def test_failed_build_after_copy_leaves_no_orphan_dir(project, orders_parquet, m
     ed = paths.entries_dir(project)
     leftover = [c.name for c in ed.iterdir() if c.is_dir()] if ed.exists() else []
     assert not leftover, f"failed build left orphan entry dir(s): {leftover}"
+
+
+def test_consistency_guard_surfaces_orphan_recipe(project, orders_parquet):
+    """The orphan branch of guard 2 (a tracked ``entries/<hash>.zip`` with no
+    pointer) must raise — the untested half of the pointer/recipe agreement check
+    (L8). The missing-pointer half is covered by
+    ``test_reset_to_revision.py::test_reset_surfaces_pointer_without_durable_recipe``."""
+    cs.genesis(project)
+    build_and_persist(project, _agg_code(orders_parquet))
+    cs.checkpoint_catalog(project, "create")  # tracks entries/<hash>.zip
+    with pytest.raises(RuntimeError, match="tracked recipes with no pointer"):
+        catalog.assert_catalog_consistent(project, set())  # pointers empty, recipe tracked
+
+
+# ---------------------------------------------------------------------------
+# Decomposition — alias state rolls back with git reset (M2)
+# ---------------------------------------------------------------------------
+
+
+def test_alias_state_survives_reset(project, orders_parquet):
+    """The alias map + history (the tracked ``aliases.jsonl`` this cut introduced)
+    rolls back with ``git reset`` — the carrier whose only coverage was the deleted
+    ``test_reset_rolls_back_alias_state`` (M2). Mirrors the display-config /
+    prompt-history survives-reset tests."""
+    from tallyman_core import aliases as al
+
+    cs.genesis(project)
+    h0 = _build_checkpoint(project, _agg_code_n(orders_parquet, _AGGS[0]), "c0")  # step 1
+    al.set_alias(project, "regions", h0, expect_exists=False)
+    cs.checkpoint_catalog(project, "c1")  # step 2: regions -> h0 (history [h0])
+    h1 = build_and_persist(project, _agg_code_n(orders_parquet, _AGGS[1])).content_hash
+    al.set_alias(project, "regions", h1)  # revise: history [h0, h1]
+    al.set_alias(project, "avg", h1, expect_exists=False)
+    cs.checkpoint_catalog(project, "c2")  # step 3: regions -> h1 (history [h0, h1]) + avg -> h1
+
+    assert al.load_aliases(project) == {"regions": h1, "avg": h1}
+    cs.reset_to(project, 2)
+    assert al.load_aliases(project) == {"regions": h0}
+    assert al.history_for(project, "regions") == [h0]
+    cs.reset_to(project, 3)
+    assert al.load_aliases(project) == {"regions": h1, "avg": h1}
+    assert al.history_for(project, "regions") == [h0, h1]
+
+
+def test_append_prompt_is_atomic_and_complete(project, orders_parquet):
+    """``_append_prompt`` rewrites ``prompts/<hash>.jsonl`` via tmp + replace (C2):
+    it runs outside the project lock (only the checkpoint holds it), so the file
+    must stay whole JSONL across appends with no leftover ``*.tmp`` the
+    checkpoint's ``git add -A`` could stage."""
+    from tallyman_xorq import read_prompts
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    h = res.content_hash
+    build_and_persist(project, _agg_code(orders_parquet), prompt="second")  # re-run, same hash, appends
+    assert [r["prompt"] for r in read_prompts(project, h)] == ["first", "second"]
+    assert not list(paths.prompts_path(project, h).parent.glob("*.tmp"))  # no interrupted temp left behind

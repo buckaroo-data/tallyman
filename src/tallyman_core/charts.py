@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import catalog_dir
 
 
@@ -44,8 +45,7 @@ def set_chart(project: str, content_hash: str, spec) -> Path:
 
     out = chart_path(project, content_hash)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(json.dumps(spec, indent=2))
-    return out
+    return atomic_write_text(out, json.dumps(spec, indent=2))
 
 
 def get_chart(project: str, content_hash: str) -> dict | None:

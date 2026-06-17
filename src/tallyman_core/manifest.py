@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field
 
+from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import (
     ENTRY_MANIFEST_FILENAME,
     ENTRY_SCHEMA_FILENAME,
@@ -56,9 +57,13 @@ class Manifest(BaseModel):
 
 
 def write_manifest(entry_path: Path, manifest: Manifest) -> Path:
+    # Atomic: manifest.json is the build's completeness sentinel — zip_pending_entries
+    # gates on (child / "manifest.json").is_file(), and the checkpoint runs from a
+    # separate process. A plain write_text is .is_file()-true the instant it is
+    # truncated, so a checkpoint firing in the write window could zip a partial
+    # manifest member; tmp + replace makes the member appear whole or not at all.
     out = entry_path / ENTRY_MANIFEST_FILENAME
-    out.write_text(json.dumps(manifest.model_dump(), indent=2))
-    return out
+    return atomic_write_text(out, json.dumps(manifest.model_dump(), indent=2))
 
 
 def read_manifest(entry_path: Path) -> Manifest:

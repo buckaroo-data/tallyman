@@ -78,7 +78,7 @@ GITIGNORE_LINES = (
     ".checkpoint.lock",
     ".xorq_build_expanded/",
     ".migrated_*",  # machine-local upgrade-migration markers (e.g. #104), not catalog content
-    "*.tmp",  # an interrupted atomic-write temp (aliases._write, write_recipe_zip, ...) — never a committable artifact
+    "*.tmp",  # an interrupted atomic write's temp (atomic_write_text / write_recipe_zip), never committable
 )
 
 
@@ -179,8 +179,23 @@ def zip_pending_entries(project: str) -> list[str]:
     return written
 
 
+def _committed_sidecar_hashes(cd: Path, prefix: str, suffix: str) -> set[str]:
+    """Content hashes of the git-tracked ``<prefix>/<hash><suffix>`` sidecars.
+
+    Reads ``git ls-files`` (the committed tree, like ``tracked_recipe_hashes``),
+    so a transient *untracked* sidecar on disk — set but not yet checkpointed —
+    is never mistaken for a committed orphan.
+    """
+    rc, out, _ = run_git(["ls-files", prefix], cwd=cd)
+    if rc != 0:
+        return set()
+    return {
+        ln[len(prefix) + 1 : -len(suffix)] for ln in out.split() if ln.startswith(f"{prefix}/") and ln.endswith(suffix)
+    }
+
+
 def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
-    """Two guards over the committed tree (#52), raising on either violation.
+    """Three guards over the committed tree (#52), raising on any violation.
 
     1. **Tracked-surface allowlist** (deny-by-default): every ``git ls-files``
        path must fnmatch ``TRACKED_SURFACE`` or it raises — so a stray dir that
@@ -189,6 +204,14 @@ def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
        (``entries/<hash>.zip``) must equal the tallyman *pointers*
        (``entry_hashes``), so a pointer with no durable recipe — or a recipe
        with no pointer — fails loudly instead of returning a masked divergence.
+    3. **Sidecar hash-reference integrity**: every decomposed file keyed by
+       content hash (``aliases.jsonl`` latest+history, ``chart_specs/<hash>``,
+       ``display_configs/<hash>``) must name a hash in the durable recipe set.
+       Guard 2 only pairs recipes with pointers; without this a committed step
+       whose alias/chart/display points at a hash with no recipe would reset
+       clean and report OK — and a dangling alias head later blows up the
+       self-chaining ``from_catalog`` build. (Notebook cells key on alias *name*,
+       not hash, so they are deliberately out of scope here.)
 
     Takes *pointers* as an argument (rather than reading ``catalog_state``) to
     keep the call direction one-way and acyclic.
@@ -209,4 +232,28 @@ def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
         raise RuntimeError(
             "catalog inconsistent: the git-tracked recipe set and the entry_hashes pointers disagree "
             f"(pointers with no durable recipe: {missing}; tracked recipes with no pointer: {orphan})"
+        )
+
+    # Guard 3 — sidecar hash-reference integrity. Function-level import keeps the
+    # call direction one-way: aliases imports only paths/fsutil, never catalog or
+    # catalog_state, so this stays acyclic. Aliases are read on-disk (== the
+    # committed tree after reset_to's git reset --hard); charts/display from git.
+    from tallyman_core import aliases as _aliases
+
+    alias_refs: set[str] = set(_aliases.load_aliases(project).values())
+    for history in _aliases.load_history(project).values():
+        alias_refs.update(history)
+
+    dangling: dict[str, list[str]] = {}
+    bad_aliases = sorted(h for h in alias_refs if h not in tracked)
+    if bad_aliases:
+        dangling["aliases.jsonl"] = bad_aliases
+    for prefix, suffix in (("chart_specs", ".vl.json"), ("display_configs", ".json")):
+        bad = sorted(h for h in _committed_sidecar_hashes(cd, prefix, suffix) if h not in tracked)
+        if bad:
+            dangling[prefix] = bad
+    if dangling:
+        raise RuntimeError(
+            "catalog inconsistent: decomposed sidecars name content hashes with no durable recipe "
+            f"(orphans by surface: {dangling})"
         )

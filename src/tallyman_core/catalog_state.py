@@ -239,10 +239,9 @@ def _project_lock(project: str):
 def ensure_catalog_repo(project: str) -> bool:
     """Idempotently git-init the catalog repo. Returns True if it exists after.
 
-    The branch is pinned to ``main`` (git ≥ 2.28): xorq's catalog layer
-    hardcodes it, and inheriting the host's ``init.defaultBranch`` (master on
-    stock git) makes every ``xorq catalog add`` fail — silently, because
-    registration is best-effort.
+    The branch is pinned to ``main`` (git ≥ 2.28) rather than inheriting the
+    host's ``init.defaultBranch`` (master on stock git), so the repo layout is
+    deterministic and host-config-independent.
     """
     cd = catalog_dir(project)
     cd.mkdir(parents=True, exist_ok=True)

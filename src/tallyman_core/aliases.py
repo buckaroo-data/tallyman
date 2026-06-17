@@ -5,14 +5,13 @@ Aliases are mutable handles that name a sequence of content hashes:
     alias_map:      {alias: latest_hash}
     alias_history:  {alias: [hash_v1, hash_v2, ...]}   # oldest first
 
-Both live as tallyman-owned keys in the catalog's ``catalog.yaml`` (read and
-written through ``catalog_state``), not as separate files. catalog.yaml is the
-versioned state carrier the catalog git repo tracks, so alias state clones and
-versions with the catalog and ``reset_to``'s ``git reset`` rolls it back for
-free — a sidecar store would have to be reconciled separately, and committing
-one *inside* the repo broke xorq's ``assert_consistency`` (#48). xorq keeps its
-own ``aliases`` key + alias symlinks in the same file; these tallyman keys sit
-alongside, and xorq round-trips them untouched.
+Both live in a tracked ``aliases.jsonl`` in the catalog repo — one line per
+alias, ``{"alias", "latest", "history": [...]}``. The native store tracks the
+file directly, so alias state clones and versions with the catalog and
+``reset_to``'s ``git reset`` rolls it back with the rest of the tree (no
+separate reconcile). Before the native cut this had to be smuggled into
+catalog.yaml keys, because committing a separate file inside the (then xorq)
+catalog repo broke its ``assert_consistency`` (#48); that constraint is gone.
 
 Identity is the content hash; the alias is a *name* for a concept that may
 evolve. The latest hash is always the current best answer; older hashes

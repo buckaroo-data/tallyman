@@ -7,14 +7,19 @@ Layout (per-project):
     ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
-        │   ├── catalog/entries/<hash>/    # the xorq catalog git repo
-        │   │                              # (alias bookkeeping is catalog.yaml keys, not files)
-        │   ├── post_processing/<name>.py
-        │   ├── stats/<name>.py
+        │   ├── catalog/               # the native catalog git repo
+        │   │   ├── entries/<hash>.zip     # immutable recipe (one blob per entry)
+        │   │   ├── entries/<hash>/        # untracked build dir (gitignored)
+        │   │   ├── aliases.jsonl          # tracked alias bookkeeping
+        │   │   ├── notebook.jsonl         # tracked notebook cells
+        │   │   ├── chart_specs/<hash>.vl.json
+        │   │   ├── display_configs/<hash>.json
+        │   │   ├── post_processing/<name>.py , stats/<name>.py
+        │   │   ├── prompts/<hash>.jsonl
+        │   │   └── entries.jsonl , compute_cache.jsonl   # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
-        ├── data/                      # input parquets (fixtures or user)
-        └── notebooks/notebook.json
+        └── data/                      # input parquets (fixtures or user)
 
 The active project lives in a single one-line file at
 ``~/.tallyman/active_project``. ``resolve_project()`` reads it on every
@@ -337,28 +342,6 @@ def resolve_project(explicit: str | None = None) -> str | None:
         return from_env
     return None
 
-
-# ---------------------------------------------------------------------------
-# xorq catalog repo path (per-project)
-# ---------------------------------------------------------------------------
-
-
-def catalog_repo_path() -> Path:
-    """Path the xorq CLI uses for its ``catalog`` git repo.
-
-    Lives at ``<project>/artifacts/catalog/`` — same dir as the tallyman
-    catalog entries. ``xorq catalog init`` writes a ``.git/`` alongside
-    them.
-
-    ``TALLYMAN_CATALOG_REPO`` env overrides for tests or external repos.
-    """
-    override = os.environ.get("TALLYMAN_CATALOG_REPO")
-    if override:
-        return Path(override)
-    project = resolve_project()
-    if project is None:
-        raise RuntimeError("catalog_repo_path called with no active project")
-    return catalog_dir(project)
 
 
 # ---------------------------------------------------------------------------

@@ -431,11 +431,9 @@ def test_cross_process_checkpoint(project, isolated_home):
 
 
 def test_catalog_repo_branch_is_main(project, monkeypatch):
-    """xorq's catalog layer hardcodes its branch as `main`; a plain `git init`
-    inherits init.defaultBranch (master on a stock machine and on CI), after
-    which `xorq catalog add` fails forever with "refs/heads/main does not
-    exist" — silently, because registration is best-effort. The repo branch
-    must be pinned, not inherited from host config."""
+    """The catalog repo pins its branch to `main` rather than inheriting the
+    host's init.defaultBranch (master on a stock machine and on CI), so the
+    repo's layout is deterministic and independent of host git config."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_SYSTEM", "/dev/null")
     cs.ensure_catalog_repo(project)

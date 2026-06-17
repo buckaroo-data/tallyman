@@ -1020,16 +1020,28 @@ def create_app(
                     m = read_manifest(entry)
                 except Exception:
                     continue
-                # The page lists deletable baked snapshots — an entry with a
-                # recorded snapshot size (manifest.cache_bytes, #87). A cheap
-                # entry bakes none (cache_bytes is None) and has nothing to
-                # delete, so it's absent: this matches the old file-walk (which
-                # only listed entries that had a materialised file) and keeps the
-                # delete button from 404ing on an undeletable row.
+                content_hash = entry.name
+                # The page lists the baked snapshots that exist on disk right now —
+                # the rows the delete button can actually evict. cache_bytes (#87) is
+                # a cheap pre-filter: None for a cheap entry (bakes nothing), so skip
+                # it without deriving a path. For an expensive entry, resolve the
+                # snapshot and skip it when the file is gone — a delete unlinks the
+                # snapshot but leaves cache_bytes set, so keying the listing on
+                # cache_bytes alone showed a phantom row (stale size, freed bytes
+                # still in the total, a delete button that 404s) until the entry was
+                # next viewed and re-baked. Size from the live file so the figure
+                # tracks disk. baked_snapshot_path re-imports the recipe, but only
+                # for the (few) expensive entries the pre-filter lets through, and
+                # this admin page isn't on a hot path.
                 if m.cache_bytes is None:
                     continue
-                size = int(m.cache_bytes)
-                content_hash = entry.name
+                try:
+                    snap = baked_snapshot_path(project, content_hash)
+                    if snap is None or not snap.exists():
+                        continue
+                    size = snap.stat().st_size
+                except Exception:
+                    continue
                 # created_at is an ISO-8601 UTC string; render it in the table's
                 # existing "%Y-%m-%d %H:%M:%S" shape (CachePage renders `created`
                 # verbatim) so the Created column is unchanged.

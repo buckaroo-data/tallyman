@@ -76,6 +76,34 @@ def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orde
     assert cheap_h not in listed
 
 
+def test_cache_pane_drops_evicted_snapshot(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # The page reflects what's on disk. After a snapshot is deleted — and not yet
+    # re-viewed, so nothing re-baked it — the entry must drop out of the listing,
+    # not linger as a phantom "cached" row. Keying the listing on manifest.cache_bytes
+    # alone (recorded at build, untouched by delete) kept showing the row with a
+    # stale size and an "on disk" total that counts bytes already freed; a second
+    # delete then 404s on a row the page is still showing.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
+    h = list_entries(project)[0]["content_hash"]
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+
+    c = TestClient(fresh_companion_app)
+    before = c.get(f"/{project}/api/result_cache").json()
+    assert h in {e["hash"] for e in before["entries"]}
+    row_size = next(e["size"] for e in before["entries"] if e["hash"] == h)
+
+    assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 200
+    assert not snap.exists()
+
+    # Listing again (no read in between, so nothing re-baked the snapshot) must
+    # drop the row and not count its freed bytes in the total.
+    after = c.get(f"/{project}/api/result_cache").json()
+    assert h not in {e["hash"] for e in after["entries"]}
+    assert after["total"] == before["total"] - row_size
+
+
 def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot

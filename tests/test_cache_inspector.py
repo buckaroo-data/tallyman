@@ -101,6 +101,28 @@ def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders
     assert h in history_for(project, "shoe_sales")  # alias history intact
 
 
+def test_cache_delete_then_read_self_heals_warm_cache(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # Deleting a snapshot must self-heal on the next read even when the read path's
+    # cached_result_expr was already warm for that entry — the companion memoises a
+    # `deferred_read_parquet` of the snapshot, so without clearing that lru the next
+    # read dereferences the just-deleted file and 500s ("At least one path is
+    # required") instead of re-baking. The delete endpoint promises a self-heal.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
+    h = list_entries(project)[0]["content_hash"]
+    # Warm the read-path lru the way a prior viewer load (api_data) would.
+    assert cached_result_expr(project, h).count().execute() > 0
+
+    c = TestClient(fresh_companion_app)
+    assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 200
+
+    # Next read must re-bake the evicted snapshot, not raise on the deleted file.
+    assert cached_result_expr(project, h).count().execute() > 0
+    assert baked_snapshot_path(project, h).exists()  # re-baked
+
+
 def test_cache_delete_missing_snapshot_404(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))

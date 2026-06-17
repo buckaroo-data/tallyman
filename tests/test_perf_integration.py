@@ -99,7 +99,25 @@ _ENTRY_LINK_NAMES = ENTRY_ARTIFACT_NAMES
 assert set(_ENTRY_LINK_NAMES).isdisjoint(ENTRY_CACHE_NAMES)  # no artifact is also a cache
 # Catalog bookkeeping the read paths need; the caches are deliberately omitted so
 # the overlay starts cold.
-_CATALOG_LINK_NAMES = ("aliases.json", "alias_history.json", "catalog.yaml", "aliases", "chart_specs", "metadata")
+_CATALOG_LINK_NAMES = (
+    # native decomposed surface (#52+)
+    "aliases.jsonl",
+    "notebook.jsonl",
+    "entries.jsonl",
+    "compute_cache.jsonl",
+    "prompts",
+    "post_processing",
+    "stats",
+    "display_configs",
+    "chart_specs",
+    # legacy xorq-catalog layout — _link skips whichever are absent, so a native
+    # corpus links the files above and an old one links these.
+    "aliases.json",
+    "alias_history.json",
+    "catalog.yaml",
+    "aliases",
+    "metadata",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -249,19 +267,38 @@ def _resolve_corpus_or_skip() -> tuple[str, Path, list[str]]:
 
 
 def _load_aliases(real_dir: Path) -> dict[str, str]:
-    p = real_dir / "artifacts" / "catalog" / "aliases.json"
-    return json.loads(p.read_text()) if p.exists() else {}
+    """Alias -> latest hash, from the native ``aliases.jsonl`` or legacy ``aliases.json``."""
+    catalog = real_dir / "artifacts" / "catalog"
+    jsonl = catalog / "aliases.jsonl"
+    if jsonl.exists():
+        out: dict[str, str] = {}
+        for line in jsonl.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[rec["alias"]] = rec["latest"]
+        return out
+    legacy = catalog / "aliases.json"
+    return json.loads(legacy.read_text()) if legacy.exists() else {}
 
 
 def _load_alias_history(real_dir: Path) -> dict[str, list[str]]:
     """Alias revision chains, from whichever store the corpus uses.
 
-    Pre-#57 catalogs kept these in ``alias_history.json``; a corpus rebuilt
-    through the fixed machinery (``scripts/rebuild_parking_catalog.py``) carries
-    them as the ``alias_history`` key in ``catalog.yaml``. Read the legacy file
-    if present, else fall back to the catalog.yaml key.
+    Native (#52+) keeps them as the ``history`` key per line of ``aliases.jsonl``.
+    Pre-#57 catalogs kept them in ``alias_history.json``; a corpus rebuilt through
+    the old ``scripts/rebuild_parking_catalog.py`` carries them as the
+    ``alias_history`` key in ``catalog.yaml``. Read native first, then the legacy
+    forms.
     """
     catalog = real_dir / "artifacts" / "catalog"
+    jsonl = catalog / "aliases.jsonl"
+    if jsonl.exists():
+        out: dict[str, list[str]] = {}
+        for line in jsonl.read_text().splitlines():
+            if line.strip():
+                rec = json.loads(line)
+                out[rec["alias"]] = rec.get("history", [])
+        return out
     legacy = catalog / "alias_history.json"
     if legacy.exists():
         return json.loads(legacy.read_text())

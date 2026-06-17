@@ -82,62 +82,98 @@ the global `~/.cache/xorq`. Per-project placement makes the cache travel
 with the project and lets `reset-to` manage it; a shared global directory
 would break both the isolation and the reset semantics.
 
-### Result cache (`src/tallyman_xorq/result_cache.py`)
+### Result cache (`src/tallyman_xorq/result_cache.py`, `source_cache.py`)
 
-Each catalog entry's expression is classified by `classify_build`, which
-reads the serialized build (no execution) and looks for expensive ops:
+Tallyman decides what to materialize at *build* time and bakes the decision
+into the entry's recipe, so every later read takes the same path. Before a
+build, `rewrite_for_build` (`source_cache.py:82`) rewrites the submitted
+expression in three steps: reject in-memory reads, inject a source-read cache
+after each non-parquet file read, and — for an expensive expression — wrap the
+whole thing in a top-level result cache. Both kinds of cache node are
+`ParquetSnapshotCache`s whose storage resolves to the per-project compute
+cache at load time (xorq's `load_expr(cache_dir=…)` rewrites every node's base
+path), so there is no separate `result_cache/` directory; both land under
+`<project>/artifacts/catalog/compute_cache/`.
 
-- **Expensive** — contains an Aggregate / Join / Sort / window / UDF, or
-  reads a non-parquet source. The expression is wrapped in a
-  `ParquetSnapshotCache` rooted at
-  `<project>/artifacts/catalog/result_cache/`. A hit reads the cached
-  parquet; a miss (including a manually deleted file) self-heals by
-  recomputing from the build.
-- **Cheap** — a parquet read plus projections / renames / row-wise scalar
-  math. No extra cache node: recompute costs about the same as reading a
-  copy, so the entry's in-place `result.parquet` is used and regenerated
-  from the build if missing.
+- **Source-read cache** — every non-parquet file read (`read_csv`,
+  `read_json`) gets a `.cache()` node injected immediately downstream
+  (`source_cache.py:142`). The snapshot key is the read's path only, so every
+  entry reading the same source hits the same cached parquet. Always on,
+  independent of result-cache worthiness. `read_parquet` / `read_delta` are
+  exempt (`_EXEMPT_READS`): re-reading a columnar source is already a pushdown.
+- **Baked result snapshot** — an expression is *worthy* when it contains an
+  Aggregate / Join / Sort / window / UDF (`_EXPENSIVE_OPS`,
+  `result_cache.py:48`). A worthy expression is wrapped in a result cache with
+  `relative_path="result_cache"` (`source_cache.py:153`), so its snapshot lands
+  under `compute_cache/result_cache/`; executing the entry at build time
+  materializes it once (`build.py:487`). A non-parquet read is *not* by itself
+  worthy (`classify_build`, `result_cache.py:61`) — its parse is already
+  handled by the source-read cache.
+
+A cheap entry — a source read plus projections / renames / row-wise scalar
+math — bakes no result snapshot. Recompute costs about the same as reading a
+copy (a pushdown over a columnar source, or over its already-cached parse), so
+an extra copy would burn storage for no savings. No `result.parquet` is
+written for any entry, cheap or expensive, at build time or on demand (#73 and
+follow-up).
+
+Every consumer reads an entry's result through one function,
+`cached_result_expr` (`result_cache.py:273`):
+
+- Expensive entry → `deferred_read_parquet` of the baked snapshot, on the
+  default backend. The snapshot was written when the entry built, so reading it
+  skips re-running the graph. If it was evicted since, the cache node recomputes
+  it once and the read proceeds — a self-heal re-checked on every call
+  (`result_cache.py:321`).
+- Cheap entry → the live expression, re-imported from the entry's `expr.py`
+  and recomputed on read.
+
+Either shape is a single-backend expression, so two entries compose (`union`,
+`join`, a diff) without tripping xorq's "multiple backends" guard (#75). The
+viewer's paginated reads, diffs, and post-processing all go through it; nothing
+reads a pre-existing `result.parquet`, because none is written.
 
 Snapshot strategy is the right one here because an entry is an immutable,
-content-addressed artifact — its result must not invalidate just because
-an upstream file's mtime drifts. No TTL: entries are permanent history,
-not expiring scratch.
-
-Both cases sit on top of `result.parquet`, which `build_and_persist` writes
-for *every* entry at build time (`loaded.to_parquet`), expensive or cheap.
-That file is the entry's canonical materialization — an immutable artifact,
-not a cache (see *Per-entry immutable records*). The `result_cache/` snapshot
-above is an *additional* read-time layer for expensive entries, not a
-replacement; the cheap path reads `result.parquet` directly. So "regenerated
-from the build if missing" is a self-heal for a deleted artifact, not the
-file's normal role.
+content-addressed artifact — its result must not invalidate just because an
+upstream file's mtime drifts. No TTL: entries are permanent history, not
+expiring scratch. The one exception is `salt` source-identity mode, where
+path-only snapshot keys would collide across entries with identical paths but
+different content; under salt, `rewrite_for_build` bakes no cache at all
+(`source_cache.py:123`) and every read recomputes.
 
 ### Compute cache (`compute_cache_dir` in `src/tallyman_core/paths.py`)
 
-`<project>/artifacts/catalog/compute_cache/` holds xorq's sub-expression
-results, seeded at build time (`src/tallyman_xorq/build.py` passes
-`cache_dir=compute_cache_dir(project)` to `load_expr`). Its distinguishing
-feature is reset-awareness: `catalog.yaml` records which cache files were
-warm at each step, and `reset_to` (`src/tallyman_core/catalog_state.py`)
-prunes or restores the cache to match the target step. Evicted files move
-to `bullpen/` rather than being deleted, so a forward reset restores them
-instead of recomputing, while a re-added entry still computes honestly
-cold.
+`<project>/artifacts/catalog/compute_cache/` is where every cache node's
+storage resolves at load time, so it holds three things: the source-read
+parses, the baked result snapshots (under `result_cache/`), and any
+sub-expression results xorq caches along the way. Build and view both load
+against it (`build.py` and `load_entry` pass `cache_dir=compute_cache_dir`), so
+a freshly added expression computes there cold and warms it for later reads.
+
+Its distinguishing feature is reset-awareness. The warm set is recorded in
+`compute_cache.jsonl` (one `{"path": relpath}` per line), a git-tracked pointer
+file captured at each checkpoint; `reset_to`
+(`src/tallyman_core/catalog_state.py:327`) prunes or restores the cache to
+match the target step. Evicted files move to `bullpen/` rather than being
+deleted, so a forward reset restores them instead of recomputing, while a
+re-added entry still computes honestly cold.
 
 ### In-memory caches in the companion
 
 All bounded LRUs over immutable keys, so eviction means a cheap rebuild
 and staleness is impossible:
 
-- `cached_result_expr` — `lru_cache(256)` keyed `(project, content_hash)`;
-  saves re-parsing expression YAML from disk
-  (`src/tallyman_xorq/result_cache.py`).
+- `cached_result_expr` — its reconstruction work is memoized on
+  `_resolve_result_plan`, `lru_cache(256)` keyed `(project, content_hash)`
+  (`result_cache.py:232`); `cached_result_expr` re-exposes that memo's
+  `cache_clear` / `cache_info`. The memo saves re-importing the entry's
+  `expr.py` and, for an expensive entry, re-deriving its baked-snapshot path.
+  `cached_result_expr` itself is a thin wrapper that re-checks the snapshot's
+  on-disk presence on every call, so an evicted snapshot self-heals.
 - `_build_compare_expr` — `lru_cache(128)` keyed
   `(project, a_hash, b_hash, keys)`; saves rebuilding diff outer-join
-  expressions (`src/tallyman_companion/app.py`). Build dirs land under
+  expressions (`src/tallyman_companion/app.py:192`). Build dirs land under
   `$TMPDIR/tallyman_diff_builds/`.
-- `result_cache` — `lru_cache(16)`; one xorq connection per project per
-  process instead of one per call.
 - Disk-usage payload — per-project, 3-second TTL
   (`_DISK_USAGE_TTL` in `src/tallyman_companion/app.py`). The only
   time-based cache in tallyman; it coalesces filesystem walks during SSE
@@ -151,7 +187,7 @@ On companion startup, a 3-second warmup budget pre-populates
 - **Session map** — `buckaroo_sessions.json` in the tallyman home
   (`TALLYMAN_HOME`, default `~/.tallyman-notebooks/`) maps content hash to
   Buckaroo session id, saving a `/load_expr` POST per entry per restart.
-  Invalidated when Buckaroo's `/health` reports a new `started_at`
+  Invalidated when Buckaroo's `/health` reports a new `started` timestamp
   (restart detected, map cleared) or when an entry's parquet is evicted.
 - **Per-entry stat cache** — `<entry>/.buckaroo_stat_cache/parquet/`, a
   `ParquetSnapshotCache` Buckaroo writes its summary stats into (the
@@ -166,21 +202,21 @@ On companion startup, a 3-second warmup budget pre-populates
 ### Per-entry immutable records
 
 Not caches in the eviction sense — immutable build outputs, valid forever
-because the entry they describe never changes. `paths.py:91` draws the line
-explicitly: `ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `result.parquet`,
-`manifest.json`, `schema.json`) are the immutable artifacts; the
-write-isolated perf overlay symlinks them read-only — safe because nothing
-ever rewrites them — and omits `ENTRY_CACHE_NAMES` so a benchmark starts
-honestly cold.
+because the entry they describe never changes. `paths.py:99` draws the line
+explicitly: `ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `manifest.json`,
+`schema.json`) are the immutable artifacts; the write-isolated perf overlay
+symlinks them read-only — safe because nothing ever rewrites them — and omits
+`ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`, `.xorq_build_expanded`) so a
+benchmark starts honestly cold.
 
-- **Materialized result** (`<entry>/result.parquet`) — written by
-  `build_and_persist` for *every* entry at build time (`loaded.to_parquet`),
-  expensive or cheap. It is the entry's canonical result and an
-  `ENTRY_ARTIFACT_NAME`, not a cache: the expensive-entry `result_cache/`
-  snapshot and the "regenerate if missing" fallback both layer on top of it.
-  Only `catalog.yaml` is git-tracked, so the bytes are untracked-but-durable
-  — recorded via the `entry_hashes` pointer and reconciled (to the bullpen)
-  by `reset_to`, never silently rewritten.
+The entry directory itself is gitignored. Its durable, git-tracked form is the
+recipe zip `entries/<hash>.zip` — a deterministic archive of `expr.py`,
+`xorq_build/`, `manifest.json`, and `schema.json`, written by the checkpoint
+(`tallyman_core/catalog.py`). So the build dir is untracked-but-durable: the
+recipe zip carries it across a clone, and `entries.jsonl` records which dirs
+should exist so `reset_to` can reconcile them from the bullpen. (See the native
+catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
+
 - **Primary key** (`src/tallyman_xorq/primary_key.py`) —
   `<entry>/primary_key.json` saves a full-table cardinality scan. A cheap
   row-preserving entry with no cached key inherits its parent version's
@@ -193,10 +229,14 @@ honestly cold.
   bust the result cache on every process restart. (Content-addressed but
   regenerable, so it is an `ENTRY_CACHE_NAME`, not an artifact — the overlay
   omits it rather than symlinking it.)
-- **Manifest / schema / alias history** — `manifest.json`,
-  `schema.json`, `aliases.json` + `alias_history.json`: row counts,
-  timings, schemas, and the append-only alias version log. They save
-  re-reading parquet metadata and re-deriving version numbers.
+- **Manifest / schema** — `<entry>/manifest.json`, `<entry>/schema.json`:
+  row counts, timings (including #87's cache-admission fields:
+  `compile_seconds`, `cache_worthy`, `cache_bytes`), and the schema, all
+  derived from the expression at build so later reads don't re-walk it.
+- **Alias history** — `<catalog>/aliases.jsonl`, one line per alias holding
+  its current head and the append-only version log (`aliases.py`). It is a
+  git-tracked file in the catalog repo, not a per-entry artifact, so it rolls
+  back with `git reset` on a `reset_to`.
 
 ## Buckaroo
 
@@ -256,6 +296,12 @@ all rely on "same key, same bytes, forever". Cleanup for those is a
 space concern (manual delete, bullpen moves on reset), and a deleted file
 self-heals by recomputing.
 
+The one documented hole in "never stale" is execution nondeterminism: an
+entry whose recipe calls `now()` / `random()` / an unseeded `sample()`
+produces different bytes each run under one content hash, so a cold recompute
+can disagree with what was built (#88). The build flags these as advisory lint
+warnings (`_nondeterminism_warnings`, `build.py`); it does not block them.
+
 Where staleness is actually possible, it is handled explicitly:
 
 - **mtime tracking** — xorq's modification-time strategy and Buckaroo's
@@ -270,4 +316,6 @@ Where staleness is actually possible, it is handled explicitly:
 The one rule to remember: snapshot-strategy caches do not notice upstream
 data changes. Tallyman is safe because entries are immutable by
 construction; anyone pointing xorq's snapshot caches at mutable source
-files has to manage invalidation themselves.
+files has to manage invalidation themselves. Tallyman's one opt-out is `salt`
+source-identity mode, which bakes no snapshot cache at all (path-only keys
+would collide across salted entries) and recomputes on every read.

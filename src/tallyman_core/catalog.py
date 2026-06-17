@@ -78,6 +78,7 @@ GITIGNORE_LINES = (
     ".checkpoint.lock",
     ".xorq_build_expanded/",
     ".migrated_*",  # machine-local upgrade-migration markers (e.g. #104), not catalog content
+    "*.tmp",  # an interrupted atomic-write temp (aliases._write, write_recipe_zip, ...) — never a committable artifact
 )
 
 
@@ -92,6 +93,18 @@ def write_gitignore(project: str) -> Path:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(body)
     return p
+
+
+def _surface_match(path: str, pattern: str) -> bool:
+    """fnmatch per path segment, so a ``*`` never spans ``/``.
+
+    ``post_processing/*.py`` matches ``post_processing/foo.py`` but NOT
+    ``post_processing/sub/leak.py`` — plain ``fnmatch`` lets ``*`` cross ``/`` and
+    would wave the nested stray through (and ``entries/*.zip`` past
+    ``entries/sub/x.zip``), defeating the deny-by-default allowlist.
+    """
+    segs, pats = path.split("/"), pattern.split("/")
+    return len(segs) == len(pats) and all(fnmatch.fnmatchcase(s, p) for s, p in zip(segs, pats))
 
 
 def _recipe_members(entry_dir: Path) -> list[tuple[Path, str]]:
@@ -183,7 +196,7 @@ def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
     cd = catalog_dir(project)
     rc, out, _ = run_git(["ls-files"], cwd=cd)
     if rc == 0:
-        unlisted = [p for p in out.split() if not any(fnmatch.fnmatch(p, pat) for pat in TRACKED_SURFACE)]
+        unlisted = [p for p in out.split() if not any(_surface_match(p, pat) for pat in TRACKED_SURFACE)]
         if unlisted:
             raise RuntimeError(
                 "catalog tracks paths outside the allowed surface (a stray file `git add -A` would commit): "

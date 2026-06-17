@@ -128,7 +128,14 @@ def capture_tallyman_state(project: str) -> dict:
     JSONL files. The decomposed sections write their own tracked files, so
     capture no longer touches charts/display/pp/stats/aliases/notebook."""
     ed = entries_dir(project)
-    entry_hashes = sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else []
+    # Only COMPLETE entry dirs (a manifest is the build's last write) — the same
+    # filter zip_pending_entries uses, so capture and the zip writer agree on the
+    # set a checkpoint records. Otherwise a checkpoint racing a mid-build dir
+    # records a pointer with no durable recipe zip, and the step is permanently
+    # un-reset-able (the pointer/recipe consistency guard rejects it).
+    entry_hashes = (
+        sorted(c.name for c in ed.iterdir() if c.is_dir() and (c / "manifest.json").is_file()) if ed.exists() else []
+    )
     compute_cache = _list_cache_files(compute_cache_dir(project))
     write_tallyman_state(project, entry_hashes=entry_hashes, compute_cache=compute_cache)
     return {"entry_hashes": entry_hashes, "compute_cache": compute_cache}

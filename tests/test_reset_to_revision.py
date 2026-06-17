@@ -540,6 +540,7 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
 
     ed = paths.entry_dir(project, "bbbb")
     ed.mkdir(parents=True)
+    (ed / "manifest.json").write_text("{}")  # a complete entry — capture only records manifest-bearing dirs
     (ed / "result.parquet").write_bytes(b"big")
     _stage_recipe_zip(project, "bbbb")  # durable recipe, so the step's two views agree (#52)
     cc = paths.compute_cache_dir(project)
@@ -568,23 +569,28 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
     pointer names an entry whose durable xorq recipe (entries/<hash>.zip) was
     never committed (#52).
 
-    This is the shape any interrupted or failed best-effort ``xorq catalog add``
-    leaves behind: the build dir + the ``entry_hashes`` pointer land, but the
-    content-addressed recipe never reaches git. On a forward reset
-    ``restore_from_bullpen`` copies the build dir back, so the tallyman view
-    claims an entry the durable xorq catalog cannot reproduce — its only copy is
-    the evictable bullpen dir. The two views of "what entries exist" disagree;
-    reset must surface that divergence, not mask it and return success."""
+    Defense-in-depth: the normal capture path no longer *creates* this divergence
+    — a manifest-less mid-build dir is not recorded as a pointer (see
+    test_native_catalog_store.py::test_checkpoint_skips_manifestless_entry_dir).
+    But should a committed step's ``entry_hashes`` pointer name an entry whose
+    durable recipe zip is absent anyway (manual corruption, or a future code path
+    that bypasses the capture filter), reset must still surface the divergence —
+    the consistency guard is the backstop — not mask it and return success. So
+    inject the divergent step directly rather than via capture."""
     cs.ensure_catalog_repo(project)
     s0 = cs.checkpoint_catalog(project, "baseline")  # no entries yet
 
-    # A build dir + pointer whose recipe zip was never committed (failed add).
-    paths.entry_dir(project, "deadbeef").mkdir(parents=True)
-    s1 = cs.checkpoint_catalog(project, "entry whose recipe never reached git")
+    # Commit a step whose pointer has no durable recipe zip, bypassing the
+    # capture manifest-filter (which would otherwise drop the bogus pointer).
+    cs.write_tallyman_state(project, entry_hashes=["deadbeef"])
+    cd = paths.catalog_dir(project)
+    cs.run_git(["add", "-A"], cwd=cd)
+    cs.run_git([*cs._GIT_ID, "commit", "-m", "pointer whose recipe never reached git", "--allow-empty"], cwd=cd)
+    cs.run_git(["tag", "-f", "step-001"], cwd=cd)
 
-    cs.reset_to(project, s0)  # evict deadbeef to the bullpen
+    cs.reset_to(project, s0)  # move away from the divergent step
     with pytest.raises(RuntimeError, match="deadbeef"):
-        cs.reset_to(project, s1)  # forward: bullpen restores the dir, recipe is gone
+        cs.reset_to(project, 1)  # restoring it must surface the pointer-without-recipe divergence
 
 
 # The xorq-catalog-coexistence section (catalog.yaml entries/aliases seeding,

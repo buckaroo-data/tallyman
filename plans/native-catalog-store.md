@@ -1,6 +1,7 @@
 # Plan: native `tallyman_core.catalog` — drop xorq's catalog package
 
-Status: **implemented** (2026-06-16) on `plan/native-catalog-store`. Refined
+Status: **implemented** (2026-06-16) on `plan/native-catalog-store`, plus a
+post-implementation bug-hunt + hardening pass (2026-06-17, see below). Refined
 through a parallel code investigation and a grilling pass; the decisions below
 are settled unless marked open.
 
@@ -34,12 +35,56 @@ verify. Where reality diverged from the plan text:
   baked snapshot parquet is *not* byte-deterministic even for one backend
   (datafusion's group-by output order varies), so the meaningful equivalence is
   the content-addressed snapshot *key* + the *data*, not raw bytes.
-- **Corpus rebuild deferred.** Eight on-disk projects under
-  `~/.tallyman-notebooks` are still old-format (`catalog.yaml` + xorq zips with
-  `metadata/` sidecars); they need rebuilding (the single-user rule permits it),
-  but the rebuild *mechanism* is the open item below, so it was not auto-run.
-  End-to-end verification ran on a fresh project instead
-  (`test_tracked_tree_is_the_decomposed_surface`).
+- **Corpus rebuild — mechanism now exists, not yet run on the real corpus.**
+  Eight on-disk projects under `~/.tallyman-notebooks` are still old-format
+  (`catalog.yaml` + xorq zips with `metadata/` sidecars). `scripts/rebuild_native_catalog.py`
+  (added in the hardening pass) re-execs a project's recipes into the native
+  store; it was validated end-to-end against a disposable copy of `first-project`
+  and by `tests/test_rebuild_native_catalog.py`, but the eight real projects are
+  the user's to run (`--dry-run` first). Key fact the rebuild rests on: a re-exec
+  does **not** reproduce the old content hashes (the build pipeline + xorq
+  serialization have moved, and the hash is sensitive to the absolute source
+  path), so the rebuild remaps every hash-keyed artifact old→new, rewrites literal
+  `from_catalog(<hash>)` refs, and expands the persisted `${TALLYMAN_PROJECT_ROOT}`
+  placeholder; alias-ref recipes survive untouched.
+
+## Post-implementation hardening (bug-hunt pass, 2026-06-17)
+
+A fan-out bug-hunt (eight surfaces, each adversarially probed and every finding
+independently re-reproduced) over the native store + Cut B found the baseline
+suite green on all eight and surfaced four in-scope regressions, all fixed
+test-first:
+
+- **Allowlist let nested strays through.** `assert_catalog_consistent` matched
+  `TRACKED_SURFACE` with `fnmatch`, whose `*` spans `/`, so `post_processing/sub/leak.py`
+  matched `post_processing/*.py` (and `entries/sub/x.zip` matched `entries/*.zip`).
+  Now a path-segment-aware `_surface_match` (equal segment count + per-segment
+  `fnmatchcase`).
+- **Interrupted atomic-write `.tmp` committed + wedged reset.** A crash between
+  `tmp.write_text` and `tmp.replace` (aliases/notebook/prompts writers,
+  `write_recipe_zip`) left a `*.tmp` the checkpoint's `git add -A` committed,
+  which then failed the allowlist on every later `reset_to`. Added `*.tmp` to the
+  repo `.gitignore`.
+- **Manifest-less mid-build dir recorded as a pointer.** `capture_tallyman_state`
+  listed every entry dir, including a mid-build one without `manifest.json` that
+  `zip_pending_entries` skips — committing a pointer with no durable recipe, a
+  self-inconsistent step `reset_to` permanently rejected. Capture now applies the
+  same manifest filter the zip writer uses.
+- **`cached_result_expr` self-heal broke once warm.** The whole function was
+  `@lru_cache`-memoised, so an expensive entry's snapshot evicted *after* a warm
+  read returned a dangling `deferred_read_parquet` (`"At least one path is
+  required"`). Split into a memoised plan resolver + a per-call existence check;
+  `.cache_clear`/`.cache_info` re-exposed on the public name.
+
+Out of scope (pre-existing, filed for separate decision, **not** fixed here):
+reset-then-recheckpoint skips a step number and orphans the future-step tag;
+`build_and_persist(project=X)` doesn't anchor X for the recipe's ambient
+`project_path`/`from_catalog` resolution; `label_step` accepts `main` (the pinned
+branch name); `version_of_hash`/`previous_version` use first-match `list.index`;
+corrupt tracked JSON surfaces as a bare HTTP 500.
+
+End-to-end verification still runs on a fresh project
+(`test_tracked_tree_is_the_decomposed_surface`).
 
 ## Problem
 

@@ -137,12 +137,14 @@ def test_recipe_zip_members_are_allowlist(project, orders_parquet, tmp_path):
     """
     res = build_and_persist(project, _agg_code(orders_parquet), prompt="seed")
     ed = paths.entry_dir(project, res.content_hash)
-    # strays that must NOT leak into the durable zip
+    # strays that must NOT leak into the durable zip (prompts.jsonl is relocated
+    # to a tracked prompts/<hash>.jsonl now; drop one here to prove the zip
+    # excludes it even if a stale copy lingers in the entry dir)
     (ed / "result.parquet").write_bytes(b"heavy")
     (ed / "foo.bin").write_bytes(b"\x00")
+    (ed / "prompts.jsonl").write_text('{"prompt": "x"}\n')
     (ed / ".xorq_build_expanded").mkdir(exist_ok=True)
     (ed / ".xorq_build_expanded" / "x.yaml").write_text("x")
-    assert (ed / "prompts.jsonl").exists()  # append-mutable provenance — also excluded
 
     dest = tmp_path / "recipe.zip"
     catalog.write_recipe_zip(ed, dest, res.content_hash)
@@ -308,3 +310,46 @@ def test_back_then_forward_restores_recipe(project, orders_parquet):
     cs.reset_to(project, 1)
     cs.reset_to(project, 2)
     assert hashes[1] in _tracked_zip_hashes(project)
+
+
+# ---------------------------------------------------------------------------
+# Decomposition — mutable state is tracked files that roll back with git reset
+# ---------------------------------------------------------------------------
+
+
+def test_prompt_history_survives_reset(project, orders_parquet):
+    """The per-entry prompt history is a tracked ``prompts/<hash>.jsonl`` now, so
+    a re-run's appended prompt rolls back with the tree on reset (it used to be a
+    loose, untracked ``entries/<hash>/prompts.jsonl`` git reset never touched)."""
+    from tallyman_xorq import read_prompts
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    h = res.content_hash
+    cs.checkpoint_catalog(project, "c1")
+    build_and_persist(project, _agg_code(orders_parquet), prompt="second")  # re-run, same hash, appends
+    cs.checkpoint_catalog(project, "c2")
+    assert [p["prompt"] for p in read_prompts(project, h)] == ["first", "second"]
+    cs.reset_to(project, 1)  # only "first" had been recorded at step 1
+    assert [p["prompt"] for p in read_prompts(project, h)] == ["first"]
+    cs.reset_to(project, 2)
+    assert [p["prompt"] for p in read_prompts(project, h)] == ["first", "second"]
+
+
+def test_display_config_survives_reset(project, orders_parquet):
+    """A display config (tracked ``display_configs/<hash>.json``) rolls back with
+    git reset — the one decomposed section with no survives-reset coverage before
+    (its old capture/materialize round-trip tests are deleted with this cut)."""
+    from tallyman_core import display_configs as dc
+
+    cs.genesis(project)
+    res = build_and_persist(project, _agg_code(orders_parquet))
+    h = res.content_hash
+    cs.checkpoint_catalog(project, "c1")  # step 1: entry, no display config
+    dc.set_display_config(project, h, {"pinned_rows": [1, 2]})
+    cs.checkpoint_catalog(project, "c2")  # step 2: display config set
+    assert dc.get_display_config(project, h) == {"pinned_rows": [1, 2]}
+    cs.reset_to(project, 1)
+    assert dc.get_display_config(project, h) is None
+    cs.reset_to(project, 2)
+    assert dc.get_display_config(project, h) == {"pinned_rows": [1, 2]}

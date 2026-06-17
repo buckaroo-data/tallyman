@@ -238,11 +238,24 @@ def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
 
 
 def post_processing_dir(project: str) -> Path:
-    return artifacts_dir(project) / "post_processing"
+    # Under the catalog repo (was artifacts/) so the native store tracks the
+    # scripts directly instead of round-tripping them through catalog.yaml.
+    return catalog_dir(project) / "post_processing"
 
 
 def stats_dir(project: str) -> Path:
-    return artifacts_dir(project) / "stats"
+    return catalog_dir(project) / "stats"
+
+
+def prompts_dir(project: str) -> Path:
+    return catalog_dir(project) / "prompts"
+
+
+def prompts_path(project: str, content_hash: str) -> Path:
+    """Tracked per-entry authoring-prompt history (was a loose
+    ``entries/<hash>/prompts.jsonl``, lost on a clone now that build dirs are
+    gitignored)."""
+    return prompts_dir(project) / f"{content_hash}.jsonl"
 
 
 def display_dir(project: str) -> Path:
@@ -369,7 +382,6 @@ def ensure_project(project: str) -> Path:
         display_dir(project),
         exports_dir(project),
         data_dir(project),
-        notebooks_dir(project),
     ):
         d.mkdir(parents=True, exist_ok=True)
     return p

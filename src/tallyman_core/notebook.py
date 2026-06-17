@@ -7,14 +7,11 @@ the current latest version of its alias — there's no notebook-level
 version pinning. Forensic versions stay in the catalog, not in the
 notebook.
 
-V0 has one default notebook per project at `notebooks/default.json`:
+V0 has one default notebook per project, tracked under the catalog repo at
+`notebook.jsonl` — one cell per line:
 
-    {
-      "cells": [
-        {"cell_id": "abc123...", "alias": "shoe_sales", "markdown": "..."},
-        ...
-      ]
-    }
+    {"cell_id": "abc123...", "alias": "shoe_sales", "markdown": "..."}
+    ...
 """
 
 from __future__ import annotations
@@ -23,7 +20,7 @@ import json
 import uuid
 from pathlib import Path
 
-from tallyman_core.paths import ensure_project, project_dir
+from tallyman_core.paths import catalog_dir, ensure_project
 
 
 class CellNotFound(KeyError):
@@ -31,26 +28,34 @@ class CellNotFound(KeyError):
 
 
 def _path(project: str, name: str = "default") -> Path:
-    return project_dir(project) / "notebooks" / f"{name}.json"
+    fname = "notebook.jsonl" if name == "default" else f"notebook.{name}.jsonl"
+    return catalog_dir(project) / fname
 
 
 def load(project: str, name: str = "default") -> dict:
     p = _path(project, name)
     if not p.exists():
         return {"cells": []}
-    try:
-        data = json.loads(p.read_text())
-    except json.JSONDecodeError:
-        return {"cells": []}
-    data.setdefault("cells", [])
-    return data
+    cells: list[dict] = []
+    for line in p.read_text().splitlines():
+        if not line.strip():
+            continue
+        try:
+            cells.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return {"cells": cells}
 
 
 def _save(project: str, data: dict, name: str = "default") -> None:
     ensure_project(project)
     p = _path(project, name)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(data, indent=2))
+    cells = data.get("cells", [])
+    if not cells:
+        p.unlink(missing_ok=True)  # an empty notebook is no file (a clean diff)
+        return
+    p.write_text("".join(json.dumps(c) + "\n" for c in cells))
 
 
 def find_cell_by_alias(project: str, alias: str, name: str = "default") -> dict | None:

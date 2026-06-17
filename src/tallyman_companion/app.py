@@ -569,7 +569,7 @@ def create_app(
             for i, h in enumerate(hist_hashes, start=1):
                 forensic_history.append({"hash": h, "version": i, "is_current": h == content_hash})
 
-        prompt_history = read_prompts(entry)
+        prompt_history = read_prompts(project, content_hash)
         chart_spec = get_chart(project, content_hash)
 
         build_artifacts: list[dict] = []

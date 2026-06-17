@@ -17,7 +17,7 @@ expr = t.group_by("region").aggregate(n=t.count())
 
 def test_first_build_records_one_prompt(project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(orders_parquet), prompt="first")
-    history = read_prompts(res.entry_path)
+    history = read_prompts(project, res.content_hash)
     assert len(history) == 1
     assert history[0]["prompt"] == "first"
 
@@ -25,7 +25,7 @@ def test_first_build_records_one_prompt(project: str, orders_parquet: Path):
 def test_re_run_appends_prompt(project: str, orders_parquet: Path):
     a = build_and_persist(project, _code(orders_parquet), prompt="first")
     build_and_persist(project, _code(orders_parquet), prompt="second")
-    history = read_prompts(a.entry_path)
+    history = read_prompts(project, a.content_hash)
     assert [p["prompt"] for p in history] == ["first", "second"]
 
 
@@ -40,7 +40,7 @@ def test_manifest_prompt_remains_first(project: str, orders_parquet: Path):
 
 def test_no_prompt_does_not_write_history(project: str, orders_parquet: Path):
     res = build_and_persist(project, _code(orders_parquet), prompt=None)
-    assert read_prompts(res.entry_path) == []
+    assert read_prompts(project, res.content_hash) == []
 
 
 def test_entry_detail_renders_prompt_history(fresh_companion_app, project: str, orders_parquet: Path):

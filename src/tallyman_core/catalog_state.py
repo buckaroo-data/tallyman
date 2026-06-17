@@ -1,38 +1,30 @@
-"""Pydata-owned state in the xorq catalog's catalog.yaml + the reset engine.
+"""The native catalog's versioning engine (see plans/adr-reset-to-revision.md).
 
-catalog.yaml is the versioned state carrier (see plans/adr-reset-to-revision.md).
-xorq owns ``entries`` and ``aliases`` in that file; tallyman owns:
+Every piece of mutable catalog state is now its own git-tracked file the
+native store (#52) allows (charts under ``chart_specs/``, display configs under
+``display_configs/``, post-processing/stats ``.py`` under the repo, aliases in
+``aliases.jsonl``, the notebook in ``notebook.jsonl``, per-entry prompt history
+in ``prompts/<hash>.jsonl``). Their own mutators write them; ``reset_to``'s
+``git reset --hard`` restores them all at once. There is no longer a
+``catalog.yaml`` round-trip (no ``capture``/``materialize`` of those sections).
 
-    post_processing: [{name, source, disabled}]
-    stats:           [{name, source, disabled}]
-    charts:          [{content_hash, spec}]
-    display_configs: [{content_hash, config}]
-    notebook:        {cells: [{cell_id, alias, markdown}]}
-    entry_hashes:    [content_hash, ...]      # pointer to untracked entries/<hash>/
-    compute_cache:   [relpath, ...]           # pointer to untracked compute cache
-    alias_map:       {alias: latest_hash}     # tallyman's alias bookkeeping
-    alias_history:   {alias: [hash, ...]}     # tallyman's alias bookkeeping
+What remains here is the *pointer* bookkeeping for the two **untracked**
+artifact sets — the entry build dirs and the compute-cache warm set — in two
+tracked JSONL files:
 
-The catalog git repo tracks only ``catalog.yaml``. tallyman's alias bookkeeping
-lives *in* it, as the ``alias_map``/``alias_history`` keys above (owned by
-``aliases.py``) — committing separate ``aliases.json``/``alias_history.json``
-files inside the repo made xorq's ``assert_consistency`` reject it and every
-``xorq catalog add`` after the first silently no-op (#48). Keeping the state as
-catalog.yaml keys means there are no extra tracked files, and ``reset_to``'s
-``git reset`` rolls alias state back with the rest of the file (no separate
-reconcile). The heavy artifacts (entries/, the caches) are content-addressed,
-additive, and
-untracked — ``git reset`` can't roll them back, so ``reset_to`` reconciles them
-to the recorded pointer lists: evictions retire to the bullpen (not deleted),
-and anything the restored step records that is missing comes back from the
-bullpen by copy. Live operations never read the bullpen, so a re-added
-expression still computes cold. The derived files (.py scripts, chart specs,
-the notebook) live outside the repo, so they are reconstructed by
-``materialize``.
+    entries.jsonl:       {"hash": content_hash}   # untracked entries/<hash>/ dirs
+    compute_cache.jsonl: {"path": relpath}        # untracked compute-cache warm set
 
-A checkpoint captures the live on-disk state into catalog.yaml and commits once,
-through the fork-safe git primitive (git_util) under a per-project lock. This
-keeps the four invariants #33 kept re-breaking structural rather than reviewed.
+Those heavy artifacts are content-addressed, additive, and gitignored, so
+``git reset`` can't roll them back; ``reset_to`` reconciles them to the recorded
+pointers via the bullpen — evictions retire (not deleted), and anything a
+restored step records but is missing comes back by copy. Live operations never
+read the bullpen, so a re-added expression still computes cold.
+
+A checkpoint captures the pointer lists, zips any pending recipe (catalog.py),
+``git add -A``, and commits once — through the fork-safe git primitive
+(git_util) under a per-project lock — keeping the four invariants #33 kept
+re-breaking structural rather than reviewed.
 """
 
 from __future__ import annotations
@@ -46,12 +38,7 @@ import re
 import shutil
 from pathlib import Path
 
-import yaml
-
-from tallyman_core import catalog, charts, notebook
-from tallyman_core import display_configs as dc
-from tallyman_core import post_processing as pp
-from tallyman_core import summary_stats as ss
+from tallyman_core import catalog
 from tallyman_core.git_util import run_git
 from tallyman_core.paths import (
     ENTRIES_DIRNAME,
@@ -59,9 +46,6 @@ from tallyman_core.paths import (
     catalog_dir,
     compute_cache_dir,
     entries_dir,
-    notebooks_dir,
-    post_processing_dir,
-    stats_dir,
 )
 
 log = logging.getLogger(__name__)
@@ -76,70 +60,61 @@ _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
-# catalog.yaml read / write (read-modify-write so xorq's keys survive)
+# pointer bookkeeping: the two tracked JSONL files that replace catalog.yaml
 # ---------------------------------------------------------------------------
 
 
-def _catalog_yaml(project: str) -> Path:
-    return catalog_dir(project) / "catalog.yaml"
+def _entries_file(project: str) -> Path:
+    return catalog_dir(project) / "entries.jsonl"
 
 
-def _read_raw(project: str) -> dict:
-    p = _catalog_yaml(project)
-    if not p.exists():
-        return {}
-    return yaml.safe_load(p.read_text()) or {}
+def _compute_cache_file(project: str) -> Path:
+    return catalog_dir(project) / "compute_cache.jsonl"
+
+
+def _read_jsonl(path: Path, field: str) -> list[str] | None:
+    """The *field* of each line, or None when the file is absent — so callers
+    can tell "never recorded" (no-op) from a recorded-empty list (reconcile to
+    nothing)."""
+    if not path.exists():
+        return None
+    return [json.loads(line)[field] for line in path.read_text().splitlines() if line.strip()]
+
+
+def _write_jsonl(path: Path, field: str, values: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(json.dumps({field: v}) + "\n" for v in values))
 
 
 def read_tallyman_state(project: str) -> dict:
-    """The tallyman-owned keys, each defaulted so callers never KeyError."""
-    raw = _read_raw(project)
+    """The pointer lists for the *untracked* artifacts the bullpen reconciles —
+    entry build dirs (``entry_hashes``) and the compute-cache warm set
+    (``compute_cache``). Each defaults to [] so callers never KeyError.
+
+    The decomposed mutable sections (charts, display, post-processing, stats,
+    aliases, notebook) are tracked files now, restored by ``git reset`` directly,
+    so they are no longer carried here.
+    """
     return {
-        "post_processing": raw.get("post_processing", []),
-        "stats": raw.get("stats", []),
-        "charts": raw.get("charts", []),
-        "display_configs": raw.get("display_configs", []),
-        "notebook": raw.get("notebook", {"cells": []}),
-        "entry_hashes": raw.get("entry_hashes", []),
-        "compute_cache": raw.get("compute_cache", []),
-        "alias_map": raw.get("alias_map", {}),
-        "alias_history": raw.get("alias_history", {}),
+        "entry_hashes": _read_jsonl(_entries_file(project), "hash") or [],
+        "compute_cache": _read_jsonl(_compute_cache_file(project), "path") or [],
     }
 
 
-def write_tallyman_state(project: str, **keys) -> None:
-    """Merge tallyman keys into catalog.yaml atomically, preserving xorq's keys.
-
-    xorq's keys are also *seeded* when absent: its ``CatalogYaml.contents``
-    indexes ``entries``/``aliases`` directly (no defaulting for dict-shaped
-    files), so a catalog.yaml born from genesis/capture without them makes
-    every best-effort ``xorq catalog add`` fail — silently. xorq round-trips
-    unknown keys, so the two empty lists are the whole coexistence contract.
-    """
-    p = _catalog_yaml(project)
-    p.parent.mkdir(parents=True, exist_ok=True)
-    raw = _read_raw(project)
-    raw.setdefault("entries", [])
-    raw.setdefault("aliases", [])
-    for k, v in keys.items():
-        if v is not None:
-            raw[k] = v
-    tmp = p.with_name(p.name + ".tmp")
-    # safe_dump, to mirror _read_raw's safe_load: the full Dumper would write a
-    # stray non-plain value (a Path in a chart spec) as a !!python/object tag,
-    # after which every read fails until the file is hand-repaired. Raising
-    # here — before the tmp replace — keeps the previous file readable.
-    tmp.write_text(yaml.safe_dump(raw, default_flow_style=False, sort_keys=False))
-    tmp.replace(p)
+def write_tallyman_state(
+    project: str, *, entry_hashes: list[str] | None = None, compute_cache: list[str] | None = None
+) -> None:
+    """Persist whichever pointer list is given to its tracked JSONL (the other
+    is left untouched)."""
+    if entry_hashes is not None:
+        _write_jsonl(_entries_file(project), "hash", entry_hashes)
+    if compute_cache is not None:
+        _write_jsonl(_compute_cache_file(project), "path", compute_cache)
 
 
 # ---------------------------------------------------------------------------
-# capture: live on-disk state -> catalog.yaml keys
+# capture: live untracked-artifact listings -> the two tracked pointer files
 # ---------------------------------------------------------------------------
-
-
-def _scan_scripts(listing: list[dict]) -> list[dict]:
-    return [{"name": e["name"], "source": e["source"], "disabled": e["disabled"]} for e in listing]
 
 
 def _list_cache_files(root: Path) -> list[str]:
@@ -149,92 +124,14 @@ def _list_cache_files(root: Path) -> list[str]:
 
 
 def capture_tallyman_state(project: str) -> dict:
-    """Read the live authored state + artifact listings into catalog.yaml."""
+    """Snapshot the pointer lists for the untracked artifacts into their tracked
+    JSONL files. The decomposed sections write their own tracked files, so
+    capture no longer touches charts/display/pp/stats/aliases/notebook."""
     ed = entries_dir(project)
-    state = {
-        "post_processing": _scan_scripts(pp.list_post_processings(project)),
-        "stats": _scan_scripts(ss.list_stats(project)),
-        "charts": [{"content_hash": h, "spec": charts.get_chart(project, h)} for h in charts.list_charts(project)],
-        "display_configs": [
-            {"content_hash": h, "config": dc.get_display_config(project, h)} for h in dc.list_display_configs(project)
-        ],
-        "notebook": notebook.load(project),
-        "entry_hashes": sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else [],
-        "compute_cache": _list_cache_files(compute_cache_dir(project)),
-    }
-    # alias_map/alias_history are written live by aliases.py and already in
-    # catalog.yaml; write_tallyman_state preserves keys it isn't given, so
-    # capture leaves them untouched rather than re-snapshotting.
-    write_tallyman_state(project, **state)
-    return state
-
-
-# ---------------------------------------------------------------------------
-# materialize: catalog.yaml keys -> on-disk derived files (non-destructive)
-# ---------------------------------------------------------------------------
-
-
-def _materialize_scripts(target: Path, entries: list[dict]) -> None:
-    if target.exists():
-        shutil.rmtree(target)  # removes _disabled/ with it
-    target.mkdir(parents=True, exist_ok=True)
-    for e in entries or []:
-        dest = (target / "_disabled") if e.get("disabled") else target
-        dest.mkdir(parents=True, exist_ok=True)
-        src = e.get("source", "")
-        (dest / f"{e['name']}.py").write_text(src if src.endswith("\n") else src + "\n")
-
-
-def _materialize_charts(project: str, entries: list[dict]) -> None:
-    recorded = {c["content_hash"]: c["spec"] for c in entries or []}
-    for h in list(charts.list_charts(project)):
-        if h not in recorded:
-            charts.remove_chart(project, h)
-    for h, spec in recorded.items():
-        charts.set_chart(project, h, spec)
-
-
-def _materialize_display_configs(project: str, entries: list[dict]) -> None:
-    recorded = {c["content_hash"]: c["config"] for c in entries or []}
-    for h in list(dc.list_display_configs(project)):
-        if h not in recorded:
-            dc.remove_display_config(project, h)
-    for h, config in recorded.items():
-        if config is not None:
-            dc.set_display_config(project, h, config)
-
-
-def _materialize_notebook(project: str, nb: dict) -> None:
-    nbfile = notebooks_dir(project) / "default.json"
-    cells = (nb or {}).get("cells") or []
-    if cells:
-        notebooks_dir(project).mkdir(parents=True, exist_ok=True)
-        nbfile.write_text(json.dumps({"cells": cells}, indent=2))
-    else:
-        nbfile.unlink(missing_ok=True)
-
-
-def materialize(project: str) -> None:
-    """Reconstruct on-disk derived files from catalog.yaml.
-
-    A section is rebuilt only when its key is *present*: an absent key means
-    the project never recorded that state (e.g. predates these keys), so its
-    on-disk files are left alone rather than wiped. A present-but-empty list is
-    a deliberate "none at this step" and clears the section.
-    """
-    raw = _read_raw(project)
-    if "post_processing" in raw:
-        _materialize_scripts(post_processing_dir(project), raw["post_processing"])
-    if "stats" in raw:
-        _materialize_scripts(stats_dir(project), raw["stats"])
-    if "charts" in raw:
-        _materialize_charts(project, raw["charts"])
-    if "display_configs" in raw:
-        _materialize_display_configs(project, raw["display_configs"])
-    if "notebook" in raw:
-        _materialize_notebook(project, raw["notebook"] or {"cells": []})
-    # alias_map/alias_history need no materialize step: aliases.py reads them
-    # straight from catalog.yaml, which git reset has already rolled back.
+    entry_hashes = sorted(c.name for c in ed.iterdir() if c.is_dir()) if ed.exists() else []
+    compute_cache = _list_cache_files(compute_cache_dir(project))
+    write_tallyman_state(project, entry_hashes=entry_hashes, compute_cache=compute_cache)
+    return {"entry_hashes": entry_hashes, "compute_cache": compute_cache}
 
 
 # ---------------------------------------------------------------------------
@@ -258,11 +155,13 @@ def _retire(src: Path, dest: Path) -> None:
 
 
 def prune_entries(project: str) -> int:
-    """Retire entry dirs not named by ``entry_hashes``. No-op when key absent."""
-    raw = _read_raw(project)
-    if "entry_hashes" not in raw:
+    """Retire entry dirs not named by ``entries.jsonl``. No-op when the pointer
+    file is absent (never captured), so a build before the first checkpoint is
+    not mistaken for an eviction."""
+    valid = _read_jsonl(_entries_file(project), "hash")
+    if valid is None:
         return 0
-    valid = set(raw["entry_hashes"] or [])
+    valid = set(valid)
     ed = entries_dir(project)
     if not ed.exists():
         return 0
@@ -274,46 +173,41 @@ def prune_entries(project: str) -> int:
     return removed
 
 
-def _prune_cache(project: str, root: Path, key: str) -> int:
-    raw = _read_raw(project)
-    if key not in raw:
+def prune_compute_cache(project: str) -> int:
+    valid = _read_jsonl(_compute_cache_file(project), "path")
+    if valid is None:
         return 0
-    valid = set(raw[key] or [])
+    valid = set(valid)
+    root = compute_cache_dir(project)
     if not root.exists():
         return 0
     removed = 0
     for p in root.rglob("*"):
         if p.is_file() and (rel := str(p.relative_to(root))) not in valid:
-            _retire(p, bullpen_dir(project) / key / rel)
+            _retire(p, bullpen_dir(project) / "compute_cache" / rel)
             removed += 1
     return removed
-
-
-def prune_compute_cache(project: str) -> int:
-    return _prune_cache(project, compute_cache_dir(project), "compute_cache")
 
 
 def restore_from_bullpen(project: str) -> int:
     """Copy recorded-but-missing artifacts back from the bullpen.
 
     The inverse of the prunes, for a reset that walks forward: anything the
-    restored catalog.yaml's pointer lists name that is absent from the live
-    tree comes back by *copy*, so the bullpen keeps its set and the
-    back/forward rehearsal loop can repeat. Only ``reset_to`` calls this —
-    live operations never see the bullpen, which is what keeps a re-added
-    expression honest (cold).
+    restored pointer files name that is absent from the live tree comes back by
+    *copy*, so the bullpen keeps its set and the back/forward rehearsal loop can
+    repeat. Only ``reset_to`` calls this — live operations never see the
+    bullpen, which is what keeps a re-added expression honest (cold).
     """
-    raw = _read_raw(project)
     bp = bullpen_dir(project)
     restored = 0
     ed = entries_dir(project)
-    for h in raw.get("entry_hashes") or []:
+    for h in _read_jsonl(_entries_file(project), "hash") or []:
         live, parked = ed / h, bp / ENTRIES_DIRNAME / h
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1
     root = compute_cache_dir(project)
-    for rel in raw.get("compute_cache") or []:
+    for rel in _read_jsonl(_compute_cache_file(project), "path") or []:
         live, parked = root / rel, bp / "compute_cache" / rel
         if not live.exists() and parked.is_file():
             live.parent.mkdir(parents=True, exist_ok=True)
@@ -375,7 +269,7 @@ def _step_tags(project: str) -> list[int]:
 
 
 def checkpoint_catalog(project: str, message: str, *, step: int | None = None, label: str | None = None) -> int | None:
-    """Capture state, commit catalog.yaml once, tag the step.
+    """Capture pointers, zip pending recipes, commit the tracked surface once, tag the step.
 
     One commit per operation (not per mutator), through the fork-safe primitive,
     under the per-project lock. Returns the step number, or None when the
@@ -425,12 +319,13 @@ def _resolve_tag(project: str, tag: str) -> str:
 
 
 def reset_to(project: str, ref: int | str) -> None:
-    """Restore the catalog to a step/label: git reset --hard, materialize the
-    derived files, then reconcile the untracked artifacts to the recorded
-    pointers — evictions retire to the bullpen, recorded-but-missing files
-    come back from it. Finally re-validate the git-tracked xorq recipe set
-    against the tallyman pointers, so a step whose two views disagree fails
-    loudly rather than returning a masked divergence (#52)."""
+    """Restore the catalog to a step/label: ``git reset --hard`` (which restores
+    every tracked file — the recipe zips and all decomposed mutable state — at
+    once), then reconcile the *untracked* artifacts to the recorded pointers:
+    evictions retire to the bullpen, recorded-but-missing files come back from
+    it. Finally re-validate the tracked recipe set against the pointers, so a
+    step whose two views disagree fails loudly rather than returning a masked
+    divergence (#52)."""
     cd = catalog_dir(project)
     tag = f"step-{ref:03d}" if isinstance(ref, int) else str(ref)
     with _project_lock(project):
@@ -438,7 +333,6 @@ def reset_to(project: str, ref: int | str) -> None:
         rc, _, err = run_git(["reset", "--hard", commit], cwd=cd)
         if rc != 0:
             raise RuntimeError(f"catalog reset to {tag!r} failed: {err}")
-        materialize(project)
         prune_entries(project)
         prune_compute_cache(project)
         restore_from_bullpen(project)

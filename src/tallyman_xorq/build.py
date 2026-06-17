@@ -33,21 +33,32 @@ from tallyman_xorq.portable import make_portable_inplace
 perf_log = logging.getLogger("tallyman.perf")
 
 
-def _append_prompt(entry_path: Path, prompt: str | None) -> None:
-    """Append a prompt event to the entry's prompts.jsonl."""
+def _append_prompt(project: str, content_hash: str, prompt: str | None) -> None:
+    """Append a prompt event to the entry's tracked ``prompts/<hash>.jsonl``.
+
+    Relocated out of the (now gitignored) entry dir so the re-run history the
+    UI disclosure shows survives a reset/clone — it is append-mutable provenance
+    that the content-addressed recipe zip deliberately excludes.
+    """
     if not prompt:
         return
+    from tallyman_core.paths import prompts_path
+
     record = {
         "prompt": prompt,
         "at": datetime.now(timezone.utc).isoformat(),
     }
-    with (entry_path / "prompts.jsonl").open("a") as fh:
+    p = prompts_path(project, content_hash)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a") as fh:
         fh.write(json.dumps(record) + "\n")
 
 
-def read_prompts(entry_path: Path) -> list[dict]:
+def read_prompts(project: str, content_hash: str) -> list[dict]:
     """Return every prompt seen for this entry, oldest first."""
-    p = entry_path / "prompts.jsonl"
+    from tallyman_core.paths import prompts_path
+
+    p = prompts_path(project, content_hash)
     if not p.exists():
         return []
     with p.open() as fh:
@@ -395,7 +406,7 @@ def build_and_persist(
             manifest_path = entry_manifest_path(project, content_hash)
             if manifest_path.exists():
                 meta = json.loads(manifest_path.read_text())
-                _append_prompt(target, prompt)
+                _append_prompt(project, content_hash, prompt)
                 return BuildResult(
                     content_hash=content_hash,
                     entry_path=target,
@@ -523,7 +534,7 @@ def build_and_persist(
         parents=parents or None,
     )
     write_manifest(target, manifest)
-    _append_prompt(target, prompt)
+    _append_prompt(project, content_hash, prompt)
 
     # Best-effort: drop the temp script.
     try:

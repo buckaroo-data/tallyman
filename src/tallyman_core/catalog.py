@@ -48,7 +48,6 @@ _ZIP_COMPRESSLEVEL = 6
 # allowlist is the durable guard, since ``git add -A`` is allow-by-default.
 TRACKED_SURFACE = (
     ".gitignore",
-    "catalog.yaml",
     "entries/*.zip",
     "chart_specs/*.vl.json",
     "display_configs/*.json",

@@ -1087,6 +1087,14 @@ def create_app(
             p.unlink()
         except OSError as exc:
             raise HTTPException(500, str(exc))
+        # Drop the read-path memo so the snapshot actually self-heals on next read.
+        # A warm cached_result_expr holds a deferred_read of the file just unlinked;
+        # left in place, the next viewer read (api_data) — and ensure_session's
+        # pre-/load_expr heal — would dereference a missing file instead of
+        # re-baking. lru_cache has no per-key eviction, and a full clear is cheap
+        # for an admin delete: entries are content-addressed, so warm exprs simply
+        # re-reconstruct (and the evicted one re-bakes) on the next read.
+        cached_result_expr.cache_clear()
         return {"ok": True, "hash": content_hash}
 
     @app.patch("/{project}/api/notebook")

@@ -1291,3 +1291,20 @@ def test_deterministic_recipe_is_not_structurally_nondeterministic(project, orde
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
     assert recipe_is_structurally_nondeterministic(project, h) is False
+
+
+def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+    # #88 part 2: a deterministic UDF recipe must NOT be flagged structural. xorq's
+    # make_pandas_udf mints a fresh class per reconstruction (see
+    # test_scalar_udf_is_worthy_in_lockstep_with_classify_build), so two reconstructions
+    # of even a pure UDF recipe hash differently — graph-hash instability from the
+    # class mint, NOT an author-time baked literal. Attributing that as structural is
+    # wrong: impure-UDF nondeterminism is execution-level (#83). The detector must
+    # exclude UDF entries so a UDF self-heal drift is labeled execution, not structural.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("udf", _scalar_udf_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is False

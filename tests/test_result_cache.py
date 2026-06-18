@@ -1059,3 +1059,141 @@ def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypat
     assert child_sources.get("src.parquet") == p_digest
     # Sanity: the frozen digest the child pinned is NOT the edited live digest.
     assert si.digest_for(project, src) != p_digest
+
+
+def test_reset_to_clears_result_plan_memo(project, orders_parquet, monkeypatch):
+    """reset_to retires the on-disk compute cache to the target revision's warm
+    set; it must also invalidate the in-process ``_resolve_result_plan`` memo,
+    which holds reconstructed plans — including the baked snapshot paths the
+    prune can delete (#80 / #96). A reactive reset layer needs this cache
+    invalidated alongside the prune, not left to ``cached_result_expr``'s
+    per-call self-heal: ``_build_compare_expr`` bakes a cached snapshot path with
+    no per-call existence re-check, so a stale plan compounds downstream.
+    """
+    from tallyman_core import catalog_state as cs
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+    step = cs.current_step(project)
+
+    cached_result_expr(project, agg_h).execute()  # warm the memo
+    assert cached_result_expr.cache_info().currsize >= 1
+
+    cs.reset_to(project, step)
+    assert cached_result_expr.cache_info().currsize == 0
+
+
+def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, orders_parquet, monkeypatch):
+    """The diff compare-expr LRU (``_build_compare_expr``) caches a serialized
+    build that bakes in each entry's baked snapshot path and — unlike
+    ``cached_result_expr`` — never re-checks ``path.exists()`` on a hit. A reset
+    that prunes a snapshot would otherwise leave that cached build pointing at a
+    deleted parquet, so ``/api/reset`` must clear it alongside the result-plan
+    memo (#80).
+    """
+    from fastapi.testclient import TestClient
+
+    from tallyman_companion.app import _build_compare_expr
+    from tallyman_core import catalog_state as cs
+    from tallyman_core.aliases import history_for
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    step = cs.current_step(project)
+    catalog_revise("shoe_sales", _agg_avg_code(project))
+    a_h, b_h = history_for(project, "shoe_sales")
+
+    _build_compare_expr(project, a_h, b_h, ("region",))  # warm the compare memo
+    assert _build_compare_expr.cache_info().currsize == 1
+
+    c = TestClient(fresh_companion_app)
+    r = c.post(f"/{project}/api/reset", json={"ref": step})
+    assert r.status_code == 200, r.text
+    assert _build_compare_expr.cache_info().currsize == 0
+
+
+def test_notify_project_reset_evicts_compare_build_over_pruned_snapshot(
+    fresh_companion_app, project, orders_parquet, monkeypatch
+):
+    """Load-bearing #80/#96 regression — stronger than ``currsize == 0``: it
+    proves the cross-process ``project_reset`` notify evicts a compare build that
+    would otherwise *execute over a deleted snapshot*, not merely that the LRU is
+    emptied.
+
+    ``reset-to`` is normally run out of process (the ``tallyman reset-to`` CLI):
+    the CLI runs ``reset_to`` — which prunes snapshots — in its own short-lived
+    process, then signals the long-lived companion via ``POST /internal/notify
+    {kind: project_reset}``. ``_build_compare_expr`` froze each entry's baked
+    snapshot path into a serialized build with no per-call ``exists()`` recheck,
+    so the companion's warm build now points at a parquet the prune deleted.
+    Executing that stale build raises ``ValueError: At least one path is
+    required`` (the #73/#74 dangling-read symptom). ``reset_to`` itself clears
+    only ``cached_result_expr`` (which self-heals anyway), never this
+    companion-layer LRU — so without the notify-path clear the gap is real and
+    the next diff view serves the broken build to buckaroo.
+
+    The flow mirrors production: ``cs.reset_to`` stands in for the CLI process's
+    prune (it does NOT reach the companion LRU), then the ``/internal/notify``
+    POST is the signal that must close the gap.
+    """
+    import pytest
+    from fastapi.testclient import TestClient
+    from xorq.ibis_yaml.compiler import load_expr
+
+    from tallyman_companion.app import _build_compare_expr
+    from tallyman_core import catalog_state as cs
+    from tallyman_core.aliases import history_for
+    from tallyman_xorq.result_cache import baked_snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    step = cs.current_step(project)  # only v1 is warm at this step
+    catalog_revise("shoe_sales", _agg_avg_code(project))
+    a_h, b_h = history_for(project, "shoe_sales")
+
+    build_path, _ = _build_compare_expr(project, a_h, b_h, ("region",))  # warm + freeze b_h's path
+    snap_b = baked_snapshot_path(project, b_h)  # capture BEFORE the prune deletes it
+    assert snap_b is not None and snap_b.exists()
+
+    # Out-of-process CLI work: reset_to prunes (retires b_h's snapshot) but does
+    # not reach the companion's _build_compare_expr LRU — the stale build stays.
+    cs.reset_to(project, step)
+    assert not snap_b.exists()  # the prune deleted b_h's snapshot
+    assert _build_compare_expr.cache_info().currsize == 1  # stale build survives reset_to
+
+    # The stale build is genuinely broken: it executes over the deleted parquet.
+    with pytest.raises(ValueError, match="At least one path is required"):
+        load_expr(str(build_path)).execute()
+
+    # The notify signal closes the gap — it must evict that broken build so the
+    # next /api/diff_data can't POST a dangling build_dir to buckaroo.
+    c = TestClient(fresh_companion_app)
+    r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
+    assert r.status_code == 200, r.text
+    assert _build_compare_expr.cache_info().currsize == 0
+
+
+def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, project, orders_parquet, monkeypatch):
+    """Parity with the in-server reset: the cross-process ``project_reset`` notify
+    clears the companion's ``cached_result_expr`` memo too. Hygiene rather than
+    correctness — ``cached_result_expr`` self-heals on every read — but both reset
+    paths share one invalidation helper, so the notify path clears it alongside
+    the compare-expr LRU (#80).
+    """
+    from fastapi.testclient import TestClient
+
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+
+    cached_result_expr(project, agg_h).execute()  # warm the memo
+    assert cached_result_expr.cache_info().currsize >= 1
+
+    c = TestClient(fresh_companion_app)
+    r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
+    assert r.status_code == 200, r.text
+    assert cached_result_expr.cache_info().currsize == 0

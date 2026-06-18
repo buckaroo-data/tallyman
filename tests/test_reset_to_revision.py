@@ -643,3 +643,46 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
 # zip-at-checkpoint durability is covered by
 # test_native_catalog_store.py::test_zip_staged_not_committed_until_checkpoint
 # and test_n_builds_track_n_zips.
+
+
+def test_reset_prune_self_heals_warmed_expensive_entry(project, orders_parquet, monkeypatch):
+    """A warmed expensive entry whose snapshot a prune retires must self-heal, not
+    dangle on the stale memoised ``deferred_read_parquet``.
+
+    Complementary coverage for ``cached_result_expr``'s self-heal arm — NOT the #80
+    fix. ``prune_compute_cache`` (the function ``reset_to`` invokes) retires the
+    snapshot; before the plan-resolver split ``cached_result_expr`` memoised the
+    snapshot existence check, so a *warmed* entry kept returning
+    ``deferred_read_parquet(<pruned path>)`` and the next execute raised
+    ``ValueError: At least one path is required``. ``ee0a90a`` moved that check to
+    run on every call, so the entry now recomputes its snapshot and serves the
+    right rows without any ``cache_clear``. That self-heal covers
+    ``cached_result_expr`` only; the non-self-healing ``_build_compare_expr`` LRU
+    (which bakes the snapshot path into a serialized build with no recheck) is the
+    real #80/#96 gap, closed by PR #124's reset-time cache invalidation.
+    """
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = (
+        "from tallyman_xorq.io import from_project\n"
+        f"t = from_project('orders.parquet', project={project!r})\n"
+        "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
+    )
+    h = build_and_persist(project, code).content_hash
+
+    # Warm the LRU exactly as a view / from_catalog read does.
+    expected = len(cached_result_expr(project, h).execute())
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+
+    # Record a target warm-set that EXCLUDES this entry's snapshot (a step recorded
+    # before the snapshot warmed), then prune to it — the exact path reset_to drives.
+    cs.write_tallyman_state(project, compute_cache=[])
+    assert cs.prune_compute_cache(project) >= 1
+    assert not snap.exists()  # retired to the bullpen
+
+    # Re-read the SAME warmed entry WITHOUT cache_clear: self-heals, never dangles.
+    df = cached_result_expr(project, h).execute()
+    assert len(df) == expected
+    assert snap.exists()  # the snapshot was recomputed in place

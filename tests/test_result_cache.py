@@ -699,7 +699,61 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkey
         df = cached_result_expr(project, h).execute()  # self-heals, must not raise
     assert len(df) > 0
     msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
-    assert any("UNFAITHFUL" in m and h in m for m in msgs), msgs
+    # Source drift keeps the recipe graph fixed (same expr.py, same read), so the
+    # drift is attributed to the execution axis (#83), not the structural one (#88).
+    assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
+
+
+def test_self_heal_warning_degrades_to_execution_when_classify_build_raises(
+    project, orders_parquet, monkeypatch, caplog
+):
+    # #88 part 2, best-effort contract: the structural-vs-execution attribution must
+    # never break the read. recipe_is_structurally_nondeterministic reads the build's
+    # serialized ops via classify_build (Path.glob + read_text); on a missing or
+    # unreadable build dir that raises, and the call sits inside the self-heal block
+    # OUTSIDE its surrounding try/except, so an unguarded raise propagates out of
+    # cached_result_expr and kills the read it was only meant to annotate. The
+    # predicate must swallow that and degrade to False (not-structural), so the drift
+    # is still labeled execution (#83) and the read still succeeds.
+    import logging
+
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))  # expensive → baked snapshot
+    h = _hash_of(project)
+
+    # Warm the plan memo with a working classify_build FIRST: _resolve_result_plan
+    # calls cache_worthy → classify_build too, so memoising the plan here means the
+    # self-heal read below skips that call and the only classify_build left on the
+    # path is the predicate's at line 360 — the one statement under test.
+    cached_result_expr.cache_clear()
+    cached_result_expr(project, h).execute()
+
+    # Drift the source and evict the snapshot so the next read self-heals to bytes
+    # that differ from the recorded digest, firing the faithfulness warning.
+    _overwrite_orders(project, seed=1)
+    p = baked_snapshot_path(project, h)
+    assert p is not None and p.exists()
+    p.unlink()
+
+    # Now make the predicate's classify_build raise. The plan stays memoised (no
+    # cache_clear), so cache_worthy is not re-invoked; only recipe_is_structurally_
+    # nondeterministic hits this on the self-heal warning path.
+    def _raise(*_a, **_k):
+        raise OSError("build_dir inaccessible")
+
+    monkeypatch.setattr("tallyman_xorq.result_cache.classify_build", _raise)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
+        df = cached_result_expr(project, h).execute()  # must NOT raise despite the fault
+    assert len(df) > 0
+    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+    # Degraded to not-structural → execution axis, never a false structural claim.
+    assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
+    assert not any("structural (#88)" in m for m in msgs), msgs
 
 
 def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
@@ -1226,3 +1280,118 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
     r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
     assert r.status_code == 200, r.text
     assert cached_result_expr.cache_info().currsize == 0
+
+
+def test_result_digest_is_framing_independent_and_order_sensitive(project, orders_parquet, monkeypatch):
+    # #83: the digest hashes row tuples in order, not the arrow IPC framing, so two
+    # reads that batch differently agree — but it IS sensitive to row order, because
+    # an unordered query that reshuffles produces different materialised bytes, which
+    # is real drift, not a false positive.
+    from tallyman_xorq.result_cache import _digest_init, _digest_update, cached_result_expr, result_digest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+
+    expr = cached_result_expr(project, h)
+    base = result_digest(expr)
+
+    # Framing independence: digest the SAME rows re-batched at two different chunk
+    # sizes and assert equality — the digest must hash row tuples, not IPC framing.
+    tbl = expr.to_pyarrow()
+
+    def _digest_at(chunk):
+        hh = _digest_init(expr.schema())
+        for b in tbl.to_batches(max_chunksize=chunk):
+            _digest_update(hh, b)
+        return hh.hexdigest()
+
+    assert _digest_at(7) == _digest_at(50) == base
+
+    # Order sensitivity: reversing the row order changes the digest (real drift —
+    # an unordered reshuffle materialises different bytes, not a false positive).
+    first_col = list(expr.schema().names)[0]
+    reordered = expr.order_by([expr[first_col].desc()])
+    assert result_digest(reordered) != base
+
+
+def _literal_nondeterministic_code(project: str) -> str:
+    # A Python-level nondeterministic literal (random.random()) baked at author
+    # time: re-importing expr.py re-evaluates it, so the reconstructed graph — and
+    # its content_hash — moves each time. NOT an ibis op, so the build-time op lint
+    # (#88 part 1) can't see it; the structural runtime detector (#88 part 2) must.
+    return (
+        "import random\n"
+        "from tallyman_xorq.io import from_project\n"
+        f"t = from_project('orders.parquet', project={project!r})\n"
+        "expr = t.group_by('region').aggregate(total=t.price.sum()).mutate(nonce=random.random())\n"
+    )
+
+
+def test_structural_nondeterminism_detected_for_baked_literal(project, orders_parquet, monkeypatch):
+    # #88 part 2: the structural case the op lint is blind to. Two reconstructions of
+    # a recipe that bakes a random literal at author time hash differently, so the
+    # entry's structural content_hash is itself unstable — distinct from an
+    # execution-nondeterministic recipe whose graph is fixed.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("nd", _literal_nondeterministic_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is True
+
+
+def test_deterministic_recipe_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+    # #88 part 2: a deterministic recipe reconstructs to the same graph hash both
+    # times, so the structural detector does not false-positive on a clean entry —
+    # its drift, if any, is execution-level (#83), not structural.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is False
+
+
+def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+    # #88 part 2: a deterministic UDF recipe must NOT be flagged structural. xorq's
+    # make_pandas_udf mints a fresh class per reconstruction (see
+    # test_scalar_udf_is_worthy_in_lockstep_with_classify_build), so two reconstructions
+    # of even a pure UDF recipe hash differently — graph-hash instability from the
+    # class mint, NOT an author-time baked literal. Attributing that as structural is
+    # wrong: impure-UDF nondeterminism is execution-level (#83). The detector must
+    # exclude UDF entries so a UDF self-heal drift is labeled execution, not structural.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("udf", _scalar_udf_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is False
+
+
+def test_self_heal_warning_labels_structural_for_baked_literal(project, orders_parquet, monkeypatch, caplog):
+    # #88 part 2, end to end: an entry that bakes a random literal reconstructs to a
+    # graph whose snapshot key differs from the build-time one, so its very first cold
+    # read self-heals to bytes that differ from the recorded digest. The faithfulness
+    # warning must fire AND attribute the drift to the structural axis (#88), not
+    # execution — the literal genuinely moves the graph hash between imports.
+    import logging
+
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("nd", _literal_nondeterministic_code(project))  # expensive (Aggregate) → baked
+    h = _hash_of(project)
+    cached_result_expr.cache_clear()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
+        df = cached_result_expr(project, h).execute()  # reconstructs a new graph → self-heals
+    assert len(df) > 0
+    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+    assert any("UNFAITHFUL" in m and h in m and "structural (#88)" in m for m in msgs), msgs

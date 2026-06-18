@@ -149,6 +149,20 @@ export interface ResultCache {
   total_formatted: string;
 }
 
+export interface CustomizationItem {
+  name: string;
+  path: string;
+  source: string;
+  disabled: boolean;
+}
+
+export interface Customizations {
+  project: string;
+  summary_stats: CustomizationItem[];
+  display_klasses: CustomizationItem[];
+  post_processings: CustomizationItem[];
+}
+
 export interface Projects {
   active: string | null;
   available: string[];

@@ -5,6 +5,7 @@ import type {
   NotebookFull,
   DiffData,
   ResultCache,
+  Customizations,
   Projects,
 } from "./types";
 
@@ -125,6 +126,9 @@ export const api = {
 
   resultCache: (project: string): Promise<ResultCache> =>
     get(`/${project}/api/result_cache`),
+
+  customizations: (project: string): Promise<Customizations> =>
+    get(`/${project}/api/customizations`),
 
   deleteResultCache: (project: string, hash: string): Promise<{ ok: boolean; hash: string }> =>
     fetch(`/${project}/api/result_cache/${hash}`, { method: "DELETE" }).then((r) => {

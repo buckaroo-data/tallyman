@@ -80,6 +80,7 @@ export function Header() {
           <Link to={`/${project}/catalog`}>catalog</Link>
           <Link to={`/${project}/notebook`}>notebook</Link>
           <Link to={`/${project}/cache`}>cache</Link>
+          <Link to={`/${project}/customizations`}>customizations</Link>
           <Link to="/projects">projects</Link>
         </nav>
       )}

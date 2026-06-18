@@ -66,6 +66,12 @@ def _is_worthy_expr(expr) -> bool:
     the serialized build) on the *live* expression, so the bake decision below
     and the read-time worthiness check stay in lockstep: an Aggregate / Join /
     Sort / window / UDF anywhere in the graph makes the result worth caching.
+
+    UDFs are matched by ancestry, not leaf name. A ``make_pandas_udf`` node is
+    classed after the user's function (e.g. ``plusone``), so its live leaf name
+    carries no "UDF" — but its MRO holds the base op name (``ScalarUDF`` /
+    ``AggUDF`` / …) that the serialized YAML emits and ``classify_build`` greps.
+    Testing the leaf name only missed scalar UDFs and broke the lockstep (#81).
     """
     from xorq.common.utils.graph_utils import walk_nodes
     from xorq.vendor.ibis.expr.operations.core import Node
@@ -73,8 +79,9 @@ def _is_worthy_expr(expr) -> bool:
     from tallyman_xorq.result_cache import _EXPENSIVE_OPS
 
     for node in walk_nodes((Node,), expr):
-        name = type(node).__name__
-        if name in _EXPENSIVE_OPS or "UDF" in name:
+        if type(node).__name__ in _EXPENSIVE_OPS:
+            return True
+        if any("UDF" in base.__name__ for base in type(node).__mro__):
             return True
     return False
 

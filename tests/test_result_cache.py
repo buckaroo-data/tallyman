@@ -74,6 +74,25 @@ expr = a.join(b, "region", how="left")
 """
 
 
+def _scalar_udf_code(project: str) -> str:  # scalar UDF only (no Aggregate/Join/Sort) → worthy via UDF (#81)
+    return f"""
+from tallyman_xorq.io import from_project
+from xorq.expr.udf import make_pandas_udf
+import xorq.vendor.ibis.expr.datatypes as dt
+from xorq.vendor.ibis import schema as ibis_schema
+
+t = from_project("orders.parquet", project={project!r})
+
+
+def plusone(df):
+    return df["qty"] + 1
+
+
+_udf = make_pandas_udf(plusone, ibis_schema({{"qty": dt.int64}}), dt.int64, name="plusone")
+expr = t.mutate(qty_plus=_udf.on_expr(t))
+"""
+
+
 def _call_under_tight_recursion_guard(fn, *args):
     """Run *fn* with the recursion limit pinned just above the current depth.
 
@@ -160,6 +179,60 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     # Reading executes against the baked snapshot; no per-entry result.parquet.
     assert len(ce.execute()) > 0
     assert not (entry_dir(project, h) / "result.parquet").exists()
+
+
+def test_scalar_udf_is_worthy_in_lockstep_with_classify_build(project, orders_parquet, monkeypatch):
+    # #81: a scalar UDF used without any accompanying expensive op must be judged
+    # worthy by BOTH predicates. classify_build greps the serialized YAML (where the
+    # node is `op: ScalarUDF`) and has always returned worthy=True; _is_worthy_expr
+    # walked the live graph testing `"UDF" in type(node).__name__`, but a
+    # make_pandas_udf node is classed after the user function (here `plusone`), so
+    # the substring missed the ScalarUDF base and the live predicate returned False —
+    # the two "change one, change both" predicates fell out of lockstep. They must agree.
+    from tallyman_xorq.result_cache import _recipe_expr
+    from tallyman_xorq.source_cache import _is_worthy_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("udf", _scalar_udf_code(project))
+    h = _hash_of(project)
+    assert "udf:ScalarUDF" in classify_build(entry_dir(project, h) / "xorq_build")["why"]
+    assert cache_worthy(project, h) is True
+    assert _is_worthy_expr(_recipe_expr(project, h)) is True
+
+
+def test_scalar_udf_only_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
+    # #81 net effect: because _is_worthy_expr returned False for a scalar-UDF-only
+    # expression, rewrite_for_build baked no top-level result cache, so every viewer
+    # / diff / from_catalog read recomputed the UDF over the whole DAG (the
+    # worthy-recompute-fallback kept results correct but uncached — a silent perf
+    # regression). With the live predicate fixed, the entry bakes a CachedNode like
+    # any other expensive entry and cached_result_expr dereferences a materialised
+    # single-backend snapshot. Mirrors test_expensive_entry_bakes_result_cache.
+    #
+    # NB: xorq's make_pandas_udf mints a fresh class per reconstruction, so the
+    # snapshot's structural key drifts across processes — the build-time bake is not
+    # reused cross-process and a cold read self-heals its own snapshot. That deeper
+    # key-stability gap is tracked separately; here we assert the lockstep fix and
+    # that a read dereferences a materialised snapshot.
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq.build import load_entry
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("udf", _scalar_udf_code(project))
+    h = _hash_of(project)
+
+    # The build bakes a top-level CachedNode (pre-fix the top op was a bare Project).
+    assert type(load_entry(project, h).op()).__name__ == "CachedNode"
+
+    # cached_result_expr dereferences a single-backend snapshot, self-healing it on
+    # this cold read; afterward a baked result_cache parquet exists on disk.
+    ce = cached_result_expr(project, h)
+    assert type(ce.op()).__name__ == "Read"
+    assert len(ce._find_backends()[0]) == 1
+    assert "qty_plus" in ce.columns
+    assert len(ce.execute()) > 0
+    assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
 
 
 def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parquet, monkeypatch):

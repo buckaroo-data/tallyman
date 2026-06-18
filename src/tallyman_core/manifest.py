@@ -48,6 +48,13 @@ class Manifest(BaseModel):
     cache_worthy: bool | None = None
     cache_worthy_why: str | None = None
     cache_bytes: int | None = None
+    # Order-sensitive content digest of the executed result bytes (#83), recorded
+    # at build as a second identity axis: content_hash keys on the expression
+    # *graph*, result_digest on the executed *bytes*. A cold recompute whose digest
+    # differs is execution nondeterminism (sample()/now()/unordered limit/impure
+    # UDF) the structural hash can't see — caught when a self-healed snapshot is
+    # re-checked. Absent on entries built before #83.
+    result_digest: str | None = None
     # rel data path -> content md5, recorded when a source-identity mode is
     # active (tallyman_xorq.source_identity); absent under mode=off.
     sources: dict[str, str] | None = None

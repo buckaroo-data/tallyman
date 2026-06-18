@@ -238,10 +238,7 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
       {tab === "code" && (
         <div className="tab-panel metadata-section" role="tabpanel">
           <h3>
-            code{" "}
-            <Link to={`/${project}/lineage/${manifest.content_hash}`} className="meta">
-              view internal lineage
-            </Link>
+            code
             {alias && (
               <button
                 type="button"

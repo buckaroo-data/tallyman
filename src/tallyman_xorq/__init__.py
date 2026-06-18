@@ -3,7 +3,6 @@ from tallyman_xorq.build import (
     BuildResult,
     build_and_persist,
     list_entries,
-    load_entry,
     read_prompts,
 )
 from tallyman_xorq.diff import (
@@ -21,23 +20,13 @@ from tallyman_xorq.diff import (
     stats_diff_xorq,
 )
 from tallyman_xorq.io import ProjectDataNotFound, from_catalog, from_project, project_path
-from tallyman_xorq.lineage import (
-    catalog_dag,
-    catalog_parents,
-    column_lineage,
-    read_data_sources,
-    read_internal_lineage,
-)
 
 __all__ = [
     "BuildError",
     "BuildResult",
     "ProjectDataNotFound",
     "build_and_persist",
-    "catalog_dag",
-    "catalog_parents",
     "code_diff",
-    "column_lineage",
     "from_catalog",
     "from_project",
     "full_diff",
@@ -48,10 +37,7 @@ __all__ = [
     "key_diff_polars",
     "key_diff_xorq",
     "list_entries",
-    "load_entry",
     "project_path",
-    "read_data_sources",
-    "read_internal_lineage",
     "read_prompts",
     "schema_diff",
     "stats_diff",

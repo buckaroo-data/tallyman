@@ -3,8 +3,6 @@ import type {
   AppError,
   EntryDetail,
   NotebookFull,
-  CatalogDagLayout,
-  LineageLayout,
   DiffData,
   ResultCache,
   Projects,
@@ -101,12 +99,6 @@ export const api = {
         return r.text().then((t) => Promise.reject(new Error(t)));
       return r.json() as Promise<{ hash: string; alias: string; version: number; row_count: number }>;
     }),
-
-  catalogDagLayout: (project: string): Promise<CatalogDagLayout> =>
-    get(`/${project}/api/catalog_dag_layout`),
-
-  lineageLayout: (project: string, hash: string): Promise<LineageLayout> =>
-    get(`/${project}/api/lineage_layout/${hash}`),
 
   diffData: (project: string, alias: string, va: number, vb: number): Promise<DiffData> =>
     get(`/${project}/api/diff_data/${alias}/${va}/${vb}`),

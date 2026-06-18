@@ -442,10 +442,10 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
     (``cached_result_expr``): a cheap entry recomputes from source, an expensive
     one reads its baked snapshot, and an entry that ``from_catalog``s an
     expensive parent self-heals an evicted parent snapshot by re-running the
-    recipe. ``load_entry`` (replaying the serialized build) can't do that last
-    case — its *bare* read of the parent's snapshot dangles on a cold compute
-    cache ("At least one path is required") — so it is not the path a reader
-    (post-processing / promote-diff / viewer via ``cached_result_expr``) takes.
+    recipe. Replaying the serialized build verbatim can't do that last case — its
+    *bare* read of the parent's snapshot dangles on a cold compute cache ("At
+    least one path is required") — which is why every reader (post-processing /
+    promote-diff / viewer) resolves through ``cached_result_expr`` instead (#76).
     Cold = first reconstruct + self-heal + execute; warm = re-execute against the
     warmed snapshot (reconstruction is memoised).
     """

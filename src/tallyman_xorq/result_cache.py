@@ -36,6 +36,7 @@ import functools
 import logging
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -381,6 +382,24 @@ def _resolve_result_plan(project: str, content_hash: str):
     return ("baked", baked, path)
 
 
+# Per-(project, content_hash) locks serialise the snapshot heal in cached_result_expr
+# so two concurrent cold reads of the same entry don't both execute the shared baked op
+# (#79). Keyed locks under a master lock; the registry grows with distinct entries read
+# (bounded by catalog size) and stale locks are harmless.
+_HEAL_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_HEAL_LOCKS_GUARD = threading.Lock()
+
+
+def _heal_lock(project: str, content_hash: str) -> threading.Lock:
+    key = (project, content_hash)
+    with _HEAL_LOCKS_GUARD:
+        lock = _HEAL_LOCKS.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _HEAL_LOCKS[key] = lock
+        return lock
+
+
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as a single-backend expression on the default backend.
 
@@ -430,12 +449,27 @@ def cached_result_expr(project: str, content_hash: str):
         return plan[1]
     _, baked, path = plan
     if not path.exists():
-        baked.count().execute()  # evicted snapshot: repopulate once, then read
-        perf_log.debug("cached_result_expr self-heal %s: evicted-self-heal", content_hash)
-        # The repopulated snapshot must match the digest recorded at build; a
-        # mismatch means this entry's recompute is execution-nondeterministic and
-        # eviction just served different bytes than were built (#83).
-        _warn_if_self_heal_unfaithful(project, content_hash, path)
+        # Single-flight the heal per (project, content_hash). _resolve_result_plan is
+        # lru-cached, so concurrent cold readers share one `baked` op; without this lock
+        # both miss the evicted snapshot and both execute it, and the loser raises —
+        # DataFusion "Already borrowed" on the shared in-process op, or FileNotFoundError
+        # on xorq ParquetStorage's fixed <key>.parquet.tmp across processes — surfacing
+        # as a 500 from api_data and, swallowed by ensure_session, an empty grid (#79).
+        with _heal_lock(project, content_hash):
+            if not path.exists():  # a peer thread may have healed it while we waited
+                try:
+                    baked.count().execute()  # evicted snapshot: repopulate once, then read
+                except (FileNotFoundError, ValueError):
+                    # A peer *process* (MCP build vs companion heal sharing compute_cache)
+                    # can win the shared-tmp rename out from under us. If the snapshot
+                    # landed, read it; otherwise the failure is real, so re-raise.
+                    if not path.exists():
+                        raise
+                perf_log.debug("cached_result_expr self-heal %s: evicted-self-heal", content_hash)
+                # The repopulated snapshot must match the digest recorded at build; a
+                # mismatch means this entry's recompute is execution-nondeterministic and
+                # eviction just served different bytes than were built (#83).
+                _warn_if_self_heal_unfaithful(project, content_hash, path)
     return deferred_read_parquet(str(path))
 
 

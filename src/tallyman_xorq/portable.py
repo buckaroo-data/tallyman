@@ -25,8 +25,6 @@ import shutil
 import threading
 from pathlib import Path
 
-from tallyman_core.paths import ENTRY_EXPANDED_BUILD_DIRNAME
-
 PLACEHOLDER = "${TALLYMAN_PROJECT_ROOT}"
 
 # Per-expanded-path locks so two concurrent loads of the same entry don't race
@@ -101,9 +99,8 @@ def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -
     concurrent expansions of the same entry within one process, but two
     separate processes expanding the same entry could still have one `rmtree`
     the partial dir while the other reads it. That is safe for tallyman's
-    single-process runtime; a cross-process load (CLI `load_entry` alongside
-    the companion serving the viewer) would need an `O_CREAT|O_EXCL` lockfile
-    here instead.
+    single-process runtime; a cross-process expansion (a second process serving
+    the viewer) would need an `O_CREAT|O_EXCL` lockfile here instead.
     """
     marker = expanded.with_name(expanded.name + ".complete")
     if marker.exists():
@@ -118,16 +115,3 @@ def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -
         expand_into_dir(build_dir, project_root, expanded)
         marker.write_text("")
     return expanded
-
-
-def load_expr_portable(build_dir: Path, project_root: Path, cache_dir):
-    """Wrap xorq.load_expr so it sees absolute paths even when the persisted build is portable.
-
-    Expands into a stable `.xorq_build_expanded` dir beside the entry (never a
-    throwaway tmp dir) — the returned expression is lazy and may read its source
-    from there long after this returns. See `ensure_expanded_build`.
-    """
-    from xorq.ibis_yaml.compiler import load_expr
-
-    expanded = ensure_expanded_build(build_dir, project_root, build_dir.parent / ENTRY_EXPANDED_BUILD_DIRNAME)
-    return load_expr(expanded, cache_dir=cache_dir)

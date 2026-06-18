@@ -268,8 +268,6 @@ def test_read_endpoints_reject_malformed_content_hash(fresh_companion_app, proje
     for path in [
         f"/{project}/api/data/NOPE",
         f"/{project}/api/entry/Deadbeef",  # uppercase: not lowercase hex
-        f"/{project}/api/lineage/not-a-hash",
-        f"/{project}/api/lineage_layout/not-a-hash",
     ]:
         assert c.get(path).status_code == 400, path
 

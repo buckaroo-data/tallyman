@@ -437,10 +437,10 @@ def child_exec(content_hash: str, out_path: str) -> None:
 
     sampler = RssSampler(psutil.Process(), interval=0.025)
 
-    from tallyman_xorq.build import load_entry
+    from tallyman_xorq.result_cache import cached_result_expr
 
     t0 = time.monotonic()
-    expr = load_entry(PROJECT, content_hash)
+    expr = cached_result_expr(PROJECT, content_hash)
     load_s = time.monotonic() - t0
     t0 = time.monotonic()
     expr.to_parquet(out_path)
@@ -958,7 +958,7 @@ def render_report(results: dict) -> str:
             )
     L.append("")
 
-    L.append("## xorq execution (fresh process; load_entry -> to_parquet)")
+    L.append("## xorq execution (fresh process; cached_result_expr -> to_parquet)")
     L.append("")
     L.append(
         "Good: union peak RSS tracks a bounded working set, not input+output; "

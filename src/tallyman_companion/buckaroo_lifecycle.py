@@ -542,8 +542,7 @@ class BuckarooManager:
             # identical across server restarts — xorq embeds the build_dir path
             # in the expression hash used by ParquetSnapshotCache, so a random
             # tmp path makes every stat-cache lookup a miss even when the cache
-            # is fully populated on disk. Marker-gated for crash safety. Shared
-            # with load_entry's diff path so the two can't drift.
+            # is fully populated on disk. Marker-gated for crash safety.
             from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
 
             expanded = ensure_expanded_build(

@@ -98,21 +98,36 @@ def alias_for_hash(project: str, content_hash: str) -> str | None:
     return None
 
 
-def version_of_hash(project: str, content_hash: str) -> tuple[str, int] | None:
-    """If `content_hash` appears in any alias history, return (alias, 1-based version)."""
+def version_of_hash(project: str, content_hash: str, alias: str | None = None) -> tuple[str, int] | None:
+    """If `content_hash` appears in an alias history, return (alias, 1-based version).
+
+    When `alias` is given and that alias's history contains `content_hash`,
+    resolution is scoped to that lineage. Otherwise (no hint, or the hint's
+    history does not contain the hash) it falls back to a dict-order scan and
+    returns the first alias whose history contains the hash. The fallback keeps
+    every existing caller unchanged; the hint only matters when a hash is shared
+    across more than one alias history (#85).
+    """
     hist = load_history(project)
+    if alias is not None and content_hash in hist.get(alias, []):
+        return alias, hist[alias].index(content_hash) + 1
     for name, hashes in hist.items():
         if content_hash in hashes:
             return name, hashes.index(content_hash) + 1
     return None
 
 
-def previous_version(project: str, content_hash: str) -> str | None:
+def previous_version(project: str, content_hash: str, alias: str | None = None) -> str | None:
     """The hash one revision earlier in this entry's alias history, or None.
 
     None when the entry is a lineage root (version 1) or appears in no history.
+    When `alias` is given, resolution is scoped to that alias's lineage so a hash
+    shared across more than one alias steps back through the *requested* lineage
+    rather than whichever alias sorts first (#85). The hint disambiguates only
+    the step being resolved; a multi-hop walk past a parent that has left the
+    hinted alias's history falls back to dict order for that hop.
     """
-    info = version_of_hash(project, content_hash)
+    info = version_of_hash(project, content_hash, alias=alias)
     if not info:
         return None
     name, version = info

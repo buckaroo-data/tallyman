@@ -125,11 +125,17 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
     so we recover the build-time binding by walking back through alias history to
     the nearest revision not already under reconstruction on this stack.
     """
-    from tallyman_core.aliases import previous_version
+    from tallyman_core.aliases import get_alias, previous_version
 
+    # `requested` is from_catalog's argument: an alias to follow, or a literal
+    # hash pin. Treat it as a lineage hint only when it names an alias, so a hash
+    # shared across histories steps back through the alias the caller asked for
+    # rather than whichever sorts first (#85). A hash pin has no lineage to
+    # follow, so it stays None and resolution keeps the dict-order fallback.
+    alias_hint = requested if get_alias(project, requested) is not None else None
     active = _RECONSTRUCTING.get()
     while (project, content_hash) in active:
-        parent = previous_version(project, content_hash)
+        parent = previous_version(project, content_hash, alias=alias_hint)
         if parent is None:
             from tallyman_xorq.build import BuildError
 

@@ -17,6 +17,7 @@ from tallyman_core import (
     set_alias,
     version_of_hash,
 )
+from tallyman_core.aliases import previous_version  # not re-exported from tallyman_core
 from tallyman_mcp.server import (
     catalog_alias,
     catalog_create,
@@ -91,6 +92,46 @@ def test_version_of_hash_returns_one_based(project: str):
     assert version_of_hash(project, "h1") == ("x", 1)
     assert version_of_hash(project, "h2") == ("x", 2)
     assert version_of_hash(project, "missing") is None
+
+
+def test_previous_version_walks_requested_alias_not_dict_order(project: str):
+    # The same hash "hS" lands in two alias histories at a different prior
+    # revision in each. "alpha" sorts before "zeta", and _write persists the
+    # aliases alphabetically, so an unscoped lookup always resolves through
+    # "alpha" — even when the caller asked about "zeta" (#85).
+    #   alpha: [a0, hS]      -> previous(hS) == a0
+    #   zeta:  [z0, z1, hS]  -> previous(hS) == z1
+    set_alias(project, "alpha", "a0")
+    set_alias(project, "alpha", "hS")
+    set_alias(project, "zeta", "z0")
+    set_alias(project, "zeta", "z1")
+    set_alias(project, "zeta", "hS")
+
+    # Unscoped: documents the dict-order fallback the issue describes.
+    assert version_of_hash(project, "hS") == ("alpha", 2)
+    assert previous_version(project, "hS") == "a0"
+
+    # Scoped to the requested alias, resolution follows that lineage (#85 fix).
+    assert version_of_hash(project, "hS", alias="zeta") == ("zeta", 3)
+    assert previous_version(project, "hS", alias="zeta") == "z1"
+    # And the hint disambiguates the alpha lineage just as explicitly.
+    assert previous_version(project, "hS", alias="alpha") == "a0"
+
+
+def test_previous_version_stale_alias_hint_falls_back_to_dict_order(project: str):
+    # A hint whose history does not contain the hash must degrade to the
+    # dict-order scan, never error — the multi-hop reconstruction walk relies
+    # on this once a parent has left the hinted alias's history (#85).
+    set_alias(project, "alpha", "a0")
+    set_alias(project, "alpha", "hS")
+    set_alias(project, "zeta", "z0")
+    set_alias(project, "zeta", "z1")
+    set_alias(project, "zeta", "hS")
+
+    # "nonexistent" names no alias: fall back to dict order (alpha) -> a0.
+    assert previous_version(project, "hS", alias="nonexistent") == "a0"
+    # "alpha" has no z1 in its history: fall back, resolving z1 through zeta.
+    assert previous_version(project, "z1", alias="alpha") == "z0"
 
 
 def test_rename_alias_preserves_history(project: str):

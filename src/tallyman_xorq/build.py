@@ -480,13 +480,20 @@ def build_and_persist(
             # broken entry that throws only on the first materialising read. Stream
             # the full result and discard it to force row-level evaluation at author
             # time (constant memory; the one pass also yields the exact row count).
+            from tallyman_xorq.result_cache import count_and_result_digest, result_digest  # noqa: PLC0415
+
             t0 = time.monotonic()
             try:
                 arrow_schema = loaded.schema().to_pyarrow()
                 if cache_worthy_v:
+                    # count() bakes the snapshot (the cache node forces full
+                    # materialisation); digest the baked result as the #83 axis.
                     row_count = int(loaded.count().execute())
+                    result_digest_v = result_digest(loaded)
                 else:
-                    row_count = sum(batch.num_rows for batch in loaded.to_pyarrow_batches())
+                    # One streaming pass forces row-level evaluation, counts, and
+                    # digests the executed bytes (#83) — no extra execution.
+                    row_count, result_digest_v = count_and_result_digest(loaded)
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
@@ -547,6 +554,7 @@ def build_and_persist(
             cache_worthy=cache_worthy_v,
             cache_worthy_why=cache_worthy_why,
             cache_bytes=cache_bytes,
+            result_digest=result_digest_v,
             sources=sources or None,
             parents=parents or None,
         )

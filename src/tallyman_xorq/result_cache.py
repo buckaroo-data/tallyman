@@ -235,6 +235,111 @@ def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
     return _cached_node_path(rewrite_for_build(_recipe_expr(project, content_hash), project))
 
 
+def result_digest(expr) -> str:
+    """Order-sensitive content digest of an expression's executed result (#83).
+
+    The second identity axis beyond ``content_hash``: the hash keys on the
+    expression *graph* (a ``SnapshotStrategy`` tokenization that can't see
+    execution), this keys on the executed *bytes*. Recorded at build and
+    re-checked when an evicted snapshot self-heals, so execution nondeterminism —
+    ``sample()`` / ``now()`` / an unordered ``limit`` / an impure UDF — that the
+    structural hash is blind to surfaces as a digest mismatch instead of silently
+    serving different bytes than were built.
+
+    Independent of arrow batch *framing* (it hashes row tuples in order, not the
+    IPC stream, so reading the baked snapshot and recomputing the recipe agree on
+    identical rows even if the two chunk differently) but sensitive to row
+    *order* — an unordered query that reshuffles is, correctly, drift, because its
+    materialised parquet bytes did change.
+    """
+    return count_and_result_digest(expr)[1]
+
+
+def _digest_init(schema):
+    import hashlib
+
+    h = hashlib.sha256()
+    h.update(repr(list(zip(schema.names, [str(t) for t in schema.types]))).encode())
+    return h
+
+
+def _digest_update(h, batch) -> int:
+    cols = [batch.column(i).to_pylist() for i in range(batch.num_columns)]
+    for row in zip(*cols):
+        h.update(repr(row).encode())
+    return batch.num_rows
+
+
+def count_and_result_digest(expr) -> tuple[int, str]:
+    """Stream the result once, returning ``(row_count, result_digest)``.
+
+    The build's cheap path already streams every row to force evaluation and
+    count; folding the digest into that one pass keeps the second identity axis
+    (#83) free of an extra execution. See ``result_digest`` for the hash's
+    framing-independence / order-sensitivity properties.
+    """
+    h = _digest_init(expr.schema())
+    n = 0
+    for batch in expr.to_pyarrow_batches():
+        n += _digest_update(h, batch)
+    return n, h.hexdigest()
+
+
+def _recorded_result_digest(project: str, content_hash: str) -> str | None:
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        return read_manifest(entry_dir(project, content_hash)).result_digest
+    except (OSError, ValueError):
+        return None
+
+
+def verify_result_faithful(project: str, content_hash: str) -> bool | None:
+    """Whether the entry's currently-served result matches its build-time digest.
+
+    Reconstructs the read expression (recompute for a cheap entry, the baked
+    snapshot for an expensive one) and digests it. Returns True when it matches
+    the recorded ``result_digest``, False on drift — the recipe is
+    execution-nondeterministic (#83) and is serving different bytes under the same
+    ``content_hash`` — and None when no digest was recorded (an entry built before
+    #83), i.e. the answer is unknown rather than faithful.
+    """
+    recorded = _recorded_result_digest(project, content_hash)
+    if not recorded:
+        return None
+    return result_digest(cached_result_expr(project, content_hash)) == recorded
+
+
+def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -> None:
+    """Compare a just-repopulated snapshot to the build-time digest, warn on drift.
+
+    Eviction's load-bearing assumption is that an evicted snapshot recomputes to
+    what was evicted (the result-cache + source-identity ADRs both call this out).
+    For an execution-nondeterministic entry that is false: the snapshot self-heals
+    to *different* bytes, silently. This fires the soundness signal — a
+    ``tallyman.perf`` warning — without ever breaking the read (best-effort).
+    """
+    recorded = _recorded_result_digest(project, content_hash)
+    if not recorded:
+        return
+    try:
+        from xorq.expr.api import deferred_read_parquet
+
+        actual = result_digest(deferred_read_parquet(str(path)))
+    except Exception:
+        return
+    if actual != recorded:
+        perf_log.warning(
+            "cached_result_expr self-heal %s: UNFAITHFUL recompute — result digest "
+            "%s != recorded %s; this entry is execution-nondeterministic (#83), so "
+            "eviction self-healed it to different bytes than were built",
+            content_hash,
+            actual,
+            recorded,
+        )
+
+
 @functools.lru_cache(maxsize=256)
 def _resolve_result_plan(project: str, content_hash: str):
     """The expensive, memoisable half of ``cached_result_expr``: reconstruct the
@@ -327,6 +432,10 @@ def cached_result_expr(project: str, content_hash: str):
     if not path.exists():
         baked.count().execute()  # evicted snapshot: repopulate once, then read
         perf_log.debug("cached_result_expr self-heal %s: evicted-self-heal", content_hash)
+        # The repopulated snapshot must match the digest recorded at build; a
+        # mismatch means this entry's recompute is execution-nondeterministic and
+        # eviction just served different bytes than were built (#83).
+        _warn_if_self_heal_unfaithful(project, content_hash, path)
     return deferred_read_parquet(str(path))
 
 

@@ -500,3 +500,70 @@ def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_par
     # Re-read the SAME entry: must self-heal, not dangle on the stale deferred read.
     df = cached_result_expr(project, agg_h).execute()
     assert len(df) == expected
+
+
+def test_concurrent_cold_heal_is_single_flighted(project, orders_parquet, monkeypatch):
+    """Concurrent cold reads of the same expensive entry must single-flight the
+    snapshot heal (#79).
+
+    ``cached_result_expr`` heals an evicted baked snapshot by executing the shared
+    (lru-memoised) ``baked`` op. Without a per-``(project, content_hash)`` guard, two
+    concurrent cold readers both run that materialisation: in-process they collide on
+    the shared op (DataFusion ``"Already borrowed"``); across processes they collide
+    on xorq ParquetStorage's fixed ``<key>.parquet.tmp`` (``FileNotFoundError`` on the
+    loser's rename). Either surfaces as a 500 from ``api_data`` and, swallowed by
+    ``ensure_session``, an empty grid. The heal must run once; the rest wait, re-check,
+    and read the materialised snapshot.
+
+    The returned expression is built but not executed inside the workers — this
+    isolates the *materialisation* race (what #79 is about) from concurrent
+    ``.execute()`` on the shared single DataFusion backend, which raises
+    ``"Already borrowed"`` for any concurrent read (warm or cold) and is a separate
+    backend-thread-safety concern.
+    """
+    import threading
+
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+
+    # Warm the plan so concurrent readers share the one baked op, and learn the result.
+    expected = len(cached_result_expr(project, agg_h).execute())
+
+    def run_round():
+        # Evict the snapshot, then fire two barrier-synced readers that each trigger the
+        # heal (building the expr, not executing it). Any raised exception is the
+        # materialisation race; the snapshot must end up materialised exactly once.
+        p = baked_snapshot_path(project, agg_h)
+        assert p is not None and p.exists()
+        p.unlink()
+
+        errors = []
+        barrier = threading.Barrier(2)
+
+        def worker():
+            barrier.wait()  # maximise overlap on the heal
+            try:
+                cached_result_expr(project, agg_h)  # triggers the heal; expr is not executed here
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        return errors, p
+
+    # A few rounds: the collision is deterministic (shared op + shared tmp), but rounds
+    # widen the window so a one-off scheduling fluke can't green a still-racy heal.
+    for _ in range(3):
+        errors, p = run_round()
+        assert not errors, f"concurrent cold heal raced: {errors!r}"
+        assert p.exists()  # materialised exactly once, intact
+
+    # The healed snapshot reads back correctly (executed sequentially — concurrent
+    # .execute() on the shared backend is out of scope for this materialisation test).
+    assert len(cached_result_expr(project, agg_h).execute()) == expected

@@ -229,6 +229,69 @@ def test_reset_prunes_compute_cache_to_warm_set(project):
     assert {p.name for p in cc.iterdir()} == {"baseline.parquet"}  # added pruned → cold
 
 
+def _from_project_code(project: str, rel: str) -> str:
+    return f"from tallyman_xorq.io import from_project\nexpr = from_project({rel!r}, project={project!r})\n"
+
+
+def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
+    # #86: under the cas default a from_project build clones its source into
+    # data/.cas/<digest>. That dir lives outside the catalog git repo, so the
+    # reset's `git reset --hard` can't roll it back — reset_to's _gc_cas_clones
+    # step reclaims clones no *surviving* entry references, keeping those a
+    # surviving entry still does. This guards the wiring (the gc_cas unit test
+    # only covers the leaf); the post-prune live set is what matters here.
+    import pandas as pd
+
+    from tallyman_core import data_dir
+
+    cs.ensure_catalog_repo(project)
+    cas = data_dir(project) / ".cas"
+
+    # Baseline: an entry over orders.parquet, so its clone is live at step s1.
+    build_and_persist(project, _from_project_code(project, "orders.parquet"))
+    s1 = cs.checkpoint_catalog(project, "baseline")
+    base_clones = {p.name for p in cas.iterdir()}
+    assert base_clones, "the cas-default build should have cloned orders.parquet into .cas"
+
+    # A second entry over a *different* source — its clone is only live after s1.
+    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
+    build_and_persist(project, _from_project_code(project, "extra.parquet"))
+    cs.checkpoint_catalog(project, "added later")
+    assert {p.name for p in cas.iterdir()} > base_clones  # extra's clone is present now
+
+    # Reset past step 2: the orphaned extra clone is reclaimed, the baseline kept.
+    cs.reset_to(project, s1)
+    assert {p.name for p in cas.iterdir()} == base_clones
+
+
+def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_parquet, monkeypatch):
+    # _gc_cas_clones is conservative: if any surviving entry's manifest can't be
+    # read it skips the whole sweep rather than delete a clone on partial info.
+    # An unreadable manifest must therefore leave every .cas clone in place.
+    import pandas as pd
+
+    from tallyman_core import data_dir
+
+    cs.ensure_catalog_repo(project)
+    cas = data_dir(project) / ".cas"
+
+    build_and_persist(project, _from_project_code(project, "orders.parquet"))
+    s1 = cs.checkpoint_catalog(project, "baseline")
+    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
+    build_and_persist(project, _from_project_code(project, "extra.parquet"))
+    cs.checkpoint_catalog(project, "added later")
+    before = {p.name for p in cas.iterdir()}
+
+    # _gc_cas_clones does a local `from tallyman_core.manifest import read_manifest`,
+    # so patch it at the source module, not on catalog_state.
+    def _boom(*_a, **_k):
+        raise OSError("boom")
+
+    monkeypatch.setattr("tallyman_core.manifest.read_manifest", _boom)
+    cs.reset_to(project, s1)  # must still succeed; GC skipped on the read failure
+    assert {p.name for p in cas.iterdir()} == before  # nothing reclaimed
+
+
 # ---------------------------------------------------------------------------
 # W5 — dispatch-boundary checkpoint hook (opt-out)
 # ---------------------------------------------------------------------------

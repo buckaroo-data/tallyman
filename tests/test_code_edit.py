@@ -54,6 +54,30 @@ def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parque
     assert history_for(project, "shoe_sales") == [v1_hash, body["hash"]]
 
 
+def test_put_code_carries_chart_and_display(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    """A code-edit revise (PUT /api/code) seeds the new version's per-entry
+    chart + display config from the previous one, same as catalog_revise."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core import get_chart, set_chart
+    from tallyman_core.display_configs import get_display_config, set_display_config
+
+    catalog_create("shoe_sales", _agg(project))
+    v1 = get_alias(project, "shoe_sales")
+    chart = {"mark": "bar", "encoding": {"x": {"field": "region"}, "y": {"field": "n"}}}
+    display = {"column_config_overrides": {"n": {"color_map_config": "BLUE_TO_RED"}}}
+    set_chart(project, v1, chart)
+    set_display_config(project, v1, display)
+
+    c = TestClient(fresh_companion_app)
+    r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _filter(project)})
+    assert r.status_code == 200, r.text
+    v2 = r.json()["hash"]
+    assert v2 != v1
+    assert get_chart(project, v2) == chart, "chart did not carry over via put_code"
+    assert get_display_config(project, v2) == display, "display config did not carry over via put_code"
+    assert set(r.json().get("carried_over", [])) == {"chart", "display_config"}
+
+
 def test_put_code_surfaces_nondeterminism_lint(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
     # An execution-nondeterministic recipe (now()) builds fine, but the PUT
     # /api/code reply must carry the advisory lint so the SPA can show it (#88).

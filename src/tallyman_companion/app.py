@@ -1134,12 +1134,14 @@ def create_app(
         project = _validate_project(project)
         if read_only:
             raise HTTPException(403, "serve mode")
+        from tallyman_core import carry_forward_entry_config  # noqa: PLC0415
         from tallyman_core import get_alias as _get_alias  # noqa: PLC0415
         from tallyman_core import set_alias as _set_alias  # noqa: PLC0415
         from tallyman_xorq import build_and_persist as _build_and_persist  # noqa: PLC0415
         from tallyman_xorq.build import BuildError  # noqa: PLC0415
 
-        if _get_alias(project, alias) is None:
+        prev_hash = _get_alias(project, alias)
+        if prev_hash is None:
             raise HTTPException(404, f"alias {alias!r} not found")
         code = payload.get("code", "")
         if not code.strip():
@@ -1153,6 +1155,9 @@ def create_app(
             await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
             raise HTTPException(400, str(exc))
         info = _set_alias(project, alias, res.content_hash, expect_exists=True)
+        # Chart + display config are keyed by content hash; seed the new version
+        # from the previous one so they follow the alias across revisions.
+        carried = carry_forward_entry_config(project, prev_hash, res.content_hash)
         await publish({"kind": "new_entry", "hash": res.content_hash, "alias": alias, "version": info["version"]})
         reply = {
             "hash": res.content_hash,
@@ -1160,6 +1165,8 @@ def create_app(
             "version": info["version"],
             "row_count": res.row_count,
         }
+        if carried:
+            reply["carried_over"] = carried
         # Surface the advisory nondeterminism lint, same as the MCP tool replies (#88).
         if res.lint_warnings:
             reply["lint_warnings"] = res.lint_warnings

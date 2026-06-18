@@ -20,7 +20,7 @@ dependencies = [
     # 3.14+ doesn't compose with xorq's under uv's lockfile resolver.
     "tornado>=6.0",
     "polars",
-    "buckaroo==0.15.0",
+    "buckaroo==0.15.1",
     "markdown>=3.10.2",
     "pygments>=2.20.0",
     # No duckdb extra: the only backend is xorq's built-in datafusion

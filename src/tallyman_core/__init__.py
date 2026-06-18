@@ -19,6 +19,7 @@ from tallyman_core.display_klasses import (
     remove_display_klass,
     write_display_klass,
 )
+from tallyman_core.entry_config import carry_forward_entry_config
 from tallyman_core.errors import clear_errors, get_error, list_errors, record_error
 from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
@@ -107,6 +108,7 @@ __all__ = [
     "entry_schema_path",
     "entry_stat_cache_dir",
     "entry_expanded_build_dir",
+    "carry_forward_entry_config",
     "ENTRY_ARTIFACT_NAMES",
     "ENTRY_CACHE_NAMES",
     "ENTRY_BUILD_DIRNAME",

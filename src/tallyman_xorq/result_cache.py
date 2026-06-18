@@ -381,7 +381,21 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
     execution-level (#83). Comparing two reconstructions to each other — not to the
     stored hash — keeps the predicate robust to any build-vs-reconstruct path skew.
     Best-effort: an unresolvable hash returns False (treated as not-structural).
+
+    UDF entries are excluded: xorq's ``make_pandas_udf`` mints a fresh class per
+    ``expr.py`` import, so even a *deterministic* UDF recipe reconstructs to a
+    different graph hash each time — graph-hash instability from the class mint,
+    not an author-time baked literal. The two-reconstruction discriminator can't
+    tell those apart, and an impure UDF's nondeterminism is execution-level anyway
+    (#83), so a UDF entry's drift is attributed execution, never structural.
     """
+    from tallyman_core.paths import entry_build_dir
+
+    # classify_build's why carries "udf:<names>" when the serialized build holds a
+    # UDF (the same detection cache_worthy uses, #81). Reuse it rather than re-walk.
+    if "udf:" in classify_build(entry_build_dir(project, content_hash))["why"]:
+        return False
+
     a = _reconstructed_hash(project, content_hash)
     b = _reconstructed_hash(project, content_hash)
     return a is not None and b is not None and a != b

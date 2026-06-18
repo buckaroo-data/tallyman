@@ -704,6 +704,58 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkey
     assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
 
 
+def test_self_heal_warning_degrades_to_execution_when_classify_build_raises(
+    project, orders_parquet, monkeypatch, caplog
+):
+    # #88 part 2, best-effort contract: the structural-vs-execution attribution must
+    # never break the read. recipe_is_structurally_nondeterministic reads the build's
+    # serialized ops via classify_build (Path.glob + read_text); on a missing or
+    # unreadable build dir that raises, and the call sits inside the self-heal block
+    # OUTSIDE its surrounding try/except, so an unguarded raise propagates out of
+    # cached_result_expr and kills the read it was only meant to annotate. The
+    # predicate must swallow that and degrade to False (not-structural), so the drift
+    # is still labeled execution (#83) and the read still succeeds.
+    import logging
+
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))  # expensive → baked snapshot
+    h = _hash_of(project)
+
+    # Warm the plan memo with a working classify_build FIRST: _resolve_result_plan
+    # calls cache_worthy → classify_build too, so memoising the plan here means the
+    # self-heal read below skips that call and the only classify_build left on the
+    # path is the predicate's at line 360 — the one statement under test.
+    cached_result_expr.cache_clear()
+    cached_result_expr(project, h).execute()
+
+    # Drift the source and evict the snapshot so the next read self-heals to bytes
+    # that differ from the recorded digest, firing the faithfulness warning.
+    _overwrite_orders(project, seed=1)
+    p = baked_snapshot_path(project, h)
+    assert p is not None and p.exists()
+    p.unlink()
+
+    # Now make the predicate's classify_build raise. The plan stays memoised (no
+    # cache_clear), so cache_worthy is not re-invoked; only recipe_is_structurally_
+    # nondeterministic hits this on the self-heal warning path.
+    def _raise(*_a, **_k):
+        raise OSError("build_dir inaccessible")
+
+    monkeypatch.setattr("tallyman_xorq.result_cache.classify_build", _raise)
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
+        df = cached_result_expr(project, h).execute()  # must NOT raise despite the fault
+    assert len(df) > 0
+    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+    # Degraded to not-structural → execution axis, never a false structural claim.
+    assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
+    assert not any("structural (#88)" in m for m in msgs), msgs
+
+
 def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
     """An expensive entry's baked snapshot evicted *after* a warm read must still
     self-heal on the next read, not dangle on a stale ``deferred_read_parquet``.

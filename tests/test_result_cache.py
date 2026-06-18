@@ -870,3 +870,192 @@ def test_cross_process_heal_reads_landed_snapshot_else_reraises(project, orders_
     with pytest.raises(FileNotFoundError):
         cached_result_expr(project, agg_h)
     assert not p.exists()
+
+
+# ---------------------------------------------------------------------------
+# #115: digest-pinned reconstruction — a cold read must serve the bytes the entry
+# was BUILT from (the frozen data/.cas/<digest> clone), not a re-digest of the
+# live source after it is edited in place. #86 made *build* identity content-aware
+# (a rebuild forks the hash) but left cold *reconstruction* re-running the recipe's
+# from_project over the live file. These pin the closure for both #74 hazards: a
+# cheap entry's cold read, and an expensive entry self-healing an evicted snapshot.
+# ---------------------------------------------------------------------------
+
+
+def _write_ints(path, values) -> None:
+    import pandas as pd
+
+    pd.DataFrame({"x": list(values)}).to_parquet(path)
+
+
+def _src_read_code(project: str, rel: str) -> str:  # cheap: a bare project read
+    return f"from tallyman_xorq.io import from_project\nexpr = from_project({rel!r}, project={project!r})\n"
+
+
+def _src_group_code(project: str, rel: str) -> str:  # expensive: group_by → Aggregate → baked snapshot
+    return (
+        "from tallyman_xorq.io import from_project\n"
+        f"t = from_project({rel!r}, project={project!r})\n"
+        "expr = t.group_by('x').aggregate(c=t.count())\n"
+    )
+
+
+def test_cas_cold_read_after_inplace_edit_serves_built_bytes(project, monkeypatch):
+    """#115: a cheap entry's cold read serves the rows it was built from, even after
+    the source is edited in place.
+
+    Pre-#115 the cold read re-imports the recipe and re-runs from_project, which under
+    cas re-digests the now-edited live file and clones it under a NEW digest — serving
+    the edited rows under the entry's ORIGINAL content_hash. Digest-pinned
+    reconstruction resolves to the frozen .cas clone the entry recorded instead.
+    """
+    from tallyman_core import data_dir
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")  # several sibling tests force off
+    assert si.mode() == "cas"
+
+    src = data_dir(project) / "src.parquet"
+    _write_ints(src, [0, 1, 2])
+    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
+
+    # Edit the source in place AFTER building. The 3→5 row edit changes the file
+    # size, so the stat-keyed digest memo invalidates without TALLYMAN_SOURCE_REHASH.
+    _write_ints(src, [0, 1, 2, 3, 4])
+    cached_result_expr.cache_clear()  # force a genuinely COLD read (re-import the recipe)
+
+    df = cached_result_expr(project, h).execute()
+    # Assert on VALUES, not just the count, so a fix that read some other 3-row file
+    # can't false-green: only the frozen clone holds exactly {0,1,2} now.
+    assert sorted(df["x"].tolist()) == [0, 1, 2]
+
+
+def test_cas_expensive_self_heal_after_edit_serves_built_bytes(project, monkeypatch, caplog):
+    """#115: an expensive entry self-healing an evicted snapshot recomputes from the
+    FROZEN source, not the edited live file.
+
+    The self-heal re-imports the recipe (cold _resolve_result_plan) and re-executes
+    the baked op; pre-#115 that recompute read the edited source, so the snapshot
+    self-healed to different bytes under the original content_hash — exactly the #83
+    UNFAITHFUL signal. Pinned reconstruction reads the frozen clone, so the heal is
+    faithful and the warning does not fire.
+    """
+    import logging
+
+    from tallyman_core import data_dir
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    assert si.mode() == "cas"
+
+    src = data_dir(project) / "src.parquet"
+    _write_ints(src, [0, 1, 2])
+    h = build_and_persist(project, _src_group_code(project, "src.parquet")).content_hash
+
+    # Capture the snapshot path BEFORE editing. Post-edit, baked_snapshot_path
+    # re-imports the recipe and (on current code) re-digests the edited source, so it
+    # returns a NEW, non-existent path — unlinking that would error in setup, not test
+    # the fix.
+    p = baked_snapshot_path(project, h)
+    assert p is not None and p.exists()
+
+    _write_ints(src, [0, 1, 2, 3, 4])  # edit the source in place
+    p.unlink()  # evict the baked snapshot → the next read must self-heal
+    cached_result_expr.cache_clear()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
+        df = cached_result_expr(project, h).execute()
+
+    # group_by('x') over the frozen {0,1,2} → 3 groups; the edited {0,1,2,3,4} would
+    # give 5. The self-heal must recompute from the frozen clone.
+    assert sorted(df["x"].tolist()) == [0, 1, 2]
+    assert p.exists()  # the heal rewrote the ORIGINAL-keyed snapshot, not a drifted one
+    # The #83 faithfulness check must NOT fire: the recompute matches the build digest
+    # because it read the frozen bytes (pre-fix it self-healed to edited bytes and
+    # logged UNFAITHFUL).
+    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+    assert not any("UNFAITHFUL" in m for m in msgs), msgs
+
+
+def test_cas_nested_chain_reconstruction_pins_each_entrys_sources(project, monkeypatch):
+    """#115: nested reconstruction restores the per-entry source map across the chain.
+
+    B unions from_catalog(A) with its own from_project(b). A cold read of B
+    reconstructs A — whose from_project must resolve to A's recorded a.parquet — then
+    reads B's own recorded b.parquet. The frozen-source contextvar is overwritten for
+    A's reconstruction and restored for B's remaining reads, so each from_project
+    pins ITS OWN built bytes even after both sources are edited in place.
+    """
+    from tallyman_core import data_dir
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    assert si.mode() == "cas"
+
+    srca = data_dir(project) / "a.parquet"
+    srcb = data_dir(project) / "b.parquet"
+    _write_ints(srca, [0, 1, 2])
+    _write_ints(srcb, [10, 11])
+
+    catalog_create("pa", _src_read_code(project, "a.parquet"))  # cheap parent over a.parquet
+    b_code = (
+        "from tallyman_xorq.io import from_project, from_catalog\n"
+        "a = from_catalog('pa')\n"
+        f"b = from_project('b.parquet', project={project!r})\n"
+        "expr = a.union(b)\n"
+    )
+    res = catalog_create("pb", b_code)
+    assert "error" not in res, res
+    b_h = _hash_of(project)
+
+    _write_ints(srca, [0, 1, 2, 3, 4])  # edit BOTH sources in place after building
+    _write_ints(srcb, [10, 11, 12])
+    cached_result_expr.cache_clear()
+
+    df = cached_result_expr(project, b_h).execute()
+    # Frozen a = {0,1,2} ∪ frozen b = {10,11}. A leaked contextvar would serve the
+    # edited {0,1,2,3,4} and/or {10,11,12}.
+    assert sorted(df["x"].tolist()) == [0, 1, 2, 10, 11]
+
+
+def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypatch):
+    """#115: building a child records the parent's FROZEN source digest, keeping the
+    parent's .cas clone alive for GC.
+
+    Building a child reconstructs the parent's recipe, re-running the parent's
+    from_project. That must record the parent's frozen digest (the bytes actually
+    read) into the child's manifest.sources — not a re-digest of the edited live file
+    — so gc_cas keeps the frozen clone the child's reconstruction depends on.
+    """
+    from tallyman_core import data_dir, entry_dir, read_manifest
+    from tallyman_xorq import source_identity as si
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    assert si.mode() == "cas"
+
+    src = data_dir(project) / "src.parquet"
+    _write_ints(src, [0, 1, 2])
+    catalog_create("pp", _src_read_code(project, "src.parquet"))
+    p_h = _hash_of(project)
+    p_digest = read_manifest(entry_dir(project, p_h)).sources["src.parquet"]
+
+    _write_ints(src, [0, 1, 2, 3, 4])  # edit in place, then build a child off the parent
+    cc_code = "from tallyman_xorq.io import from_catalog\nt = from_catalog('pp')\nexpr = t.mutate(y=t.x * 2)\n"
+    res = catalog_create("cc", cc_code)
+    assert "error" not in res, res
+    c_h = _hash_of(project)
+
+    child_sources = read_manifest(entry_dir(project, c_h)).sources or {}
+    assert child_sources.get("src.parquet") == p_digest
+    # Sanity: the frozen digest the child pinned is NOT the edited live digest.
+    assert si.digest_for(project, src) != p_digest

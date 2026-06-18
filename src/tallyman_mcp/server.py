@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import sys
+from dataclasses import asdict
 
 import httpx
 from fastmcp import FastMCP
@@ -44,7 +45,8 @@ from tallyman_core import (
     write_post_processing,
     write_stat,
 )
-from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries
+from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
+from tallyman_xorq.recalc import recalc
 
 log = logging.getLogger("tallyman_mcp")
 COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
@@ -124,6 +126,8 @@ _NO_CHECKPOINT = frozenset(
     {
         "catalog_list",
         "catalog_diff",
+        "catalog_scan_staleness",  # read-only staleness scan
+        "catalog_recalc",  # self-checkpoints (arg-aware: dry-run takes none, a real run one)
         "catalog_list_summary_stats",
         "catalog_list_post_processings",
         "catalog_run_post_processing",  # preview, persists nothing
@@ -869,6 +873,76 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         "keys": keys,
         "row_count": result.row_count,
     }
+
+
+@mcp.tool()
+@_tag_project
+def catalog_scan_staleness() -> dict:
+    """Scan every catalog entry for staleness against its recorded inputs.
+
+    Read-only. An entry is *stale* when an input it was built against moved:
+    a followed alias (built with ``from_catalog("name")``) advanced past the
+    recorded head, or a recorded source file's content drifted on disk. A
+    *directly* stale entry has its own input moved; a *transitively* stale entry
+    is a clean descendant of a stale ancestor. Use ``catalog_recalc`` to act.
+
+    Returns:
+        stale: hashes that are directly stale (the natural recalc roots).
+        transitively_stale: clean descendants carried by a stale ancestor.
+        entries: ``{hash: verdict}`` for every live entry, where a verdict is
+            ``{stale, reasons:[{axis, ref, was, now}], unknown_axes,
+            transitively_stale}``.
+    """
+    project = _resolve_active_project()
+    verdicts = staleness.scan(project)
+    return {
+        "stale": sorted(h for h, v in verdicts.items() if v.stale),
+        "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
+        "entries": {h: asdict(v) for h, v in verdicts.items()},
+    }
+
+
+@mcp.tool()
+@_tag_project
+def catalog_recalc(roots: list[str] | None = None, dry_run: bool = True) -> dict:
+    """Recompute stale entries and their dependents, in dependency order.
+
+    ``dry_run=True`` (the default) previews the cone — what would rebuild, in
+    order — without building anything. Run it first; call again with
+    ``dry_run=False`` to commit. A real run replays each entry's recipe (so it
+    re-resolves a followed parent to the advanced alias head), re-points the
+    followed aliases, and takes ONE checkpoint for the whole walk, so a recalc
+    is a single revision ``reset_to`` can undo atomically. A hash-pinned child
+    re-pins the same parent and is left unchanged. On a build failure the walk
+    stops, the already-rebuilt prefix stays committed, and the report flags it.
+
+    Args:
+        roots: content hashes to recompute together with their dependents. When
+            omitted, defaults to every directly-stale entry (a scan-driven recalc).
+        dry_run: preview only (default True). False commits the recompute.
+
+    Returns the report: the ordered ``cone``, each entry's ``action``
+    (dry-run: rebuild/cascade/unchanged; real: rebuilt/noop/failed/skipped),
+    the old→new ``remap``, the ``status`` (ok/failed/cycle), and
+    ``checkpoint_step`` for a real run that changed something.
+    """
+    project = _resolve_active_project()
+    if roots is None:
+        roots = sorted(h for h, v in staleness.scan(project).items() if v.stale)
+    if not roots:
+        return {
+            "status": "ok",
+            "roots": [],
+            "cone": [],
+            "entries": [],
+            "dry_run": dry_run,
+            "remap": {},
+            "note": "nothing stale to recompute",
+        }
+    report = recalc(project, roots, dry_run=dry_run)
+    if not dry_run and report.remap:
+        _notify("recalc", extra={"remap": report.remap})
+    return asdict(report)
 
 
 @mcp.tool()

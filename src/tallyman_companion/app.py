@@ -7,6 +7,7 @@ import logging
 import os
 import re
 import time
+from dataclasses import asdict
 from pathlib import Path
 
 import markdown as md_lib
@@ -369,6 +370,8 @@ def create_app(
             return True  # cache/log clears, not authored state
         if path.endswith("/api/reset"):
             return True  # reset moves `current`; it is not a new step
+        if path.endswith("/api/recalc"):
+            return True  # recalc self-checkpoints (one tx for the whole walk; dry-run takes none)
         return False
 
     @app.middleware("http")
@@ -1164,6 +1167,61 @@ def create_app(
         step = current_step(project)
         await publish({"kind": "project_reset", "step": step})
         return {"ok": True, "step": step, "reloaded": reloaded}
+
+    @app.get("/{project}/api/staleness")
+    def api_staleness(project: str):
+        """Staleness scan for every entry — the scan-on-load reactive surface.
+
+        Read-only (no checkpoint). Drives the per-entry staleness badge: ``stale``
+        lists directly-stale hashes (their own input moved), ``transitively_stale``
+        the clean descendants a recalc would carry, ``entries`` the full verdict
+        map. The SPA fires this on project load / switch and after a recalc.
+        """
+        project = _validate_project(project)
+        from tallyman_xorq import staleness  # noqa: PLC0415
+
+        verdicts = staleness.scan(project)
+        return {
+            "project": project,
+            "stale": sorted(h for h, v in verdicts.items() if v.stale),
+            "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
+            "entries": {h: asdict(v) for h, v in verdicts.items()},
+        }
+
+    @app.post("/{project}/api/recalc")
+    async def api_recalc(project: str, payload: dict | None = None):
+        """Recompute stale entries and their dependents in dependency order.
+
+        Exempt from the checkpoint middleware — ``recalc`` takes its own single
+        checkpoint for the whole walk (only on a real run that changed something),
+        so the operation is one revision ``reset_to`` undoes atomically.
+        ``dry_run`` (default True) previews the cone without building. A committed
+        run invalidates the companion caches, reloads buckaroo sessions, and
+        publishes a ``recalc`` event so open views refetch.
+        """
+        project = _validate_project(project)
+        if read_only:
+            raise HTTPException(403, "serve mode")
+        payload = payload or {}
+        dry_run = bool(payload.get("dry_run", True))
+        roots = payload.get("roots")
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from tallyman_xorq import staleness  # noqa: PLC0415
+        from tallyman_xorq.recalc import recalc  # noqa: PLC0415
+
+        if roots is None:
+            verdicts = await run_in_threadpool(staleness.scan, project)
+            roots = sorted(h for h, v in verdicts.items() if v.stale)
+        if not roots:
+            return {"status": "ok", "roots": [], "cone": [], "entries": [], "dry_run": dry_run, "remap": {}}
+        report = await run_in_threadpool(recalc, project, roots, dry_run=dry_run)
+        if not dry_run and report.remap:
+            _invalidate_reset_caches()
+            if buckaroo:
+                buckaroo.reload_project_sessions(project)
+            await publish({"kind": "recalc", "remap": report.remap, "step": report.checkpoint_step})
+        return asdict(report)
 
     # ------------------------------------------------------------------
     # Project-agnostic routes (no project prefix)

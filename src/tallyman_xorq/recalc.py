@@ -42,7 +42,7 @@ from dataclasses import dataclass, field
 
 from tallyman_core import aliases
 from tallyman_core.entry_config import carry_forward_entry_config
-from tallyman_core.paths import entry_dir, project_dir
+from tallyman_core.paths import entry_dir, entry_manifest_path, project_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.dependents import DependencyCycleError, build_dag, descendant_cone
 from tallyman_xorq.portable import PLACEHOLDER
@@ -125,9 +125,13 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
     ``reset_to`` undoes atomically. Stops at the first build failure (the prefix
     stays committed); never raises on a build error.
     """
-    # Drop roots that name no on-disk entry (a caller mistake) so the walk never
-    # indexes a missing verdict; an all-bogus root set yields an empty report.
-    roots = [r for r in roots if entry_dir(project, r).exists()]
+    # Drop roots that name no live entry (a caller mistake, or a crashed
+    # mid-build leftover dir) so the walk never indexes a missing verdict; an
+    # all-bogus root set yields an empty report. Gate on the manifest, not the
+    # directory: `verdicts` (and the cone) are keyed by manifest-bearing entries
+    # (scan/list_entries), so a dir-without-manifest root would otherwise enter
+    # the cone and KeyError the walk at verdicts[hash].
+    roots = [r for r in roots if entry_manifest_path(project, r).exists()]
     try:
         cone = descendant_cone(project, roots)
     except DependencyCycleError as exc:

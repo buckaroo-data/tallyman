@@ -19,6 +19,7 @@ from tallyman_core import (
     PostProcessingSourceError,
     StatSourceError,
     alias_for_hash,
+    carry_forward_entry_config,
     entry_dir,
     entry_schema_path,
     export_notebook_path,
@@ -556,7 +557,8 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
         prompt: Optional human-readable description of what changed.
     """
     project = _resolve_active_project()
-    if get_alias(project, name) is None:
+    prev_hash = get_alias(project, name)
+    if prev_hash is None:
         return {"error": f"alias {name!r} does not exist. Use catalog_create to create it."}
     out = _run_and_record(project, code, prompt, tool="catalog_revise")
     if "error" in out:
@@ -565,6 +567,11 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     out.pop("_build", None)
     out["alias"] = info["name"]
     out["version"] = info["version"]
+    # Chart + display config are keyed by content hash; seed the new version
+    # from the previous one so they follow the alias across revisions.
+    carried = carry_forward_entry_config(project, prev_hash, out["hash"])
+    if carried:
+        out["carried_over"] = carried
     _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
     return out
 

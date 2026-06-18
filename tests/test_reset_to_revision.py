@@ -646,17 +646,20 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
 
 
 def test_reset_prune_self_heals_warmed_expensive_entry(project, orders_parquet, monkeypatch):
-    """#80: a warmed expensive entry whose snapshot reset_to prunes must self-heal,
-    not dangle on the stale memoised ``deferred_read_parquet``.
+    """A warmed expensive entry whose snapshot a prune retires must self-heal, not
+    dangle on the stale memoised ``deferred_read_parquet``.
 
-    reset_to prunes the per-project compute_cache to the target step's warm-set
-    (``prune_compute_cache``, the function reset_to invokes). Before the
-    plan-resolver split, ``cached_result_expr`` memoised the snapshot existence
-    check, so a *warmed* entry kept returning ``deferred_read_parquet(<pruned
-    path>)`` and the next execute raised ``ValueError: At least one path is
-    required``. The existence re-check now runs on every call, so after a real
-    prune the entry recomputes its snapshot and serves the right rows — without
-    any ``cache_clear``. This drives the actual prune path #80 names.
+    Complementary coverage for ``cached_result_expr``'s self-heal arm — NOT the #80
+    fix. ``prune_compute_cache`` (the function ``reset_to`` invokes) retires the
+    snapshot; before the plan-resolver split ``cached_result_expr`` memoised the
+    snapshot existence check, so a *warmed* entry kept returning
+    ``deferred_read_parquet(<pruned path>)`` and the next execute raised
+    ``ValueError: At least one path is required``. ``ee0a90a`` moved that check to
+    run on every call, so the entry now recomputes its snapshot and serves the
+    right rows without any ``cache_clear``. That self-heal covers
+    ``cached_result_expr`` only; the non-self-healing ``_build_compare_expr`` LRU
+    (which bakes the snapshot path into a serialized build with no recheck) is the
+    real #80/#96 gap, closed by PR #124's reset-time cache invalidation.
     """
     from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 

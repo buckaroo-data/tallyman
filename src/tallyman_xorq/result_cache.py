@@ -393,7 +393,18 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
 
     # classify_build's why carries "udf:<names>" when the serialized build holds a
     # UDF (the same detection cache_worthy uses, #81). Reuse it rather than re-walk.
-    if "udf:" in classify_build(entry_build_dir(project, content_hash))["why"]:
+    # Best-effort, like _reconstructed_hash below: classify_build does unguarded
+    # Path.glob + read_text, so a missing or unreadable build dir raises. This
+    # predicate runs on the self-heal warning path OUTSIDE its try/except (and, per
+    # #125, would run at build time too), so a fault here must degrade to "not
+    # structural" — the conservative execution (#83) attribution — never break the
+    # read it only annotates. The docstring's "an unresolvable hash returns False"
+    # contract owns this for every caller.
+    try:
+        why = classify_build(entry_build_dir(project, content_hash))["why"]
+    except Exception:
+        return False
+    if "udf:" in why:
         return False
 
     a = _reconstructed_hash(project, content_hash)

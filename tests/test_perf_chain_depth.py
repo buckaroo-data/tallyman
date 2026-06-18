@@ -190,9 +190,10 @@ def _build_corpus() -> dict:
     Shape B — for each measured depth k, an expensive ``Aggregate`` ``eb_k`` over
     shape A's ``ak`` (so the cheap chain ``a0..ak`` sits *below* the boundary),
     then a cheap leaf ``lb_k = from_catalog(eb_k).mutate(...)`` *above* it.
-    ``shape_b[k]`` is ``lb_k``. Comparing ``shape_b[k]`` against ``shape_a[k]`` at
-    matching k is the H2 truncation test: does the expensive boundary flatten the
-    cost as the chain below it deepens?
+    ``shape_b[k]`` is ``lb_k``. The H2 truncation test is whether ``shape_b[k]``'s
+    *execute* stays flat as the cheap chain below the boundary deepens (k low→high) —
+    it reads only the baked aggregate snapshot — while ``shape_a[k]`` (no boundary)
+    grows with depth; shape A at matching k is the reference.
     """
     seed_dir = Path(os.environ["TALLYMAN_HOME"]) / "projects" / PROJECT / "data"
     seed_dir.mkdir(parents=True, exist_ok=True)
@@ -320,7 +321,10 @@ def _hypotheses(rows_a: list[dict], rows_b: list[dict]) -> list[str]:
     reads_lo, reads_hi = a[lo]["cold_reads"], a[hi]["cold_reads"]
     per_link = (reads_hi - reads_lo) / (hi - lo) if hi != lo else float("nan")
     s_lo, s_hi = a[lo]["cold_s"], a[hi]["cold_s"]
-    depth_ratio = hi / lo if lo else float("nan")
+    # Ratio of entries the chain walks (depth k walks ~k+1), so it's well-defined
+    # even when 0 ∈ DEPTHS — a literal hi/lo would be NaN/inf and flip H1 to a
+    # bogus "super-linear" verdict.
+    depth_ratio = (hi + 1) / (lo + 1)
     time_ratio = (s_hi / s_lo) if s_lo else float("inf")
     h1_linear = abs(per_link - 1.0) < 0.25 and time_ratio <= depth_ratio * 1.6
     L += [
@@ -336,28 +340,44 @@ def _hypotheses(rows_a: list[dict], rows_b: list[dict]) -> list[str]:
         "",
     ]
 
-    # H2 — does an expensive boundary truncate the cost above it? Compare shape B
-    # (expensive boundary over the depth-k cheap chain) against shape A at depth k.
-    if b:
-        kk = sorted(set(b) & set(a))
+    # H2 — does an expensive boundary truncate the cost above it? The discriminating
+    # signal is EXECUTE, not warm_ms: a warm re-read is an O(1) hot-LRU lookup that is
+    # ~0 for both shapes regardless of depth (it proves the memo works, not truncation).
+    # A truncating boundary means shape B's leaf executes only the small baked snapshot,
+    # so its execute is flat as the cheap chain *below* the boundary deepens — while
+    # shape A's recompute, with no boundary, grows with depth. cold_reads is the
+    # counter-signal: if it still grows, the cold snapshot-key derivation re-walks the
+    # sub-DAG and does NOT truncate.
+    kk = sorted(set(b) & set(a))
+    if kk:
         klo, khi = kk[0], kk[-1]
-        warm_b_lo, warm_b_hi = b[klo]["warm_ms"], b[khi]["warm_ms"]
-        warm_a_hi = a[khi]["warm_ms"]
-        cold_b_reads = {k: b[k]["cold_reads"] for k in kk}
-        warm_truncates = warm_b_hi <= max(2.0 * warm_b_lo, warm_b_lo + 5.0)
+        ex_b_lo, ex_b_hi = b[klo]["execute_s"], b[khi]["execute_s"]
+        ex_a_lo, ex_a_hi = a[klo]["execute_s"], a[khi]["execute_s"]
+        reads_b = {k: b[k]["cold_reads"] for k in kk}
+        # B's execute stays flat across depth-below; A's grows. The 0.01s floor keeps
+        # sub-ms jitter from reading as growth at tiny seeds.
+        b_flat = ex_b_hi <= max(2.0 * ex_b_lo, ex_b_lo + 0.01)
+        a_grows = ex_a_hi > ex_a_lo
+        cold_grows = (reads_b[khi] - reads_b[klo]) > 2
         L += [
             f"**H2 — expensive boundary truncation.** A cheap leaf above an `Aggregate` boundary, with a "
-            f"depth-k cheap chain *below* it. Warm re-read stays {warm_b_lo:.1f}ms→{warm_b_hi:.1f}ms across "
-            f"depth-below {klo}→{khi} (shape-A depth {khi} warm {warm_a_hi:.1f}ms): "
+            f"depth-k cheap chain *below* it (shape A at depth k is the no-boundary reference). "
+            f"Execute stays {ex_b_lo:.3f}s→{ex_b_hi:.3f}s across depth-below {klo}→{khi} while shape A grows "
+            f"{ex_a_lo:.3f}s→{ex_a_hi:.3f}s: "
             + (
-                "**truncates** as #74 claims — the warm read is the bare snapshot read."
-                if warm_truncates
-                else "does **not** flatten — investigate."
+                "the executed/returned expression **truncates** at the boundary as #74 claims — the leaf reads "
+                "only its parent's baked snapshot, independent of the depth below it."
+                if (b_flat and a_grows)
+                else "execute does **not** show the expected flat-B / growing-A split — investigate."
             ),
-            f"  Cold reconstruct count below the boundary: {cold_b_reads} — "
-            "if this still grows with depth-below, locating the snapshot's structural key re-imports the "
-            "expensive recipe and re-walks its sub-DAG (truncation is in the *returned expression* / warm "
-            "path and execute, not the cold key derivation).",
+            f"  But cold reconstruct count below the boundary {reads_b} "
+            + (
+                "still grows with depth-below: locating the parent snapshot's structural key re-imports the "
+                "expensive recipe and re-walks its full sub-DAG, so truncation does **not** extend to the cold "
+                "key derivation (the evicted parent snapshot also self-heals once — the `heals` column)."
+                if cold_grows
+                else "is flat — cold key derivation truncates too."
+            ),
             "",
         ]
 
@@ -394,8 +414,11 @@ def _render(rows_a: list[dict], rows_b: list[dict]) -> str:
         f"project `{PROJECT}` · seed {ROWS:,} rows · depths {DEPTHS}",
         "",
         "Cold = evicted reconstruct LRU + cold compute cache (recipe re-imported); "
-        "warm = memoised plan. `cold_reads` = entries the cold read walked (#59 explanatory variable). "
-        "`cold_s` is reconstruct *without* execute.",
+        "warm = memoised plan (an O(1) hot-LRU lookup — flat for both shapes, a memo sanity check, not a "
+        "truncation signal). `cold_reads` = entries the cold read walked (#59 explanatory variable). "
+        "`cold_s` is reconstruct *without* execute for Shape A; for a Shape B leaf it additionally includes "
+        "the one-time self-heal execute of the evicted expensive-parent snapshot (the `heals` column), so "
+        "B's `cold_s` is not directly comparable to A's.",
         "",
     ]
 

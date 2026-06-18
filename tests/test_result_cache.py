@@ -608,6 +608,102 @@ def test_ensure_result_is_removed():
     assert not hasattr(rc, "ensure_viewer_expanded_build")
 
 
+def _overwrite_orders(project: str, seed: int) -> None:
+    """Rewrite the orders source with different values (same schema, same rows).
+
+    A from_project recompute under ``off`` identity reads the live path, so this
+    makes a previously-built entry's recompute drift from its build-time bytes —
+    the execution-nondeterminism stand-in #83's faithfulness check must catch.
+    """
+    from tallyman_cli.fixtures import write_shoe_orders
+    from tallyman_core import data_dir
+
+    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=seed)
+
+
+def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch):
+    # #83: every build records a result_digest — a content digest of the executed
+    # bytes, the second identity axis the structural content_hash can't see. It is
+    # recorded for cheap and expensive entries alike and is stable: the same recipe
+    # over the same source digests identically run-to-run.
+    from tallyman_core import entry_dir, read_manifest
+    from tallyman_xorq.result_cache import cached_result_expr, result_digest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+
+    for name, code in (("proj", _project_code(project)), ("agg", _agg_code(project))):
+        catalog_create(name, code)
+        h = _hash_of(project)
+        digest = read_manifest(entry_dir(project, h)).result_digest
+        assert digest, f"{name} entry recorded no result_digest"
+        # Recomputing the same entry's result hashes to the recorded digest.
+        cached_result_expr.cache_clear()
+        assert result_digest(cached_result_expr(project, h)) == digest
+
+
+def test_verify_result_faithful_true_for_deterministic_entry(project, orders_parquet, monkeypatch):
+    # #83: a deterministic entry's served bytes match its build-time digest, so the
+    # faithfulness predicate is True. None would mean "no digest recorded"; False
+    # would mean drift — neither is right for a clean entry.
+    from tallyman_xorq.result_cache import verify_result_faithful
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    assert verify_result_faithful(project, h) is True
+
+
+def test_verify_result_faithful_detects_recompute_drift(project, orders_parquet, monkeypatch):
+    # #83: the soundness hole. A cheap entry recomputes on read; if its source
+    # drifts under it, the recompute serves different bytes under the SAME
+    # content_hash — invisible to the structural hash. The result_digest catches
+    # it: verify_result_faithful flips True -> False once the bytes change.
+    from tallyman_xorq.result_cache import cached_result_expr, verify_result_faithful
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    assert verify_result_faithful(project, h) is True
+
+    _overwrite_orders(project, seed=1)  # recompute now reads different bytes
+    cached_result_expr.cache_clear()
+    assert verify_result_faithful(project, h) is False
+
+
+def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkeypatch, caplog):
+    # #83: eviction's load-bearing assumption is that an evicted snapshot recomputes
+    # to what was evicted. For an entry whose recompute drifts, that is false — the
+    # snapshot self-heals to DIFFERENT bytes, silently. The faithfulness check fires
+    # a tallyman.perf warning when a self-healed snapshot's digest != the recorded
+    # one, and the read still succeeds (the check is advisory, never fatal).
+    import logging
+
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))  # expensive → baked snapshot
+    h = _hash_of(project)
+
+    # Drift the source, then evict the snapshot so the next read self-heals from the
+    # now-different source rather than returning the frozen build-time bytes.
+    _overwrite_orders(project, seed=1)
+    p = baked_snapshot_path(project, h)
+    assert p is not None and p.exists()
+    p.unlink()
+    cached_result_expr.cache_clear()
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
+        df = cached_result_expr(project, h).execute()  # self-heals, must not raise
+    assert len(df) > 0
+    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
+    assert any("UNFAITHFUL" in m and h in m for m in msgs), msgs
+
+
 def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
     """An expensive entry's baked snapshot evicted *after* a warm read must still
     self-heal on the next read, not dangle on a stale ``deferred_read_parquet``.

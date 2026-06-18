@@ -62,6 +62,10 @@ def _parent_hash(project: str, content_hash: str) -> str | None:
     """The previous version of the alias this entry is the current version of."""
     from tallyman_core.aliases import previous_version
 
+    # PK inheritance keys purely on content_hash and has no requested alias in
+    # scope, so it keeps the dict-order fallback (#85). A hash shared across two
+    # histories is harmless here: the inherited key is re-validated against this
+    # entry's own columns by the caller. An alias-scoped pass is deferred.
     return previous_version(project, content_hash)
 
 

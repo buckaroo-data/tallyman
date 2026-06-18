@@ -422,6 +422,68 @@ def test_revise_in_place_self_reference_terminates(project, orders_parquet, monk
     assert expr.execute().shape[0] == cached_result_expr(project, v1).execute().shape[0]
 
 
+def test_resolve_noncyclic_hash_scopes_step_back_to_requested_alias(project):
+    # The resolver derives a lineage hint from `requested`:
+    #   alias_hint = requested if get_alias(...) is not None else None  (#85)
+    # so a hash that lives in two histories steps back through the alias
+    # from_catalog was actually invoked on, not whichever sorts first. This
+    # pins that derivation directly — test_revise_in_place_self_reference_
+    # terminates only exercises a single-alias chain where the hint is moot.
+    from tallyman_core.aliases import set_alias
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash
+
+    # Shared head "hS" in two histories; _write persists alphabetically, so an
+    # unscoped (dict-order) step-back always resolves through "alpha".
+    #   alpha: [a0, hS]      -> step back from hS == a0
+    #   zeta:  [z0, z1, hS]  -> step back from hS == z1
+    set_alias(project, "alpha", "a0")
+    set_alias(project, "alpha", "hS")
+    set_alias(project, "zeta", "z0")
+    set_alias(project, "zeta", "z1")
+    set_alias(project, "zeta", "hS")
+
+    # Mark only hS in-flight so the resolver takes exactly one hop; the returned
+    # parent reveals which lineage was followed.
+    token = _RECONSTRUCTING.set(frozenset({(project, "hS")}))
+    try:
+        # requested names an alias -> hint scopes the step-back to that lineage.
+        assert _resolve_noncyclic_hash(project, "zeta", "hS") == "z1"
+        assert _resolve_noncyclic_hash(project, "alpha", "hS") == "a0"
+        # requested is a literal hash pin (no such alias) -> hint is None and the
+        # resolver keeps the dict-order fallback ("alpha"), proving the hash-pin
+        # branch of the derivation.
+        assert _resolve_noncyclic_hash(project, "hS", "hS") == "a0"
+    finally:
+        _RECONSTRUCTING.reset(token)
+
+
+def test_resolve_noncyclic_hash_multi_hop_stays_in_requested_lineage(project):
+    # The hint is computed once and reused for every hop. A multi-hop walk that
+    # stays inside the requested alias's history must keep following it: each
+    # parent is still in that history, so the hint never goes stale within the
+    # lineage. Without scoping, the second hop would resolve through the
+    # alphabetically-first alias and pick the wrong parent (#85, #74).
+    from tallyman_core.aliases import set_alias
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash
+
+    #   alpha: [ax, z1]          -> dict-order step back from z1 == ax (the trap)
+    #   zeta:  [z0, z1, z2]      -> scoped step back: z2 -> z1 -> z0
+    set_alias(project, "alpha", "ax")
+    set_alias(project, "alpha", "z1")
+    set_alias(project, "zeta", "z0")
+    set_alias(project, "zeta", "z1")
+    set_alias(project, "zeta", "z2")
+
+    # Both z2 and its parent z1 are in-flight, forcing two hops.
+    token = _RECONSTRUCTING.set(frozenset({(project, "z2"), (project, "z1")}))
+    try:
+        # z2 -> z1 -> z0, all within "zeta". A stale hint at the z1 hop would
+        # resolve through "alpha" and return "ax".
+        assert _resolve_noncyclic_hash(project, "zeta", "z2") == "z0"
+    finally:
+        _RECONSTRUCTING.reset(token)
+
+
 def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_parquet, monkeypatch):
     # #73 made entry reconstruction (cached_result_expr -> _recipe_expr ->
     # _import_script) a per-READ operation. _import_script registers the recipe

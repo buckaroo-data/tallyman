@@ -1135,6 +1135,12 @@ def create_app(
             await run_in_threadpool(reset_to, project, ref)
         except RuntimeError as exc:
             raise HTTPException(404, str(exc))
+        # reset_to clears the result-plan memo; the compare-expr LRU is a
+        # companion-layer cache, so clear it here. It bakes each entry's snapshot
+        # path into a serialized build with no per-call exists() recheck, so a
+        # reset that pruned a snapshot would otherwise serve a build over a
+        # deleted parquet (#80). Cheap: a content-addressed pair rebuilds identically.
+        _build_compare_expr.cache_clear()
         reloaded = buckaroo.reload_project_sessions(project) if buckaroo else 0
         step = current_step(project)
         await publish({"kind": "project_reset", "step": step})

@@ -870,3 +870,56 @@ def test_cross_process_heal_reads_landed_snapshot_else_reraises(project, orders_
     with pytest.raises(FileNotFoundError):
         cached_result_expr(project, agg_h)
     assert not p.exists()
+
+
+def test_reset_to_clears_result_plan_memo(project, orders_parquet, monkeypatch):
+    """reset_to retires the on-disk compute cache to the target revision's warm
+    set; it must also invalidate the in-process ``_resolve_result_plan`` memo,
+    which holds reconstructed plans — including the baked snapshot paths the
+    prune can delete (#80 / #96). A reactive reset layer needs this cache
+    invalidated alongside the prune, not left to ``cached_result_expr``'s
+    per-call self-heal: ``_build_compare_expr`` bakes a cached snapshot path with
+    no per-call existence re-check, so a stale plan compounds downstream.
+    """
+    from tallyman_core import catalog_state as cs
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+    step = cs.current_step(project)
+
+    cached_result_expr(project, agg_h).execute()  # warm the memo
+    assert cached_result_expr.cache_info().currsize >= 1
+
+    cs.reset_to(project, step)
+    assert cached_result_expr.cache_info().currsize == 0
+
+
+def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, orders_parquet, monkeypatch):
+    """The diff compare-expr LRU (``_build_compare_expr``) caches a serialized
+    build that bakes in each entry's baked snapshot path and — unlike
+    ``cached_result_expr`` — never re-checks ``path.exists()`` on a hit. A reset
+    that prunes a snapshot would otherwise leave that cached build pointing at a
+    deleted parquet, so ``/api/reset`` must clear it alongside the result-plan
+    memo (#80).
+    """
+    from fastapi.testclient import TestClient
+
+    from tallyman_companion.app import _build_compare_expr
+    from tallyman_core import catalog_state as cs
+    from tallyman_core.aliases import history_for
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    step = cs.current_step(project)
+    catalog_revise("shoe_sales", _agg_avg_code(project))
+    a_h, b_h = history_for(project, "shoe_sales")
+
+    _build_compare_expr(project, a_h, b_h, ("region",))  # warm the compare memo
+    assert _build_compare_expr.cache_info().currsize == 1
+
+    c = TestClient(fresh_companion_app)
+    r = c.post(f"/{project}/api/reset", json={"ref": step})
+    assert r.status_code == 200, r.text
+    assert _build_compare_expr.cache_info().currsize == 0

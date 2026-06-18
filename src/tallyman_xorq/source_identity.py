@@ -50,7 +50,7 @@ _MODES = ("off", "cas", "salt")
 
 
 def mode() -> str:
-    m = os.environ.get(_MODE_ENV, "off")
+    m = os.environ.get(_MODE_ENV, "cas")
     if m not in _MODES:
         raise ValueError(f"{_MODE_ENV}={m!r}; expected one of {_MODES}")
     return m
@@ -106,9 +106,18 @@ def _clone(src: Path, dst: Path) -> None:
     NOT a hardlink: a hardlink shares the inode, so an in-place edit of the
     source would silently rewrite the "snapshot" and the digest-named file
     would lie about its content.
+
+    macOS uses ``cp -c`` (APFS clonefile); Linux uses ``cp --reflink=auto``,
+    a CoW clone on btrfs/XFS that degrades to a real copy on ext4 (a full copy
+    per content version — the cost the ``.cas`` GC bounds). Both fall back to
+    ``shutil.copy2`` when the platform ``cp`` is unavailable or fails.
     """
     if sys.platform == "darwin":
         proc = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
+        if proc.returncode == 0:
+            return
+    elif sys.platform.startswith("linux"):
+        proc = subprocess.run(["cp", "--reflink=auto", str(src), str(dst)], capture_output=True)
         if proc.returncode == 0:
             return
     shutil.copy2(src, dst)
@@ -123,6 +132,30 @@ def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
         _clone(src, tmp)
         os.replace(tmp, dst)
     return dst
+
+
+def gc_cas(project: str, live_digests: set[str]) -> int:
+    """Delete ``.cas`` clones whose digest no live entry references.
+
+    ``live_digests`` is the union of every live entry's ``manifest.sources``
+    values — the md5 the clone is named by (``<digest><suffix>``). Returns the
+    number of files removed; a no-op when the ``.cas`` dir is absent. ``.cas``
+    lives under ``data/``, outside the catalog git repo, so a reset's
+    ``git reset`` never reclaims it — this is the explicit reclaim, called from
+    ``reset_to`` against the post-prune live entry set.
+    """
+    cas_dir = data_dir(project) / ".cas"
+    if not cas_dir.is_dir():
+        return 0
+    removed = 0
+    for f in cas_dir.iterdir():
+        if f.is_file() and f.stem not in live_digests:
+            try:
+                f.unlink()
+                removed += 1
+            except OSError:
+                pass  # best-effort reclaim; never fail a reset over GC
+    return removed
 
 
 # ---------------------------------------------------------------------------

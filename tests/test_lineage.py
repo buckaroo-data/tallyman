@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from tallyman_core.manifest import read_manifest
+from tallyman_core.paths import entry_dir
 from tallyman_xorq import (
     build_and_persist,
     catalog_dag,
@@ -48,7 +50,12 @@ def test_read_data_sources_lists_input_paths(project: str, orders_parquet: Path)
     assert sources, "expected at least one source"
     # Persisted form is the portable placeholder, not the absolute path.
     assert all("${TALLYMAN_PROJECT_ROOT}" in s for s in sources)
-    assert any(s.endswith("data/orders.parquet") for s in sources)
+    # Under the cas default the build embeds the content-addressed clone path
+    # (data/.cas/<digest>.parquet); the human name "orders.parquet" lives in
+    # manifest.sources. Tie the embedded clone back to orders.parquet via its
+    # recorded digest.
+    digest = read_manifest(entry_dir(project, res.content_hash)).sources["orders.parquet"]
+    assert any(s.endswith(f"data/.cas/{digest}.parquet") for s in sources)
 
 
 def test_no_catalog_parents_for_a_root_entry(project: str, orders_parquet: Path):

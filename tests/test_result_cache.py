@@ -699,7 +699,9 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkey
         df = cached_result_expr(project, h).execute()  # self-heals, must not raise
     assert len(df) > 0
     msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
-    assert any("UNFAITHFUL" in m and h in m for m in msgs), msgs
+    # Source drift keeps the recipe graph fixed (same expr.py, same read), so the
+    # drift is attributed to the execution axis (#83), not the structural one (#88).
+    assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
 
 
 def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
@@ -1226,3 +1228,66 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
     r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
     assert r.status_code == 200, r.text
     assert cached_result_expr.cache_info().currsize == 0
+
+
+def test_result_digest_is_framing_independent_and_order_sensitive(project, orders_parquet, monkeypatch):
+    # #83: the digest hashes row tuples in order, not the arrow IPC framing, so two
+    # reads that batch differently agree — but it IS sensitive to row order, because
+    # an unordered query that reshuffles produces different materialised bytes, which
+    # is real drift, not a false positive.
+    from tallyman_xorq.result_cache import cached_result_expr, result_digest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+
+    base = result_digest(cached_result_expr(project, h))
+    # Framing independence: a re-read (possibly different batch chunking) is equal.
+    cached_result_expr.cache_clear()
+    assert result_digest(cached_result_expr(project, h)) == base
+    # Order sensitivity: reversing the row order changes the digest.
+    expr = cached_result_expr(project, h)
+    first_col = list(expr.schema().names)[0]
+    reordered = expr.order_by([expr[first_col].desc()])
+    assert result_digest(reordered) != base
+
+
+def _literal_nondeterministic_code(project: str) -> str:
+    # A Python-level nondeterministic literal (random.random()) baked at author
+    # time: re-importing expr.py re-evaluates it, so the reconstructed graph — and
+    # its content_hash — moves each time. NOT an ibis op, so the build-time op lint
+    # (#88 part 1) can't see it; the structural runtime detector (#88 part 2) must.
+    return (
+        "import random\n"
+        "from tallyman_xorq.io import from_project\n"
+        f"t = from_project('orders.parquet', project={project!r})\n"
+        "expr = t.group_by('region').aggregate(total=t.price.sum()).mutate(nonce=random.random())\n"
+    )
+
+
+def test_structural_nondeterminism_detected_for_baked_literal(project, orders_parquet, monkeypatch):
+    # #88 part 2: the structural case the op lint is blind to. Two reconstructions of
+    # a recipe that bakes a random literal at author time hash differently, so the
+    # entry's structural content_hash is itself unstable — distinct from an
+    # execution-nondeterministic recipe whose graph is fixed.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("nd", _literal_nondeterministic_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is True
+
+
+def test_deterministic_recipe_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+    # #88 part 2: a deterministic recipe reconstructs to the same graph hash both
+    # times, so the structural detector does not false-positive on a clean entry —
+    # its drift, if any, is execution-level (#83), not structural.
+    from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    h = _hash_of(project)
+    assert recipe_is_structurally_nondeterministic(project, h) is False

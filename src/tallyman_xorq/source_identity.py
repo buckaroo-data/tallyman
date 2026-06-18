@@ -36,6 +36,7 @@ from __future__ import annotations
 import contextvars
 import hashlib
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -43,6 +44,11 @@ import sys
 from pathlib import Path
 
 from tallyman_core import artifacts_dir, data_dir
+
+# Shares tallyman.perf with result_cache so the one branch where reconstruction
+# can't be content-faithful surfaces on the same namespace as the #83 self-heal
+# faithfulness warning.
+_log = logging.getLogger("tallyman.perf")
 
 _MODE_ENV = "TALLYMAN_SOURCE_IDENTITY"
 _REHASH_ENV = "TALLYMAN_SOURCE_REHASH"
@@ -132,6 +138,40 @@ def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
         _clone(src, tmp)
         os.replace(tmp, dst)
     return dst
+
+
+def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
+    """The frozen ``.cas`` clone named by *digest*, for digest-pinned reconstruction (#115).
+
+    Returns ``data/.cas/<digest><suffix>`` — the bytes the entry was built from —
+    WITHOUT re-digesting the live source, so a cold read after an in-place edit serves
+    what was built, not the edited file. The clone is normally already on disk: the
+    ``.cas`` GC (``gc_cas``) preserves any clone a live entry's ``manifest.sources``
+    references.
+
+    If the clone is absent — manually deleted, or a fresh cross-machine catalog clone,
+    since ``.cas`` lives under ``data/`` outside the catalog git repo — re-materialise
+    it from the live source IFF the live bytes still hash to *digest*. The check hashes
+    file *content* (``_digest_file``), never ``digest_for``, so the stat-keyed memo
+    can't certify an in-place edit that preserved ``(mtime_ns, size, inode)`` as the
+    original (the documented memo hole). When the clone is gone AND the live source has
+    drifted, the original bytes are unrecoverable: serve the live source best-effort
+    (never crash a read) but warn — this is the one branch that is NOT content-faithful.
+    """
+    cas_dir = data_dir(project) / ".cas"
+    dst = cas_dir / f"{digest}{live_src.suffix}"
+    if dst.exists():
+        return dst
+    if live_src.exists() and _digest_file(live_src) == digest:
+        return ensure_cas_path(project, live_src, digest)
+    _log.warning(
+        "recon_cas_path: frozen .cas clone %s%s missing and live source %s drifted — "
+        "serving live bytes; this cold read is NOT faithful to the build (#115)",
+        digest,
+        live_src.suffix,
+        live_src,
+    )
+    return live_src
 
 
 def gc_cas(project: str, live_digests: set[str]) -> int:

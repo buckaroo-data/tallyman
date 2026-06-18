@@ -212,6 +212,27 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     return build_path, overrides
 
 
+def _invalidate_reset_caches() -> None:
+    """Drop the companion's process-global result/compare caches after a reset.
+
+    A reset prunes baked snapshots (``catalog_state.reset_to`` →
+    ``prune_compute_cache``). ``_build_compare_expr`` serializes those snapshot
+    paths into a build with no per-call ``exists()`` recheck, so a warmed diff
+    pair would otherwise serve a build over a parquet the prune deleted —
+    buckaroo reads zero files → empty compare grid (#80). ``cached_result_expr``
+    self-heals on every read so clearing its memo is hygiene, not load-bearing,
+    but we clear it for parity. Blunt global clear is correct and cheap: entries
+    are content-addressed, so the next call rebuilds an identical expression.
+
+    Called from BOTH reset paths — the in-server ``/api/reset`` and the
+    cross-process CLI ``reset-to`` that arrives as a ``project_reset`` on
+    ``/internal/notify`` — so the two can't drift. (The in-server path having the
+    clear while the notify path lacked it was exactly #80's "Communication gap".)
+    """
+    _build_compare_expr.cache_clear()
+    cached_result_expr.cache_clear()
+
+
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
     """Add alias/version fields and sort: named entries (by alias) first, then scratch."""
     aliases = load_aliases(project)
@@ -1135,12 +1156,10 @@ def create_app(
             await run_in_threadpool(reset_to, project, ref)
         except RuntimeError as exc:
             raise HTTPException(404, str(exc))
-        # reset_to clears the result-plan memo; the compare-expr LRU is a
-        # companion-layer cache, so clear it here. It bakes each entry's snapshot
-        # path into a serialized build with no per-call exists() recheck, so a
-        # reset that pruned a snapshot would otherwise serve a build over a
-        # deleted parquet (#80). Cheap: a content-addressed pair rebuilds identically.
-        _build_compare_expr.cache_clear()
+        # reset_to ran in-process and cleared the result-plan memo; the
+        # compare-expr LRU is a companion-layer cache it can't reach, so invalidate
+        # the companion caches here (#80). Shared with the cross-process notify path.
+        _invalidate_reset_caches()
         reloaded = buckaroo.reload_project_sessions(project) if buckaroo else 0
         step = current_step(project)
         await publish({"kind": "project_reset", "step": step})
@@ -1163,6 +1182,13 @@ def create_app(
             getattr(payload, "hash", None),
         )
         if payload.kind in ("post_processing_changed", "summary_stat_changed", "display_changed", "project_reset"):
+            if payload.kind == "project_reset":
+                # Out-of-process CLI `reset-to` ran reset_to in the CLI process, so
+                # this long-lived companion's result/compare LRUs are still warm and
+                # may point at snapshots the prune deleted. Clear them here, matching
+                # the in-server /api/reset path (#80). Not gated on `buckaroo`: the
+                # LRUs are process memory independent of the buckaroo subprocess.
+                _invalidate_reset_caches()
             if buckaroo:
                 reloaded = buckaroo.reload_project_sessions(project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)

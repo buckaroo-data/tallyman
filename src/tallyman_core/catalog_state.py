@@ -344,12 +344,15 @@ def reset_to(project: str, ref: int | str) -> None:
         restore_from_bullpen(project)
         _gc_cas_clones(project)
         catalog.assert_catalog_consistent(project, set(read_tallyman_state(project)["entry_hashes"]))
-    # The prune above retires baked snapshots on disk; invalidate the in-process
-    # plan memo that points at them (#80 / #96). cached_result_expr re-checks a
-    # baked snapshot's existence on every call, but its memoised _resolve_result_plan
-    # half caches the resolved path, and downstream caches that bake it in (the
-    # companion's _build_compare_expr) have no such per-call recheck — so the reset
-    # layer invalidates the memo rather than relying on the self-heal. Blunt global
+    # The prune above retires baked snapshots on disk. Clear the in-process
+    # result-plan memo that resolved their paths: #96's literal complaint is that
+    # the LRU outlives the prune, so drop it. For the dangling-read *symptom* this
+    # clear is belt-and-suspenders — cached_result_expr re-checks path.exists()
+    # and self-heals on every read (ee0a90a), so its own reads already survive a
+    # prune. The load-bearing protection against the symptom is the companion's
+    # _build_compare_expr clear (#80): that is the one LRU that bakes the resolved
+    # path into a serialized build with no per-call recheck, and it lives in the
+    # companion layer (see app._invalidate_reset_caches), not here. Blunt global
     # clear is correct and cheap: entries are content-addressed, so the next read
     # rebuilds an identical plan. Lazy import avoids a core->xorq import cycle.
     from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415

@@ -383,16 +383,13 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
 
     mgr.ensure_session(child_h, project)
 
-    # The heal must populate the snapshot the *build replay* reads — the path
-    # buckaroo's /load_expr resolves — not merely some snapshot, so reload the
-    # build the same way (load_entry replays it too) and assert it serves real
-    # rows rather than the empty grid the bare snapshot read yields cold. (The
-    # snapshot key embeds the build path, so this holds when build and read share
-    # a project root, i.e. the same-machine cold cache; see the PR for the
-    # cross-machine clone caveat.)
-    from tallyman_xorq.build import load_entry  # noqa: PLC0415
-
-    assert len(load_entry(project, child_h).execute()) > 0
+    # The heal must repopulate the snapshot the *build replay* reads — the path
+    # buckaroo's /load_expr resolves — before POSTing, so the cold grid isn't
+    # empty. ensure_session ran cached_result_expr(child_h), which recomputes the
+    # evicted parent's baked snapshot; assert that snapshot is back on disk. (The
+    # snapshot key embeds the build path, so this holds when build and read share a
+    # project root, i.e. the same-machine cold cache; cross-machine clone is #77.)
+    assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
 
 
 # ---------------------------------------------------------------------------

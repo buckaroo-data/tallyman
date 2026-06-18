@@ -5,8 +5,6 @@ import { NewEntryPill } from "./components/NewEntryPill";
 import { SSEProvider } from "./SSEContext";
 import { CatalogPage } from "./pages/CatalogPage";
 import { NotebookPage } from "./pages/NotebookPage";
-import { LineagePage } from "./pages/LineagePage";
-import { LineageEntryPage } from "./pages/LineageEntryPage";
 import { DiffPage } from "./pages/DiffPage";
 import { CachePage } from "./pages/CachePage";
 import { EmptyStatePage } from "./pages/EmptyStatePage";
@@ -52,8 +50,6 @@ export default function App() {
                 <Route path="catalog/:hash" element={<CatalogPage />} />
                 <Route path="errors/:errorId" element={<CatalogPage />} />
                 <Route path="notebook" element={<NotebookPage />} />
-                <Route path="lineage" element={<LineagePage />} />
-                <Route path="lineage/:hash" element={<LineageEntryPage />} />
                 <Route path="cache" element={<CachePage />} />
                 <Route path="diff/:alias" element={<DiffPage />} />
                 <Route path="diff/:alias/:va/:vb" element={<DiffPage />} />

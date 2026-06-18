@@ -157,8 +157,7 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     # (so every loader reads the cached result), materialised in the compute
     # cache — not a build-time entry result.parquet, not the retired result_cache dir.
     from tallyman_core.paths import compute_cache_dir
-    from tallyman_xorq.build import load_entry
-    from tallyman_xorq.result_cache import cached_result_expr
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))
@@ -166,8 +165,8 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     assert not (entry_dir(project, h) / "result.parquet").exists()
     # The result_cache/ dir was retired in #73 — baked results live in the compute cache.
     assert not (catalog_dir(project) / "result_cache").exists()
-    # The build still carries a baked CachedNode (load_entry surfaces it)...
-    assert type(load_entry(project, h).op()).__name__ == "CachedNode"
+    # The entry bakes a result-cache snapshot (located by the same rewrite the build used)...
+    assert baked_snapshot_path(project, h) is not None
     # ...but cached_result_expr reads that baked snapshot as a single-backend
     # deferred read, not the cache node itself: a CachedNode carries its own
     # storage connection, which would make a composed union/join span two
@@ -215,15 +214,15 @@ def test_scalar_udf_only_entry_bakes_result_cache(project, orders_parquet, monke
     # key-stability gap is tracked separately; here we assert the lockstep fix and
     # that a read dereferences a materialised snapshot.
     from tallyman_core.paths import compute_cache_dir
-    from tallyman_xorq.build import load_entry
-    from tallyman_xorq.result_cache import cached_result_expr
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("udf", _scalar_udf_code(project))
     h = _hash_of(project)
 
-    # The build bakes a top-level CachedNode (pre-fix the top op was a bare Project).
-    assert type(load_entry(project, h).op()).__name__ == "CachedNode"
+    # The entry bakes a result-cache snapshot (pre-fix the top op was a bare
+    # Project, so nothing was baked).
+    assert baked_snapshot_path(project, h) is not None
 
     # cached_result_expr dereferences a single-backend snapshot, self-healing it on
     # this cold read; afterward a baked result_cache parquet exists on disk.
@@ -399,11 +398,10 @@ def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(proj
     child that chains off it serialises a *bare* ``deferred_read_parquet`` of
     that snapshot (no recipe, no source to recompute from — #75 strips the
     parent's ``CachedNode`` so the composed expression stays on one backend). On
-    a cold compute cache (fresh clone / write-isolated overlay) that read
-    resolves to zero files and ``load_entry`` raises ``ValueError: At least one
-    path is required``. ``cached_result_expr`` instead reconstructs via the recipe
-    — re-resolving ``from_catalog`` and recomputing the parent — so the read
-    self-heals.
+    a cold compute cache (fresh clone / write-isolated overlay) that bare read
+    resolves to zero files (``ValueError: At least one path is required``).
+    ``cached_result_expr`` reconstructs via the recipe instead — re-resolving
+    ``from_catalog`` and recomputing the parent — so the read self-heals.
     """
     import shutil
 

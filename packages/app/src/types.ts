@@ -90,37 +90,6 @@ export interface NotebookFull {
   buckaroo_available: boolean;
 }
 
-export interface DagNode {
-  hash: string;
-  row_count: number;
-  execute_seconds: number;
-  created_at: string;
-}
-
-export interface CatalogDagLayout {
-  project: string;
-  nodes: DagNode[];
-  edges: Array<{ from: string; to: string }>;
-  positions: Record<string, [number, number]>;
-  width: number;
-  height: number;
-  annotated: Record<string, { alias: string | null; version: number | null }>;
-}
-
-export interface LineageLayout {
-  project: string;
-  content_hash: string;
-  lineage: {
-    nodes: Array<{ id: string; type: string; label: string | null }>;
-    edges: Array<[string, string]>;
-    root: string;
-  };
-  positions: Record<string, [number, number]>;
-  width: number;
-  height: number;
-  column_trees: Record<string, string>;
-}
-
 export interface DiffData {
   project: string;
   alias: string;

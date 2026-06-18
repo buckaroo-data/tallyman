@@ -548,25 +548,6 @@ def test_label_step_rejects_unsafe_names(project):
     assert tags == {f"step-{s:03d}"}  # nothing created, deleted, or clobbered
 
 
-def test_load_entry_uses_per_project_compute_cache(project, monkeypatch):
-    """#45: caches warm lazily at view time, and view time goes through
-    load_entry — so load_entry must use the per-project compute cache, not the
-    global ~/.cache/xorq. Otherwise the recorded warm-set is vacuous and
-    reset's prune cannot make a re-added expression compute cold."""
-    from tallyman_xorq import build as build_mod
-
-    (paths.entry_dir(project, "cafe0001") / "xorq_build").mkdir(parents=True)
-    seen = {}
-
-    def spy(build_dir, project_root, cache_dir=None):
-        seen["cache_dir"] = Path(cache_dir)
-        return "expr"
-
-    monkeypatch.setattr("tallyman_xorq.portable.load_expr_portable", spy)
-    assert build_mod.load_entry(project, "cafe0001") == "expr"
-    assert seen["cache_dir"] == paths.compute_cache_dir(project)
-
-
 # ---------------------------------------------------------------------------
 # Cache bullpen — evictions are retired, not destroyed; forward reset restores
 # ---------------------------------------------------------------------------

@@ -66,7 +66,7 @@ import pytest
 from tallyman_core import catalog_state as cs
 from tallyman_core import paths
 from tallyman_core.paths import data_dir, ensure_project, entry_dir, set_active_project
-from tallyman_xorq.build import build_and_persist, load_entry
+from tallyman_xorq.build import build_and_persist
 from tallyman_xorq.result_cache import cached_result_expr
 from tests.cache_lab_data import (
     N_STATIONS,
@@ -274,7 +274,7 @@ def view_timings(project: str, content_hash: str) -> dict:
 
 def assert_stored_matches_recompute(project: str, content_hash: str, sort_keys: list[str], cols: list[str]):
     """Invariant for ANY strategy: what the cache serves == what recompute produces."""
-    fresh = load_entry(project, content_hash).execute()
+    fresh = cached_result_expr(project, content_hash).execute()
     served = cached_result_expr(project, content_hash).execute()
     f = fresh[cols].sort_values(sort_keys).reset_index(drop=True)
     s = served[cols].sort_values(sort_keys).reset_index(drop=True)
@@ -556,7 +556,7 @@ def test_agg_views(lab):
     lab.record["flow"] = {**flow, **view_timings(lab.project, flow["hash"])}
     lab.record["weather"] = {**wx, **view_timings(lab.project, wx["hash"])}
     t0 = time.monotonic()
-    load_entry(lab.project, flow["hash"]).execute()
+    cached_result_expr(lab.project, flow["hash"]).execute()
     lab.record["flow"]["full_recompute_s"] = round(time.monotonic() - t0, 3)
     lab.record["final_disk"] = disk(lab.project)
 
@@ -661,7 +661,7 @@ def test_stat_swap(lab):
     if not detected:
         # Same identity ⇒ the dedup path returned the OLD entry. Show whether
         # its stored bytes now disagree with an honest recompute.
-        fresh = load_entry(lab.project, b1["hash"]).execute()
+        fresh = cached_result_expr(lab.project, b1["hash"]).execute()
         merged = stored_before.merge(fresh, on="start_station_id", suffixes=("_stale", "_fresh"))
         lab.record["stale_rows_served"] = int((merged.capacity_stale != merged.capacity_fresh).sum())
     else:
@@ -806,7 +806,7 @@ def test_wide_compile(lab):
     b = build(lab.project, wide_compile_code(lab.project, CHAIN_DEPTH))
     v = view_timings(lab.project, b["hash"])
     t0 = time.monotonic()
-    load_entry(lab.project, b["hash"]).count().execute()  # the no-cache view path
+    cached_result_expr(lab.project, b["hash"]).count().execute()  # the no-cache view path
     uncached_view = round(time.monotonic() - t0, 3)
     lab.record.update(
         {

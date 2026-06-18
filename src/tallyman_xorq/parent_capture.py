@@ -2,11 +2,12 @@
 
 Mirrors ``source_identity``'s source-digest collector. Since #73/#74,
 ``from_catalog`` composes the parent's *expression* into the child instead of
-reading the parent's ``result.parquet``, so the child's ``expr.yaml`` no longer
-carries a path that ``lineage.catalog_parents`` can match — the inter-entry DAG
-went dark (#84). The edge isn't lost, only unrecorded: ``from_catalog`` resolves
-the parent's content hash at build time. This collector captures that resolution
-so ``build_and_persist`` can persist it into ``manifest.parents``.
+reading the parent's ``result.parquet``, so the child's ``expr.yaml`` carries no
+path naming the parent entry. The edge isn't lost, only implicit:
+``from_catalog`` resolves the parent's content hash at build time. This collector
+captures that resolution so ``build_and_persist`` persists it into
+``manifest.parents`` — durable provenance kept for a future lineage feature
+(#84; the inter-entry DAG view that read it was removed pending a proper rebuild).
 
 Each entry records ``{hash, ref, follow}``:
 

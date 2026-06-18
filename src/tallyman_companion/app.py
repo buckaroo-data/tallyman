@@ -39,14 +39,10 @@ from tallyman_core import (
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_xorq import (
-    catalog_dag,
-    column_lineage,
     full_diff,
     list_entries,
-    read_internal_lineage,
     read_prompts,
 )
-from tallyman_xorq.layout import layered_positions
 from tallyman_xorq.primary_key import diff_keys
 from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
@@ -92,8 +88,8 @@ def _dir_size(path: Path) -> int:
 
 
 # A catalog entry's content hash is the lowercase-hex name of its entry dir
-# (xorq's build_path.name; same charset lineage.catalog_parents matches). Used
-# to reject path-param junk before it can name anything under the entries tree.
+# (xorq's build_path.name). Used to reject path-param junk before it can name
+# anything under the entries tree.
 _CONTENT_HASH_RE = re.compile(r"\A[0-9a-f]+\Z")
 
 
@@ -616,75 +612,6 @@ def create_app(
             "total_rows": total_rows,
             "buckaroo_session": buckaroo_session,
             "buckaroo_ws_base": buckaroo_ws_base,
-        }
-
-    @app.get("/{project}/api/lineage/{content_hash}")
-    def api_lineage(project: str, content_hash: str):
-        project = _validate_project(project)
-        _require_hash(content_hash)
-        if not entry_dir(project, content_hash).exists():
-            raise HTTPException(404)
-        return {
-            "internal": read_internal_lineage(project, content_hash),
-        }
-
-    @app.get("/{project}/api/catalog_dag")
-    def api_catalog_dag(project: str):
-        project = _validate_project(project)
-        return {"project": project, **catalog_dag(project)}
-
-    @app.get("/{project}/api/catalog_dag_layout")
-    def api_catalog_dag_layout(project: str):
-        """Catalog DAG with pre-computed layout positions for the React SPA."""
-        project = _validate_project(project)
-        dag = catalog_dag(project)
-        nodes_for_layout = [{"id": n["hash"], **n} for n in dag["nodes"]]
-        targets = {e["to"] for e in dag["edges"]}
-        roots = [n["id"] for n in nodes_for_layout if n["id"] not in targets]
-        root = roots[0] if roots else (nodes_for_layout[0]["id"] if nodes_for_layout else None)
-        layout = layered_positions(nodes_for_layout, dag["edges"], root=root, x_step=200, y_step=80)
-        aliases = load_aliases(project)
-        by_latest = {h: a for a, h in aliases.items()}
-        annotated: dict[str, dict] = {}
-        for n in dag["nodes"]:
-            h = n["hash"]
-            info = version_of_hash(project, h)
-            annotated[h] = {
-                "alias": by_latest.get(h) or (info[0] if info else None),
-                "version": info[1] if info else None,
-            }
-        return {
-            "project": project,
-            "nodes": dag["nodes"],
-            "edges": dag["edges"],
-            "positions": layout["positions"],
-            "width": layout["width"],
-            "height": layout["height"],
-            "annotated": annotated,
-        }
-
-    @app.get("/{project}/api/lineage_layout/{content_hash}")
-    def api_lineage_layout(project: str, content_hash: str):
-        """Internal expression lineage with layout positions for the React SPA."""
-        project = _validate_project(project)
-        aliases = load_aliases(project)
-        if content_hash in aliases:
-            content_hash = aliases[content_hash]
-        else:
-            _require_hash(content_hash)
-        if not entry_dir(project, content_hash).exists():
-            raise HTTPException(404)
-        lin = read_internal_lineage(project, content_hash)
-        layout = layered_positions(lin["nodes"], lin["edges"], root=lin["root"], x_step=180, y_step=70)
-        cols = column_lineage(project, content_hash)
-        return {
-            "project": project,
-            "content_hash": content_hash,
-            "lineage": lin,
-            "positions": layout["positions"],
-            "width": layout["width"],
-            "height": layout["height"],
-            "column_trees": cols,
         }
 
     @app.get("/{project}/api/session/{content_hash}")

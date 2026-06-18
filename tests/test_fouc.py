@@ -28,7 +28,6 @@ def test_spa_catch_all_serves_index_html(built_spa, fresh_companion_app, project
     for path in [
         f"/{project}/catalog",
         f"/{project}/notebook",
-        f"/{project}/lineage",
     ]:
         r = c.get(path)
         assert r.status_code == 200, path
@@ -90,16 +89,3 @@ def test_entry_detail_api_returns_entry_data(fresh_companion_app, project: str, 
     assert body["alias"] == "shoe_sales"
     assert "schema" in body
     assert "code" in body
-
-
-def test_lineage_api_returns_layout_data(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    """Lineage layout is served via JSON API for the React SPA DAG renderer."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_create("shoe_sales", _agg(project))
-    c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/api/lineage_layout/{out['hash']}")
-    assert r.status_code == 200
-    body = r.json()
-    assert "lineage" in body
-    assert "positions" in body
-    assert body["content_hash"] == out["hash"]

@@ -1,7 +1,9 @@
 # ADR: Content-addressed source reads (CAS) so `content_hash` tracks source data
 
-- **Status:** Proposed (2026-06-10; same-day revision — the original draft's
-  mechanism was disproved by measurement, see "What changed")
+- **Status:** Accepted (2026-06-18 — default flipped `off` → `cas` in #86, with
+  `cp --reflink=auto` on Linux and `.cas` GC wired into `reset_to`; supersedes
+  the 2026-06-10 Proposed draft below. See the reconstruction caveat under
+  Consequences.)
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),
@@ -136,3 +138,11 @@ data under the old identity.
   display the human name from the manifest `sources` map.
 - Cross-machine identity (absolute path prefix in the hash) remains broken
   under every mode — `pack`/`serve` portability needs its own decision.
+- **Caveat — the flip does NOT make cold reconstruction content-faithful.**
+  `cached_result_expr` re-runs a cheap entry's recipe on every cold read
+  (`result_cache.py` `_recipe_expr` → `_import_script`), and `from_project`
+  re-digests the *live* source under `cas` (`io.py:55-60`), so an evicted or
+  cheap entry still serves edited bytes under its old `content_hash`. The flip
+  makes *build* identity content-aware (a rebuild forks the hash) — what
+  `test_append_invalidates` and the fast-suite pins assert — but closing the
+  cold-read hazard (#74) needs digest-pinned reconstruction, tracked in #115.

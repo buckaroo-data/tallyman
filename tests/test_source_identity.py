@@ -75,3 +75,22 @@ def test_gc_cas_removes_unreferenced_digests(project):
     assert removed == 1
     assert referenced.exists()
     assert not orphan.exists()
+
+
+def test_cas_clone_is_a_snapshot_not_a_hardlink(project):
+    """ensure_cas_path freezes the bytes: editing the source must not change the clone.
+
+    A hardlink would share the inode and let an in-place edit rewrite the
+    "snapshot"; ``_clone`` uses a CoW clone (``cp -c`` / ``cp --reflink=auto``)
+    or a plain copy, never a hardlink. Also guards the Linux reflink arm, which
+    runs on CI.
+    """
+    src = data_dir(project) / "frozen.parquet"
+    _write_parquet(src, 3)
+    digest = si.digest_for(project, src)
+    clone = si.ensure_cas_path(project, src, digest)
+
+    _write_parquet(src, 5)  # edit the source in place, after cloning
+
+    assert pd.read_parquet(clone).shape[0] == 3
+    assert clone.stat().st_ino != src.stat().st_ino  # distinct inode — not a hardlink

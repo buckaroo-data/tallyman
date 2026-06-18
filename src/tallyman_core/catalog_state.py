@@ -342,7 +342,34 @@ def reset_to(project: str, ref: int | str) -> None:
         prune_entries(project)
         prune_compute_cache(project)
         restore_from_bullpen(project)
+        _gc_cas_clones(project)
         catalog.assert_catalog_consistent(project, set(read_tallyman_state(project)["entry_hashes"]))
+
+
+def _gc_cas_clones(project: str) -> int:
+    """Reclaim content-addressed source clones (``data/.cas``) no surviving entry
+    references, after a reset has pruned the entry set.
+
+    ``.cas`` lives under ``data/`` — outside the catalog git repo — so the
+    ``git reset`` above cannot roll it back; this is the explicit reclaim.
+    Liveness is the union of every surviving entry's ``manifest.sources``
+    digests. Conservative and best-effort: if any entry's manifest can't be read
+    we skip the sweep rather than risk deleting a live clone on partial
+    information, and a failure here never aborts the reset.
+    """
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq import source_identity  # lazy: avoid a core->xorq import cycle
+
+    live_digests: set[str] = set()
+    for h in read_tallyman_state(project)["entry_hashes"]:
+        try:
+            sources = read_manifest(entry_dir(project, h)).sources
+        except Exception:
+            return 0  # unreadable manifest — don't GC on partial information
+        if sources:
+            live_digests.update(sources.values())
+    return source_identity.gc_cas(project, live_digests)
 
 
 def genesis(project: str) -> int | None:

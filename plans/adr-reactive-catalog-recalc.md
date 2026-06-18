@@ -432,9 +432,11 @@ replaced — see Reconciliation. Retained for the diagnosis it grounds.)
   the source digest is unchanged" (cheap; folds into the stage-2 instrumentation).
   *Execution* nondeterminism (`.sample()`, `ibis.now()`, unordered `.limit()`,
   impure UDF) leaves the graph — and the hash — unchanged while the bytes differ,
-  so the hash can't see it and cas can't fix it (it is not source drift). v0 is a
-  build-time lint on known-nondeterministic ops; the durable fix (it also breaks
-  #30's evict-and-recompute faithfulness) is #83. No hard enforcement (see
+  so the hash can't see it and cas can't fix it (it is not source drift). The v0
+  build-time lint on known-nondeterministic ops **shipped (#88,
+  `_NONDETERMINISTIC_OPS` at build.py:261, surfaced via the MCP server and
+  companion)**; the durable fix (it also breaks #30's evict-and-recompute
+  faithfulness) is #83, still open. No hard enforcement (see
   `plans/adr-source-identity-content-hash.md`).
 - **Deep-chain build cost (now #82).** Originally framed as timing eager
   `load_expr` against the tagged-read reference; #74 took the composition fork, so
@@ -451,9 +453,11 @@ replaced — see Reconciliation. Retained for the diagnosis it grounds.)
   (`@functools.lru_cache`, result_cache.py:232) with `cache_clear` / `cache_info`
   re-exposed on the public `cached_result_expr` name, and fixed the related
   warm-then-evicted dangling-path bug by re-checking `path.exists()` on every call
-  (result_cache.py:321). #80 itself — `reset_to` does not call `cache_clear` — is
-  still open; a reactive recalc/staleness layer has to treat this in-process cache
-  as one more thing to invalidate. Filed #80.
+  (result_cache.py:321), which now runs on every call (warm hits included), so the
+  concrete dangling-path failure is defended at the read site. #80 (and its sibling
+  #96, the LRU surviving a compute-cache prune) — `reset_to` does not call
+  `cache_clear` — are still open as filed; a reactive recalc/staleness layer has to
+  treat this in-process cache as one more thing to invalidate. Filed #80/#96.
 
 ## Not in scope here
 

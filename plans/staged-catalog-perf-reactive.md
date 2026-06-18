@@ -24,8 +24,9 @@ that Stage 2 listed as open. **#103** (#52) replaced xorq's catalog package with
 native `tallyman_core.catalog` store and decomposed `catalog.yaml` into
 per-concern tracked files — which *dissolves Stage 1's whole bug cluster by
 construction* rather than fixing it within xorq, supersedes the PR #57 mechanism
-(aliases moved out to `aliases.jsonl`, not folded into `catalog.yaml`), ships
-Stage 1's rebuild script (`scripts/rebuild_native_catalog.py`), and — via #84 —
+(aliases moved out to `aliases.jsonl`, not folded into `catalog.yaml`), ships a
+catalog rebuild script (`scripts/rebuild_native_catalog.py` — a migration
+convenience, not on the critical path; see Stage 1 item 4), and — via #84 —
 ships the manifest `parents` edge Stage 3 listed as a prerequisite. Per-item
 annotations below; full design in `plans/native-catalog-store.md`.
 
@@ -127,21 +128,27 @@ then produces a clean parking catalog for stage 2 to measure.
    corrupt tracked JSON surfaces as a bare HTTP 500. Re-scope #56 against the
    native store before doing any work; the original swallow it targeted is gone.
 
-4. **PARTLY DONE (PR #103) — reproducible rebuild script shipped; not yet run on
-   the real corpus.** No migration/repair — rebuild from scratch by re-execing
-   recipes through the now-native machinery. `scripts/rebuild_native_catalog.py`
-   (+ `tests/test_rebuild_native_catalog.py`) reads a project's old catalog across
-   all three layouts (native `aliases.jsonl`, the `aliases.json` era, and the
-   `catalog.yaml` era), toposorts the `from_catalog` graph, wipes `catalog/` keeping
-   `data/`, and re-builds each entry in dependency order. Because a re-exec does
-   **not** reproduce the old content hashes, it remaps every hash-keyed artifact
-   old→new, rewrites literal `from_catalog(<hash>)` refs, and re-points aliases as
-   each revision rebuilds; it clears the `cached_result_expr` memo to avoid
-   re-execing a child against a pre-wipe parent. Validated against a disposable copy
-   of one project. **Remaining:** run it on the real `~/.tallyman-notebooks`
-   projects (`--dry-run` first) and emit the two stage-2 corpus variants (full
-   ≈10M+ rows, truncated ≈1M). **Blocking input:** confirm the parking source
-   parquet(s) still exist / where. See `plans/native-catalog-store.md`.
+4. **Build the stage-2 corpus FRESH in native format — we do NOT migrate old
+   catalogs.** Per the project rule (single-user dev repo, no installed base):
+   there is no migration/upgrade burden, and **rebuilding the corpus from scratch
+   is always the accepted fix**. So the stage-2 corpus is produced by re-authoring
+   the entries fresh against the source parquets through the normal build path
+   (`build_and_persist`) — the same way the originals were created — **not** by
+   converting the pre-#103 on-disk parking catalogs. The source parquets exist
+   (`/Users/paddy/code/parking_speeding_data/`, ≈25GB). Truncation is a build-time
+   parameter of the fresh authoring (`head(1M)` on the source read; see Truncation
+   design under Deliverable 2), not a property of any conversion step. The pre-#103
+   on-disk parking catalogs (`parking_ticket_analysis`, `parking_ticket_analysis_1m`)
+   are stale and can simply be discarded and rebuilt; their layout is irrelevant.
+
+   `scripts/rebuild_native_catalog.py` (shipped in PR #103) is a *migration*
+   convenience that re-execs an old catalog's recipes into the native store. It is
+   **not on the critical path** and we don't need it for our own data — its
+   build-time alias-revision pinning limit on schema-evolving corpora is a
+   migration-only concern and **out of scope** under the no-migration rule. (#98 —
+   the old `rebuild_parking_catalog.py` shelling to `xorq catalog add` — is likewise
+   moot; #99 — the perf harness reading native `aliases.jsonl` — is already fixed in
+   code, `b51216f`, and closeable.) See `plans/native-catalog-store.md`.
 
 ### Tests / acceptance
 
@@ -204,7 +211,8 @@ summary at :427), `execute_seconds` in `build.py:493`. The work:
   manifest now persists the structural `cache_worthy` / `cache_worthy_why` verdict
   (no longer computed and thrown away) alongside the measured inputs —
   `compile_seconds` (the dominant per-view cost), `cache_bytes` (the
-  result/snapshot byte-size), and `execute_seconds` (manifest.py:47-50). #87 also
+  result/snapshot byte-size) at manifest.py:47-50, plus `execute_seconds` at
+  manifest.py:38. #87 also
   added the `compute_cache` byte count to disk accounting (app.py:129), supplying
   the byte denominator and closing the #74 disk-usage follow-up. What remains is
   the side-by-side comparison/flip logic and the per-read path tags: tag each cold
@@ -219,6 +227,13 @@ source of build/load/execute events. (buckaroo changes are in scope — it's the
 companion's own viewer — and follow buckaroo's build/test conventions.)
 
 ### Deliverable 1 — the expression-lifecycle cost model (write before any perf test)
+
+> **Update (PR #47, merged):** the *prose* lifecycle model and the refreshed
+> cache map shipped as `docs/expression-lifecycle.md` and `docs/caching.md`, both
+> already post-#74/#104 accurate (baked snapshot is the only materialized copy,
+> baked at build; source-read cache; no `result.parquet`). What remains for this
+> deliverable is the *measured* per-action build/load/execute counts, which
+> Deliverable 2's harness produces.
 
 For each user-facing action — open the app, view an entry, revise a source, open a
 diff, reset — answer: how many expressions get **built** (graph constructed /
@@ -241,9 +256,9 @@ Build/load/execute counts are the explanatory variable; wall-clock is the sympto
 
 The cache layers matter only insofar as they change those counts (a hit skips a
 re-execution; a shallow graph skips a build). The catalogue of layers already
-exists — the `docs/caching-architecture` branch ("map every cache in the
+exists — merged via PR #47 as `docs/caching.md` ("map every cache in the
 tallyman/xorq/buckaroo stack", `xorq` `SnapshotStrategy`, the `.cas` store +
-`content_hash`, buckaroo's stat/session caches). **Refresh it for #74/#104:** the
+`content_hash`, buckaroo's stat/session caches). **The #74/#104 refresh is already in that merged doc:** the
 separate `result_cache/` dir is retired (baked results now co-locate in the
 per-project content-addressed `compute_cache`), and a new source-read cache
 (snapshot `.cache()` after each `read_csv`/`read_json`, shared across entries,
@@ -253,8 +268,10 @@ now closed, across two PRs: #87 (PR #94) added the `compute_cache` byte count to
 bucket and repointed the cache inspector + delete off the manifest `cache_bytes`
 and the baked snapshot path, listing only snapshots that exist on disk (app.py:1007
 / :1085) — there is no on-demand `result.parquet` left to reflect. Reuse the map as
-the levers section; the deliverable here is the lifecycle model on top, not a
-re-derived cache-key taxonomy.
+the levers section; the prose lifecycle model on top also shipped
+(`docs/expression-lifecycle.md`, PR #47), so what is left for this deliverable is
+the *measured* per-action build/load/execute counts — produced by Deliverable 2's
+harness, not a re-derived cache-key taxonomy.
 
 Existing backlog items are findings against this model: #21 (lazy warm), #22
 (checkpoint capture cost per mutating request), #30 (measured cost rubric vs
@@ -266,6 +283,17 @@ rebuilt or reloaded per app open; does revising a source re-execute dependents a
 all today (ADR says no — fast but stale).
 
 ### Deliverable 2 — performance integration tests (#59)
+
+> **Update (#59 / #64, both closed):** both tiers shipped — Tier B
+> (`tests/test_perf_integration.py`, `perf` marker: execute / page-load / diff,
+> cold+warm) and Tier A (`tests/test_perf_tier_a.py`, `perf_tier_a` marker, #64:
+> Playwright to `.df-viewer .ag-cell` + backend/total calibration). Three things
+> remain: (1) it is **report-only** — promote #45's diff time to a regression gate
+> once baselined; (2) the harness still references the OLD
+> `scripts/rebuild_parking_catalog.py` for its corpus — repoint it at the
+> freshly-built native corpus (Stage 1 item 4; no migration), with truncation done
+> at authoring time (`head(1M)` source read); (3) the **#82 deep-chain depth
+> measurement does not exist** and gates Stage 3.
 
 Three measurements, each on both corpus variants (full / truncated) and across a
 cold/warm cache axis. Local-only on this Mac, marker-gated off CI (same convention
@@ -300,8 +328,9 @@ unexplained slowdown.
 
 **Truncation design.** Truncate at the raw-source read (`head(1M)` on the source
 parquet) so the DAG shape and build/tokenize cost are identical to the full
-corpus and only execution cost drops. Both variants emitted by the stage-1
-rebuild script; regenerable, not checked in.
+corpus and only execution cost drops. Both variants are built fresh in the native
+format from the source parquets (Stage 1 item 4 — no migration of old catalogs);
+regenerable, not checked in.
 
 **Gating.** Report-only first (no baselines yet), matching the existing perf-report
 suite. Promote a few to regression gates once baselined — #45's diff time is the
@@ -372,18 +401,59 @@ its own issue; the 2026-06-16 design review settled their direction):
   structural verdict (`cache_worthy` / `cache_worthy_why`) alongside
   `compile_seconds` and `cache_bytes` (manifest.py:47-50); the side-by-side
   comparison/flip logic is the remaining work.
-- **Determinism lint** — build-time hint on nondeterministic ops; durable fix #83.
-- **In-process LRU invalidation on reset** — #80 (the memo moved onto
-  `_resolve_result_plan` in #103's hardening pass; `reset_to` still does not clear
-  it).
+- **Determinism lint** — ✅ **SHIPPED (#88):** the build-time hint on
+  nondeterministic ops landed (`_NONDETERMINISTIC_OPS`, build.py:261; wired into
+  `build_and_persist` at build.py:370; surfaced via the MCP server and companion;
+  tests pass). Residual: the runtime structural-case predicate log (reconstructed
+  hash ≠ stored `content_hash`); the durable execution-nondeterminism fix is still
+  #83 (open).
+- **In-process LRU invalidation on reset** — #80 / #96 (still open). The memo
+  moved onto `_resolve_result_plan` (`@functools.lru_cache`) in #103's hardening
+  pass and `reset_to` still does not call `cache_clear`, so as filed both stay
+  open — but the concrete dangling-path failure is now *mitigated*: the
+  `path.exists()` re-check + self-heal runs in the public `cached_result_expr`
+  body (result_cache.py:321) on every call, warm LRU hits included, so a reset or
+  prune no longer serves a deleted snapshot. A reactive layer still has to treat
+  this in-process cache as one more thing to invalidate.
 
-**Still genuinely open (the reactive feature's design):** the reactive *consumer*
-that walks `manifest.parents` to find and recompute dependents, plus the trigger
-model (button vs scan-on-load vs auto-cascade — leaning button + scan),
-cascade/transaction semantics, and archive overlay (derived vs stored). The DAG
-and read-intent *capture* are now in place (#84, merged via PR #91; made durable by
-#103); these staleness-layer decisions sit on top, once `cas` is the default and
-the alias-history ambiguity is fixed.
+**Still genuinely open (the reactive feature's design — tracked as epic #89):**
+the reactive *consumer* that walks `manifest.parents` to find and recompute
+dependents, plus the trigger model (button vs scan-on-load vs auto-cascade —
+leaning button + scan), cascade/transaction semantics, and archive overlay
+(derived vs stored). Nothing in the tree walks `manifest.parents` to recompute
+today — `catalog_dag` / `catalog_parents` feed only the DAG-visualization
+endpoints. The DAG and read-intent *capture* are in place (#84, merged via PR #91;
+made durable by #103); these staleness-layer decisions sit on top, once `cas` is
+the default and the alias-history ambiguity is fixed.
+
+**Recompute-substrate correctness holes the consumer inherits (filed since the
+#103 reconciliation; not yet reflected above).** The consumer recomputes
+dependents through the same `cached_result_expr` / `from_catalog` substrate these
+bugs sit in, so each effectively gates a *correct* cascade:
+
+- **#75** — an entry combining ≥2 catalog parents hits "Multiple backends found".
+  Multi-parent composition (joins/unions across entries) is the normal case a
+  cascade must rebuild. Appears handled in-tree (the multi-parent self-heal test
+  passes) but the issue is still open — confirm before relying on it.
+- **#76 / #77** — an expensive-parent child pins the parent's untracked
+  `compute_cache` snapshot *by path*; on a pruned or cross-machine-cloned snapshot
+  the child read fails (#76) or the viewer shows an empty grid (#77) instead of
+  recomputing from the parent. Recompute can be "correct" via `cached_result_expr`
+  while the user-facing grid is still stale/empty.
+- **#97** — a 0-row expensive parent bakes no snapshot, so a child's `/load_expr`
+  replay reads zero files and the self-heal can't repopulate it. Any cascade that
+  produces a 0-row intermediate breaks every downstream dependent.
+- **#79** — concurrent on-demand materialisation of the same cold entry races on
+  the output path (torn snapshot + 500, no single-flight lock). A cascade or
+  scan-on-load that warms many entries introduces exactly this concurrency.
+- **#81** — scalar-UDF-only entries are misclassified by `_is_worthy_expr`
+  (source_cache.py) vs `classify_build`, so some expensive entries bake nothing and
+  recompute on every read. A concrete instance of the #30/#87 worthiness
+  disagreement; it skews the recompute-cost model the staleness signal relies on.
+
+None of these are referenced in the plan/ADR today. They don't change the staged
+sequencing, but the cascade/transaction design above should treat them as gating
+the substrate it runs on.
 
 ---
 
@@ -391,20 +461,22 @@ the alias-history ambiguity is fixed.
 
 ```
 #48 ✓ ─┐
-#52 ✓ ─┤   rebuild script ✓ (#103) ─► run on real corpus ─► stage 2 corpus
-#103 ✓ ─┴─► (native store)                                    │
-                                                              │
-cache-architecture map (refresh for #74/#104) ────────────► perf tests ─► numbers
-                                                              (incl. #82)    │
-                                                          ┌──────────────────┘
+#52 ✓ ─┤   native store ✓ ─► build stage-2 corpus FRESH ──► stage 2 corpus
+#103 ✓ ─┴─► (no migration of old catalogs — re-author)     │
+                                                            │
+cache map + lifecycle docs ✓ (PR #47) ──► perf tiers ✓ (#59/#64) ─► numbers
+                                          (deep-chain #82 ✗)        │
+                                                          ┌─────────┘
 substrate (merged: #74 source-cache + baked result,      │
            #104 result.parquet removal, #103 native store)│
                                                           ▼
               prerequisites: parents-DAG + read-intent ✓ (#84/PR #91),
-              cas default, previous_version fix, admission telemetry
-              (recording shipped #87/PR #94), determinism lint, #80 LRU-on-reset
+              determinism lint ✓ (#88), admission telemetry recording ✓ (#87/PR #94);
+              still open: cas default (#86), previous_version fix (#85),
+              #30 worthiness flip, #80/#96 LRU-on-reset (mitigated)
                                                           │
                                                           ▼
-              stage 3 reactive feature: consume parents-DAG (recompute
+              stage 3 reactive feature (epic #89): consume parents-DAG (recompute
               dependents), trigger model, cascade, archive
+              — gated also by substrate holes #75/#76/#77/#97/#79/#81
 ```

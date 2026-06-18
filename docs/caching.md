@@ -86,7 +86,7 @@ would break both the isolation and the reset semantics.
 
 Tallyman decides what to materialize at *build* time and bakes the decision
 into the entry's recipe, so every later read takes the same path. Before a
-build, `rewrite_for_build` (`source_cache.py:82`) rewrites the submitted
+build, `rewrite_for_build` (`source_cache.py:89`) rewrites the submitted
 expression in three steps: reject in-memory reads, inject a source-read cache
 after each non-parquet file read, and — for an expensive expression — wrap the
 whole thing in a top-level result cache. Both kinds of cache node are
@@ -103,12 +103,19 @@ path), so there is no separate `result_cache/` directory; both land under
   exempt (`_EXEMPT_READS`): re-reading a columnar source is already a pushdown.
 - **Baked result snapshot** — an expression is *worthy* when it contains an
   Aggregate / Join / Sort / window / UDF (`_EXPENSIVE_OPS`,
-  `result_cache.py:48`). A worthy expression is wrapped in a result cache with
-  `relative_path="result_cache"` (`source_cache.py:153`), so its snapshot lands
+  `result_cache.py:49`). A worthy expression is wrapped in a result cache with
+  `relative_path="result_cache"` (`source_cache.py:160`), so its snapshot lands
   under `compute_cache/result_cache/`; executing the entry at build time
-  materializes it once (`build.py:487`). A non-parquet read is *not* by itself
-  worthy (`classify_build`, `result_cache.py:61`) — its parse is already
-  handled by the source-read cache.
+  materializes it once (`build.py:491`). A non-parquet read is *not* by itself
+  worthy (`classify_build`, `result_cache.py:62`) — its parse is already
+  handled by the source-read cache. Worthiness is decided by two predicates that
+  must agree: `_is_worthy_expr` gates the bake (`source_cache.py:62`) and
+  `classify_build` records `cache_worthy` in the manifest. `_is_worthy_expr`
+  matches a UDF by class ancestry (`type(node).__mro__`, `source_cache.py:84`)
+  and `classify_build` by the serialized op name containing `UDF`
+  (`result_cache.py:85`; a scalar UDF serializes as `op: ScalarUDF`); the two now
+  agree for a scalar UDF, so a scalar-UDF-only entry is worthy under both and
+  bakes its snapshot instead of recomputing the whole graph on every read (#81).
 
 A cheap entry — a source read plus projections / renames / row-wise scalar
 math — bakes no result snapshot. Recompute costs about the same as reading a
@@ -118,13 +125,17 @@ written for any entry, cheap or expensive, at build time or on demand (#73 and
 follow-up).
 
 Every consumer reads an entry's result through one function,
-`cached_result_expr` (`result_cache.py:273`):
+`cached_result_expr` (`result_cache.py:403`):
 
 - Expensive entry → `deferred_read_parquet` of the baked snapshot, on the
   default backend. The snapshot was written when the entry built, so reading it
   skips re-running the graph. If it was evicted since, the cache node recomputes
-  it once and the read proceeds — a self-heal re-checked on every call
-  (`result_cache.py:321`).
+  it once and the read proceeds — a self-heal re-checked on every call,
+  single-flighted per `(project, content_hash)` so concurrent cold readers don't
+  both run the shared cache op; after a repopulate the snapshot's digest is
+  checked against the recorded `result_digest` and a mismatch is logged as
+  recompute drift (`result_cache.py:451-473`, `_heal_lock`,
+  `_warn_if_self_heal_unfaithful`; #79, #83).
 - Cheap entry → the live expression, re-imported from the entry's `expr.py`
   and recomputed on read.
 
@@ -136,10 +147,20 @@ reads a pre-existing `result.parquet`, because none is written.
 Snapshot strategy is the right one here because an entry is an immutable,
 content-addressed artifact — its result must not invalidate just because an
 upstream file's mtime drifts. No TTL: entries are permanent history, not
-expiring scratch. The one exception is `salt` source-identity mode, where
-path-only snapshot keys would collide across entries with identical paths but
-different content; under salt, `rewrite_for_build` bakes no cache at all
-(`source_cache.py:123`) and every read recomputes.
+expiring scratch.
+
+How a source file's content reaches the key is set by `TALLYMAN_SOURCE_IDENTITY`
+(`source_identity.py:52`). The default is `cas`: `from_project` reads through a
+content-addressed clone at `<project>/data/.cas/<digest>` (`io.py:58`), so the
+path xorq tokenizes embeds the content digest and every xorq-level key — build
+hash and snapshot keys alike — is content-honest, and a rebuild over an edited
+source forks the hash instead of deduping to the stale entry. `off` is the
+historical path-only mode: no digest, no clone, an edit collides with the prior
+entry. `salt` is the remaining exception to baking: it folds source digests into
+the entry hash but leaves xorq's own keys path-only, so a baked snapshot's
+path-only key would collide across entries with identical paths but different
+content. Under salt, `rewrite_for_build` bakes no cache at all
+(`source_cache.py:130`) and every read recomputes.
 
 ### Compute cache (`compute_cache_dir` in `src/tallyman_core/paths.py`)
 
@@ -156,7 +177,11 @@ file captured at each checkpoint; `reset_to`
 (`src/tallyman_core/catalog_state.py:327`) prunes or restores the cache to
 match the target step. Evicted files move to `bullpen/` rather than being
 deleted, so a forward reset restores them instead of recomputing, while a
-re-added entry still computes honestly cold.
+re-added entry still computes honestly cold. `reset_to` also reclaims orphaned
+`cas` clones: `<project>/data/.cas` lives outside the catalog git repo, so
+`git reset` can't touch it, and `_gc_cas_clones` (`catalog_state.py:349`,
+`source_identity.gc_cas`) deletes any `.cas` file no surviving entry's
+`manifest.sources` still references (#86).
 
 ### In-memory caches in the companion
 
@@ -165,14 +190,18 @@ and staleness is impossible:
 
 - `cached_result_expr` — its reconstruction work is memoized on
   `_resolve_result_plan`, `lru_cache(256)` keyed `(project, content_hash)`
-  (`result_cache.py:232`); `cached_result_expr` re-exposes that memo's
+  (`result_cache.py:345`); `cached_result_expr` re-exposes that memo's
   `cache_clear` / `cache_info`. The memo saves re-importing the entry's
   `expr.py` and, for an expensive entry, re-deriving its baked-snapshot path.
   `cached_result_expr` itself is a thin wrapper that re-checks the snapshot's
-  on-disk presence on every call, so an evicted snapshot self-heals.
+  on-disk presence on every call, so an evicted snapshot self-heals; the heal
+  runs under a per-entry lock (`_heal_lock`, `result_cache.py:393`) so only the
+  first of several concurrent cold readers executes it, and a peer process that
+  wins xorq's fixed-`.tmp` rename is caught and retried once if the snapshot
+  landed, else re-raised (#79).
 - `_build_compare_expr` — `lru_cache(128)` keyed
   `(project, a_hash, b_hash, keys)`; saves rebuilding diff outer-join
-  expressions (`src/tallyman_companion/app.py:192`). Build dirs land under
+  expressions (`src/tallyman_companion/app.py:189`). Build dirs land under
   `$TMPDIR/tallyman_diff_builds/`.
 - Disk-usage payload — per-project, 3-second TTL
   (`_DISK_USAGE_TTL` in `src/tallyman_companion/app.py`). The only
@@ -231,12 +260,23 @@ catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
   omits it rather than symlinking it.)
 - **Manifest / schema** — `<entry>/manifest.json`, `<entry>/schema.json`:
   row counts, timings (including #87's cache-admission fields:
-  `compile_seconds`, `cache_worthy`, `cache_bytes`), and the schema, all
+  `compile_seconds`, `cache_worthy`, `cache_bytes`), the #83 `result_digest`
+  (a content hash of the executed result bytes), and the schema, all
   derived from the expression at build so later reads don't re-walk it.
 - **Alias history** — `<catalog>/aliases.jsonl`, one line per alias holding
   its current head and the append-only version log (`aliases.py`). It is a
   git-tracked file in the catalog repo, not a per-entry artifact, so it rolls
   back with `git reset` on a `reset_to`.
+- **Per-hash config** — `<catalog>/chart_specs/<hash>.vl.json` and
+  `<catalog>/display_configs/<hash>.json` hold an entry's chart and display
+  config, keyed by content hash. These are mutable (set or cleared from the UI),
+  not build outputs. Because the key is the hash, a revise mints a new hash and
+  would orphan them, so `carry_forward_entry_config` (`entry_config.py:21`)
+  copies each from the prior version unless the new version already defines its
+  own — called from `catalog_revise` (`server.py:572`) and the companion's
+  `put_code`. Post-processing and summary stats are not carried: they are
+  project-global (keyed by name, not hash) and already apply to every version
+  (#109).
 
 ## Buckaroo
 
@@ -296,11 +336,23 @@ all rely on "same key, same bytes, forever". Cleanup for those is a
 space concern (manual delete, bullpen moves on reset), and a deleted file
 self-heals by recomputing.
 
-The one documented hole in "never stale" is execution nondeterminism: an
-entry whose recipe calls `now()` / `random()` / an unseeded `sample()`
-produces different bytes each run under one content hash, so a cold recompute
-can disagree with what was built (#88). The build flags these as advisory lint
-warnings (`_nondeterminism_warnings`, `build.py`); it does not block them.
+Two documented holes break "never stale". The first is execution
+nondeterminism: an entry whose recipe calls `now()` / `random()` / an unseeded
+`sample()` produces different bytes each run under one content hash, so a cold
+recompute can disagree with what was built (#88). The build flags these as
+advisory lint warnings (`_nondeterminism_warnings`, `build.py`); it does not
+block them. As of #83 the build also records a `result_digest` of the executed
+bytes in the manifest, and the self-heal compares the repopulated snapshot
+against it (`verify_result_faithful`, `result_cache.py:299`;
+`_warn_if_self_heal_unfaithful`, `result_cache.py:315`), so this drift is now
+detected on recompute even though it is still not prevented. The second is
+cold-reconstruction faithfulness under the `cas`
+default: `cas` makes *build* identity content-aware (a rebuild over an edited
+source forks the hash) but not *reconstruction*. `cached_result_expr` re-runs a
+cheap entry's `expr.py` on every read, and `from_project` re-digests the live
+source, so a cheap entry — or an expensive entry self-healing an evicted
+snapshot — serves the edited bytes under its original `content_hash`. Closing
+this needs digest-pinned reconstruction, tracked in #115.
 
 Where staleness is actually possible, it is handled explicitly:
 
@@ -313,9 +365,12 @@ Where staleness is actually possible, it is handled explicitly:
   `purgeInfiniteCache` on sort/ops change, the session map clearing on
   Buckaroo restart, and the stat-cache deletion on reload.
 
-The one rule to remember: snapshot-strategy caches do not notice upstream
-data changes. Tallyman is safe because entries are immutable by
-construction; anyone pointing xorq's snapshot caches at mutable source
-files has to manage invalidation themselves. Tallyman's one opt-out is `salt`
-source-identity mode, which bakes no snapshot cache at all (path-only keys
-would collide across salted entries) and recomputes on every read.
+The one rule to remember: snapshot-strategy caches do not notice upstream data
+changes. The `cas` default papers over this at *build* time — an edited source
+forks the entry hash rather than deduping to the stale one — but a cold read of
+a cheap or evicted entry still re-digests the live source and can serve edited
+bytes under the old hash (#74, above). Anyone who needs reconstruction to be
+content-faithful today should treat a source as immutable once an entry is built.
+`off` reverts to xorq's path-only identity (an edit collides silently); `salt`
+mixes digests into the entry hash but bakes no snapshot cache at all (path-only
+keys would collide across salted entries) and recomputes on every read.

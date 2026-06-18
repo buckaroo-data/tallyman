@@ -348,6 +348,45 @@ def verify_result_faithful(project: str, content_hash: str) -> bool | None:
     return result_digest(cached_result_expr(project, content_hash)) == recorded
 
 
+def _reconstructed_hash(project: str, content_hash: str) -> str | None:
+    """Best-effort structural ``content_hash`` of the entry's current reconstructed
+    recipe — re-import ``expr.py``, rewrite for build, tokenize. Returns None if
+    any step fails (a warning enrichment must never break the read). Tokenize only,
+    no execute.
+    """
+    import tempfile
+
+    try:
+        from xorq.ibis_yaml.compiler import build_expr
+
+        from tallyman_xorq.source_cache import rewrite_for_build
+
+        rewritten = rewrite_for_build(_recipe_expr(project, content_hash), project)
+        with tempfile.TemporaryDirectory(prefix="tallyman_rehash_") as d:
+            return Path(build_expr(rewritten, builds_dir=Path(d))).name
+    except Exception:
+        return None
+
+
+def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> bool:
+    """Whether two reconstructions of the recipe yield different graph hashes (#88).
+
+    A recipe that bakes a Python-level nondeterministic literal (``random.random()``,
+    ``pd.Timestamp.now()``) at author time re-derives a different graph each
+    ``expr.py`` import, so its content_hash moves between reconstructions — the
+    structural case the op lint can't see (the literal is not an ibis op, so
+    ``build._nondeterminism_warnings`` is blind to it). A stable graph whose only
+    nondeterminism is at execute (an ibis nondeterministic op, an impure UDF, or
+    source drift under ``off`` identity) hashes the same both times; that drift is
+    execution-level (#83). Comparing two reconstructions to each other — not to the
+    stored hash — keeps the predicate robust to any build-vs-reconstruct path skew.
+    Best-effort: an unresolvable hash returns False (treated as not-structural).
+    """
+    a = _reconstructed_hash(project, content_hash)
+    b = _reconstructed_hash(project, content_hash)
+    return a is not None and b is not None and a != b
+
+
 def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -> None:
     """Compare a just-repopulated snapshot to the build-time digest, warn on drift.
 
@@ -355,7 +394,9 @@ def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -
     what was evicted (the result-cache + source-identity ADRs both call this out).
     For an execution-nondeterministic entry that is false: the snapshot self-heals
     to *different* bytes, silently. This fires the soundness signal — a
-    ``tallyman.perf`` warning — without ever breaking the read (best-effort).
+    ``tallyman.perf`` warning — without ever breaking the read (best-effort),
+    attributing the drift as structural (#88: the recipe's graph hash itself moves)
+    vs execution (#83: a fixed graph that runs differently).
     """
     recorded = _recorded_result_digest(project, content_hash)
     if not recorded:
@@ -367,11 +408,17 @@ def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -
     except Exception:
         return
     if actual != recorded:
+        kind = (
+            "structural (#88) — the recipe bakes a nondeterministic literal that re-derives a different graph hash"
+            if recipe_is_structurally_nondeterministic(project, content_hash)
+            else "execution (#83) — a fixed graph that runs differently each execute, or source drift under off"
+        )
         perf_log.warning(
-            "cached_result_expr self-heal %s: UNFAITHFUL recompute — result digest "
-            "%s != recorded %s; this entry is execution-nondeterministic (#83), so "
-            "eviction self-healed it to different bytes than were built",
+            "cached_result_expr self-heal %s: UNFAITHFUL recompute [%s] — result "
+            "digest %s != recorded %s; eviction self-healed it to different bytes "
+            "than were built",
             content_hash,
+            kind,
             actual,
             recorded,
         )

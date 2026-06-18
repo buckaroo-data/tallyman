@@ -567,3 +567,77 @@ def test_concurrent_cold_heal_is_single_flighted(project, orders_parquet, monkey
     # The healed snapshot reads back correctly (executed sequentially — concurrent
     # .execute() on the shared backend is out of scope for this materialisation test).
     assert len(cached_result_expr(project, agg_h).execute()) == expected
+
+
+def test_cross_process_heal_reads_landed_snapshot_else_reraises(project, orders_parquet, monkeypatch):
+    """The cross-process arm of the heal: a peer *process* can win xorq
+    ParquetStorage's fixed ``<key>.parquet.tmp`` rename, so this process's
+    ``baked.count().execute()`` raises ``FileNotFoundError``/``ValueError`` (#79).
+    The ``except`` gates on the snapshot's on-disk presence, not the exception type:
+    if the peer's snapshot landed, read it; otherwise the failure is real and must
+    propagate rather than dangle on a missing-path ``deferred_read_parquet``.
+
+    Two interpreters can't share one in-process backend here, so this stubs
+    ``_resolve_result_plan`` to hand back a baked op whose ``execute()`` raises after
+    (landed) the snapshot reappeared or (not-landed) it stayed gone — exactly the two
+    outcomes the arm distinguishes. The in-process collision is covered separately by
+    ``test_concurrent_cold_heal_is_single_flighted``.
+    """
+    import pytest
+
+    import tallyman_xorq.result_cache as rc
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    agg_h = _hash_of(project)
+
+    # Warm + learn the result, and keep a real valid parquet to "land" in the peer case.
+    expected = len(cached_result_expr(project, agg_h).execute())
+    p = baked_snapshot_path(project, agg_h)
+    assert p is not None and p.exists()
+    snapshot_bytes = p.read_bytes()
+
+    class _FakeBaked:
+        def __init__(self, on_execute):
+            self._on_execute = on_execute
+
+        def count(self):
+            return self
+
+        def execute(self):
+            self._on_execute()
+
+    def _stub_plan(on_execute):
+        # Stand in for the lru-memoised plan so the heal hits our controlled execute()
+        # against the REAL evicted path — the only thing the except arm reads.
+        monkeypatch.setattr(rc, "_resolve_result_plan", lambda _proj, _h: ("baked", _FakeBaked(on_execute), p))
+
+    # Landed: the peer's rename completed (snapshot back on disk) but our execute still
+    # raised on the vanished shared tmp — swallow it and read the materialised file.
+    # Both caught exception types must behave identically; the gate is path presence.
+    landed_excs = [
+        FileNotFoundError("peer won the shared .parquet.tmp rename"),
+        ValueError("snapshot tmp vanished mid-read"),
+    ]
+    for exc in landed_excs:
+        p.unlink()
+
+        def _land_then_raise(_exc=exc):
+            p.write_bytes(snapshot_bytes)
+            raise _exc
+
+        _stub_plan(_land_then_raise)
+        assert len(cached_result_expr(project, agg_h).execute()) == expected
+
+    # Not landed: no peer materialised the snapshot, so the failure is real and must
+    # propagate rather than hand back a dangling read of a missing path.
+    p.unlink()
+
+    def _just_raise():
+        raise FileNotFoundError("shared .parquet.tmp gone, snapshot never landed")
+
+    _stub_plan(_just_raise)
+    with pytest.raises(FileNotFoundError):
+        cached_result_expr(project, agg_h)
+    assert not p.exists()

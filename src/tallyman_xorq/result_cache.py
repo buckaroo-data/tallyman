@@ -114,6 +114,35 @@ _RECONSTRUCTING: contextvars.ContextVar[frozenset] = contextvars.ContextVar("_re
 # machine-locking memory blowup into a fast, clear error instead.
 _MAX_RECON_DEPTH = 64
 
+# The source digests ({rel_path: digest} from manifest.sources) the entry being
+# reconstructed on this stack was BUILT from, threaded into from_project so a cold
+# read resolves each source to the frozen data/.cas/<digest> clone it was built from —
+# not a re-digest of the (possibly edited-in-place) live file (#115). Set per-entry in
+# _recipe_expr alongside _RECONSTRUCTING and OVERWRITTEN (then restored) by each nested
+# reconstruction, so a grandparent's from_project sees the grandparent's recorded
+# sources. Carries the project so a from_project resolving a *different* project falls
+# through to the live path. None outside reconstruction (the build path); an entry that
+# recorded no sources (mode=off / pre-#86) yields an empty map, so from_project also
+# falls through.
+_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
+    "_recon_sources", default=None
+)
+
+
+def _recorded_sources(project: str, content_hash: str) -> dict:
+    """The entry's recorded ``manifest.sources`` ({rel_path: digest}), or ``{}``.
+
+    Empty when the manifest is unreadable or the entry recorded no sources (mode=off,
+    or a build predating #86); from_project then falls through to its live-file path.
+    """
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        return read_manifest(entry_dir(project, content_hash)).sources or {}
+    except (OSError, ValueError):
+        return {}
+
 
 def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> str:
     """The hash ``from_catalog`` should load, stepped out of any reconstruction cycle.
@@ -176,10 +205,17 @@ def _recipe_expr(project: str, content_hash: str):
     code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
     # Mark this entry in-flight for the duration of the recipe exec, so any
     # from_catalog the recipe issues can step back out of a self-reference (#74).
+    # In the SAME window, pin this entry's recorded sources so any from_project the
+    # recipe issues resolves to the frozen .cas clone it was built from, not a
+    # re-digest of the edited-in-place live file (#115). Both contextvars must wrap
+    # _import_script — that is where the recipe's from_catalog / from_project run —
+    # and reset in this finally, NOT the sys.modules-cleanup finally below.
     token = _RECONSTRUCTING.set(active | {(project, content_hash)})
+    recon_token = _RECON_SOURCES.set((project, _recorded_sources(project, content_hash)))
     try:
         module, tmp = _import_script(code)
     finally:
+        _RECON_SOURCES.reset(recon_token)
         _RECONSTRUCTING.reset(token)
     try:
         expr = getattr(module, _RECIPE_VAR, None)

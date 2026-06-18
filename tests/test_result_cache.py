@@ -893,10 +893,12 @@ def _src_read_code(project: str, rel: str) -> str:  # cheap: a bare project read
 
 
 def _src_group_code(project: str, rel: str) -> str:  # expensive: group_by → Aggregate → baked snapshot
+    # order_by('x') pins a deterministic row order so the #83 result_digest is stable
+    # build-to-self-heal (an unordered aggregate would reshuffle and read as drift).
     return (
         "from tallyman_xorq.io import from_project\n"
         f"t = from_project({rel!r}, project={project!r})\n"
-        "expr = t.group_by('x').aggregate(c=t.count())\n"
+        "expr = t.group_by('x').aggregate(c=t.count()).order_by('x')\n"
     )
 
 
@@ -1059,6 +1061,33 @@ def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypat
     assert child_sources.get("src.parquet") == p_digest
     # Sanity: the frozen digest the child pinned is NOT the edited live digest.
     assert si.digest_for(project, src) != p_digest
+
+
+def test_off_built_entry_reads_under_cas_default_without_crash(project, monkeypatch):
+    """#115 graceful degradation: an entry built under mode=off (no recorded sources)
+    read under the cas default falls through to a live read, not a crash.
+
+    The digest-pinned hook is a no-op when manifest.sources is None — there is no
+    frozen clone to pin — so reconstruction reads the live source as before. (Per the
+    single-user rebuild-always policy, rebuilding such an entry under cas is the path
+    to pinning; this only pins the no-crash contract.)
+    """
+    from tallyman_core import data_dir, entry_dir, read_manifest
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = data_dir(project) / "src.parquet"
+    _write_ints(src, [0, 1, 2])
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
+    assert read_manifest(entry_dir(project, h)).sources is None  # off records no sources
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")  # flip to the default
+    cached_result_expr.cache_clear()
+    df = cached_result_expr(project, h).execute()  # must not raise; reads the live source
+    assert sorted(df["x"].tolist()) == [0, 1, 2]
 
 
 def test_reset_to_clears_result_plan_memo(project, orders_parquet, monkeypatch):

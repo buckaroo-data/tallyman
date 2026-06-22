@@ -14,12 +14,11 @@ from __future__ import annotations
 
 import logging
 
-from tallyman_core.config import auto_recalc_enabled, set_auto_recalc
-
 from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_core import data_dir
 from tallyman_core.aliases import get_alias
 from tallyman_core.catalog_state import current_step, reset_to
+from tallyman_core.config import auto_recalc_enabled, set_auto_recalc
 from tallyman_core.errors import error_for_hash
 from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
@@ -47,10 +46,18 @@ expr = t.select("region", "price").mutate(extra=1)
 """
 
 
-def _child_code(parent: str) -> str:  # from_catalog child (alias name → follow=True)
+def _child_code(parent: str) -> str:  # cheap from_catalog child (alias name → follow=True)
     return f"""
 from tallyman_xorq.io import from_catalog
 t = from_catalog({parent!r})
+expr = t.mutate(doubled=t.price * 2)
+"""
+
+
+def _self_chain_code(alias: str) -> str:  # documented revise-in-place pattern: chain off own alias
+    return f"""
+from tallyman_xorq.io import from_catalog
+t = from_catalog({alias!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
@@ -282,3 +289,78 @@ def test_env_overrides_config_file(project, monkeypatch):
     assert auto_recalc_enabled(project) is True
     monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
     assert auto_recalc_enabled(project) is False
+
+
+def test_read_config_tolerates_unreadable_file(project, monkeypatch):
+    # The docstring promises a corrupt config never wedges a tool call. A non-UTF8
+    # config.json must resolve to defaults (auto_recalc ON), not raise.
+    from tallyman_core.config import _config_file, read_config
+
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    p = _config_file(project)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"\xff\xfe not valid utf-8 \x00\x80")
+
+    assert read_config(project) == {}
+    assert auto_recalc_enabled(project) is True
+
+
+# ---------------------------------------------------------------------------
+# tie-back robustness: self-referential revise + skipped-but-directly-stale
+# ---------------------------------------------------------------------------
+
+
+def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parquet, monkeypatch):
+    # The documented revise-in-place pattern (a recipe that reads from_catalog of
+    # its OWN alias) leaves the new head permanently alias-stale by design (#74/#85:
+    # the self-pin can never refresh). Auto-recalc must NOT (a) pointlessly replay
+    # it on the self-revise, nor (b) flag it UNEXPLAINED ("file a bug") on every
+    # later unrelated revise — that would make the UNEXPLAINED signal untrustworthy.
+    _clean_env(monkeypatch)
+    _second_source(project, "widgets.parquet", seed=1)
+    _hash(catalog_create("tpd", _src_code(project)))  # has a price column
+    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+
+    self_out = catalog_revise("tpd", _self_chain_code("tpd"))
+    tpd_head = get_alias(project, "tpd")
+    # (a) the self-chained head is not pointlessly carried into its own cascade cone
+    assert tpd_head not in self_out["recalc"]["cone"]
+
+    # (b) a later, unrelated revise must not flag it UNEXPLAINED
+    out = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
+    orphans = {o["hash"]: o for o in out["recalc"]["orphan_stale"]}
+    assert tpd_head in orphans  # it IS directly (self-)stale, so it is accounted for
+    assert "UNEXPLAINED" not in orphans[tpd_head]["explanation"]
+    assert "self-referential" in orphans[tpd_head]["explanation"].lower()
+
+
+def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orders_parquet, monkeypatch):
+    # When a cascade halts, an entry it SKIPS that is independently directly stale
+    # must still be accounted for: recorded against the durable error store so a
+    # later unrelated revise classifies it "explained", not a false UNEXPLAINED.
+    # Construction uses the cheap-chain source leak: b and c (cheap children) carry
+    # orders.parquet in their own manifest.sources, so editing it makes them
+    # directly source-stale independent of the alias axis.
+    _clean_env(monkeypatch)
+    _second_source(project, "widgets.parquet", seed=1)
+    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    _hash(catalog_create("a", _src_code(project)))
+    b1 = _hash(catalog_create("b", _child_code("a")))  # cheap child of a (leaks orders)
+    c1 = _hash(catalog_create("c", _child_code("b")))  # cheap child of b (leaks orders)
+
+    (entry_dir(project, b1) / "expr.py").write_text("broken (((\n")
+    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=250, seed=7)  # drift orders
+    assert scan(project)[c1].stale is True  # c is directly source-stale (cheap leak)
+
+    out1 = catalog_revise("a", _src_code_v2(project))  # cone [b, c]: b fails, c skipped
+    assert out1["recalc"]["status"] == "failed"
+    by = {e["content_hash"]: e for e in out1["recalc"]["entries"]}
+    assert by[b1]["action"] == "failed" and by[c1]["action"] == "skipped"
+    # the skipped-but-directly-stale entry is recorded, so error_for_hash resolves it
+    assert error_for_hash(project, c1) is not None
+
+    out2 = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))  # unrelated
+    orphans = {o["hash"]: o for o in out2["recalc"]["orphan_stale"]}
+    assert c1 in orphans
+    assert "UNEXPLAINED" not in orphans[c1]["explanation"]
+    assert "explained by error" in orphans[c1]["explanation"]

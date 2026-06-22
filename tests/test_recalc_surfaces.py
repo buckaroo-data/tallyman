@@ -136,9 +136,66 @@ def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, monk
     out = catalog_recalc(dry_run=False)
     assert out["status"] == "ok"
     assert captured["kind"] == "recalc"
-    assert "step" in captured["extra"]  # finding 2: step is forwarded, not dropped
-    assert captured["extra"]["step"] == out["checkpoint_step"]
-    assert captured["extra"]["remap"] == out["remap"]
+    # Flat kwargs, NOT nested under `extra` — `_notify(kind, **extra)` would wrap a
+    # literal `extra={...}` as extra.extra, and the companion handler reads
+    # payload.extra.remap, so the nested form silently dropped remap on the wire.
+    assert captured["remap"] == out["remap"]
+    assert captured["step"] == out["checkpoint_step"]
+
+
+def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_parquet, monkeypatch):
+    # End-to-end across the seam the mocked tests miss: the exact JSON
+    # tallyman_mcp._notify puts on the wire, fed to the REAL /internal/notify
+    # handler, must deliver remap + step to the republished SSE event. Previously
+    # the producer half (mocked _notify) and consumer half (hand-built payload)
+    # were tested against different shapes, hiding a double-wrap that dropped remap.
+    from fastapi.testclient import TestClient
+
+    import tallyman_companion.app as appmod
+    import tallyman_mcp.server as server
+    from tallyman_companion import create_app
+    from tallyman_mcp.server import catalog_create, catalog_recalc
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+
+    sent: dict = {}
+
+    class _CaptureClient:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, _url, json=None):
+            sent.clear()
+            sent.update(json or {})
+
+    monkeypatch.setattr(server.httpx, "Client", _CaptureClient)
+
+    catalog_create("a", _base_code(project))
+    catalog_create("b", _child_code("a"))
+    _edit_source(project)
+    out = catalog_recalc(dry_run=False)  # the real call site fires _notify("recalc", ...)
+    assert out["remap"] and sent.get("kind") == "recalc"
+
+    captured: list = []
+    monkeypatch.setattr(
+        appmod,
+        "_recalc_sse_event",
+        lambda remap, step: captured.append((remap, step)) or {"kind": "recalc", "remap": remap, "step": step},
+        raising=False,
+    )
+    c = TestClient(create_app(project))
+    r = c.post("/internal/notify", json=sent)  # feed the EXACT wire payload to the real handler
+    assert r.status_code == 200, r.text
+    assert captured, "handler dropped the recalc payload"
+    remap, step = captured[0]
+    assert remap == out["remap"]  # remap survived the wire (not double-wrapped away)
+    assert step == out["checkpoint_step"]
 
 
 # ---------------------------------------------------------------------------

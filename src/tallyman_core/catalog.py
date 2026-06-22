@@ -52,6 +52,7 @@ TRACKED_SURFACE = (
     "chart_specs/*.vl.json",
     "display_configs/*.json",
     "aliases.jsonl",
+    "config.json",
     "notebook.jsonl",
     "entries.jsonl",
     "compute_cache.jsonl",

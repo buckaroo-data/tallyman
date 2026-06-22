@@ -7,6 +7,8 @@ from pathlib import Path
 
 from tallyman_core.paths import ensure_project, errors_path
 
+_UNBOUNDED = 1_000_000_000  # list_errors caps at `limit`; this means "all rows"
+
 
 def _errors_path(project: str) -> Path:
     return errors_path(project)
@@ -18,8 +20,16 @@ def record_error(
     message: str,
     prompt: str | None = None,
     tool: str | None = None,
+    hash: str | None = None,
 ) -> dict:
-    """Append a build-failure record. Returns the recorded entry (with id)."""
+    """Append a build-failure record. Returns the recorded entry (with id).
+
+    ``hash`` ties the failure to the catalog entry that failed to (re)build — set
+    by recalc/auto-recalc so a later staleness scan can attribute a lingering
+    stale entry to a known prior failure (``error_for_hash``) instead of flagging
+    it UNEXPLAINED. ``errors.jsonl`` lives in ``artifacts_dir``, outside the
+    catalog git repo, so a recorded failure survives ``reset_to``.
+    """
     ensure_project(project)
     entry = {
         "id": uuid.uuid4().hex[:12],
@@ -28,6 +38,7 @@ def record_error(
         "code": code,
         "message": message,
         "tool": tool,
+        "hash": hash,
     }
     p = _errors_path(project)
     with p.open("a") as fh:
@@ -60,6 +71,19 @@ def clear_errors(project: str) -> int:
         n = sum(1 for line in fh if line.strip())
     p.unlink()
     return n
+
+
+def error_for_hash(project: str, content_hash: str) -> dict | None:
+    """The most recent recorded error carrying ``hash == content_hash``, or None.
+
+    Powers the orphan-stale tie-back: an entry that is still stale because a prior
+    recalc/build of it failed is "explained by" that recorded error, not an
+    unexplained invariant break. Most-recent-first so the freshest failure wins.
+    """
+    for row in list_errors(project, limit=_UNBOUNDED):
+        if row.get("hash") == content_hash:
+            return row
+    return None
 
 
 def get_error(project: str, error_id: str) -> dict | None:

@@ -38,15 +38,19 @@ report surfaces it (``action="noop"`` with the verdict) but does not loop on it.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+import logging
+from dataclasses import asdict, dataclass, field
 
 from tallyman_core import aliases
 from tallyman_core.entry_config import carry_forward_entry_config
+from tallyman_core.errors import error_for_hash, record_error
 from tallyman_core.paths import entry_dir, entry_manifest_path, project_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.dependents import DependencyCycleError, build_dag, descendant_cone
 from tallyman_xorq.portable import PLACEHOLDER
-from tallyman_xorq.staleness import StaleReason, scan
+from tallyman_xorq.staleness import StaleReason, StaleVerdict, scan
+
+log = logging.getLogger("tallyman_xorq.recalc")
 
 
 @dataclass
@@ -132,18 +136,17 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
     # (scan/list_entries), so a dir-without-manifest root would otherwise enter
     # the cone and KeyError the walk at verdicts[hash].
     roots = [r for r in roots if entry_manifest_path(project, r).exists()]
-    try:
-        cone = descendant_cone(project, roots)
-    except DependencyCycleError as exc:
-        return RecalcReport(project, roots, [], [], dry_run, "cycle", error=str(exc))
-
-    # Reuse the Stage-1 scan for the direct/transitive verdicts (one pass over the
-    # project), then index into it for the cone. Keeps the staleness semantics in
-    # one tested place rather than re-deriving them here.
-    verdicts = scan(project)
-    cone_set = set(cone)
 
     if dry_run:
+        try:
+            cone = descendant_cone(project, roots)
+        except DependencyCycleError as exc:
+            return RecalcReport(project, roots, [], [], True, "cycle", error=str(exc))
+        # Reuse the Stage-1 scan for the direct/transitive verdicts (one pass over
+        # the project), then index into it for the cone. Keeps the staleness
+        # semantics in one tested place rather than re-deriving them here.
+        verdicts = scan(project)
+        cone_set = set(cone)
         dag = build_dag(project)
         entries = [
             RecalcEntry(
@@ -158,6 +161,35 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
         ]
         return RecalcReport(project, roots, cone, entries, True, "ok")
 
+    # Real run: the checkpoint-free walk, then this function's one checkpoint —
+    # only when a change actually landed. ``catalog_recalc`` is exempt from its
+    # surface's generic per-op checkpoint, so this is the sole writer.
+    report = _run_walk(project, roots)
+    report.checkpoint_step = _checkpoint(project, report.remap) if report.remap else None
+    return report
+
+
+def _run_walk(project: str, roots: list[str]) -> RecalcReport:
+    """Replay *roots* and their cone in dependency order, **without** taking a
+    checkpoint — the reusable engine behind both the public ``recalc`` and the
+    auto-recalc folded into ``catalog_revise``.
+
+    Replays each recipe through ``build_and_persist``, re-points each followed
+    alias to its fresh hash, carries entry config forward, and records each build
+    failure to the durable error store keyed by the failed entry's hash (so a
+    later staleness scan can attribute lingering staleness to a known failure).
+    Stop-and-report on the first failure: the prefix is left in the working tree
+    for the caller's single checkpoint to commit. Returns a report with
+    ``checkpoint_step=None`` — the *caller* owns the one checkpoint (``recalc``
+    for an explicit run; the per-op decorator/middleware for an embedded one).
+    """
+    roots = [r for r in roots if entry_manifest_path(project, r).exists()]
+    try:
+        cone = descendant_cone(project, roots)
+    except DependencyCycleError as exc:
+        return RecalcReport(project, roots, [], [], False, "cycle", error=str(exc))
+
+    verdicts = scan(project)
     remap: dict[str, str] = {}
     entries: list[RecalcEntry] = []
     status = "ok"
@@ -173,6 +205,15 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
         try:
             result = build_and_persist(project, _recipe_code(project, old_hash))
         except BuildError as exc:
+            # Persist the failure (outside the catalog repo, so it survives
+            # reset_to) keyed by the failed hash — the orphan-stale tie-back.
+            record_error(
+                project,
+                code=_recipe_code(project, old_hash),
+                message=str(exc),
+                tool="catalog_recalc",
+                hash=old_hash,
+            )
             entries.append(
                 _entry(old_hash, "failed", verdict, project, alias=heading[0] if heading else None, error=str(exc))
             )
@@ -195,8 +236,72 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
         else:
             entries.append(_entry(old_hash, "noop", verdict, project, alias=heading[0] if heading else None))
 
-    step = _checkpoint(project, remap) if remap else None
-    return RecalcReport(project, roots, cone, entries, False, status, remap=remap, checkpoint_step=step)
+    return RecalcReport(project, roots, cone, entries, False, status, remap=remap)
+
+
+def followers_of(project: str, name: str, verdicts: dict[str, StaleVerdict] | None = None) -> list[str]:
+    """Entries a revise of alias *name* made directly stale: those directly stale
+    with an alias-axis reason whose ``ref`` is *name*. These are the auto-recalc
+    roots — the cone expands from them. Pre-existing staleness from other causes
+    is deliberately excluded (it is logged as orphan-stale, never recomputed)."""
+    verdicts = verdicts if verdicts is not None else scan(project)
+    return sorted(
+        h for h, v in verdicts.items() if v.stale and any(r.axis == "alias" and r.ref == name for r in v.reasons)
+    )
+
+
+def _classify_orphan(project: str, content_hash: str, verdict: StaleVerdict) -> dict:
+    """Classify a stale entry an auto-recalc did *not* recompute against the
+    durable error store: explained by a recorded failure, or UNEXPLAINED."""
+    err = error_for_hash(project, content_hash)
+    if err is not None:
+        explanation = f"explained by error {err['id']}"
+    else:
+        explanation = "UNEXPLAINED stale entry — staleness with no recorded recalc error; file a bug."
+    return {
+        "hash": content_hash,
+        "alias": (_aliases_heading(project, content_hash) or [None])[0],
+        "reasons": [asdict(r) for r in verdict.reasons],
+        "explanation": explanation,
+    }
+
+
+def auto_recalc(project: str, name: str) -> dict:
+    """Recompute the followers a revise of alias *name* made stale, **without**
+    taking a checkpoint, and account for every other stale entry it did not touch.
+
+    The cascade is scoped to *name*'s followers (``followers_of``); their cone is
+    replayed by ``_run_walk``. Every directly-stale entry *outside* that cone is an
+    orphan — stale for a different cause (a drifted source, a different alias not
+    yet recalced, or an invariant break) — left untouched, logged at WARNING, and
+    returned in ``orphan_stale`` classified against the error store (#6).
+
+    Returns the recalc report (``catalog_recalc``'s shape) plus ``orphan_stale``.
+    The caller embeds this in its own transaction: it owns the single checkpoint
+    and the cross-process notify / SSE publish.
+    """
+    verdicts = scan(project)
+    directly_stale = [h for h, v in verdicts.items() if v.stale]
+    roots = followers_of(project, name, verdicts)
+
+    report = _run_walk(project, roots)  # checkpoint-free; caller commits
+
+    recomputed = set(report.cone)
+    orphans = sorted(h for h in directly_stale if h not in recomputed)
+    orphan_stale = [_classify_orphan(project, h, verdicts[h]) for h in orphans]
+    for o in orphan_stale:
+        log.warning(
+            "auto-recalc(%s): orphan-stale entry %s (alias=%s) left unrecomputed — %s; reasons=%s",
+            name,
+            o["hash"],
+            o["alias"],
+            o["explanation"],
+            o["reasons"],
+        )
+
+    out = asdict(report)
+    out["orphan_stale"] = orphan_stale
+    return out
 
 
 def _entry(content_hash, action, verdict, project, *, new_hash=None, alias=None, error=None) -> RecalcEntry:

@@ -20,6 +20,7 @@ from tallyman_core import (
     PostProcessingSourceError,
     StatSourceError,
     alias_for_hash,
+    auto_recalc_enabled,
     carry_forward_entry_config,
     entry_dir,
     entry_schema_path,
@@ -201,6 +202,29 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
     except Exception as exc:
         # Companion may not be up; that's allowed. Log and move on.
         print(f"[tallyman_mcp] notify failed ({kind}): {exc}", file=sys.stderr)
+
+
+def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
+    """Cascade-recompute *name*'s stale followers right after an existing alias
+    head advanced — shared by every MCP path that re-points an existing alias
+    (``catalog_revise``, ``catalog_promote_diff``).
+
+    The walk is **checkpoint-free**: it leaves the re-pointed dependents in the
+    working tree for the surrounding op's single checkpoint (the dispatch
+    decorator, or promote_diff's own checkpoint) to commit, so the head advance
+    and the whole cascade land as ONE git revision. Returns the recalc sub-report
+    (``catalog_recalc``'s shape plus ``orphan_stale``), or ``None`` when the
+    per-project ``auto_recalc`` switch is off. Best-effort cross-process notify so
+    the companion invalidates caches / reloads sessions / emits the SSE event.
+    """
+    if not auto_recalc_enabled(project):
+        return None
+    from tallyman_xorq.recalc import auto_recalc  # noqa: PLC0415
+
+    report = auto_recalc(project, name)
+    if report.get("remap"):
+        _notify("recalc", extra={"remap": report["remap"], "step": report.get("checkpoint_step")})
+    return report
 
 
 @mcp.tool()
@@ -577,6 +601,12 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     if carried:
         out["carried_over"] = carried
     _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
+    # Auto-recalc: cascade-recompute name's stale followers in this op's single
+    # checkpoint (the dispatch decorator commits the head advance + the cascade as
+    # one revision). Off → the explicit scan→recalc path. See plans/auto-recalc-on-revise.md.
+    recalc_report = _auto_recalc_after_head_advance(project, name)
+    if recalc_report is not None:
+        out["recalc"] = recalc_report
     return out
 
 
@@ -839,10 +869,12 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     except BuildError as exc:
         return {"error": str(exc)}
 
+    repointed = False
     try:
         set_alias(project, target_alias, result.content_hash, expect_exists=False)
     except AliasExists:
         set_alias(project, target_alias, result.content_hash)
+        repointed = True  # re-pointed an existing alias → its followers may go stale
 
     set_display_config(
         project,
@@ -860,9 +892,15 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         },
     )
 
+    # D5: every existing-alias head-mover triggers auto-recalc via the shared
+    # helper. A fresh target_alias (expect_exists=False) has no followers; only
+    # the re-point branch can. The checkpoint-free walk runs BEFORE this op's
+    # checkpoint so that one revision sweeps the promote + the cascade together.
+    recalc_report = _auto_recalc_after_head_advance(project, target_alias) if repointed else None
+
     checkpoint_catalog(project, f"tallyman: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
     _notify("entry_added", content_hash=result.content_hash)
-    return {
+    out = {
         "alias": target_alias,
         "hash": result.content_hash,
         "source_alias": name,
@@ -873,6 +911,9 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         "keys": keys,
         "row_count": result.row_count,
     }
+    if recalc_report is not None:
+        out["recalc"] = recalc_report
+    return out
 
 
 @mcp.tool()

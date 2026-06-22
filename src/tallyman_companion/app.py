@@ -367,6 +367,29 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
+    async def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
+        """Cascade-recompute *name*'s stale followers after an in-browser head
+        advance (PUT /api/code, promote_diff), in the SAME revision the checkpoint
+        middleware commits — the walk takes no checkpoint of its own. Returns the
+        recalc sub-report (plus ``orphan_stale``), or ``None`` when the per-project
+        ``auto_recalc`` switch is off. On a real cascade, invalidates the companion
+        caches, reloads buckaroo sessions, and publishes the canonical recalc SSE
+        event — the same cleanup /api/recalc does. Parity with the MCP path."""
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from tallyman_core.config import auto_recalc_enabled  # noqa: PLC0415
+        from tallyman_xorq.recalc import auto_recalc  # noqa: PLC0415
+
+        if not await run_in_threadpool(auto_recalc_enabled, project):
+            return None
+        report = await run_in_threadpool(auto_recalc, project, name)
+        if report.get("remap"):
+            _invalidate_reset_caches()
+            if buckaroo:
+                buckaroo.reload_project_sessions(project)
+            await publish(_recalc_sse_event(report["remap"], report.get("checkpoint_step")))
+        return report
+
     # ------------------------------------------------------------------
     # Dispatch-boundary checkpoint (reset-to-revision). Opt-out: every
     # successful non-GET response checkpoints once, unless the route is on
@@ -877,10 +900,12 @@ def create_app(
         except BuildError as exc:
             raise HTTPException(500, str(exc)) from exc
 
+        repointed = False
         try:
             set_alias(project, target_alias, result.content_hash, expect_exists=False)
         except AliasExists:
             set_alias(project, target_alias, result.content_hash)
+            repointed = True  # re-pointed an existing alias → its followers may go stale
 
         set_display_config(
             project,
@@ -898,10 +923,14 @@ def create_app(
             },
         )
 
+        # D5 parity: re-pointing an existing alias cascades to its followers in the
+        # same revision (the walk runs before this route's checkpoint).
+        recalc_report = await _auto_recalc_after_head_advance(project, target_alias) if repointed else None
+
         checkpoint_catalog(project, f"tallyman: catalog_promote_diff {alias} V{a_idx}→V{b_idx}")
         await publish({"kind": "entry_added", "hash": result.content_hash})
 
-        return {
+        out = {
             "alias": target_alias,
             "hash": result.content_hash,
             "source_alias": alias,
@@ -912,6 +941,9 @@ def create_app(
             "keys": keys,
             "row_count": result.row_count,
         }
+        if recalc_report is not None:
+            out["recalc"] = recalc_report
+        return out
 
     @app.get("/{project}/api/error/{error_id}")
     def api_error_single(project: str, error_id: str):
@@ -1134,6 +1166,13 @@ def create_app(
         # Surface the advisory nondeterminism lint, same as the MCP tool replies (#88).
         if res.lint_warnings:
             reply["lint_warnings"] = res.lint_warnings
+        # Auto-recalc: cascade this in-browser revise to the alias's stale
+        # followers in the SAME revision — the checkpoint middleware commits the
+        # head advance + the cascade as one (the walk takes no checkpoint of its
+        # own). Off → today's no-cascade behavior. Parity with catalog_revise.
+        rep = await _auto_recalc_after_head_advance(project, alias)
+        if rep is not None:
+            reply["recalc"] = rep
         return reply
 
     @app.put("/{project}/api/markdown/{cell_id}")

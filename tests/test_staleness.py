@@ -122,6 +122,11 @@ def test_off_mode_reports_source_axis_unknown_not_fresh(project, orders_parquet,
 
 def test_scan_distinguishes_direct_from_transitive_staleness(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    # Opt out of auto-recalc-on-revise: this test needs the revise to advance "a"
+    # WITHOUT cascading, so the scan can observe b directly-stale and c only
+    # transitively-stale. With the cascade on (the default), the revise would
+    # recompute b and c, leaving no transitive-only node to classify.
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
     a_v1 = _hash(catalog_create("a", _base_code(project)))
     # b is an expensive (Aggregate) intermediate: reconstructing it reads its
     # baked snapshot rather than re-running its recipe, so its from_catalog("a")

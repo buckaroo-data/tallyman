@@ -223,7 +223,10 @@ def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
 
     report = auto_recalc(project, name)
     if report.get("remap"):
-        _notify("recalc", extra={"remap": report["remap"], "step": report.get("checkpoint_step")})
+        # Flat kwargs: _notify packs **extra into the wire `extra`, and the
+        # companion handler reads extra.remap / extra.step. A literal extra={...}
+        # would nest as extra.extra and silently drop both (#129 follow-up).
+        _notify("recalc", remap=report["remap"], step=report.get("checkpoint_step"))
     return report
 
 
@@ -982,10 +985,12 @@ def catalog_recalc(roots: list[str] | None = None, dry_run: bool = True) -> dict
         }
     report = recalc(project, roots, dry_run=dry_run)
     if not dry_run and report.remap:
-        # Forward both the remap and the checkpoint step so the companion can
+        # Forward remap + checkpoint step as FLAT kwargs so the companion can
         # republish the same normalized {kind, remap, step} SSE event the
-        # in-process /api/recalc route emits (see app._recalc_sse_event).
-        _notify("recalc", extra={"remap": report.remap, "step": report.checkpoint_step})
+        # in-process /api/recalc route emits (see app._recalc_sse_event). _notify
+        # packs **extra into the wire `extra`; a literal extra={...} would nest as
+        # extra.extra and the handler's extra.remap read would drop it.
+        _notify("recalc", remap=report.remap, step=report.checkpoint_step)
     return asdict(report)
 
 

@@ -240,6 +240,43 @@ def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet
     assert cfg["column_config_overrides"]["membership"]["merge_rule"] == "hidden"
 
 
+def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: str, orders_parquet: Path, monkeypatch):
+    # D5: catalog_promote_diff re-pointing an EXISTING alias is an auto-recalc
+    # trigger. Re-promoting onto the same target advances it, so its followers must
+    # cascade-recompute in the SAME revision (the walk runs before promote_diff's
+    # own checkpoint). This guards the ordering the atomicity depends on.
+    from tallyman_core.aliases import get_alias
+    from tallyman_core.catalog_state import current_step, reset_to
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+
+    catalog_create("ss", _agg_code(project))  # v1
+    catalog_revise("ss", _filter_code(project))  # v2
+    d1 = catalog_promote_diff("ss", alias="mydiff")["hash"]  # creates mydiff
+    foll = catalog_create(
+        "foll",
+        "from tallyman_xorq.io import from_catalog\nt = from_catalog('mydiff')\nexpr = t.select('region')\n",
+    )["hash"]
+
+    catalog_revise("ss", _agg_code(project))  # v3 → the latest-two diff now differs
+    step_before = current_step(project)
+    out = catalog_promote_diff("ss", alias="mydiff")  # AliasExists → re-point mydiff → cascade
+
+    assert out["alias"] == "mydiff" and out["hash"] != d1  # mydiff advanced to a new diff
+    assert "recalc" in out  # the cascade fired
+    foll2 = get_alias(project, "foll")
+    assert foll2 != foll  # the follower was recomputed
+    assert out["recalc"]["remap"].get(foll) == foll2
+
+    # Atomic: reset_to before the re-promote restores BOTH the diff alias and the follower.
+    reset_to(project, step_before)
+    assert get_alias(project, "mydiff") == d1
+    assert get_alias(project, "foll") == foll
+
+
 def test_catalog_promote_diff_no_history_returns_error(project: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_promote_diff("nonexistent")

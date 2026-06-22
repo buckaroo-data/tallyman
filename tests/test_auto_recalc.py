@@ -291,6 +291,26 @@ def test_env_overrides_config_file(project, monkeypatch):
     assert auto_recalc_enabled(project) is False
 
 
+def test_config_json_is_tracked_and_reset_restores_it(project, orders_parquet, monkeypatch):
+    # config.json must be on the catalog's tracked-surface allowlist: it is swept
+    # into checkpoints and reset_to's assert_catalog_consistent would otherwise
+    # reject it as an unlisted tracked path. Pin both that reset doesn't raise and
+    # that the setting versions with the catalog.
+    from tallyman_core.config import read_config
+
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)
+    _hash(catalog_create("a", _src_code(project)))  # this checkpoint commits config.json (auto_recalc=false)
+    step = current_step(project)
+
+    set_auto_recalc(project, True)
+    _hash(catalog_create("b", _src_code_v2(project)))  # later checkpoint commits auto_recalc=true
+    assert read_config(project)["auto_recalc"] is True
+
+    reset_to(project, step)  # must not raise; reverts the tracked config.json
+    assert read_config(project)["auto_recalc"] is False
+
+
 def test_read_config_tolerates_unreadable_file(project, monkeypatch):
     # The docstring promises a corrupt config never wedges a tool call. A non-UTF8
     # config.json must resolve to defaults (auto_recalc ON), not raise.
@@ -335,32 +355,43 @@ def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parqu
 
 
 def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orders_parquet, monkeypatch):
-    # When a cascade halts, an entry it SKIPS that is independently directly stale
-    # must still be accounted for: recorded against the durable error store so a
-    # later unrelated revise classifies it "explained", not a false UNEXPLAINED.
-    # Construction uses the cheap-chain source leak: b and c (cheap children) carry
-    # orders.parquet in their own manifest.sources, so editing it makes them
-    # directly source-stale independent of the alias axis.
+    # When a cascade halts, an entry it SKIPS that is itself directly stale must
+    # still be accounted for: recorded against the durable error store so a later
+    # unrelated revise classifies it "explained", not a false UNEXPLAINED.
+    #
+    # Two siblings b and c both follow a, so revising a makes BOTH directly
+    # alias-stale (both become recalc roots). Break both recipes: whichever the
+    # walk reaches first fails and halts, leaving the other SKIPPED while still
+    # directly stale — exactly the case the skipped-record covers, order-agnostic.
     _clean_env(monkeypatch)
     _second_source(project, "widgets.parquet", seed=1)
     _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
     _hash(catalog_create("a", _src_code(project)))
-    b1 = _hash(catalog_create("b", _child_code("a")))  # cheap child of a (leaks orders)
-    c1 = _hash(catalog_create("c", _child_code("b")))  # cheap child of b (leaks orders)
+    # Distinct recipes so b and c are different entries (same recipe → same hash →
+    # one entry with two aliases), both following a.
+    b1 = _hash(
+        catalog_create(
+            "b", "from tallyman_xorq.io import from_catalog\nt = from_catalog('a')\nexpr = t.mutate(d2=t.price * 2)\n"
+        )
+    )
+    c1 = _hash(
+        catalog_create(
+            "c", "from tallyman_xorq.io import from_catalog\nt = from_catalog('a')\nexpr = t.mutate(d3=t.price * 3)\n"
+        )
+    )
+    for h in (b1, c1):
+        (entry_dir(project, h) / "expr.py").write_text("broken (((\n")
 
-    (entry_dir(project, b1) / "expr.py").write_text("broken (((\n")
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=250, seed=7)  # drift orders
-    assert scan(project)[c1].stale is True  # c is directly source-stale (cheap leak)
-
-    out1 = catalog_revise("a", _src_code_v2(project))  # cone [b, c]: b fails, c skipped
+    out1 = catalog_revise("a", _src_code_v2(project))  # roots [b, c]: one fails, the other is skipped
     assert out1["recalc"]["status"] == "failed"
-    by = {e["content_hash"]: e for e in out1["recalc"]["entries"]}
-    assert by[b1]["action"] == "failed" and by[c1]["action"] == "skipped"
+    by = {e["content_hash"]: e["action"] for e in out1["recalc"]["entries"]}
+    assert sorted([by[b1], by[c1]]) == ["failed", "skipped"]
+    skipped = b1 if by[b1] == "skipped" else c1
     # the skipped-but-directly-stale entry is recorded, so error_for_hash resolves it
-    assert error_for_hash(project, c1) is not None
+    assert error_for_hash(project, skipped) is not None
 
-    out2 = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))  # unrelated
+    out2 = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))  # unrelated revise
     orphans = {o["hash"]: o for o in out2["recalc"]["orphan_stale"]}
-    assert c1 in orphans
-    assert "UNEXPLAINED" not in orphans[c1]["explanation"]
-    assert "explained by error" in orphans[c1]["explanation"]
+    assert skipped in orphans
+    assert "UNEXPLAINED" not in orphans[skipped]["explanation"]
+    assert "explained by error" in orphans[skipped]["explanation"]

@@ -45,12 +45,12 @@ def read_config(project: str) -> dict:
     p = _config_file(project)
     if not p.exists():
         return {}
-    text = p.read_text().strip()
-    if not text:
-        return {}
     try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
+        text = p.read_text().strip()
+        data = json.loads(text) if text else {}
+    except (OSError, ValueError):
+        # ValueError covers json.JSONDecodeError and a non-UTF8 read; OSError a
+        # transient read failure. Either way fall back to defaults — never wedge.
         return {}
     return data if isinstance(data, dict) else {}
 

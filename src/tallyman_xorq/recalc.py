@@ -197,6 +197,17 @@ def _run_walk(project: str, roots: list[str]) -> RecalcReport:
     for old_hash in cone:
         verdict = verdicts[old_hash]
         if halted:
+            # A skipped entry that is ITSELF directly stale would otherwise surface
+            # as a false UNEXPLAINED orphan on a later unrelated revise. Record it
+            # (keyed by hash) so the tie-back explains it as a casualty of this halt.
+            if verdict.stale:
+                record_error(
+                    project,
+                    code=_recipe_code(project, old_hash),
+                    message="skipped: an upstream build failure halted the recalc walk",
+                    tool="catalog_recalc",
+                    hash=old_hash,
+                )
             entries.append(_entry(old_hash, "skipped", verdict, project))
             continue
         # Resolve the heading alias(es) BEFORE re-pointing anything for this entry,
@@ -239,22 +250,38 @@ def _run_walk(project: str, roots: list[str]) -> RecalcReport:
     return RecalcReport(project, roots, cone, entries, False, status, remap=remap)
 
 
+def _is_self_ref(content_hash: str, reason: StaleReason) -> bool:
+    """An alias-axis reason whose current head is the entry itself — the entry
+    follows its OWN alias (the documented revise-in-place pattern). Permanently
+    stale by design (#74/#85: the from_catalog(self) pin can never refresh), so it
+    is neither a meaningful recalc root nor an UNEXPLAINED invariant break."""
+    return reason.axis == "alias" and reason.now == content_hash
+
+
 def followers_of(project: str, name: str, verdicts: dict[str, StaleVerdict] | None = None) -> list[str]:
     """Entries a revise of alias *name* made directly stale: those directly stale
     with an alias-axis reason whose ``ref`` is *name*. These are the auto-recalc
     roots — the cone expands from them. Pre-existing staleness from other causes
-    is deliberately excluded (it is logged as orphan-stale, never recomputed)."""
+    is deliberately excluded (it is logged as orphan-stale, never recomputed), as
+    is a self-referential pin (it would replay to a no-op and can never refresh)."""
     verdicts = verdicts if verdicts is not None else scan(project)
     return sorted(
-        h for h, v in verdicts.items() if v.stale and any(r.axis == "alias" and r.ref == name for r in v.reasons)
+        h
+        for h, v in verdicts.items()
+        if v.stale and any(r.axis == "alias" and r.ref == name and not _is_self_ref(h, r) for r in v.reasons)
     )
 
 
 def _classify_orphan(project: str, content_hash: str, verdict: StaleVerdict) -> dict:
-    """Classify a stale entry an auto-recalc did *not* recompute against the
-    durable error store: explained by a recorded failure, or UNEXPLAINED."""
-    err = error_for_hash(project, content_hash)
-    if err is not None:
+    """Classify a stale entry an auto-recalc did *not* recompute: a self-referential
+    pin (expected), explained by a recorded failure, or UNEXPLAINED.
+
+    Self-reference is checked first and only when it is the SOLE cause (every reason
+    is the entry following its own head): an entry that is also source- or
+    alias-drifted for a real reason still classifies normally."""
+    if verdict.reasons and all(_is_self_ref(content_hash, r) for r in verdict.reasons):
+        explanation = "self-referential revise pin (follows its own alias head); permanently stale by design — expected"
+    elif (err := error_for_hash(project, content_hash)) is not None:
         explanation = f"explained by error {err['id']}"
     else:
         explanation = "UNEXPLAINED stale entry — staleness with no recorded recalc error; file a bug."

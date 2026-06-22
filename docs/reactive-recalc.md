@@ -14,11 +14,14 @@ checkpoints, failure handling) underneath.
 
 The short version of how it works today:
 
-- Building or revising an alias **does not** recompute anything downstream. It
-  advances that one alias and leaves its followers pointing at their old builds.
-- A scan tells you which followers are now stale. A separate, explicit recalc
-  recomputes them and re-points their aliases. There is no automatic cascade on
-  revise.
+- Building an alias does not recompute anything downstream; it advances that one
+  alias. *Revising* an alias, by default, recomputes its stale followers in the
+  same atomic checkpoint (auto-recalc — see *Trigger model*). The switch is
+  per-project and env-overridable; turn it off for the explicit path below.
+- A scan tells you which followers are stale. With auto-recalc off, a separate
+  explicit recalc recomputes them and re-points their aliases — and that explicit
+  recalc is still the path for source-file drift, which the revise trigger doesn't
+  cover.
 - A recalc that rebuilds an entry advances that entry's alias to a **new
   revision** (the alias history is append-only), and takes **one** catalog
   checkpoint for the whole walk.
@@ -151,9 +154,13 @@ The same flow drives a revision of an *aggregation* alias. Revise `by_region` an
 direction is always downstream: revising an alias makes its **followers** stale,
 never its parents.
 
-What this flow does **not** do: it does not fire automatically. `catalog_revise`
-advances one alias and returns; it never recomputes dependents on your behalf. The
-scan is passive. The recalc is the one deliberate step that writes.
+This three-step flow (revise, scan, recalc) is the explicit path — the one that
+runs when auto-recalc is **off**. By default it is **on**, and `catalog_revise`
+folds the recalc into itself: it advances the alias *and* recomputes its stale
+followers in the same atomic checkpoint, so the scan-and-recalc dance above
+collapses to a single `catalog_revise` call. See *Trigger model* for the switch
+and what the auto path reports. The scan stays passive either way; it never
+writes.
 
 ## When are new alias revisions created
 
@@ -432,8 +439,11 @@ the published SSE event. What is not yet built:
   (`hello`, `ping`, `new_entry`, `build_failed`, `notebook_changed`,
   `chart_attached`, `post_processing_changed`, `summary_stat_changed`,
   `project_switched`) but **not** `recalc` — the backend emits it, nothing consumes
-  it, so open views do not auto-refresh after a recalc yet. There is also no
-  staleness badge and no recalc affordance in the UI, and nothing calls
+  it, so open views do not auto-refresh after a recalc yet. Auto-recalc-on-revise
+  does not change this: it emits the same `recalc` event, which the SPA still
+  ignores, so a view open on a cascaded dependent needs a manual refresh. Wiring the
+  listener is the one piece that makes the cascade visible in the viewer. There is
+  also no staleness badge and no recalc affordance in the UI, and nothing calls
   `/api/staleness` or `/api/recalc` from the frontend. For now, drive recalc through
   MCP or a direct HTTP call and refresh the view manually.
 - **Deletion-side semantics.** Archive / delete-cone behavior and multi-parent
@@ -442,9 +452,46 @@ the published SSE event. What is not yet built:
 
 ## Trigger model
 
-The system is scan-on-load plus explicit recalc. The scan surfaces
-(`catalog_scan_staleness` / `GET …/api/staleness`) are passive — they flag
-staleness but never act. Recalc (`catalog_recalc` / `POST …/api/recalc`) is the
-explicit action and is always the one that writes. There is no automatic cascade on
-revise: advancing an alias marks its followers stale, but recomputing them is a
-deliberate step you take.
+There are two triggers: auto-recalc on revise (the default), and the explicit
+scan-then-recalc path. The scan surfaces (`catalog_scan_staleness` /
+`GET …/api/staleness`) are passive under both — they flag staleness but never act.
+
+### Auto-recalc on revise (default)
+
+Revising an alias recomputes its stale followers in the **same** checkpoint as the
+head advance. Every surface that re-points an *existing* alias triggers it —
+`catalog_revise`, the companion `PUT …/api/code/{alias}`, and `catalog_promote_diff`
+when it re-points an existing target. The cascade is scoped to *this* revise's
+followers: roots are the entries the advance made directly stale on the alias axis,
+and the descendant cone expands from there. Pre-existing staleness from any other
+cause is left untouched.
+
+The whole thing is one git revision. The head advance, the rebuilt dependents, and
+their re-pointed aliases are swept into the surface's single per-operation
+checkpoint, so `reset_to` the step before the revise undoes the revise *and* every
+dependent it recomputed, atomically. A failing dependent is stop-and-report (the
+same policy as explicit recalc): the revise still lands, the failure is reported,
+the rest are skipped.
+
+The revise reply carries a `recalc` sub-report — `catalog_recalc`'s shape (`cone`,
+`entries`, `remap`, `status`) plus `orphan_stale`. `orphan_stale` lists every entry
+that was directly stale but *not* a follower of this revise (a drifted source, a
+different alias not yet recalced, or an invariant break): not recomputed, logged at
+WARNING, and classified against the durable error store — "explained by error
+`<id>`" when a recorded recalc/build failure carries that hash, else "UNEXPLAINED
+… file a bug." Cascade failures are persisted to `errors.jsonl` (keyed by the
+failed hash) so the tie-back works across calls; that log lives outside the catalog
+repo, so it survives `reset_to`.
+
+The switch resolves env → config → default: `TALLYMAN_AUTO_RECALC` (a recognized
+boolean) wins, else the `auto_recalc` key in the catalog repo's tracked
+`config.json`, else the built-in default **ON**. Turn it off to get the explicit
+path below.
+
+### Explicit recalc
+
+With the switch off, advancing an alias marks its followers stale but recomputes
+nothing. `catalog_recalc` / `POST …/api/recalc` is then the deliberate action that
+writes — preview with a dry run, commit with `dry_run=False`. This is also the path
+for staleness the auto trigger never sees: a drifted source file, or any alias
+left stale because auto-recalc was off when it was revised.

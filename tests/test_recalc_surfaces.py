@@ -24,6 +24,14 @@ expr = t.select("region", "price")
 """
 
 
+def _base_code_v2(project: str) -> str:
+    return f"""
+from tallyman_xorq.io import from_project
+t = from_project("orders.parquet", project={project!r})
+expr = t.select("region", "price").mutate(extra=1)
+"""
+
+
 def _child_code(parent: str) -> str:
     return f"""
 from tallyman_xorq.io import from_catalog
@@ -183,3 +191,61 @@ def test_companion_recalc_commit_is_one_revision_and_repoints(
     assert len(r.json()["remap"]) == 2
     assert get_alias(project, "a") != a
     assert len(_steps(project)) == len(base) + 1
+
+
+# ---------------------------------------------------------------------------
+# Stage B — companion in-browser revise (PUT /api/code) cascades, parity with MCP
+# ---------------------------------------------------------------------------
+
+
+def test_companion_revise_cascades_and_is_one_revision(fresh_companion_app, project, orders_parquet, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    a = catalog_create("a", _base_code(project))["hash"]
+    b = catalog_create("b", _child_code("a"))["hash"]
+
+    c = TestClient(fresh_companion_app)
+    base = _steps(project)
+
+    r = c.put(f"/{project}/api/code/a", json={"code": _base_code_v2(project)})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["hash"] != a
+    # The in-browser revise cascaded to the follower, in one revision.
+    assert "recalc" in body
+    assert get_alias(project, "b") != b
+    assert body["recalc"]["remap"] == {b: get_alias(project, "b")}
+    assert len(_steps(project)) == len(base) + 1
+
+
+def test_companion_revise_publishes_recalc_event(project, orders_parquet, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    import tallyman_companion.app as appmod
+    from tallyman_companion import create_app
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    catalog_create("a", _base_code(project))
+    b = catalog_create("b", _child_code("a"))["hash"]
+
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        appmod,
+        "_recalc_sse_event",
+        lambda remap, step: captured.append((remap, step)) or {"kind": "recalc", "remap": remap, "step": step},
+        raising=False,
+    )
+
+    c = TestClient(create_app(project))
+    r = c.put(f"/{project}/api/code/a", json={"code": _base_code_v2(project)})
+    assert r.status_code == 200, r.text
+    # The companion publishes the canonical recalc SSE event with the cascade's remap.
+    assert captured, "no recalc event published"
+    remap, _step = captured[0]
+    assert remap == {b: get_alias(project, "b")}

@@ -234,6 +234,19 @@ def _invalidate_reset_caches() -> None:
     cached_result_expr.cache_clear()
 
 
+def _recalc_sse_event(remap: dict, step: int | None) -> dict:
+    """The recalc SSE event, in one canonical shape: ``{kind, remap, step}``.
+
+    Both recalc emitters publish through this — the in-process ``/api/recalc``
+    route and the cross-process ``/internal/notify`` path an MCP-driven recalc
+    arrives on — so the event a frontend sees can't depend on which surface
+    triggered it (the two used to drift: the notify path republished the raw
+    ``payload.model_dump()``, burying ``remap`` under ``extra`` and dropping
+    ``step``).
+    """
+    return {"kind": "recalc", "remap": remap, "step": step}
+
+
 def _annotate_entries(project: str, entries: list[dict]) -> list[dict]:
     """Add alias/version fields and sort: named entries (by alias) first, then scratch."""
     aliases = load_aliases(project)
@@ -1220,7 +1233,7 @@ def create_app(
             _invalidate_reset_caches()
             if buckaroo:
                 buckaroo.reload_project_sessions(project)
-            await publish({"kind": "recalc", "remap": report.remap, "step": report.checkpoint_step})
+            await publish(_recalc_sse_event(report.remap, report.checkpoint_step))
         return asdict(report)
 
     # ------------------------------------------------------------------
@@ -1239,18 +1252,37 @@ def create_app(
             payload.kind,
             getattr(payload, "hash", None),
         )
-        if payload.kind in ("post_processing_changed", "summary_stat_changed", "display_changed", "project_reset"):
-            if payload.kind == "project_reset":
-                # Out-of-process CLI `reset-to` ran reset_to in the CLI process, so
-                # this long-lived companion's result/compare LRUs are still warm and
-                # may point at snapshots the prune deleted. Clear them here, matching
-                # the in-server /api/reset path (#80). Not gated on `buckaroo`: the
-                # LRUs are process memory independent of the buckaroo subprocess.
+        if payload.kind in (
+            "post_processing_changed",
+            "summary_stat_changed",
+            "display_changed",
+            "project_reset",
+            "recalc",
+        ):
+            if payload.kind in ("project_reset", "recalc"):
+                # project_reset: out-of-process CLI `reset-to` ran reset_to in the
+                # CLI process, so this long-lived companion's result/compare LRUs
+                # are still warm and may point at snapshots the prune deleted.
+                # recalc: an MCP-driven catalog_recalc (arriving here via _notify,
+                # not the in-process /api/recalc route) re-pointed aliases and
+                # rebuilt entries. Either way, clear the LRUs and reload sessions —
+                # the same cleanup /api/recalc and /api/reset do — so the MCP path
+                # doesn't leave the viewer serving stale state (#80's communication
+                # gap). Not gated on `buckaroo`: the LRUs are process memory
+                # independent of the buckaroo subprocess.
                 _invalidate_reset_caches()
             if buckaroo:
                 reloaded = buckaroo.reload_project_sessions(project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)
-        await publish(payload.model_dump())
+        # Republish a recalc in the canonical {kind, remap, step} shape so the
+        # cross-process notify path emits the identical event /api/recalc does;
+        # other kinds pass through their raw payload unchanged.
+        if payload.kind == "recalc":
+            extra = payload.extra or {}
+            event = _recalc_sse_event(extra.get("remap", {}), extra.get("step"))
+        else:
+            event = payload.model_dump()
+        await publish(event)
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 
     @app.get("/api/projects")

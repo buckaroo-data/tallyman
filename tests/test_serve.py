@@ -96,6 +96,55 @@ def test_notify_other_kind_does_not_reload_sessions(project: str):
     assert stub.reload_calls == []
 
 
+def test_notify_recalc_reloads_sessions_and_invalidates_caches(project: str, monkeypatch):
+    """An MCP-driven recalc reaches the companion as a ``kind="recalc"`` notify.
+    The handler must reload buckaroo sessions AND invalidate the result/compare
+    LRUs — the same cleanup the in-process /api/recalc route does — so the
+    primary (MCP) recalc path doesn't leave the viewer serving stale state.
+    """
+    import tallyman_companion.app as appmod
+
+    invalidated: list[bool] = []
+    monkeypatch.setattr(appmod, "_invalidate_reset_caches", lambda: invalidated.append(True))
+    stub = _TrackingBuckaroo()
+    app = create_app(project, buckaroo=stub)
+    c = TestClient(app)
+    r = c.post("/internal/notify", json={"kind": "recalc", "extra": {"remap": {"old": "new"}, "step": 3}})
+    assert r.status_code == 200
+    assert stub.reload_calls == [project]  # buckaroo reloaded, like project_reset
+    assert invalidated == [True]  # LRUs cleared, like project_reset
+
+
+def test_recalc_sse_event_has_canonical_shape():
+    """Both recalc emitters — the in-process /api/recalc route and the
+    cross-process /internal/notify path — publish through this one helper, so
+    the SSE event shape cannot drift between the two surfaces."""
+    from tallyman_companion.app import _recalc_sse_event
+
+    assert _recalc_sse_event({"a": "b"}, 7) == {"kind": "recalc", "remap": {"a": "b"}, "step": 7}
+    assert _recalc_sse_event({}, None) == {"kind": "recalc", "remap": {}, "step": None}
+
+
+def test_notify_recalc_publishes_normalized_event(project: str, monkeypatch):
+    """The notify handler must republish a recalc in the canonical {kind, remap,
+    step} shape (via ``_recalc_sse_event``), not the raw ``payload.model_dump()``
+    that wraps remap under ``extra`` and drops ``step`` entirely."""
+    import tallyman_companion.app as appmod
+
+    captured: list[tuple] = []
+    monkeypatch.setattr(
+        appmod,
+        "_recalc_sse_event",
+        lambda remap, step: captured.append((remap, step)) or {"kind": "recalc", "remap": remap, "step": step},
+        raising=False,
+    )
+    app = create_app(project)
+    c = TestClient(app)
+    r = c.post("/internal/notify", json={"kind": "recalc", "extra": {"remap": {"o": "n"}, "step": 5}})
+    assert r.status_code == 200
+    assert captured == [({"o": "n"}, 5)]  # remap + step pulled from extra, routed through the normalizer
+
+
 def test_project_path_override_relocates_project(
     project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
 ):

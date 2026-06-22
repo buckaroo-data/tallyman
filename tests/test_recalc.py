@@ -248,3 +248,20 @@ def test_recalc_reports_a_cycle_instead_of_hanging(project):
     assert report.status == "cycle"
     assert report.error
     assert report.entries == []
+
+
+def test_recalc_skips_a_root_dir_without_a_manifest(project):
+    # A directory that exists but holds no manifest.json (a crashed mid-build
+    # leftover) is not a real entry — scan() / list_entries() never see it. The
+    # root guard must match that set, else the cone carries a hash that isn't in
+    # `verdicts` and the walk KeyErrors. It must instead drop it and report clean.
+    ghost = "cafebabe" * 4  # a hash-shaped name with a dir but no manifest
+    entry_dir(project, ghost).mkdir(parents=True, exist_ok=True)
+    assert not (entry_dir(project, ghost) / "manifest.json").exists()
+
+    for dry in (True, False):
+        report = recalc(project, [ghost], dry_run=dry)
+        assert report.status == "ok"
+        assert report.cone == []
+        assert report.entries == []
+        assert report.remap == {}

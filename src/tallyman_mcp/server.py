@@ -941,7 +941,10 @@ def catalog_recalc(roots: list[str] | None = None, dry_run: bool = True) -> dict
         }
     report = recalc(project, roots, dry_run=dry_run)
     if not dry_run and report.remap:
-        _notify("recalc", extra={"remap": report.remap})
+        # Forward both the remap and the checkpoint step so the companion can
+        # republish the same normalized {kind, remap, step} SSE event the
+        # in-process /api/recalc route emits (see app._recalc_sse_event).
+        _notify("recalc", extra={"remap": report.remap, "step": report.checkpoint_step})
     return asdict(report)
 
 

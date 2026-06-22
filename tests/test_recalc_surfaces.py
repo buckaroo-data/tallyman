@@ -110,6 +110,29 @@ def test_mcp_recalc_no_stale_reports_nothing(project, orders_parquet, monkeypatc
     assert _steps(project) == base
 
 
+def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, monkeypatch):
+    # A committed recalc must hand the companion BOTH the remap and the checkpoint
+    # `step`, so the republished SSE event carries the normalized {kind, remap,
+    # step} shape the in-process /api/recalc route emits (not just remap).
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    import tallyman_mcp.server as server
+    from tallyman_mcp.server import catalog_create, catalog_recalc
+
+    captured: dict = {}
+    monkeypatch.setattr(server, "_notify", lambda kind, **kw: captured.update(kind=kind, **kw))
+
+    catalog_create("a", _base_code(project))
+    catalog_create("b", _child_code("a"))
+    _edit_source(project)
+
+    out = catalog_recalc(dry_run=False)
+    assert out["status"] == "ok"
+    assert captured["kind"] == "recalc"
+    assert "step" in captured["extra"]  # finding 2: step is forwarded, not dropped
+    assert captured["extra"]["step"] == out["checkpoint_step"]
+    assert captured["extra"]["remap"] == out["remap"]
+
+
 # ---------------------------------------------------------------------------
 # companion routes
 # ---------------------------------------------------------------------------

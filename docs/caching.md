@@ -150,7 +150,7 @@ upstream file's mtime drifts. No TTL: entries are permanent history, not
 expiring scratch.
 
 How a source file's content reaches the key is set by `TALLYMAN_SOURCE_IDENTITY`
-(`source_identity.py:52`). The default is `cas`: `from_project` reads through a
+(`source_identity.py:52`). The default is `cas`: `read_project_file` reads through a
 content-addressed clone at `<project>/data/.cas/<digest>` (`io.py:58`), so the
 path xorq tokenizes embeds the content digest and every xorq-level key — build
 hash and snapshot keys alike — is content-honest, and a rebuild over an edited
@@ -349,7 +349,7 @@ detected on recompute even though it is still not prevented. The second is
 cold-reconstruction faithfulness under the `cas`
 default: `cas` makes *build* identity content-aware (a rebuild over an edited
 source forks the hash) but not *reconstruction*. `cached_result_expr` re-runs a
-cheap entry's `expr.py` on every read, and `from_project` re-digests the live
+cheap entry's `expr.py` on every read, and `read_project_file` re-digests the live
 source, so a cheap entry — or an expensive entry self-healing an evicted
 snapshot — serves the edited bytes under its original `content_hash`. Closing
 this needs digest-pinned reconstruction, tracked in #115.

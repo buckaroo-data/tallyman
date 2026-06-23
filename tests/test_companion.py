@@ -87,8 +87,8 @@ def test_api_data_cheap_entry_serves_page_without_materialising(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
@@ -117,8 +117,8 @@ def test_api_data_expensive_entry_paginates_without_per_entry_parquet(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.order_by("order_id").select("order_id", "region", "price")
 """
     h = build_and_persist(project, code, prompt="ordered").content_hash
@@ -152,8 +152,8 @@ def test_api_data_cheap_entry_paginates_consistently_across_pages(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("order_id", "region", "price")
 """
     h = build_and_persist(project, code, prompt="cheap").content_hash
@@ -184,8 +184,8 @@ def test_api_data_missing_manifest_serves_page_without_500(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
@@ -210,15 +210,15 @@ def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     catalog_create(
         "shoe_sales",
         f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
     )
     scratch = catalog_run(
         f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.order_by("region")
 """,
         prompt="exploratory",

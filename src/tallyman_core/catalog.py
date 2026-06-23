@@ -212,7 +212,7 @@ def assert_catalog_consistent(project: str, pointers: set[str]) -> None:
        Guard 2 only pairs recipes with pointers; without this a committed step
        whose alias/chart/display points at a hash with no recipe would reset
        clean and report OK — and a dangling alias head later blows up the
-       self-chaining ``from_catalog`` build. Two other hash/name-keyed surfaces
+       self-chaining ``tracked_expr_from_alias`` build. Two other hash/name-keyed surfaces
        are deliberately out of scope: notebook cells key on alias *name* not hash,
        and ``prompts/<hash>.jsonl`` is append-only provenance that is inert when
        orphaned (read only for an entry the UI is already showing).

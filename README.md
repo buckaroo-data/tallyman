@@ -22,7 +22,7 @@ What's working:
   - `/notebook` — curated narrative: cells anchored on aliases, vertical layout,
     inline markdown editor, ↑/↓ reorder, × remove.
   - `/lineage` and `/lineage/<hash>` — catalog DAG (cross-entry parents derived
-    from `from_catalog`) and per-entry internal expression DAG. Pure SVG, no
+    from `tracked_expr_from_alias`) and per-entry internal expression DAG. Pure SVG, no
     Cytoscape dep.
   - `/diff/<alias>[/<va>/<vb>]` — version diff with code diff, schema diff,
     per-column stats, key-joined side-by-side, and head() side-by-side.
@@ -114,7 +114,7 @@ affordances. Mutation routes return 403.
   resolves through ibis's backend loader and fails). Use
   `import xorq.api as xo` and `import xorq.vendor.ibis as ibis`. Do NOT
   `import ibis` directly.
-- Prefer `from tallyman_xorq.io import from_project; t = from_project("name.parquet")`
+- Prefer `from tallyman_xorq.io import read_project_file; t = read_project_file("name.parquet")`
   over absolute paths — the catalog records project-relative intent and the
   build is portable across machines/users.
 - Content hash is xorq's build hash — same code + same inputs → same hash → same

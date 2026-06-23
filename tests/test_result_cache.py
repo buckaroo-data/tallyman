@@ -10,78 +10,78 @@ from tallyman_xorq.result_cache import cache_worthy, classify_build
 
 def _agg_code(project: str) -> str:  # Aggregate → expensive → cache-worthy
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _project_code(project: str) -> str:  # parquet read + projection → cheap
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
 
 
 def _parent_code(project: str, col: str) -> str:  # single-column rename → distinct, unionable
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select(k=t.{col})
 """
 
 
-def _union_code(parent_a: str, parent_b: str) -> str:  # combine two from_catalog parents
+def _union_code(parent_a: str, parent_b: str) -> str:  # combine two tracked_expr_from_alias parents
     return f"""
-from tallyman_xorq.io import from_catalog
-a = from_catalog({parent_a!r}).select(k="k")
-b = from_catalog({parent_b!r}).select(k="k")
+from tallyman_xorq.io import tracked_expr_from_alias
+a = tracked_expr_from_alias({parent_a!r}).select(k="k")
+b = tracked_expr_from_alias({parent_b!r}).select(k="k")
 expr = a.union(b)
 """
 
 
 def _self_chain_code(alias: str) -> str:  # the documented revise pattern: chain off own alias
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({alias!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({alias!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
 
 def _chain_off_expensive_code(parent: str) -> str:  # cheap child chaining off ONE expensive parent
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(total2=t.total * 2)
 """
 
 
 def _agg_avg_code(project: str) -> str:  # a second Aggregate → expensive, joins on region
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(avg_price=t.price.mean())
 """
 
 
 def _join_two_expensive_code(parent_a: str, parent_b: str) -> str:  # multi-parent: join two expensive parents
     return f"""
-from tallyman_xorq.io import from_catalog
-a = from_catalog({parent_a!r})
-b = from_catalog({parent_b!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+a = tracked_expr_from_alias({parent_a!r})
+b = tracked_expr_from_alias({parent_b!r})
 expr = a.join(b, "region", how="left")
 """
 
 
 def _scalar_udf_code(project: str) -> str:  # scalar UDF only (no Aggregate/Join/Sort) → worthy via UDF (#81)
     return f"""
-from tallyman_xorq.io import from_project
+from tallyman_xorq.io import read_project_file
 from xorq.expr.udf import make_pandas_udf
 import xorq.vendor.ibis.expr.datatypes as dt
 from xorq.vendor.ibis import schema as ibis_schema
 
-t = from_project("orders.parquet", project={project!r})
+t = read_project_file("orders.parquet", project={project!r})
 
 
 def plusone(df):
@@ -202,7 +202,7 @@ def test_scalar_udf_is_worthy_in_lockstep_with_classify_build(project, orders_pa
 def test_scalar_udf_only_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
     # #81 net effect: because _is_worthy_expr returned False for a scalar-UDF-only
     # expression, rewrite_for_build baked no top-level result cache, so every viewer
-    # / diff / from_catalog read recomputed the UDF over the whole DAG (the
+    # / diff / tracked_expr_from_alias read recomputed the UDF over the whole DAG (the
     # worthy-recompute-fallback kept results correct but uncached — a silent perf
     # regression). With the live predicate fixed, the entry bakes a CachedNode like
     # any other expensive entry and cached_result_expr dereferences a materialised
@@ -282,26 +282,26 @@ def test_cold_read_logs_path_and_wall_time(project, orders_parquet, monkeypatch,
     assert any("evicted-self-heal" in m and agg_h in m for m in msgs)
 
 
-def test_multi_parent_from_catalog_shares_one_backend(project, orders_parquet, monkeypatch):
-    # #75: combining two from_catalog parents in one expression must resolve to a
-    # single backend. #73's expression-level from_catalog loaded each parent into
+def test_multi_parent_tracked_expr_from_alias_shares_one_backend(project, orders_parquet, monkeypatch):
+    # #75: combining two tracked_expr_from_alias parents in one expression must resolve to a
+    # single backend. #73's expression-level tracked_expr_from_alias loaded each parent into
     # its own backend, so a union/join raised "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import from_catalog
+    from tallyman_xorq.io import tracked_expr_from_alias
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
     catalog_create("pb", _parent_code(project, "category"))
 
-    a = from_catalog("pa").select(k="k")
-    b = from_catalog("pb").select(k="k")
+    a = tracked_expr_from_alias("pa").select(k="k")
+    b = tracked_expr_from_alias("pb").select(k="k")
     # Must not raise XorqError: Multiple backends found for this expression.
     ibis.union(a, b)._find_backend()
 
 
-def test_multi_parent_from_catalog_union_builds(project, orders_parquet, monkeypatch):
-    # #75: an entry that unions two from_catalog parents must build end-to-end.
+def test_multi_parent_tracked_expr_from_alias_union_builds(project, orders_parquet, monkeypatch):
+    # #75: an entry that unions two tracked_expr_from_alias parents must build end-to-end.
     # On the #73 branch this aborted with BuildError: Multiple backends found.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
@@ -313,58 +313,58 @@ def test_multi_parent_from_catalog_union_builds(project, orders_parquet, monkeyp
     assert res["row_count"] == 400
 
 
-def _mix_code(project: str, parent: str) -> str:  # from_project + from_catalog in one expression
+def _mix_code(project: str, parent: str) -> str:  # read_project_file + tracked_expr_from_alias in one expression
     return f"""
-from tallyman_xorq.io import from_project, from_catalog
-fp = from_project("orders.parquet", project={project!r}).select(k="region")
-fc = from_catalog({parent!r}).select(k="k")
+from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
+fp = read_project_file("orders.parquet", project={project!r}).select(k="region")
+fc = tracked_expr_from_alias({parent!r}).select(k="k")
 expr = fp.union(fc)
 """
 
 
-def test_from_project_and_from_catalog_mix_shares_one_backend(project, orders_parquet, monkeypatch):
-    # #75: a from_project read combined with a from_catalog parent in one
-    # expression must resolve to a single backend. #73 rooted from_project on the
-    # default backend but loaded from_catalog into its own, so the mix raised
+def test_read_project_file_and_tracked_expr_from_alias_mix_shares_one_backend(project, orders_parquet, monkeypatch):
+    # #75: a read_project_file read combined with a tracked_expr_from_alias parent in one
+    # expression must resolve to a single backend. #73 rooted read_project_file on the
+    # default backend but loaded tracked_expr_from_alias into its own, so the mix raised
     # "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import from_catalog, from_project
+    from tallyman_xorq.io import tracked_expr_from_alias, read_project_file
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
 
-    fp = from_project("orders.parquet", project=project).select(k="region")
-    fc = from_catalog("pa").select(k="k")
+    fp = read_project_file("orders.parquet", project=project).select(k="region")
+    fc = tracked_expr_from_alias("pa").select(k="k")
     ibis.union(fp, fc)._find_backend()  # must not raise
 
 
-def test_from_project_and_from_catalog_mix_builds(project, orders_parquet, monkeypatch):
-    # #75: an entry mixing from_project and from_catalog must build end-to-end.
+def test_read_project_file_and_tracked_expr_from_alias_mix_builds(project, orders_parquet, monkeypatch):
+    # #75: an entry mixing read_project_file and tracked_expr_from_alias must build end-to-end.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
 
     res = catalog_create("mix", _mix_code(project, "pa"))
     assert "error" not in res, res
-    # 200 from_project rows + 200 from_catalog rows.
+    # 200 read_project_file rows + 200 tracked_expr_from_alias rows.
     assert res["row_count"] == 400
 
 
-def test_expensive_from_catalog_mix_shares_one_backend(project, orders_parquet, monkeypatch):
+def test_expensive_tracked_expr_from_alias_mix_shares_one_backend(project, orders_parquet, monkeypatch):
     # #75: an expensive parent resolves to a deferred read of its baked snapshot —
-    # a bare Read on the default backend — so mixing it with a from_project read
+    # a bare Read on the default backend — so mixing it with a read_project_file read
     # also stays on one backend. A baked CachedNode (the #73 form) would have
     # dragged its own storage backend in and re-raised "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import from_catalog, from_project
+    from tallyman_xorq.io import tracked_expr_from_alias, read_project_file
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))  # Aggregate → expensive → baked snapshot
 
-    ft = from_project("orders.parquet", project=project)
+    ft = read_project_file("orders.parquet", project=project)
     fp = ft.group_by("region").aggregate(total=ft.price.sum(), n=ft.count())
-    fc = from_catalog("agg")  # region, total, n — same schema as fp
+    fc = tracked_expr_from_alias("agg")  # region, total, n — same schema as fp
     ibis.union(fp, fc)._find_backend()  # must not raise
 
 
@@ -391,7 +391,7 @@ def test_diff_route_survives_cold_cache(fresh_companion_app, project, orders_par
 
 
 def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(project, orders_parquet, monkeypatch):
-    """#73/#74: reading an entry that ``from_catalog``s an expensive parent must
+    """#73/#74: reading an entry that ``tracked_expr_from_alias``s an expensive parent must
     self-heal an evicted parent snapshot, not error.
 
     An expensive parent bakes its result into the per-project compute cache; a
@@ -401,7 +401,7 @@ def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(proj
     a cold compute cache (fresh clone / write-isolated overlay) that bare read
     resolves to zero files (``ValueError: At least one path is required``).
     ``cached_result_expr`` reconstructs via the recipe instead — re-resolving
-    ``from_catalog`` and recomputing the parent — so the read self-heals.
+    ``tracked_expr_from_alias`` and recomputing the parent — so the read self-heals.
     """
     import shutil
 
@@ -428,7 +428,7 @@ def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(proj
 
 
 def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_parquet, monkeypatch):
-    """#73/#75: a multi-parent entry joining two expensive ``from_catalog`` parents
+    """#73/#75: a multi-parent entry joining two expensive ``tracked_expr_from_alias`` parents
     must self-heal *both* evicted parent snapshots on a cold cache.
 
     This is the ``tickets_and_ghosts`` shape: a join of two expensive parents.
@@ -462,17 +462,17 @@ def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache
 
 
 def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):
-    """A revise-in-place recipe that reads ``from_catalog`` of its OWN alias must
+    """A revise-in-place recipe that reads ``tracked_expr_from_alias`` of its OWN alias must
     not self-recurse forever when later reconstructed.
 
     ``catalog_revise`` repoints the alias to the new head *after* building, so a
-    recipe that chains off ``from_catalog(name)`` (the pattern its own docstring
+    recipe that chains off ``tracked_expr_from_alias(name)`` (the pattern its own docstring
     recommends) resolves to the *previous* revision at build time but to *itself*
     afterwards. #73 made ``cached_result_expr`` re-import the raw recipe and
-    re-resolve ``from_catalog`` against the live head, so post-revise
+    re-resolve ``tracked_expr_from_alias`` against the live head, so post-revise
     reconstruction (diff, further chaining) recursed without bound — a ~50GB RSS
     spike that locked a 48GB machine. The fix resolves a self-referential
-    ``from_catalog`` to the build-time parent revision.
+    ``tracked_expr_from_alias`` to the build-time parent revision.
     """
     from tallyman_core.aliases import get_alias
     from tallyman_xorq.result_cache import cached_result_expr
@@ -480,12 +480,12 @@ def test_revise_in_place_self_reference_terminates(project, orders_parquet, monk
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("tpd", _project_code(project))  # v1: region, price
     v1 = get_alias(project, "tpd")
-    catalog_revise("tpd", _self_chain_code("tpd"))  # v2: from_catalog('tpd').mutate(doubled=price*2)
+    catalog_revise("tpd", _self_chain_code("tpd"))  # v2: tracked_expr_from_alias('tpd').mutate(doubled=price*2)
     v2 = get_alias(project, "tpd")
     assert v2 != v1
 
     # Pre-fix: infinite recursion (guarded so the failure is a fast RecursionError,
-    # not an OOM). Post-fix: resolves from_catalog('tpd') to v1 and returns.
+    # not an OOM). Post-fix: resolves tracked_expr_from_alias('tpd') to v1 and returns.
     expr = _call_under_tight_recursion_guard(cached_result_expr, project, v2)
 
     # Correct reconstruction == v1's rows plus the mutated column.
@@ -497,7 +497,7 @@ def test_resolve_noncyclic_hash_scopes_step_back_to_requested_alias(project):
     # The resolver derives a lineage hint from `requested`:
     #   alias_hint = requested if get_alias(...) is not None else None  (#85)
     # so a hash that lives in two histories steps back through the alias
-    # from_catalog was actually invoked on, not whichever sorts first. This
+    # tracked_expr_from_alias was actually invoked on, not whichever sorts first. This
     # pins that derivation directly — test_revise_in_place_self_reference_
     # terminates only exercises a single-alias chain where the hint is moot.
     from tallyman_core.aliases import set_alias
@@ -609,7 +609,7 @@ def test_ensure_result_is_removed():
 def _overwrite_orders(project: str, seed: int) -> None:
     """Rewrite the orders source with different values (same schema, same rows).
 
-    A from_project recompute under ``off`` identity reads the live path, so this
+    A read_project_file recompute under ``off`` identity reads the live path, so this
     makes a previously-built entry's recompute drift from its build-time bytes —
     the execution-nondeterminism stand-in #83's faithfulness check must catch.
     """
@@ -772,7 +772,7 @@ def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_par
     catalog_create("agg", _agg_code(project))
     agg_h = _hash_of(project)
 
-    # Warm the LRU via a real read, exactly as the public from_catalog API does.
+    # Warm the LRU via a real read, exactly as the public tracked_expr_from_alias API does.
     expected = len(cached_result_expr(project, agg_h).execute())
 
     # Evict the baked snapshot while the LRU stays WARM (no cache_clear).
@@ -931,7 +931,7 @@ def test_cross_process_heal_reads_landed_snapshot_else_reraises(project, orders_
 # was BUILT from (the frozen data/.cas/<digest> clone), not a re-digest of the
 # live source after it is edited in place. #86 made *build* identity content-aware
 # (a rebuild forks the hash) but left cold *reconstruction* re-running the recipe's
-# from_project over the live file. These pin the closure for both #74 hazards: a
+# read_project_file over the live file. These pin the closure for both #74 hazards: a
 # cheap entry's cold read, and an expensive entry self-healing an evicted snapshot.
 # ---------------------------------------------------------------------------
 
@@ -943,15 +943,15 @@ def _write_ints(path, values) -> None:
 
 
 def _src_read_code(project: str, rel: str) -> str:  # cheap: a bare project read
-    return f"from tallyman_xorq.io import from_project\nexpr = from_project({rel!r}, project={project!r})\n"
+    return f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel!r}, project={project!r})\n"
 
 
 def _src_group_code(project: str, rel: str) -> str:  # expensive: group_by → Aggregate → baked snapshot
     # order_by('x') pins a deterministic row order so the #83 result_digest is stable
     # build-to-self-heal (an unordered aggregate would reshuffle and read as drift).
     return (
-        "from tallyman_xorq.io import from_project\n"
-        f"t = from_project({rel!r}, project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file({rel!r}, project={project!r})\n"
         "expr = t.group_by('x').aggregate(c=t.count()).order_by('x')\n"
     )
 
@@ -960,7 +960,7 @@ def test_cas_cold_read_after_inplace_edit_serves_built_bytes(project, monkeypatc
     """#115: a cheap entry's cold read serves the rows it was built from, even after
     the source is edited in place.
 
-    Pre-#115 the cold read re-imports the recipe and re-runs from_project, which under
+    Pre-#115 the cold read re-imports the recipe and re-runs read_project_file, which under
     cas re-digests the now-edited live file and clones it under a NEW digest — serving
     the edited rows under the entry's ORIGINAL content_hash. Digest-pinned
     reconstruction resolves to the frozen .cas clone the entry recorded instead.
@@ -1043,10 +1043,10 @@ def test_cas_expensive_self_heal_after_edit_serves_built_bytes(project, monkeypa
 def test_cas_nested_chain_reconstruction_pins_each_entrys_sources(project, monkeypatch):
     """#115: nested reconstruction restores the per-entry source map across the chain.
 
-    B unions from_catalog(A) with its own from_project(b). A cold read of B
-    reconstructs A — whose from_project must resolve to A's recorded a.parquet — then
+    B unions tracked_expr_from_alias(A) with its own read_project_file(b). A cold read of B
+    reconstructs A — whose read_project_file must resolve to A's recorded a.parquet — then
     reads B's own recorded b.parquet. The frozen-source contextvar is overwritten for
-    A's reconstruction and restored for B's remaining reads, so each from_project
+    A's reconstruction and restored for B's remaining reads, so each read_project_file
     pins ITS OWN built bytes even after both sources are edited in place.
     """
     from tallyman_core import data_dir
@@ -1064,9 +1064,9 @@ def test_cas_nested_chain_reconstruction_pins_each_entrys_sources(project, monke
 
     catalog_create("pa", _src_read_code(project, "a.parquet"))  # cheap parent over a.parquet
     b_code = (
-        "from tallyman_xorq.io import from_project, from_catalog\n"
-        "a = from_catalog('pa')\n"
-        f"b = from_project('b.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file, tracked_expr_from_alias\n"
+        "a = tracked_expr_from_alias('pa')\n"
+        f"b = read_project_file('b.parquet', project={project!r})\n"
         "expr = a.union(b)\n"
     )
     res = catalog_create("pb", b_code)
@@ -1088,7 +1088,7 @@ def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypat
     parent's .cas clone alive for GC.
 
     Building a child reconstructs the parent's recipe, re-running the parent's
-    from_project. That must record the parent's frozen digest (the bytes actually
+    read_project_file. That must record the parent's frozen digest (the bytes actually
     read) into the child's manifest.sources — not a re-digest of the edited live file
     — so gc_cas keeps the frozen clone the child's reconstruction depends on.
     """
@@ -1106,7 +1106,7 @@ def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypat
     p_digest = read_manifest(entry_dir(project, p_h)).sources["src.parquet"]
 
     _write_ints(src, [0, 1, 2, 3, 4])  # edit in place, then build a child off the parent
-    cc_code = "from tallyman_xorq.io import from_catalog\nt = from_catalog('pp')\nexpr = t.mutate(y=t.x * 2)\n"
+    cc_code = "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('pp')\nexpr = t.mutate(y=t.x * 2)\n"
     res = catalog_create("cc", cc_code)
     assert "error" not in res, res
     c_h = _hash_of(project)
@@ -1323,8 +1323,8 @@ def _literal_nondeterministic_code(project: str) -> str:
     # (#88 part 1) can't see it; the structural runtime detector (#88 part 2) must.
     return (
         "import random\n"
-        "from tallyman_xorq.io import from_project\n"
-        f"t = from_project('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file('orders.parquet', project={project!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum()).mutate(nonce=random.random())\n"
     )
 

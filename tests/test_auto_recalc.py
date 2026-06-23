@@ -32,32 +32,32 @@ from tallyman_xorq.staleness import scan
 
 def _src_code(project: str, src: str = "orders.parquet") -> str:  # a source projection
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project({src!r}, project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({src!r}, project={project!r})
 expr = t.select("region", "price")
 """
 
 
 def _src_code_v2(project: str, src: str = "orders.parquet") -> str:  # different graph, same source
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project({src!r}, project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({src!r}, project={project!r})
 expr = t.select("region", "price").mutate(extra=1)
 """
 
 
-def _child_code(parent: str) -> str:  # cheap from_catalog child (alias name → follow=True)
+def _child_code(parent: str) -> str:  # cheap tracked_expr_from_alias child (alias name → follow=True)
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
 
 def _self_chain_code(alias: str) -> str:  # documented revise-in-place pattern: chain off own alias
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({alias!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({alias!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
@@ -348,7 +348,7 @@ def test_read_config_tolerates_unreadable_file(project, monkeypatch):
 
 
 def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parquet, monkeypatch):
-    # The documented revise-in-place pattern (a recipe that reads from_catalog of
+    # The documented revise-in-place pattern (a recipe that reads tracked_expr_from_alias of
     # its OWN alias) leaves the new head permanently alias-stale by design (#74/#85:
     # the self-pin can never refresh). Auto-recalc must NOT (a) pointlessly replay
     # it on the self-revise, nor (b) flag it UNEXPLAINED ("file a bug") on every
@@ -388,12 +388,12 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
     # one entry with two aliases), both following a.
     b1 = _hash(
         catalog_create(
-            "b", "from tallyman_xorq.io import from_catalog\nt = from_catalog('a')\nexpr = t.mutate(d2=t.price * 2)\n"
+            "b", "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('a')\nexpr = t.mutate(d2=t.price * 2)\n"
         )
     )
     c1 = _hash(
         catalog_create(
-            "c", "from tallyman_xorq.io import from_catalog\nt = from_catalog('a')\nexpr = t.mutate(d3=t.price * 3)\n"
+            "c", "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('a')\nexpr = t.mutate(d3=t.price * 3)\n"
         )
     )
     for h in (b1, c1):

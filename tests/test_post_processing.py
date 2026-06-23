@@ -161,16 +161,16 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
 
 def _agg_code(project: str) -> str:
     return (
-        "from tallyman_xorq.io import from_project\n"
-        f"t = from_project('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file('orders.parquet', project={project!r})\n"
         "expr = t.group_by('region').aggregate(n=t.count())\n"
     )
 
 
 def _cheap_code(project: str) -> str:  # parquet read + projection → cheap, bakes no snapshot
     return (
-        "from tallyman_xorq.io import from_project\n"
-        f"t = from_project('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file('orders.parquet', project={project!r})\n"
         "expr = t.select('region', 'price')\n"
     )
 

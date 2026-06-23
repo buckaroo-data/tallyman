@@ -34,8 +34,8 @@ latest hash for a concept and keeps the full history of hashes it has pointed at
 (`aliases.jsonl`, one line per alias: `{"alias", "latest", "history": [...]}`).
 
 A recipe is a self-contained Python script that binds a top-level `expr`. It
-reads a raw file with `from_project(...)` and reads another catalog entry with
-`from_catalog(...)`. Build a three-node chain — a source projection, an
+reads a raw file with `read_project_file(...)` and reads another catalog entry with
+`tracked_expr_from_alias(...)`. Build a three-node chain — a source projection, an
 aggregation over it, and a filter over that:
 
 ```python
@@ -43,24 +43,24 @@ from tallyman_mcp.server import catalog_create
 
 # Node 1 — a source alias: project some columns out of a raw parquet.
 catalog_create("orders", '''
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet")
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet")
 expr = t.select("region", "price")
 ''')
 # -> {"hash": <orders_v1>, "alias": "orders", "version": 1, ...}
 
 # Node 2 — an aggregation alias that FOLLOWS orders by name.
 catalog_create("by_region", '''
-from tallyman_xorq.io import from_catalog
-t = from_catalog("orders")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders")
 expr = t.group_by("region").agg(total=t.price.sum())
 ''')
 # -> {"hash": <by_region_v1>, "alias": "by_region", "version": 1, ...}
 
 # Node 3 — follows the aggregation.
 catalog_create("top_regions", '''
-from tallyman_xorq.io import from_catalog
-t = from_catalog("by_region")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("by_region")
 expr = t.filter(t.total > 1000)
 ''')
 # -> {"hash": <top_regions_v1>, "alias": "top_regions", "version": 1, ...}
@@ -70,15 +70,15 @@ expr = t.filter(t.total > 1000)
 the alias at **version 1**. It errors if the alias already exists (use
 `catalog_revise` for an existing name). There is no `project` argument on the
 tool: it operates on the session's active project (set by `project_switch`); the
-optional `project=` kwarg on `from_project`/`from_catalog` defaults to that same
+optional `project=` kwarg on `read_project_file`/`tracked_expr_from_alias` defaults to that same
 active project, so recipes omit it.
 
 The follow relationship is the whole game:
 
-- `from_catalog("orders")` — an alias *name* — records the edge as **follow=True**.
+- `tracked_expr_from_alias("orders")` — an alias *name* — records the edge as **follow=True**.
   The recipe means "whatever `orders` is now," and at build time it resolves to
   `orders`'s current head.
-- `from_catalog("<hash>")` — a literal hash — records the edge as
+- `tracked_expr_from_alias("<hash>")` — a literal hash — records the edge as
   **follow=False**: a pin to that exact revision. A pinned child never goes stale
   when its parent advances, and recalc deliberately leaves it alone.
 
@@ -96,8 +96,8 @@ from tallyman_mcp.server import catalog_revise, catalog_scan_staleness, catalog_
 
 # Revise the source alias: keep an extra column this time.
 catalog_revise("orders", '''
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet")
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet")
 expr = t.select("region", "price", "qty")
 ''')
 # -> {"hash": <orders_v2>, "alias": "orders", "version": 2, ...}
@@ -146,7 +146,7 @@ catalog_recalc(dry_run=False)
 
 The walk replays `by_region` first. Because dependency order re-points
 `by_region`'s alias *before* `top_regions` replays, `top_regions`'s
-`from_catalog("by_region")` reads the advanced parent and rebuilds against it.
+`tracked_expr_from_alias("by_region")` reads the advanced parent and rebuilds against it.
 Both aliases now point at fresh, version-2 hashes; a re-scan is clean.
 
 The same flow drives a revision of an *aggregation* alias. Revise `by_region` and
@@ -189,7 +189,7 @@ Three edges make that precise:
   intermediate node referenced only by a hash pin — produces a new hash and a
   `remap` entry but **zero** alias revisions. A head carrying two aliases advances
   both.
-- A **hash-pinned** child (`from_catalog("<hash>")`) re-resolves to the same
+- A **hash-pinned** child (`tracked_expr_from_alias("<hash>")`) re-resolves to the same
   parent and is a `noop`, so it neither rebuilds nor advances its alias.
 
 This per-alias revision is distinct from the catalog-level checkpoint. The alias
@@ -207,7 +207,7 @@ it exists and is worth knowing.
 An entry is judged on two independent axes, each tied to a kind of recorded input:
 
 - **alias** — a `follow=True` parent (recorded when the recipe referenced a parent
-  by alias name, `from_catalog("orders")`) is stale when that alias now resolves to
+  by alias name, `tracked_expr_from_alias("orders")`) is stale when that alias now resolves to
   a different hash than the one recorded at build. This is what fires when you
   revise an upstream alias. A `follow=False` parent (a literal-hash pin) is never
   stale on this axis: the recipe asked for *that* revision and still gets it.
@@ -232,7 +232,7 @@ this system.
 
 Source-axis staleness only works under content-addressed source identity, which is
 the default. `source_identity.mode()` reads `TALLYMAN_SOURCE_IDENTITY` and falls
-back to `"cas"` (`source_identity.py:59`). In `cas` mode, `from_project` reads each
+back to `"cas"` (`source_identity.py:59`). In `cas` mode, `read_project_file` reads each
 source through a copy-on-write clone at `data/.cas/<digest><suffix>`, so the path
 xorq hashes is the content identity: editing a source in place yields a different
 digest, the manifest records that digest at build time, and a later scan can tell

@@ -516,7 +516,7 @@ class BuckarooManager:
         if not build_dir.is_dir():
             return None
         # Materialise the entry's baked snapshot before buckaroo replays the
-        # build via /load_expr. A from_catalog chain off an expensive parent
+        # build via /load_expr. A tracked_expr_from_alias chain off an expensive parent
         # embeds a *bare* read of the parent's snapshot (#75 strips the parent
         # CachedNode to keep the composed expression on one backend), so on a
         # cold compute cache — a fresh clone, or an entry the startup warmup

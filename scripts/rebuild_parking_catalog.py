@@ -42,7 +42,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# The three raw sources the recipes read via `from_project(...)`.
+# The three raw sources the recipes read via `read_project_file(...)`.
 SOURCES = (
     "camera_select_columns.parquet",
     "camera_violations.parquet",
@@ -58,19 +58,19 @@ class Step:
 
 
 # The build sequence, in dependency order. Each alias's full create->revise chain
-# is built before any dependent reads it, so `from_catalog(alias)` resolves to the
+# is built before any dependent reads it, so `tracked_expr_from_alias(alias)` resolves to the
 # intended head. Codes are the recipes recovered from the original entry dirs.
 STEPS: tuple[Step, ...] = (
-    # --- Tier 0: raw sources (from_project) ---
+    # --- Tier 0: raw sources (read_project_file) ---
     Step(
         "camera_select_columns",
         "create",
-        "from tallyman_xorq.io import from_project\nexpr = from_project('camera_select_columns.parquet')\n",
+        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('camera_select_columns.parquet')\n",
     ),
     Step(
         "camera_select_columns",
         "revise",
-        "from tallyman_xorq.io import from_project\n"
+        "from tallyman_xorq.io import read_project_file\n"
         "import xorq.vendor.ibis as ibis\n"
         "def parse_issue_date(t):\n"
         "    return (\n"
@@ -80,40 +80,40 @@ STEPS: tuple[Step, ...] = (
         "        .else_(t.issue_date.to_date('%m/%d/%Y'))\n"
         "        .end()\n"
         "    )\n"
-        "expr = from_project('camera_select_columns.parquet').mutate(issue_date=parse_issue_date)\n",
+        "expr = read_project_file('camera_select_columns.parquet').mutate(issue_date=parse_issue_date)\n",
     ),
     Step(
         "camera_violations",
         "create",
-        "from tallyman_xorq.io import from_project\nexpr = from_project('camera_violations.parquet')\n",
+        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('camera_violations.parquet')\n",
     ),
     Step(
         "camera_violations",
         "revise",
-        "from tallyman_xorq.io import from_project\n"
-        "expr = from_project('camera_violations.parquet').limit(10_000_000)\n",
+        "from tallyman_xorq.io import read_project_file\n"
+        "expr = read_project_file('camera_violations.parquet').limit(10_000_000)\n",
     ),
     Step(
         "camera_violations",
         "revise",
-        "from tallyman_xorq.io import from_project\n"
-        "expr = from_project('camera_violations.parquet').limit(5_000_000)\n",
+        "from tallyman_xorq.io import read_project_file\n"
+        "expr = read_project_file('camera_violations.parquet').limit(5_000_000)\n",
     ),
     Step(
         "parking_plt_only4",
         "create",
-        "from tallyman_xorq.io import from_project\nexpr = from_project('parking_plt_only4.parquet')\n",
+        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('parking_plt_only4.parquet')\n",
     ),
     # --- Tier 1: depend on tier-0 aliases ---
     Step(
         "all_violations",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
-        "camera = from_catalog('camera_select_columns').select(\n"
+        "camera = tracked_expr_from_alias('camera_select_columns').select(\n"
         "    plate='plate', state='state', issue_date='issue_date', violation='violation',\n"
         ")\n"
-        "parking = from_catalog('parking_plt_only4').select(\n"
+        "parking = tracked_expr_from_alias('parking_plt_only4').select(\n"
         "    plate='plate_id', state='registration_state', issue_date='issue_date',\n"
         "    violation=ibis.literal('parking'),\n"
         ")\n"
@@ -122,8 +122,8 @@ STEPS: tuple[Step, ...] = (
     Step(
         "camera_violations_by_plate",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
-        "t = from_catalog('camera_select_columns')\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('camera_select_columns')\n"
         "expr = (\n"
         "    t.group_by('plate')\n"
         "    .aggregate(\n"
@@ -137,9 +137,9 @@ STEPS: tuple[Step, ...] = (
     Step(
         "tickets_per_day",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
-        "t = from_catalog('all_violations')\n"
+        "t = tracked_expr_from_alias('all_violations')\n"
         "is_parking = t.violation == 'parking'\n"
         "is_speeding = t.violation != 'parking'\n"
         "daily = (\n"
@@ -176,9 +176,9 @@ STEPS: tuple[Step, ...] = (
     Step(
         "tickets_per_day",
         "revise",
-        "from tallyman_xorq.io import from_catalog\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
-        "t = from_catalog('all_violations').filter(lambda r: r.issue_date.year() > 2013)\n"
+        "t = tracked_expr_from_alias('all_violations').filter(lambda r: r.issue_date.year() > 2013)\n"
         "is_parking = t.violation == 'parking'\n"
         "is_speeding = t.violation != 'parking'\n"
         "daily = (\n"
@@ -219,16 +219,16 @@ STEPS: tuple[Step, ...] = (
         # multi-million-row aliases).
         "tickets_per_day",
         "revise",
-        "from tallyman_xorq.io import from_catalog\n"
-        "t = from_catalog('tickets_per_day')\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('tickets_per_day')\n"
         "expr = t.mutate(total_tickets=t.parking_count + t.speeding_count)\n",
     ),
     Step(
         "habitual_speeder_stats",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
-        "t = from_catalog('all_violations')\n"
+        "t = tracked_expr_from_alias('all_violations')\n"
         "is_parking = t.violation == 'parking'\n"
         "is_speeding = t.violation != 'parking'\n"
         "parking_date = ibis.case().when(is_parking, t.issue_date).else_(ibis.null()).end()\n"
@@ -249,9 +249,9 @@ STEPS: tuple[Step, ...] = (
     Step(
         "habitual_speeder_stats",
         "revise",
-        "from tallyman_xorq.io import from_catalog\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
-        "t = from_catalog('all_violations')\n"
+        "t = tracked_expr_from_alias('all_violations')\n"
         "is_parking = t.violation == 'parking'\n"
         "is_speeding = t.violation != 'parking'\n"
         "parking_date = ibis.case().when(is_parking, t.issue_date).else_(ibis.null()).end()\n"
@@ -277,8 +277,8 @@ STEPS: tuple[Step, ...] = (
     Step(
         "probable_ghost_plate",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
-        "t = from_catalog('habitual_speeder_stats')\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('habitual_speeder_stats')\n"
         "filtered = t.filter(\n"
         "    (t.speeding_count >= 5) & (t.last_speeding_to_last_parking > 365 * 3)\n"
         ")\n"
@@ -292,10 +292,10 @@ STEPS: tuple[Step, ...] = (
     Step(
         "tickets_and_ghosts",
         "create",
-        "from tallyman_xorq.io import from_catalog\n"
-        "tpd = from_catalog('tickets_per_day')\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "tpd = tracked_expr_from_alias('tickets_per_day')\n"
         "pgp = (\n"
-        "    from_catalog('probable_ghost_plate')\n"
+        "    tracked_expr_from_alias('probable_ghost_plate')\n"
         "    .filter(lambda r: r.last_speeding_date.year() > 2013)\n"
         "    .rename(issue_date='last_speeding_date', ghost_plate_count='count')\n"
         "    .select('issue_date', 'ghost_plate_count')\n"
@@ -387,7 +387,7 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
     ensure_project(project)
     ensure_catalog_repo(project)
     genesis(project)
-    # from_project/from_catalog inside recipe code resolve the active project with
+    # read_project_file/tracked_expr_from_alias inside recipe code resolve the active project with
     # no explicit arg, and resolve_project() reads the active_project file *before*
     # TALLYMAN_PROJECT (env is only a one-shot seed when the file is absent). Write
     # the file so resolution is deterministic even when a different project was

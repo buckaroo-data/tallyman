@@ -249,10 +249,10 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     PREFERRED pattern:
 
-        from tallyman_xorq.io import from_project, from_catalog
+        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
         import xorq.vendor.ibis as ibis
-        t = from_catalog("alias_name")            # named catalog entry (alias or hash)
-        t = from_project("file.parquet")          # raw file under <project>/data/
+        t = tracked_expr_from_alias("alias_name")      # named catalog entry by alias (records lineage)
+        t = read_project_file("file.parquet")          # raw file under <project>/data/
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
 
     THREE NAMESPACES — mixing these up is the #1 build failure:
@@ -261,7 +261,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
                                          # xo.memtable, xo.deferred_read_parquet, xo.connect
         import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
                                          # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
-        from tallyman_xorq.io import from_project, from_catalog   # reading data
+        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias   # reading data
 
         t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
         # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
@@ -269,19 +269,24 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
         #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
         # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
-        # Read data only via from_project / from_catalog (no xo.read_parquet / ibis.read_parquet).
+        # Read data only via read_project_file / tracked_expr_from_alias (no xo.read_parquet / ibis.read_parquet).
 
     ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
-    everything with the ibis expression API over from_project/from_catalog.
+    everything with the ibis expression API over read_project_file/tracked_expr_from_alias.
 
-    DATA SOURCING — choose between `from_catalog` and `from_project`:
-      - `from_catalog("name")` resolves catalog aliases AND bare content hashes.
-        Use this when the source appears in `catalog_list` output.
-      - `from_project("file.parquet")` reads raw files under `<project>/data/`.
+    DATA SOURCING — three functions, each with a distinct role:
+      - `tracked_expr_from_alias("name")` reads a catalog entry by alias and records it
+        as a parent in the lineage DAG. Use this for normal recipe chaining — the
+        standard way to build on top of another catalog entry.
+      - `read_project_file("file.parquet")` reads raw files under `<project>/data/`.
         Use this only for raw files visible on disk (not catalog aliases).
+      - `pinned_expr_from_alias("name_or_hash")` reads a catalog entry by alias or
+        content hash and records a pinned (follow=False) parent edge. Use when you
+        want to stay on a specific version — recalc will find the entry but won't
+        advance it when the parent alias moves.
       - When in doubt, call `catalog_list` first. A name that looks like a file
-        is often actually an alias — `from_project` on an alias raises
+        is often actually an alias — `read_project_file` on an alias raises
         `ProjectDataNotFound`.
 
     COLUMN NAMES — do not guess. The source step returns a `schema`, and
@@ -445,7 +450,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         import xorq.expr.datatypes as dt
         from xorq.ml import deferred_fit_predict_sklearn, train_test_splits
         from sklearn.linear_model import LinearRegression
-        t = from_catalog("diamond_features")
+        t = tracked_expr_from_alias("diamond_features")
         train, test = train_test_splits(t, test_sizes=0.25, random_seed=42)
         deferred = deferred_fit_predict_sklearn(cls=LinearRegression, return_type=dt.float64)
         instance = deferred(train, target="price", features=["carat", "depth", "x", "y", "z"])
@@ -460,7 +465,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         - fabricate placeholder values that look like real output (e.g. a
           memtable of zeros) when you cannot compute the requested result —
           return an error or a clearly-labelled column instead.
-        - pass a project= argument to from_project/from_catalog; the active
+        - pass a project= argument to read_project_file/tracked_expr_from_alias; the active
           project is implicit.
 
     Args:
@@ -500,7 +505,7 @@ def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dic
     project = _resolve_active_project()
     if name and get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
-    code = f"from tallyman_xorq.io import from_project\nexpr = from_project({rel_path!r})\n"
+    code = f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel_path!r})\n"
     out = _run_and_record(project, code, prompt, tool="catalog_load_parquet")
     if "error" in out:
         return out
@@ -588,7 +593,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     in the catalog as a forensic artifact and is recorded in alias_history.
 
     Code conventions and gotchas are documented in `catalog_run`. The same
-    rules apply here. Use `from_catalog(name)` to chain off the previous
+    rules apply here. Use `tracked_expr_from_alias(name)` to chain off the previous
     version of the alias (or any other named entry).
 
     Args:
@@ -939,7 +944,7 @@ def catalog_scan_staleness() -> dict:
     """Scan every catalog entry for staleness against its recorded inputs.
 
     Read-only. An entry is *stale* when an input it was built against moved:
-    a followed alias (built with ``from_catalog("name")``) advanced past the
+    a followed alias (built with ``tracked_expr_from_alias("name")``) advanced past the
     recorded head, or a recorded source file's content drifted on disk. A
     *directly* stale entry has its own input moved; a *transitively* stale entry
     is a clean descendant of a stale ancestor. Use ``catalog_recalc`` to act.

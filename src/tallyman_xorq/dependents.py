@@ -1,6 +1,6 @@
 """Read the cross-entry dependency DAG recorded in each manifest (#84/#89).
 
-``manifest.parents`` records every entry's resolved ``from_catalog`` edges
+``manifest.parents`` records every entry's resolved ``tracked_expr_from_alias`` edges
 (``{hash, ref, follow}``) at build time, but nothing reads them: #76 deleted
 ``lineage.py`` (``catalog_parents`` / ``catalog_dag``) along with the column-
 lineage views that were its only consumer. The reactive consumer needs the DAG

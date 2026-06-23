@@ -30,7 +30,7 @@ catalog_load_parquet(rel_path="stocks.parquet", name="stocks_raw", prompt="Raw m
 **2. Parse the string date with an explicit strptime format, sort per symbol, and derive the lagged monthly return; put the new return column first.**  _(`catalog_create`)_
 
 ```python
-catalog_create(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nw = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nt = t.mutate(prev_price=t.price.lag(1).over(w))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1)\nexpr = t.select(\"monthly_return\", *[c for c in t.columns if c != \"monthly_return\"])\n", prompt="Parse 'Jan 1 2000' dates, order by symbol+date, compute lagged monthly return; return column leftmost.")
+catalog_create(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nw = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nt = t.mutate(prev_price=t.price.lag(1).over(w))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1)\nexpr = t.select(\"monthly_return\", *[c for c in t.columns if c != \"monthly_return\"])\n", prompt="Parse 'Jan 1 2000' dates, order by symbol+date, compute lagged monthly return; return column leftmost.")
 ```
 > _Probes:_ The string-date parse trap: as_timestamp('%b %d %Y') must build AND execute (bare .to_timestamp() with no format silently mis-parses). lag(1).over(window) over a partitioned+ordered series. New-column-first reselect. CRITICAL: as_timestamp yields a UTC-tz timestamp (+00:00) — a downstream trap if any later step compares it to a tz-naive literal. This entry has a WindowFunction op so it is cache_worthy=True (result lives in the snapshot cache, result.parquet may later be evicted).
 
@@ -44,7 +44,7 @@ catalog_chart(hash_or_alias="stock_returns", vega_spec={"$schema": "https://vega
 **4. Revise the alias to add a rolling 3-month and 12-month moving average plus a cumulative running-max drawdown reference, keeping the prior version in history.**  _(`catalog_revise`)_
 
 ```python
-catalog_revise(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import from_catalog\nt = from_catalog(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nbase = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nroll3 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=2, following=0)\nroll12 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=11, following=0)\ncumw = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=None, following=0)\nt = t.mutate(prev_price=t.price.lag(1).over(base))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1, ma3=t.price.mean().over(roll3), ma12=t.price.mean().over(roll12), running_max=t.price.max().over(cumw))\nt = t.mutate(drawdown=(t.price / t.running_max) - 1)\nexpr = t.select(\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\", *[c for c in t.columns if c not in (\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\")])\n", prompt="Add rolling 3/12-month MA, running-max, and drawdown windows; keep returns. New cols leftmost.")
+catalog_revise(name="stock_returns", code="import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias(\"stocks_raw\")\nt = t.mutate(ts=t.date.as_timestamp(\"%b %d %Y\"))\nbase = ibis.window(group_by=\"symbol\", order_by=\"ts\")\nroll3 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=2, following=0)\nroll12 = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=11, following=0)\ncumw = ibis.window(group_by=\"symbol\", order_by=\"ts\", preceding=None, following=0)\nt = t.mutate(prev_price=t.price.lag(1).over(base))\nt = t.mutate(monthly_return=(t.price / t.prev_price) - 1, ma3=t.price.mean().over(roll3), ma12=t.price.mean().over(roll12), running_max=t.price.max().over(cumw))\nt = t.mutate(drawdown=(t.price / t.running_max) - 1)\nexpr = t.select(\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\", *[c for c in t.columns if c not in (\"monthly_return\", \"ma3\", \"ma12\", \"drawdown\")])\n", prompt="Add rolling 3/12-month MA, running-max, and drawdown windows; keep returns. New cols leftmost.")
 ```
 > _Probes:_ Three distinct window frames in one expr: bounded rolling (preceding=2/11, following=0) AND an unbounded cumulative frame (preceding=None). Multiple WindowFunction ops stress the build's op-classification regex in classify_build. V1 vs V2 now differ by 4 added columns over the SAME (symbol, date) grain — sets up the keyed diff in step 6. Confirms revise keeps V1's hash in forensic history.
 
@@ -213,16 +213,16 @@ catalog_add_post_processing(name="return_normality", source="def process(expr):\
 catalog_load_parquet(rel_path="wine_red.parquet", name="wine_red", prompt="UCI red wine quality: 11 float chemical features with spaces in names + quality int")
 catalog_load_parquet(rel_path="wine_white.parquet", name="wine_white", prompt="UCI white wine quality, identical schema to red")
 ```
-> _Probes:_ Two back-to-back named loads. Probes whether catalog_load_parquet correctly registers two aliases + two notebook cells in one beat, and that the staged files land under <project>/data/ where from_project can find them. schema.json for each must capture the space-in-name columns verbatim (used later for primary-key inference and diff).
+> _Probes:_ Two back-to-back named loads. Probes whether catalog_load_parquet correctly registers two aliases + two notebook cells in one beat, and that the staged files land under <project>/data/ where read_project_file can find them. schema.json for each must capture the space-in-name columns verbatim (used later for primary-key inference and diff).
 
 **2. UNION red and white into one labeled table. Each side gets a literal wine_type column, then .union(); the new label column is selected leftmost. This is the foundation entry for the whole hypothesis test.**  _(`catalog_create`)_
 
 ```python
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_project
+from tallyman_xorq.io import read_project_file
 
-red = from_project("wine_red.parquet").mutate(wine_type=ibis.literal("red"))
-white = from_project("wine_white.parquet").mutate(wine_type=ibis.literal("white"))
+red = read_project_file("wine_red.parquet").mutate(wine_type=ibis.literal("red"))
+white = read_project_file("wine_white.parquet").mutate(wine_type=ibis.literal("white"))
 # re-select new column leftmost and force identical column order on both sides
 cols = ["wine_type", "fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "free sulfur dioxide", "total sulfur dioxide", "density", "pH", "sulphates", "alcohol", "quality"]
 red = red.select(cols)
@@ -231,15 +231,15 @@ expr = red.union(white)
 
 catalog_create(name="wine_all", code=code, prompt="red+white unioned with a wine_type label, columns aligned for the two-sample test")
 ```
-> _Probes:_ .union() of two from_project sources: column order/type alignment is fragile — if either select() reorders columns differently the union silently mis-pairs or raises a schema-mismatch. Probes that ibis.literal('red') becomes a proper string column (not a constant folded away), and that selecting cols by bracket-name list survives the space-in-name columns. Also stresses cache_worthy: a union is not in _EXPENSIVE_OPS, so wine_all may be classified CHEAP despite being a real combine — a mis-classification surface for the result cache and primary-key inheritance.
+> _Probes:_ .union() of two read_project_file sources: column order/type alignment is fragile — if either select() reorders columns differently the union silently mis-pairs or raises a schema-mismatch. Probes that ibis.literal('red') becomes a proper string column (not a constant folded away), and that selecting cols by bracket-name list survives the space-in-name columns. Also stresses cache_worthy: a union is not in _EXPENSIVE_OPS, so wine_all may be classified CHEAP despite being a real combine — a mis-classification surface for the result cache and primary-key inheritance.
 
 **3. Compute per-wine_type descriptive stats for every chemical property: mean, std, and n, grouped by wine_type. This is the table the t-test and the grouped-bar chart read from.**  _(`catalog_create`)_
 
 ```python
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 
-t = from_catalog("wine_all")
+t = tracked_expr_from_alias("wine_all")
 props = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "free sulfur dioxide", "total sulfur dioxide", "density", "pH", "sulphates", "alcohol"]
 aggs = {"n": t.count()}
 for p in props:
@@ -256,9 +256,9 @@ catalog_create(name="wine_group_stats", code=code, prompt="per-wine_type mean/st
 
 ```python
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 
-g = from_catalog("wine_group_stats")
+g = tracked_expr_from_alias("wine_group_stats")
 red = g.filter(g.wine_type == "red")
 white = g.filter(g.wine_type == "white")
 props = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "free sulfur dioxide", "total sulfur dioxide", "density", "pH", "sulphates", "alcohol"]
@@ -341,8 +341,8 @@ catalog_add_post_processing(name="welch_ttest", source=safe_code)  # re-add -> r
 
 # (b) revise the grouped-stats entry (drop the two sulfur columns) and diff
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
-t = from_catalog("wine_all")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("wine_all")
 props = ["fixed acidity", "volatile acidity", "citric acid", "residual sugar", "chlorides", "density", "pH", "sulphates", "alcohol"]
 aggs = {"n": t.count()}
 for p in props:
@@ -493,7 +493,7 @@ catalog_diff(name="wine_group_stats", va=-2, vb=-1)
 
 - **catalog_add_post_processing validator vs catalog_run_post_processing (step 6)** — validate_post_processing_source dry-runs process() against xo.memtable({'a':[1,2,3],'b':['x','y','z']}); a scipy Welch-test process() that does df[df['wine_type']=='red'] and indexes space-named columns raises KeyError on that 3-row {a,b} frame and is REJECTED at commit time, even though step 5's catalog_run_post_processing (real result.parquet) succeeded. The two paths disagree on what a valid function is — a function the operator just saw produce correct p-values cannot be committed without a defensive column-presence guard.
 - **scipy import under restricted-globals exec in both validate and run (steps 5-7)** — _restricted_globals() injects only ibis and xorq and sets __builtins__ to a hand-picked allowlist that omits __import__. If the exec'd process() body's 'from scipy import stats' resolves __import__ through that stripped builtins map, the import fails inside validate_post_processing_source and/or run_post_processing with a confusing 'source raised at exec time' or 'process() raised' message — so the scipy escape hatch is silently unusable, and the failure mode differs between the validate path (tiny memtable) and run path (real data), making it hard to diagnose.
-- **.union() schema/type alignment of two from_project sources (step 2)** — red.select(cols).union(white.select(cols)) requires byte-identical column order AND dtypes. The space-named float columns and the freshly-mutated ibis.literal('red')/('white') wine_type must line up; if white's parquet promotes any column to a different float width or the literal label is typed as a different string variant, .union() raises a schema-mismatch at catalog_create-save time (the bare-ibis-import-style late TypeError), or worse unions silently with mis-paired columns producing a corrupt wine_all that every downstream step inherits.
+- **.union() schema/type alignment of two read_project_file sources (step 2)** — red.select(cols).union(white.select(cols)) requires byte-identical column order AND dtypes. The space-named float columns and the freshly-mutated ibis.literal('red')/('white') wine_type must line up; if white's parquet promotes any column to a different float width or the literal label is typed as a different string variant, .union() raises a schema-mismatch at catalog_create-save time (the bare-ibis-import-style late TypeError), or worse unions silently with mis-paired columns producing a corrupt wine_all that every downstream step inherits.
 - **primary-key inference on a 2-row aggregate diff (step 8)** — catalog_diff(wine_group_stats) compares two Aggregate (cache_worthy) versions, so neither inherits a parent PK and _detect_pk_xorq runs live on a 2-row frame. With only 2 rows every column has ~100% cardinality at the 0.98 threshold, so the detector may pick a float *_mean column (or an arbitrary single column) as the key instead of wine_type, producing a meaningless keyed-row diff. The dropped sulfur-dioxide columns between versions also shrink the schema, so diff_keys must intersect a key present in BOTH schemas — wine_type survives but a wrongly-detected mean-column key from one side may not exist on the other, forcing a fallback that the keyed diff may not handle gracefully.
 - **post-processing remove/re-add live-reload churn (steps 7-8)** — remove_post_processing soft-deletes welch_ttest to _disabled/ and re-add overwrites; the live-reload path (this branch) must (a) clear the _disabled/welch_ttest.py copy on re-add so catalog_list_post_processings doesn't show the name as both active and disabled, and (b) replace the already-loaded ColAnalysis klass in the live buckaroo session rather than registering a second dropdown entry or serving the stale pre-remove definition. A leaked klass means selecting welch_ttest re-renders with the old function body, masking the freshly-committed version.
 - **cache_worthy mis-classification of wine_all union (step 2 feeding 3-8)** — classify_build scans the build YAML for ops in _EXPENSIVE_OPS, which lists Join/Aggregate/Sort/Window but NOT Union. A union of two 1.6k/4.9k-row reads is therefore classified CHEAP, so wine_all gets no snapshot cache and relies on in-place result.parquet regeneration. If that result.parquet is evicted, ensure_result recomputes the union from the build — but every downstream entry (wine_group_stats, the t-test run, both charts' /api/data) reads through cached_result_expr(wine_all), so a flaky union recompute or a stale label column silently corrupts the entire hypothesis-test chain and the diff anchor.
@@ -521,9 +521,9 @@ catalog_load_parquet(rel_path="titanic.parquet", name="titanic_raw", prompt="Raw
 **2. Compute survival rate by sex and by class as a long-format cohort table — the headline target-rate-by-segment view. Average the int 0/1 survived column to get a rate, count cohort size, and put the new computed columns first.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("titanic_raw")
+t = tracked_expr_from_alias("titanic_raw")
 by_sex = t.group_by("sex").aggregate(survival_rate=t.survived.mean(), n=t.survived.count()).mutate(cohort_kind=ibis.literal("sex")).rename(cohort_value="sex")
 by_class = t.group_by("pclass").aggregate(survival_rate=t.survived.mean(), n=t.survived.count()).mutate(cohort_kind=ibis.literal("pclass")).mutate(cohort_value=t.pclass.cast("string")).drop("pclass")
 unioned = by_sex.union(by_class)
@@ -534,9 +534,9 @@ expr = unioned.select("cohort_kind", "cohort_value", "survival_rate", "n").order
 **3. Build the sex x pclass survival crosstab by grouping on two columns at once, then attach it as a named entry. This is the wide cohort grid behind the heatmap.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("titanic_raw")
+t = tracked_expr_from_alias("titanic_raw")
 expr = (t.group_by(["sex", "pclass"]).aggregate(survival_rate=t.survived.mean(), n=t.survived.count(), avg_fare=t.fare.mean()).order_by(["sex", "pclass"]))
 ```
 > _Probes:_ group_by([two cols]) crosstab grain. Companion must render a 6-row long table that the heatmap (step 9) re-pivots client-side via Vega-Lite encoding — long->wide happens in the chart, not the query. Probes that catalog_chart's auto-served parquet exposes sex+pclass+survival_rate columns by exact name for the heatmap x/y/color channels.
@@ -544,9 +544,9 @@ expr = (t.group_by(["sex", "pclass"]).aggregate(survival_rate=t.survived.mean(),
 **4. Audit the null landscape before imputing: per-column null counts and null fractions for the columns we care about (age, deck, embarked), computed as explicit aggregates since .describe() is unavailable.**  _(`mcp__tallyman__catalog_run`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("titanic_raw")
+t = tracked_expr_from_alias("titanic_raw")
 n = t.count()
 expr = t.aggregate(
     n_rows=t.count(),
@@ -562,8 +562,8 @@ expr = t.aggregate(
 **5. Create the imputation alias as V1 = the raw passenger rows passed through unchanged (select all columns), establishing a baseline version to diff against. This is deliberately row-preserving and cheap.**  _(`mcp__tallyman__catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
-t = from_catalog("titanic_raw")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("titanic_raw")
 cols = ["survived", "pclass", "sex", "age", "sibsp", "parch", "fare", "embarked", "class", "who", "adult_male", "deck", "embark_town", "alive", "alone"]
 expr = t.select(*cols)
 ```
@@ -572,9 +572,9 @@ expr = t.select(*cols)
 **6. Revise the impute alias to V2: median-impute age within each (sex, pclass) cohort using a partitioned window — the .transform trap done in ibis. Fill nulls with the group median, keep all other rows identical. New/changed column goes first.**  _(`mcp__tallyman__catalog_revise`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("impute_age")
+t = tracked_expr_from_alias("impute_age")
 w = ibis.window(group_by=["sex", "pclass"])
 group_median = t.age.approx_median().over(w)
 filled = t.age.fill_null(group_median)
@@ -594,9 +594,9 @@ catalog_diff(name="impute_age", va=1, vb=2)
 **8. Add an age-band cohort as a third impute version (V3) so a second diff exercises schema-add diffing on a keyless frame, then audit survival rate by band.**  _(`mcp__tallyman__catalog_revise`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("impute_age")
+t = tracked_expr_from_alias("impute_age")
 band = (ibis.case().when(t.age < 13, "child").when(t.age < 20, "teen").when(t.age < 40, "adult").when(t.age < 60, "middle").else_("senior").end())
 expr = t.mutate(age_band=band).select("age_band", *t.columns)
 ```
@@ -838,14 +838,14 @@ catalog_add_summary_stat(name="null_frac", source="def compute(col):\n    return
 
 ### Steps
 
-**1. Register the raw diamonds parquet as a named catalog alias so it becomes a notebook cell and a from_catalog-resolvable source for the feature pipeline.**  _(`catalog_load_parquet`)_
+**1. Register the raw diamonds parquet as a named catalog alias so it becomes a notebook cell and a tracked_expr_from_alias-resolvable source for the feature pipeline.**  _(`catalog_load_parquet`)_
 
 ```python
 rel_path="diamonds.parquet"
 name="diamonds"
 prompt="Raw diamonds dataset (53,940 rows): carat, cut/color/clarity ordered categoricals, x/y/z dims, price target. Base for regression feature engineering."
 ```
-> _Probes:_ 54K-row register + first Buckaroo session load; whether load_parquet records an alias that from_catalog (not from_project) must later resolve. Confirms the column-stat/session path can open a 50K-row entry at all.
+> _Probes:_ 54K-row register + first Buckaroo session load; whether load_parquet records an alias that tracked_expr_from_alias (not read_project_file) must later resolve. Confirms the column-stat/session path can open a 50K-row entry at all.
 
 **2. Build the engineered feature table in one mutate/select chain: price_per_carat, volume=x*y*z, log_price, log_carat, plus a carat_bin via ibis.cases(). New computed columns selected leftmost per the new-column-first rule.**  _(`catalog_create`)_
 
@@ -854,8 +854,8 @@ name="diamond_features"
 prompt="Engineered regression features: price_per_carat, volume, log-log cols, carat bins. New cols first."
 code='''
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
-t = from_catalog("diamonds")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("diamonds")
 price_per_carat = (t.price / t.carat).name("price_per_carat")
 volume = (t.x * t.y * t.z).name("volume")
 log_price = t.price.log().name("log_price")
@@ -879,8 +879,8 @@ name="diamond_features"
 prompt="Add ordinal encodings cut_ord (Fair=1..Ideal=5), color_ord (J=1..D=7), clarity_ord (I1=1..IF=8) for correlation/modeling."
 code='''
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
-t = from_catalog("diamond_features")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("diamond_features")
 cut_ord = ibis.cases((t.cut=="Fair",1),(t.cut=="Good",2),(t.cut=="Very Good",3),(t.cut=="Premium",4),(t.cut=="Ideal",5),else_=0).name("cut_ord")
 color_ord = ibis.cases((t.color=="J",1),(t.color=="I",2),(t.color=="H",3),(t.color=="G",4),(t.color=="F",5),(t.color=="E",6),(t.color=="D",7),else_=0).name("color_ord")
 clarity_ord = ibis.cases((t.clarity=="I1",1),(t.clarity=="SI2",2),(t.clarity=="SI1",3),(t.clarity=="VS2",4),(t.clarity=="VS1",5),(t.clarity=="VVS2",6),(t.clarity=="VVS1",7),(t.clarity=="IF",8),else_=0).name("clarity_ord")
@@ -905,8 +905,8 @@ name="price_corr"
 prompt="Correlation of each numeric/ordinal feature with price (single wide row)."
 code='''
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import from_catalog
-t = from_catalog("diamond_features")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("diamond_features")
 expr = t.aggregate(
     carat=t.carat.corr(t.price),
     volume=t.volume.corr(t.price),
@@ -1092,9 +1092,9 @@ catalog_load_parquet(rel_path="penguins.parquet", prompt="Raw Palmer penguins: 3
 **2. Build the clean feature matrix: drop any row with a null in the four clustering features, and add a stable integer row id (leftmost) so downstream joins and the keyed diff have an unambiguous primary key.**  _(`catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("penguins_raw")
+t = tracked_expr_from_alias("penguins_raw")
 feats = ["bill_length_mm", "bill_depth_mm", "flipper_length_mm", "body_mass_g"]
 clean = t.filter(
     t.bill_length_mm.notnull()
@@ -1113,9 +1113,9 @@ expr = clean.select(
 **3. Create the standardized feature matrix as a NAMED alias: replace each raw feature with its population z-score using a window aggregate over the whole table, keeping penguin_id and species for later labeling.**  _(`catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("penguins_clean")
+t = tracked_expr_from_alias("penguins_clean")
 w = ibis.window()  # whole-table frame
 def z(col):
     c = t[col]
@@ -1179,11 +1179,11 @@ catalog_add_post_processing(name="kmeans_k3", source=code)
 **6. Materialize the cluster assignment as a first-class catalog entry by re-running the KMeans output through an ibis UDF-free path: persist the labeled rows so charts and diffs can target them. Run it as a named alias.**  _(`catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
 import pandas as pd
 from sklearn.cluster import KMeans
-z = from_catalog("penguins_z")
+z = tracked_expr_from_alias("penguins_z")
 df = z.execute()
 feature_cols = ["bill_length_z", "bill_depth_z", "flipper_length_z", "body_mass_z"]
 X = df[feature_cols].to_numpy()
@@ -1199,9 +1199,9 @@ expr = ibis.memtable(df).select("cluster", "dist_to_centroid", *df.columns[:-2].
 **7. Profile the segments: group the labeled entry by cluster and compute size plus per-cluster mean of each z-feature, so we can read off what distinguishes each segment.**  _(`catalog_create`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("penguin_clusters")
+t = tracked_expr_from_alias("penguin_clusters")
 expr = t.group_by("cluster").aggregate(
     n=t.count(),
     mean_bill_length_z=t.bill_length_z.mean(),
@@ -1238,9 +1238,9 @@ catalog_add_summary_stat(name="cluster_purity", source=source)
 **10. Revise the standardized feature matrix to use sample std with explicit null-safe handling, then diff it against the previous version to confirm only the z-values shifted and the row grain / primary key is unchanged.**  _(`catalog_revise`)_
 
 ```python
-from tallyman_xorq.io import from_catalog
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = from_catalog("penguins_clean")
+t = tracked_expr_from_alias("penguins_clean")
 w = ibis.window()
 def z(col):
     c = t[col]

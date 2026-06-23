@@ -113,7 +113,7 @@ cascade.
 
 Roots are scoped to the consequences of *this* revise, not the project's whole stale
 set. After advancing `name` from `prev_hash`, the directly-stale followers are
-exactly the entries whose recorded `from_catalog(name)` (follow=True) head no longer
+exactly the entries whose recorded `tracked_expr_from_alias(name)` (follow=True) head no longer
 matches. Reuse `scan` and filter to the alias axis on this name:
 
 ```

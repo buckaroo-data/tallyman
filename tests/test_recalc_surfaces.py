@@ -18,24 +18,24 @@ from tallyman_core.aliases import get_alias
 
 def _base_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
 
 
 def _base_code_v2(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price").mutate(extra=1)
 """
 
 
 def _child_code(parent: str) -> str:
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 

@@ -30,7 +30,7 @@
 
 ## Infrastructure failure (not in the plan)
 
-`from_project("citibike_large")` does not resolve catalog aliases. It looks for a raw data file at `.../data/citibike_large`. To read a prior catalog entry from new code you must hardcode the artifact parquet path. There is no clean "read current version of alias X" API for use inside expressions.
+`read_project_file("citibike_large")` does not resolve catalog aliases. It looks for a raw data file at `.../data/citibike_large`. To read a prior catalog entry from new code you must hardcode the artifact parquet path. There is no clean "read current version of alias X" API for use inside expressions.
 
 ---
 

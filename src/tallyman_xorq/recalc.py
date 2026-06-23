@@ -12,7 +12,7 @@ hash; a hash-pinned child re-pins the same parent and is a no-op.
 Why a plain topological replay is correct *and* idempotent:
 
 - A recipe references a followed parent by its *alias name*
-  (``from_catalog("A")``), which ``io.from_catalog`` resolves to the alias's
+  (``tracked_expr_from_alias("A")``), which ``io.tracked_expr_from_alias`` resolves to the alias's
   **current** head at build time (``get_alias``). Re-pointing alias ``A`` to its
   recomputed hash *before* replaying ``A``'s dependents means each dependent's
   replay reads the advanced parent. Dependency order (``descendant_cone``)
@@ -253,7 +253,7 @@ def _run_walk(project: str, roots: list[str]) -> RecalcReport:
 def _is_self_ref(content_hash: str, reason: StaleReason) -> bool:
     """An alias-axis reason whose current head is the entry itself — the entry
     follows its OWN alias (the documented revise-in-place pattern). Permanently
-    stale by design (#74/#85: the from_catalog(self) pin can never refresh), so it
+    stale by design (#74/#85: the tracked_expr_from_alias(self) pin can never refresh), so it
     is neither a meaningful recalc root nor an UNEXPLAINED invariant break."""
     return reason.axis == "alias" and reason.now == content_hash
 

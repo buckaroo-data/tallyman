@@ -18,7 +18,7 @@ goes to stderr every ~15s so a long quiet stretch still shows live RSS. Exits
 This is a backstop for *unknown* spikes (e.g. a full-source ``pq.read_table`` of
 a 100M-row parquet). The known reconstruction cycle has its own in-process
 backstop — ``result_cache._MAX_RECON_DEPTH`` — which turns a runaway
-``from_catalog`` cycle into a fast ``BuildError`` instead of an OOM.
+``tracked_expr_from_alias`` cycle into a fast ``BuildError`` instead of an OOM.
 """
 
 from __future__ import annotations

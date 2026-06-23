@@ -19,11 +19,11 @@ to the absolute source path). So the rebuild treats hashes as NOT preserved and
 remaps every hash-keyed artifact through an ``old_hash -> new_hash`` table built
 as it goes:
 
-* recipes that chain by ALIAS (``from_catalog("citibike")``) survive untouched —
+* recipes that chain by ALIAS (``tracked_expr_from_alias("citibike")``) survive untouched —
   the alias is re-pointed at the rebuilt parent before the child is built;
-* recipes that chain by literal HASH (``from_catalog("763193211746")``) are
+* recipes that chain by literal HASH (``tracked_expr_from_alias("763193211746")``) are
   rewritten in place (old hash -> new hash) before the child builds, which is why
-  the build order is a topological sort of the from_catalog dependency graph;
+  the build order is a topological sort of the tracked_expr_from_alias dependency graph;
 * charts (``chart_specs/<hash>.vl.json``) and notebook cells are remapped;
 * alias history is reconstructed with the remapped hashes;
 * per-entry prompt history is carried across to the new ``prompts/<hash>.jsonl``.
@@ -44,7 +44,7 @@ catalog bookkeeping (recipes are regenerated); the single-user no-migration rule
 permits it. Use ``--dry-run`` first.
 
 Known limitation — build-time alias revision. A recipe chains a parent by ALIAS
-with no version pin (``from_catalog("habitual_speeder_stats")``), so when that
+with no version pin (``tracked_expr_from_alias("habitual_speeder_stats")``), so when that
 alias was revised *after* a child was built and the revision changed the parent's
 schema, the rebuild re-points the alias at its FINAL latest revision and the
 child can fail to find a column the older revision had. The exact build-time
@@ -67,8 +67,8 @@ from dataclasses import dataclass, field
 
 # 12-char lowercase-hex content hash (the entry-dir / pointer naming).
 _HASH_RE = re.compile(r"\b[0-9a-f]{12}\b")
-# from_catalog("ref") / from_catalog('ref', ...) — first positional arg only.
-_FROM_CAT_RE = re.compile(r"from_catalog\(\s*['\"]([^'\"]+)['\"]")
+# tracked_expr_from_alias("ref") / tracked_expr_from_alias('ref', ...) — first positional arg only.
+_FROM_CAT_RE = re.compile(r"tracked_expr_from_alias\(\s*['\"]([^'\"]+)['\"]")
 
 
 @dataclass
@@ -185,7 +185,7 @@ def parse_deps(
 
     A literal hash ref is itself. An alias ref resolves to the alias's *build-time*
     target: if this entry is a revision of that alias (the documented self-chaining
-    revise — ``from_catalog`` of one's own alias, #74), the dependency is the
+    revise — ``tracked_expr_from_alias`` of one's own alias, #74), the dependency is the
     PREVIOUS revision in the alias history, not the current latest (which would be
     this very entry, a false self-cycle); otherwise it is the alias's current hash.
     """
@@ -208,7 +208,7 @@ def parse_deps(
 def toposort(
     recipes: dict[str, str], aliases: dict[str, str], history: dict[str, list[str]] | None = None
 ) -> list[str]:
-    """Dependency order (parents before children) over the from_catalog graph."""
+    """Dependency order (parents before children) over the tracked_expr_from_alias graph."""
     history = history or {}
     known = set(recipes)
     dmap = {h: parse_deps(t, h, aliases, history, known) for h, t in recipes.items()}
@@ -218,14 +218,14 @@ def toposort(
         ready = sorted(h for h in recipes if h not in placed and dmap[h] <= placed)
         if not ready:
             stuck = {h: sorted(dmap[h] - placed) for h in recipes if h not in placed}
-            raise RuntimeError(f"unresolvable from_catalog dependencies (cycle or missing parent): {stuck}")
+            raise RuntimeError(f"unresolvable tracked_expr_from_alias dependencies (cycle or missing parent): {stuck}")
         order.extend(ready)
         placed.update(ready)
     return order
 
 
 def rewrite_hash_refs(expr_text: str, remap: dict[str, str]) -> str:
-    """Replace literal old-hash from_catalog refs with their rebuilt new hash.
+    """Replace literal old-hash tracked_expr_from_alias refs with their rebuilt new hash.
 
     Only rewrites hashes already in *remap* (parents built earlier in topo order);
     alias refs are left alone (the alias is re-pointed before the child builds).
@@ -272,10 +272,10 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
     cat = catalog_dir(project)
     shutil.rmtree(cat)  # wipe catalog bookkeeping; data/ is untouched
     ensure_project(project)
-    set_active_project(project)  # recipes resolve project_path/from_catalog against the active project
+    set_active_project(project)  # recipes resolve project_path/tracked_expr_from_alias against the active project
     catalog_state.genesis(project)
     # The catalog just changed under the process-global result-expr memo; a stale
-    # plan would make a from_catalog child re-exec against the pre-wipe parent.
+    # plan would make a tracked_expr_from_alias child re-exec against the pre-wipe parent.
     # (A fresh-process CLI run has an empty memo; an in-process rebuild does not.)
     from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
@@ -283,7 +283,7 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
 
     # Re-point an alias at each of its revisions AS that revision is rebuilt
     # (topo order replays history oldest-first), so a later self-chaining revise
-    # resolves from_catalog(alias) to its build-time parent, and a cross-alias
+    # resolves tracked_expr_from_alias(alias) to its build-time parent, and a cross-alias
     # child resolves to the latest-built revision. Keyed on history membership,
     # not just the final target.
     revises_at: dict[str, list[str]] = {}
@@ -295,7 +295,7 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
 
     # The persisted recipe is portable: build.py rewrites the data path to a
     # ${TALLYMAN_PROJECT_ROOT} placeholder. Expand it back so the re-exec reads
-    # the real source (recipes that read via project_path()/from_project() carry
+    # the real source (recipes that read via project_path()/read_project_file() carry
     # no placeholder, so this is a no-op for them).
     root = str(project_dir(project))
 

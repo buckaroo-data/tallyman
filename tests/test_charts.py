@@ -21,8 +21,8 @@ SAMPLE_SPEC = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -186,8 +186,8 @@ def test_api_data_default_limit_is_200(fresh_companion_app, project: str, orders
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     # Use a passthrough expression (raw orders, 200 rows in the fixture).
     code = """
-from tallyman_xorq.io import from_project
-expr = from_project("orders.parquet")
+from tallyman_xorq.io import read_project_file
+expr = read_project_file("orders.parquet")
 """
     res = build_and_persist(project, code)
     c = TestClient(fresh_companion_app)

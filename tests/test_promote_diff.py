@@ -21,16 +21,16 @@ from tallyman_xorq.result_cache import cached_result_expr
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
 """
@@ -258,7 +258,7 @@ def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: s
     d1 = catalog_promote_diff("ss", alias="mydiff")["hash"]  # creates mydiff
     foll = catalog_create(
         "foll",
-        "from tallyman_xorq.io import from_catalog\nt = from_catalog('mydiff')\nexpr = t.select('region')\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('mydiff')\nexpr = t.select('region')\n",
     )["hash"]
 
     catalog_revise("ss", _agg_code(project))  # v3 → the latest-two diff now differs
@@ -461,7 +461,7 @@ def test_marimo_export_loads_in_marimo_without_collisions(
     """The exported notebook must load in marimo without a MultipleDefinitionError.
 
     Each code cell inlines an ``expr.py`` that binds ``expr`` and imports
-    ``os`` / ``xo`` / ``from_project``. With more than one entry those names
+    ``os`` / ``xo`` / ``read_project_file``. With more than one entry those names
     used to leak into marimo's global dataflow graph and collide; the closure
     wrapper in ``marimo_export`` keeps them cell-local. String assertions
     alone never caught this — we have to actually build the marimo graph.

@@ -29,8 +29,8 @@ SAMPLE_CONFIG = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 

@@ -1,7 +1,7 @@
 """Decide whether a catalog entry is stale relative to its recorded inputs (#89).
 
 Everything the consumer needs is already captured at build: ``manifest.parents``
-(the resolved ``from_catalog`` edges and their read-intent) and
+(the resolved ``tracked_expr_from_alias`` edges and their read-intent) and
 ``manifest.sources`` (each source's content digest). Nothing reads it. This is
 the read-only half — no recompute — of the reactive consumer: compare the
 recorded inputs against the current world and report what moved.

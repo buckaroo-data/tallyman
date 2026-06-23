@@ -232,7 +232,7 @@ def test_hint_bare_xorq_attribute_points_to_api():
 
 def test_hint_ibis_read_parquet_points_to_loaders():
     h = _ibis_import_hint("module 'ibis' has no attribute 'read_parquet'")
-    assert "from_project" in h
+    assert "read_project_file" in h
 
 
 def test_hint_ibis_math_func_is_column_method():
@@ -242,7 +242,7 @@ def test_hint_ibis_math_func_is_column_method():
 
 def test_hint_io_import_typo_lists_real_exports():
     h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'tallyman_xorq.io'")
-    assert "from_project" in h and "from_catalog" in h
+    assert "read_project_file" in h and "tracked_expr_from_alias" in h
 
 
 def test_hint_missing_table_column():

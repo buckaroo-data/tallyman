@@ -94,13 +94,13 @@ def test_stdio_create_revise_diff_round_trip(isolated_home: Path, project: str, 
     async def go():
         async with _client(project, isolated_home) as client:
             code1 = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
             code2 = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """

@@ -370,3 +370,25 @@ def test_companion_revise_publishes_recalc_event(project, orders_parquet, monkey
     # commits the revision AFTER the handler returns, and (unlike the MCP decorator)
     # the response is already serialized, so there's nothing to backfill into.
     assert step is None
+
+
+def test_companion_promote_diff_is_one_revision(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # Finding #1: the companion POST /api/promote_diff route self-checkpoints
+    # (app.py) AND was not in _checkpoint_exempt, so the dispatch middleware
+    # checkpointed it a second time — a double-commit (trailing empty revision),
+    # the exact bug already fixed on the MCP side. The promote must land in exactly
+    # ONE revision, mirroring catalog_promote_diff.
+    from fastapi.testclient import TestClient
+
+    from tallyman_mcp.server import catalog_create, catalog_revise
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    catalog_create("ss", _base_code(project))  # v1
+    catalog_revise("ss", _base_code_v2(project))  # v2 → a diff exists between v1 and v2
+
+    c = TestClient(fresh_companion_app)
+    base = _steps(project)
+    r = c.post(f"/{project}/api/promote_diff/ss/1/2")  # target alias is auto-derived
+    assert r.status_code == 200, r.text
+    assert len(_steps(project)) == len(base) + 1

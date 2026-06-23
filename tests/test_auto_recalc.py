@@ -416,3 +416,54 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
     assert skipped in orphans
     assert "UNEXPLAINED" not in orphans[skipped]["explanation"]
     assert "explained by error" in orphans[skipped]["explanation"]
+
+
+# ---------------------------------------------------------------------------
+# review finding #2: a cascade failure on the revise auto-path attributes the
+# error to the triggering tool, not the hard-coded "catalog_recalc"
+# ---------------------------------------------------------------------------
+
+
+def test_cascade_failure_records_triggering_tool(project, orders_parquet, monkeypatch):
+    # The persisted recalc failure must name the tool that actually ran. On the
+    # auto-recalc path that is catalog_revise; "catalog_recalc" (which never ran
+    # here) would misattribute the failure in the error banner / forensics.
+    _clean_env(monkeypatch)
+    a1 = _hash(catalog_create("a", _src_code(project)))
+    b1 = _hash(catalog_create("b", _child_code("a")))
+    (entry_dir(project, b1) / "expr.py").write_text("broken (((\n")
+
+    out = catalog_revise("a", _src_code_v2(project))
+    assert out["recalc"]["status"] == "failed"
+    err = error_for_hash(project, b1)
+    assert err is not None and err["hash"] == b1
+    assert err["tool"] == "catalog_revise"
+    assert a1 != out["hash"]
+
+
+# ---------------------------------------------------------------------------
+# review finding #3: auto_recalc scans staleness once, not twice (it reused the
+# verdicts it already computed instead of letting the cone walk re-scan)
+# ---------------------------------------------------------------------------
+
+
+def test_auto_recalc_scans_staleness_once(project, orders_parquet, monkeypatch):
+    # auto_recalc computed verdicts via scan(), then the cone walk scanned again —
+    # two full staleness scans (each re-digests every source) per revise. The walk
+    # must reuse the verdicts auto_recalc already holds.
+    import tallyman_xorq.recalc as recalc_mod
+
+    _clean_env(monkeypatch)
+    _hash(catalog_create("a", _src_code(project)))
+    _hash(catalog_create("b", _child_code("a")))
+
+    calls = {"n": 0}
+    real_scan = recalc_mod.scan
+
+    def counting_scan(p):
+        calls["n"] += 1
+        return real_scan(p)
+
+    monkeypatch.setattr(recalc_mod, "scan", counting_scan)
+    catalog_revise("a", _src_code_v2(project))
+    assert calls["n"] == 1

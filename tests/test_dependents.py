@@ -10,20 +10,23 @@ from tallyman_xorq.dependents import (
     dependents_index,
     descendant_cone,
     parents_of,
+    sources_of,
 )
 
 
-def _write_entry(project: str, content_hash: str, parents=None) -> str:
+def _write_entry(project: str, content_hash: str, parents=None, sources=None) -> str:
     """Write a minimal entry (manifest.json only) with the given parent edges.
 
     The dependents reader walks ``manifest.parents`` and never executes a
     recipe, so a hand-written manifest is a faithful and fast graph fixture —
-    no xorq build required. ``parents`` is a list of ``(hash, ref, follow)``.
+    no xorq build required. ``parents`` is a list of ``(hash, ref, follow)``;
+    ``sources`` is the recorded ``{rel_path: digest}`` map (``None`` = built
+    under identity ``off``, the default).
     """
     d = entry_dir(project, content_hash)
     d.mkdir(parents=True, exist_ok=True)
     refs = [ParentRef(hash=h, ref=r, follow=f) for (h, r, f) in (parents or [])]
-    write_manifest(d, Manifest(content_hash=content_hash, project=project, parents=refs or None))
+    write_manifest(d, Manifest(content_hash=content_hash, project=project, parents=refs or None, sources=sources))
     return content_hash
 
 
@@ -37,6 +40,24 @@ def test_parents_of_returns_recorded_edges(project):
     _write_entry(project, "child", [("root", "root", True)])
     edges = parents_of(project, "child")
     assert [(e.hash, e.ref, e.follow) for e in edges] == [("root", "root", True)]
+
+
+def test_sources_of_none_when_unrecorded(project):
+    # Built under identity off (sources never recorded) — None, not {}, so the
+    # staleness source axis reports "unknown" rather than silently "fresh".
+    _write_entry(project, "root")
+    assert sources_of(project, "root") is None
+
+
+def test_sources_of_empty_dict_is_preserved(project):
+    # Identity on, but the recipe read no raw files: {} is distinct from None.
+    _write_entry(project, "noraw", sources={})
+    assert sources_of(project, "noraw") == {}
+
+
+def test_sources_of_returns_recorded_digests(project):
+    _write_entry(project, "leaf", sources={"orders.parquet": "abc123"})
+    assert sources_of(project, "leaf") == {"orders.parquet": "abc123"}
 
 
 def test_build_dag_maps_every_live_entry(project):

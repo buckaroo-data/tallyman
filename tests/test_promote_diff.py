@@ -271,6 +271,13 @@ def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: s
     assert foll2 != foll  # the follower was recomputed
     assert out["recalc"]["remap"].get(foll) == foll2
 
+    # The reported checkpoint_step names the revision the promote + cascade landed
+    # in, AND it is exactly one revision — promote_diff self-checkpoints, so it
+    # must be checkpoint-exempt; a redundant dispatch-decorator checkpoint would
+    # both append a trailing empty commit and make the report name THAT step.
+    assert out["recalc"]["checkpoint_step"] == step_before + 1
+    assert current_step(project) == step_before + 1
+
     # Atomic: reset_to before the re-promote restores BOTH the diff alias and the follower.
     reset_to(project, step_before)
     assert get_alias(project, "mydiff") == d1

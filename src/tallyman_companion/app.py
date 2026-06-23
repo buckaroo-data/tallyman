@@ -367,10 +367,11 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
-    async def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
+    async def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> dict | None:
         """Cascade-recompute *name*'s stale followers after an in-browser head
         advance (PUT /api/code, promote_diff), in the SAME revision the checkpoint
-        middleware commits — the walk takes no checkpoint of its own. Returns the
+        middleware commits — the walk takes no checkpoint of its own. ``tool`` names
+        the route so a persisted cascade failure is attributed to it. Returns the
         recalc sub-report (plus ``orphan_stale``), or ``None`` when the per-project
         ``auto_recalc`` switch is off. On a real cascade, invalidates the companion
         caches, reloads buckaroo sessions, and publishes the canonical recalc SSE
@@ -382,7 +383,7 @@ def create_app(
 
         if not await run_in_threadpool(auto_recalc_enabled, project):
             return None
-        report = await run_in_threadpool(auto_recalc, project, name)
+        report = await run_in_threadpool(auto_recalc, project, name, tool=tool)
         if report.get("remap"):
             _invalidate_reset_caches()
             if buckaroo:
@@ -414,6 +415,8 @@ def create_app(
             return True  # reset moves `current`; it is not a new step
         if path.endswith("/api/recalc"):
             return True  # recalc self-checkpoints (one tx for the whole walk; dry-run takes none)
+        if "/api/promote_diff/" in path:
+            return True  # promote_diff self-checkpoints (the promote + cascade as one tx)
         return False
 
     @app.middleware("http")
@@ -931,7 +934,11 @@ def create_app(
 
         # D5 parity: re-pointing an existing alias cascades to its followers in the
         # same revision (the walk runs before this route's checkpoint).
-        recalc_report = await _auto_recalc_after_head_advance(project, target_alias) if repointed else None
+        recalc_report = (
+            await _auto_recalc_after_head_advance(project, target_alias, tool="companion_promote_diff")
+            if repointed
+            else None
+        )
 
         checkpoint_catalog(project, f"tallyman: catalog_promote_diff {alias} V{a_idx}→V{b_idx}")
         await publish({"kind": "entry_added", "hash": result.content_hash})
@@ -1176,7 +1183,7 @@ def create_app(
         # followers in the SAME revision — the checkpoint middleware commits the
         # head advance + the cascade as one (the walk takes no checkpoint of its
         # own). Off → today's no-cascade behavior. Parity with catalog_revise.
-        rep = await _auto_recalc_after_head_advance(project, alias)
+        rep = await _auto_recalc_after_head_advance(project, alias, tool="companion_revise")
         if rep is not None:
             reply["recalc"] = rep
         return reply

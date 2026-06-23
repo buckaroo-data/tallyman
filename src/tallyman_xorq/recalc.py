@@ -43,7 +43,7 @@ from dataclasses import asdict, dataclass, field
 
 from tallyman_core import aliases
 from tallyman_core.entry_config import carry_forward_entry_config
-from tallyman_core.errors import error_for_hash, record_error
+from tallyman_core.errors import errors_by_hash, record_error
 from tallyman_core.paths import entry_dir, entry_manifest_path, project_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.dependents import DependencyCycleError, build_dag, descendant_cone
@@ -169,7 +169,13 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
     return report
 
 
-def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
+def _replay_cone(
+    project: str,
+    roots: list[str],
+    *,
+    verdicts: dict[str, StaleVerdict] | None = None,
+    tool: str = "catalog_recalc",
+) -> RecalcReport:
     """Replay *roots* and their cone in dependency order, **without** taking a
     checkpoint — the reusable engine behind both the public ``recalc`` and the
     auto-recalc folded into ``catalog_revise``.
@@ -182,6 +188,11 @@ def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
     for the caller's single checkpoint to commit. Returns a report with
     ``checkpoint_step=None`` — the *caller* owns the one checkpoint (``recalc``
     for an explicit run; the per-op decorator/middleware for an embedded one).
+
+    ``verdicts`` lets a caller that already scanned (``auto_recalc``) hand them in
+    so the walk doesn't re-scan; ``tool`` names the surface that triggered the
+    walk, recorded on each persisted failure so the forensic record names the tool
+    that actually ran (not always ``catalog_recalc``).
     """
     roots = [r for r in roots if entry_manifest_path(project, r).exists()]
     try:
@@ -189,7 +200,8 @@ def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
     except DependencyCycleError as exc:
         return RecalcReport(project, roots, [], [], False, "cycle", error=str(exc))
 
-    verdicts = scan(project)
+    if verdicts is None:
+        verdicts = scan(project)
     remap: dict[str, str] = {}
     entries: list[RecalcEntry] = []
     status = "ok"
@@ -205,7 +217,7 @@ def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
                     project,
                     code=_recipe_code(project, old_hash),
                     message="skipped: an upstream build failure halted the recalc walk",
-                    tool="catalog_recalc",
+                    tool=tool,
                     hash=old_hash,
                 )
             entries.append(_entry(old_hash, "skipped", verdict, project))
@@ -222,7 +234,7 @@ def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
                 project,
                 code=_recipe_code(project, old_hash),
                 message=str(exc),
-                tool="catalog_recalc",
+                tool=tool,
                 hash=old_hash,
             )
             entries.append(
@@ -272,22 +284,41 @@ def followers_of(project: str, name: str, verdicts: dict[str, StaleVerdict] | No
     )
 
 
-def _classify_orphan(project: str, content_hash: str, verdict: StaleVerdict) -> dict:
+def _alias_heads_index(project: str) -> dict[str, list[str]]:
+    """``{content_hash: [alias, ...]}`` over the current alias heads, built once.
+
+    The reverse of ``_aliases_heading`` for a batch caller (``classify_orphans``)
+    so classifying N orphans loads ``aliases.jsonl`` a single time, not N times."""
+    index: dict[str, list[str]] = {}
+    for name, latest in aliases.load_aliases(project).items():
+        index.setdefault(latest, []).append(name)
+    for names in index.values():
+        names.sort()
+    return index
+
+
+def _classify_orphan(
+    content_hash: str,
+    verdict: StaleVerdict,
+    errors_index: dict[str, dict],
+    alias_index: dict[str, list[str]],
+) -> dict:
     """Classify a stale entry an auto-recalc did *not* recompute: a self-referential
     pin (expected), explained by a recorded failure, or UNEXPLAINED.
 
     Self-reference is checked first and only when it is the SOLE cause (every reason
     is the entry following its own head): an entry that is also source- or
-    alias-drifted for a real reason still classifies normally."""
+    alias-drifted for a real reason still classifies normally. ``errors_index`` /
+    ``alias_index`` are the prebuilt one-pass lookups (see ``classify_orphans``)."""
     if verdict.reasons and all(_is_self_ref(content_hash, r) for r in verdict.reasons):
         explanation = "self-referential revise pin (follows its own alias head); permanently stale by design — expected"
-    elif (err := error_for_hash(project, content_hash)) is not None:
+    elif (err := errors_index.get(content_hash)) is not None:
         explanation = f"explained by error {err['id']}"
     else:
         explanation = "UNEXPLAINED stale entry — staleness with no recorded recalc error; file a bug."
     return {
         "hash": content_hash,
-        "alias": (_aliases_heading(project, content_hash) or [None])[0],
+        "alias": (alias_index.get(content_hash) or [None])[0],
         "reasons": [asdict(r) for r in verdict.reasons],
         "explanation": explanation,
     }
@@ -303,12 +334,20 @@ def classify_orphans(
     rebuilt as *recomputed*, so only the leftovers are classified. The
     scan-on-load surfaces pass nothing: at scan time no cascade ran, so every
     directly-stale entry is an orphan to be accounted for (the D5 backstop —
-    a project load surfaces orphans even when no revise has happened since)."""
+    a project load surfaces orphans even when no revise has happened since).
+
+    The error store and alias heads are read once up front (``errors_by_hash`` /
+    ``_alias_heads_index``) and shared across all orphans, so the pass is one log
+    read + one aliases read regardless of orphan count."""
     orphans = sorted(h for h, v in verdicts.items() if v.stale and h not in recomputed)
-    return [_classify_orphan(project, h, verdicts[h]) for h in orphans]
+    if not orphans:
+        return []
+    errors_index = errors_by_hash(project)
+    alias_index = _alias_heads_index(project)
+    return [_classify_orphan(h, verdicts[h], errors_index, alias_index) for h in orphans]
 
 
-def auto_recalc(project: str, name: str) -> dict:
+def auto_recalc(project: str, name: str, *, tool: str = "catalog_revise") -> dict:
     """Recompute the followers a revise of alias *name* made stale, **without**
     taking a checkpoint, and account for every other stale entry it did not touch.
 
@@ -318,6 +357,10 @@ def auto_recalc(project: str, name: str) -> dict:
     yet recalced, or an invariant break) — left untouched, logged at WARNING, and
     returned in ``orphan_stale`` classified against the error store (#6).
 
+    ``tool`` names the surface that triggered this auto-recalc (``catalog_revise``,
+    ``catalog_promote_diff``, the companion routes); it is recorded on any persisted
+    cascade failure so the forensic record names the tool that actually ran.
+
     Returns the recalc report (``catalog_recalc``'s shape) plus ``orphan_stale``.
     The caller embeds this in its own transaction: it owns the single checkpoint
     and the cross-process notify / SSE publish.
@@ -325,7 +368,9 @@ def auto_recalc(project: str, name: str) -> dict:
     verdicts = scan(project)
     roots = followers_of(project, name, verdicts)
 
-    report = _replay_cone(project, roots)  # checkpoint-free; caller commits
+    # Reuse the verdicts just scanned (one scan per revise, not two) and tag any
+    # persisted failure with the triggering tool.
+    report = _replay_cone(project, roots, verdicts=verdicts, tool=tool)  # checkpoint-free; caller commits
 
     orphan_stale = classify_orphans(project, verdicts, recomputed=frozenset(report.cone))
     for o in orphan_stale:

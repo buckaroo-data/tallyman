@@ -168,11 +168,13 @@ def _with_checkpoint(fn):
             project = _resolve_active_project()
             if project:
                 step = checkpoint_catalog(project, f"tallyman: {fn.__name__}")
-                # An auto-path recalc sub-report (revise/promote_diff) is built by
-                # the checkpoint-free walk *before* this per-op checkpoint exists,
-                # so its checkpoint_step is None. This is the checkpoint that
-                # commits the head advance + cascade as one revision; backfill the
-                # real landed step the report couldn't yet know.
+                # catalog_revise's auto-path recalc sub-report is built by the
+                # checkpoint-free walk *before* this per-op checkpoint exists, so its
+                # checkpoint_step is None. This is the checkpoint that commits the head
+                # advance + cascade as one revision; backfill the real landed step the
+                # report couldn't yet know. (catalog_promote_diff is _NO_CHECKPOINT-
+                # exempt and self-checkpoints, so it stamps its own step and never
+                # reaches here.)
                 recalc_report = result.get("recalc") if isinstance(result, dict) else None
                 if isinstance(recalc_report, dict) and recalc_report.get("checkpoint_step") is None:
                     recalc_report["checkpoint_step"] = step
@@ -213,10 +215,11 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
         print(f"[tallyman_mcp] notify failed ({kind}): {exc}", file=sys.stderr)
 
 
-def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
+def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> dict | None:
     """Cascade-recompute *name*'s stale followers right after an existing alias
     head advanced — shared by every MCP path that re-points an existing alias
-    (``catalog_revise``, ``catalog_promote_diff``).
+    (``catalog_revise``, ``catalog_promote_diff``). ``tool`` names that surface so
+    a persisted cascade failure is attributed to the tool that actually ran.
 
     The walk is **checkpoint-free**: it leaves the re-pointed dependents in the
     working tree for the surrounding op's single checkpoint (the dispatch
@@ -230,7 +233,7 @@ def _auto_recalc_after_head_advance(project: str, name: str) -> dict | None:
         return None
     from tallyman_xorq.recalc import auto_recalc  # noqa: PLC0415
 
-    report = auto_recalc(project, name)
+    report = auto_recalc(project, name, tool=tool)
     if report.get("remap"):
         # Flat kwargs: _notify packs **extra into the wire `extra`, and the
         # companion handler reads extra.remap / extra.step. A literal extra={...}
@@ -621,7 +624,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     # Auto-recalc: cascade-recompute name's stale followers in this op's single
     # checkpoint (the dispatch decorator commits the head advance + the cascade as
     # one revision). Off → the explicit scan→recalc path. See plans/auto-recalc-on-revise.md.
-    recalc_report = _auto_recalc_after_head_advance(project, name)
+    recalc_report = _auto_recalc_after_head_advance(project, name, tool="catalog_revise")
     if recalc_report is not None:
         out["recalc"] = recalc_report
     return out
@@ -913,7 +916,9 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     # helper. A fresh target_alias (expect_exists=False) has no followers; only
     # the re-point branch can. The checkpoint-free walk runs BEFORE this op's
     # checkpoint so that one revision sweeps the promote + the cascade together.
-    recalc_report = _auto_recalc_after_head_advance(project, target_alias) if repointed else None
+    recalc_report = (
+        _auto_recalc_after_head_advance(project, target_alias, tool="catalog_promote_diff") if repointed else None
+    )
 
     # promote_diff is checkpoint-exempt (self-checkpoints): THIS is the single
     # revision the promote + cascade land in. Stamp its step onto the recalc

@@ -73,6 +73,22 @@ def clear_errors(project: str) -> int:
     return n
 
 
+def errors_by_hash(project: str) -> dict[str, dict]:
+    """Map each entry hash to its most-recent recorded error, in ONE pass over the log.
+
+    The batch form of ``error_for_hash`` for the orphan-stale tie-back, which
+    classifies many stale entries at once: read ``errors.jsonl`` a single time and
+    keep the freshest error per hash, instead of re-scanning the whole log once per
+    entry (the classify pass is O(orphans) lookups).
+    """
+    out: dict[str, dict] = {}
+    for row in list_errors(project, limit=_UNBOUNDED):  # most-recent first
+        h = row.get("hash")
+        if h is not None and h not in out:  # first seen wins → freshest failure
+            out[h] = row
+    return out
+
+
 def error_for_hash(project: str, content_hash: str) -> dict | None:
     """The most recent recorded error carrying ``hash == content_hash``, or None.
 
@@ -80,10 +96,7 @@ def error_for_hash(project: str, content_hash: str) -> dict | None:
     recalc/build of it failed is "explained by" that recorded error, not an
     unexplained invariant break. Most-recent-first so the freshest failure wins.
     """
-    for row in list_errors(project, limit=_UNBOUNDED):
-        if row.get("hash") == content_hash:
-            return row
-    return None
+    return errors_by_hash(project).get(content_hash)
 
 
 def get_error(project: str, error_id: str) -> dict | None:

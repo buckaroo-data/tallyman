@@ -21,7 +21,7 @@ from tallyman_core.display_klasses import (
     write_display_klass,
 )
 from tallyman_core.entry_config import carry_forward_entry_config
-from tallyman_core.errors import clear_errors, error_for_hash, get_error, list_errors, record_error
+from tallyman_core.errors import clear_errors, error_for_hash, errors_by_hash, get_error, list_errors, record_error
 from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
 from tallyman_core.marimo_export import export_notebook_path, notebook_to_marimo
@@ -103,6 +103,7 @@ __all__ = [
     "clear_errors",
     "data_dir",
     "error_for_hash",
+    "errors_by_hash",
     "read_config",
     "set_auto_recalc",
     "write_config",

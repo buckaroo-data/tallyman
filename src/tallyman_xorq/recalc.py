@@ -164,12 +164,12 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
     # Real run: the checkpoint-free walk, then this function's one checkpoint —
     # only when a change actually landed. ``catalog_recalc`` is exempt from its
     # surface's generic per-op checkpoint, so this is the sole writer.
-    report = _run_walk(project, roots)
+    report = _replay_cone(project, roots)
     report.checkpoint_step = _checkpoint(project, report.remap) if report.remap else None
     return report
 
 
-def _run_walk(project: str, roots: list[str]) -> RecalcReport:
+def _replay_cone(project: str, roots: list[str]) -> RecalcReport:
     """Replay *roots* and their cone in dependency order, **without** taking a
     checkpoint — the reusable engine behind both the public ``recalc`` and the
     auto-recalc folded into ``catalog_revise``.
@@ -313,7 +313,7 @@ def auto_recalc(project: str, name: str) -> dict:
     taking a checkpoint, and account for every other stale entry it did not touch.
 
     The cascade is scoped to *name*'s followers (``followers_of``); their cone is
-    replayed by ``_run_walk``. Every directly-stale entry *outside* that cone is an
+    replayed by ``_replay_cone``. Every directly-stale entry *outside* that cone is an
     orphan — stale for a different cause (a drifted source, a different alias not
     yet recalced, or an invariant break) — left untouched, logged at WARNING, and
     returned in ``orphan_stale`` classified against the error store (#6).
@@ -325,7 +325,7 @@ def auto_recalc(project: str, name: str) -> dict:
     verdicts = scan(project)
     roots = followers_of(project, name, verdicts)
 
-    report = _run_walk(project, roots)  # checkpoint-free; caller commits
+    report = _replay_cone(project, roots)  # checkpoint-free; caller commits
 
     orphan_stale = classify_orphans(project, verdicts, recomputed=frozenset(report.cone))
     for o in orphan_stale:

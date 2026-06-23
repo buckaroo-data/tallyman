@@ -292,7 +292,8 @@ def md5_file(path: Path) -> str:
 
 def _prelude(project: str) -> str:
     return (
-        f"from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, pinned_expr_from_alias\nimport xorq.vendor.ibis as ibis\n_P = {project!r}\n"
+        "from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, pinned_expr_from_alias\n"
+        f"import xorq.vendor.ibis as ibis\n_P = {project!r}\n"
     )
 
 

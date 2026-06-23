@@ -329,7 +329,7 @@ def test_read_project_file_and_tracked_expr_from_alias_mix_shares_one_backend(pr
     # "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import tracked_expr_from_alias, read_project_file
+    from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
@@ -357,7 +357,7 @@ def test_expensive_tracked_expr_from_alias_mix_shares_one_backend(project, order
     # dragged its own storage backend in and re-raised "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import tracked_expr_from_alias, read_project_file
+    from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))  # Aggregate → expensive → baked snapshot
@@ -1106,7 +1106,10 @@ def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypat
     p_digest = read_manifest(entry_dir(project, p_h)).sources["src.parquet"]
 
     _write_ints(src, [0, 1, 2, 3, 4])  # edit in place, then build a child off the parent
-    cc_code = "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('pp')\nexpr = t.mutate(y=t.x * 2)\n"
+    cc_code = (
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('pp')\nexpr = t.mutate(y=t.x * 2)\n"
+    )
     res = catalog_create("cc", cc_code)
     assert "error" not in res, res
     c_h = _hash_of(project)

@@ -388,12 +388,16 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
     # one entry with two aliases), both following a.
     b1 = _hash(
         catalog_create(
-            "b", "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('a')\nexpr = t.mutate(d2=t.price * 2)\n"
+            "b",
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "t = tracked_expr_from_alias('a')\nexpr = t.mutate(d2=t.price * 2)\n",
         )
     )
     c1 = _hash(
         catalog_create(
-            "c", "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('a')\nexpr = t.mutate(d3=t.price * 3)\n"
+            "c",
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "t = tracked_expr_from_alias('a')\nexpr = t.mutate(d3=t.price * 3)\n",
         )
     )
     for h in (b1, c1):

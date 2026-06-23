@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tallyman_xorq import ProjectDataNotFound, read_project_file, project_path
+from tallyman_xorq import ProjectDataNotFound, project_path, read_project_file
 
 
 def test_project_path_resolves(orders_parquet: Path, project: str, monkeypatch):

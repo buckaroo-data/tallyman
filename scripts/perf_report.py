@@ -358,7 +358,10 @@ def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
     limit = max(int(SMALL_LIMIT * scale), 1_000)
     codes = {
         "events_scan": "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('events.parquet')\n",
-        "lowcard_scan": "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('events_lowcard.parquet')\n",
+        "lowcard_scan": (
+            "from tallyman_xorq.io import read_project_file\n"
+            "expr = read_project_file('events_lowcard.parquet')\n"
+        ),
         "union_wide": (
             "from tallyman_xorq.io import read_project_file\n"
             "a = read_project_file('wide_a.parquet')\n"
@@ -366,7 +369,8 @@ def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
             "expr = a.union(b)\n"
         ),
         "small_limit": (
-            f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file('events.parquet').limit({limit})\n"
+            f"from tallyman_xorq.io import read_project_file\n"
+            f"expr = read_project_file('events.parquet').limit({limit})\n"
         ),
         # Grouped approximate distinct count. The exact `nunique()` here is the
         # datafusion memory bomb (#46: ~37KB transient/group); `approx_nunique`

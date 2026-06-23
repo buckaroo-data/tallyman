@@ -73,17 +73,31 @@ tool: it operates on the session's active project (set by `project_switch`); the
 optional `project=` kwarg on `read_project_file`/`tracked_expr_from_alias` defaults to that same
 active project, so recipes omit it.
 
+A recipe pulls in data through one of three functions in `tallyman_xorq.io`, and
+which one you call is what records the dependency edge:
+
+| Function | Reads | Records | Goes stale when |
+|---|---|---|---|
+| `read_project_file("orders.parquet")` | a raw file under `<project>/data/` | a **source** leaf (`rel_path → digest`) | the file's bytes change on disk |
+| `tracked_expr_from_alias("orders")` | a catalog entry, by **alias** | a **parent** edge, `follow=True` | the alias advances to a new head |
+| `pinned_expr_from_alias(...)` | a catalog entry, by alias **or** hash | a **parent** edge, `follow=False` | never (it pinned that exact revision) |
+
 The follow relationship is the whole game:
 
-- `tracked_expr_from_alias("orders")` — an alias *name* — records the edge as **follow=True**.
-  The recipe means "whatever `orders` is now," and at build time it resolves to
-  `orders`'s current head.
-- `tracked_expr_from_alias("<hash>")` — a literal hash — records the edge as
-  **follow=False**: a pin to that exact revision. A pinned child never goes stale
-  when its parent advances, and recalc deliberately leaves it alone.
+- `tracked_expr_from_alias("orders")` means "whatever `orders` is now." It accepts
+  an alias only — pass it a hash and it raises, because a hash has no head to
+  follow — resolves to the alias's current head at build time, and records
+  **follow=True**. The child goes stale and recomputes when `orders` advances.
+  This is normal chaining.
+- `pinned_expr_from_alias("orders")` or `pinned_expr_from_alias("<hash>")` is the
+  deliberate opt-out. It accepts an alias or a hash, records **follow=False**, and
+  the child stays on that exact revision: it never goes stale on the alias axis,
+  and recalc finds it but leaves it alone.
+- `read_project_file` is the root of every chain: a raw file with no catalog
+  identity, the leaf the graph bottoms out in.
 
 So after these three calls: `orders → by_region → top_regions`, each aliased at
-version 1, each following its parent by name.
+version 1, each following its parent by name (`tracked_expr_from_alias`).
 
 ## Revising an alias and recomputing its dependents
 
@@ -189,7 +203,7 @@ Three edges make that precise:
   intermediate node referenced only by a hash pin — produces a new hash and a
   `remap` entry but **zero** alias revisions. A head carrying two aliases advances
   both.
-- A **hash-pinned** child (`tracked_expr_from_alias("<hash>")`) re-resolves to the same
+- A **hash-pinned** child (`pinned_expr_from_alias("<hash>")`) re-resolves to the same
   parent and is a `noop`, so it neither rebuilds nor advances its alias.
 
 This per-alias revision is distinct from the catalog-level checkpoint. The alias
@@ -197,6 +211,120 @@ head advancing is bookkeeping inside `aliases.jsonl`; the checkpoint is the sing
 git revision that commits the whole walk (see *One revision, undoable atomically*
 below). One recalc can append many alias revisions and still take exactly one
 checkpoint.
+
+## How the dependency graph is recorded and read
+
+Staleness, the cone, and the cascade all run on a dependency graph the reactive
+system never introspects live. The graph is **recorded into each entry's manifest
+at build time, then read back by scanning those manifests**. There is no separate
+graph database and no global index; the adjacency is rebuilt from the manifests on
+each query (cheap for a notebook-sized catalog — one small JSON read per entry).
+
+### Where the edges live
+
+Each entry has a `manifest.json` with two fields that carry the graph:
+
+- **`manifest.parents`** — the resolved cross-entry edges, a list of
+  `{hash, ref, follow}`. `hash` is the parent's build-time content hash, `ref` the
+  original argument (alias or hash), `follow` its read-intent. Empty for a root (an
+  entry that reads no other entry).
+- **`manifest.sources`** — the raw-file leaves, `{rel_path: digest}`: the project
+  files the recipe read via `read_project_file`, each with the content digest it
+  was built against. `None` when the entry was built under `off` identity mode (so
+  the source axis can't be evaluated); `{}` when the recipe read no raw files.
+
+`tracked_`/`pinned_expr_from_alias` write `parents`; `read_project_file` writes
+`sources`. Together they are the only record of the graph.
+
+### Roots, leaves, and direction
+
+This doc uses the **data-flow** convention (as in Airflow, dbt, Spark lineage):
+edges point downstream, the direction data moves.
+
+- A **source / root** has no incoming edges — nothing it depends on: a
+  `read_project_file` raw input, or an entry with empty `manifest.parents`.
+- A **leaf / sink** has no outgoing edges — nothing depends on it: a final
+  aggregation nobody chains off.
+
+A recalc starts at the changed roots and flows down to the leaves. (Build-system
+tools — Make, Bazel — point the arrows the other way and swap these names, which is
+the usual source of confusion.)
+
+### Cheap vs expensive parents — and what lands in `manifest.sources`
+
+When a recipe reads a parent with `tracked_expr_from_alias`, what comes back
+depends on whether the parent was classified **expensive** or **cheap** at build.
+This is the materialized-vs-not distinction:
+
+- An **expensive** parent (an Aggregate, Join, Sort, or UDF) bakes a result
+  snapshot when built (materialized). A child reading it gets a *read of that baked
+  snapshot* — the parent's work is computed once and shared, and the child does not
+  re-run it.
+- A **cheap** parent (row-wise: select, filter, mutate) bakes nothing
+  (non-materialized). A child reading it gets the parent's *recipe re-run inline* —
+  pushdown makes that ~free — so the parent's expression, down to its own
+  `read_project_file` reads, is composed into the child.
+
+That second case is why a cheap parent's sources show up in the **child's**
+`manifest.sources`: the inlined recipe re-runs the parent's `read_project_file`
+calls during the child's build, and those reads get collected into the child's own
+source set. So editing that raw file makes the child **directly** stale on the
+source axis, not merely transitively stale. A child reading an *expensive* parent
+reads the snapshot instead, so the parent's raw sources never enter the child's
+sources — there the source edit makes the *parent* directly stale, and the child
+follows only when the parent's alias advances.
+
+Which work is materialized is otherwise an implementation detail you don't see:
+`tracked_expr_from_alias` returns an expression either way, and the child never
+depends on the parent having a `result.parquet` on disk.
+
+### Build-time capture, not live introspection
+
+The edges are captured the moment a recipe runs, not by walking the built
+expression afterward. While `build_and_persist` imports the recipe, two collectors
+are armed, and each loader announces itself as it executes: `read_project_file`
+notes the source digest, `tracked_`/`pinned_expr_from_alias` notes the resolved
+parent hash. After the import those bags are written into the manifest. The capture
+happens once, at build; nothing re-derives it later.
+
+This is a **tallyman** mechanism, not an xorq one. xorq's unit is a single
+expression and its content hash; it has no concept of a catalog, an alias, an
+entry, or an inter-entry edge — those are all tallyman's. xorq builds one
+expression and hashes it; tallyman wraps that build, harvests the edges its own
+loaders announced, and writes the manifest beside xorq's artifact.
+
+The capture is a side-channel because the parent edge is **not recoverable from
+xorq's output**. Since the expression-composition change (#73/#74),
+`tracked_expr_from_alias` composes the parent's *expression* into the child (cheap:
+the inlined recipe; expensive: a read of the baked snapshot) rather than reading
+the parent's `result.parquet` by a path that named it. The result is one flattened
+graph with no node that says "this subtree was entry `<parent_hash>`." Before the
+change a child read `entries/<parent_hash>/result.parquet` — a leaf path naming the
+parent — and the edge was readable straight out of the expression. After it, the
+only place the edge survives is the manifest tallyman wrote.
+
+### Reading it back: one seam
+
+All graph reads go through `tallyman_xorq.dependents`, which scans the manifests
+and assembles the views the reactive system needs:
+
+- `parents_of(hash)` / `sources_of(hash)` — one entry's recorded inputs.
+- `build_dag()` — forward edges for every live entry, `{child: [parents]}`.
+- `dependents_index()` — the reverse index, `{parent: {children}}`: how a recalc
+  goes from a changed entry to everything downstream.
+- `descendant_cone(roots)` — the roots and all their transitive dependents,
+  topologically ordered (parents before children) — the recalc order.
+
+Both `staleness` and `recalc` go through this module rather than touching manifest
+fields directly, so it is the single seam over the recorded graph: swapping the
+implementation (a persistent index, say) is a change to `dependents` alone.
+
+A consequence worth noting (and a candidate future check): because the parent edge
+is gone from xorq's flattened expression, you can't reconcile tallyman's recorded
+parents against xorq's graph. What you *can* reconcile is the source leaves — a
+child's inlined raw-file reads should equal the union of `sources` over its
+transitive cheap parents. That invariant is checkable; the parent edges are only as
+good as what the side-channel captured at build.
 
 ## The two staleness axes
 
@@ -209,19 +337,20 @@ An entry is judged on two independent axes, each tied to a kind of recorded inpu
 - **alias** — a `follow=True` parent (recorded when the recipe referenced a parent
   by alias name, `tracked_expr_from_alias("orders")`) is stale when that alias now resolves to
   a different hash than the one recorded at build. This is what fires when you
-  revise an upstream alias. A `follow=False` parent (a literal-hash pin) is never
-  stale on this axis: the recipe asked for *that* revision and still gets it.
+  revise an upstream alias. A `follow=False` parent (a `pinned_expr_from_alias`
+  reference, by alias or hash) is never stale on this axis: the recipe asked for
+  *that* revision and still gets it.
 - **source** — a recorded `(rel_path, digest)` is stale when the file on disk no
   longer digests to the recorded value. The check forces a faithful re-read so an
   in-place content swap can't be masked by a cached digest. In a closed catalog
   you don't expect this to fire; it covers the case where a raw parquet under
   `data/` is replaced.
 
-A note on cheap chains: a *cheap* child inlines its parent's recipe rather than
-referencing it through the catalog, so the parent's source files are collected
-into the child's own `manifest.sources`. Editing that source makes the child
-*directly* stale on the source axis, not merely transitively stale. This is
-expected; it falls out of how cheap entries record their inputs.
+A note on cheap chains: when a child reads a *cheap* (non-materialized) parent,
+that parent's recipe is inlined into the child, so the parent's source files land
+in the child's own `manifest.sources` (see *Cheap vs expensive parents* above).
+Editing such a source makes the child **directly** stale on the source axis, not
+merely transitively stale. This is expected.
 
 `result_digest` is deliberately not a staleness input. An entry that recomputes to
 the same `content_hash` but a different result is *nondeterministic*, not stale,

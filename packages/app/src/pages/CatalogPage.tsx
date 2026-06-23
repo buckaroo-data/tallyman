@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useSSE } from "../SSEContext";
+import { recalcTarget } from "../recalcRefresh";
 import { CatalogSidebar } from "../components/CatalogSidebar";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
 import { VegaChart } from "../components/VegaChart";
@@ -330,7 +331,8 @@ export function CatalogPage() {
     hash?: string;
     errorId?: string;
   }>();
-  const { version } = useSSE();
+  const { version, lastEvent } = useSSE();
+  const navigate = useNavigate();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [errors, setErrors] = useState<AppError[]>([]);
   const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(
@@ -342,6 +344,20 @@ export function CatalogPage() {
     api.entries(project).then((d) => setEntries(d.entries)).catch(() => {});
     api.errors(project, 5).then((d) => setErrors(d.errors)).catch(() => {});
   }, [project, version]);
+
+  // A recalc re-points aliases to recomputed hashes; if the open entry view is
+  // one of them, navigate to the new hash so the detail pane (keyed on the URL
+  // hash) refetches the fresh result. Process each SSE version at most once
+  // (StrictMode double-fires effects), mirroring NewEntryPill.
+  const seenRecalc = useRef(0);
+  useEffect(() => {
+    if (version === seenRecalc.current) return;
+    seenRecalc.current = version;
+    if (!project || !lastEvent || lastEvent.kind !== "recalc") return;
+    const target = recalcTarget(hash, lastEvent.remap as Record<string, string> | undefined);
+    if (target && target !== hash) navigate(`/${project}/catalog/${target}`);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [version]);
 
   useEffect(() => {
     localStorage.setItem("catalog.sidebarCollapsed", sidebarCollapsed ? "1" : "0");

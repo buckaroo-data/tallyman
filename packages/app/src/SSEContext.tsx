@@ -40,6 +40,12 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     es.addEventListener("chart_attached", (e) => bump(e, "chart_attached"));
     es.addEventListener("post_processing_changed", (e) => bump(e, "post_processing_changed"));
     es.addEventListener("summary_stat_changed", (e) => bump(e, "summary_stat_changed"));
+    // An auto-recalc / explicit recalc re-points aliases; the event carries the
+    // {oldHash: newHash} remap. Bumping version refetches the catalog list (heads
+    // moved); CatalogPage additionally navigates an open entry view that was
+    // remapped (see recalcTarget). Without this the SPA never saw the nine other
+    // kinds change but missed `recalc`, so an open view went silently stale.
+    es.addEventListener("recalc", (e) => bump(e, "recalc"));
     es.addEventListener("project_switched", (e) => {
       const data: SSEEvent = JSON.parse(e.data);
       console.log("[tallyman-sse] project_switched", data);

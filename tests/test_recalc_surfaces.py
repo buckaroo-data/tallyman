@@ -72,6 +72,44 @@ def test_mcp_scan_staleness_lists_drifted_entries(project, orders_parquet, monke
     assert out["entries"][a]["reasons"][0]["axis"] == "source"
 
 
+def test_mcp_scan_staleness_classifies_orphans_when_auto_recalc_on(project, orders_parquet, monkeypatch):
+    # D5 scan-on-load backstop: bypasses (and source drift) leave entries stale
+    # without a triggering revise, so no auto-recalc ever classifies them. The
+    # scan-on-load surface runs the same orphan classification so a project load
+    # surfaces them even when no revise has happened since.
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)  # default ON
+    from tallyman_mcp.server import catalog_create, catalog_scan_staleness
+
+    a = catalog_create("a", _base_code(project))["hash"]
+    catalog_create("b", _child_code("a"))
+    _edit_source(project)  # a (and its cheap child) directly source-stale; no revise fired
+
+    out = catalog_scan_staleness()
+    assert a in out["stale"]
+    orphans = {o["hash"]: o for o in out["orphan_stale"]}
+    assert a in orphans
+    # No recorded recalc error explains it → UNEXPLAINED, the loud case.
+    assert "UNEXPLAINED" in orphans[a]["explanation"]
+
+
+def test_mcp_scan_staleness_no_orphans_when_auto_recalc_off(project, orders_parquet, monkeypatch):
+    # Manual mode (flag off) owns its own staleness: the explicit scan→recalc
+    # workflow expects directly-stale followers as an intermediate state, so the
+    # scan surface must NOT flag them as orphan/UNEXPLAINED ("file a bug").
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    from tallyman_core.config import set_auto_recalc
+    from tallyman_mcp.server import catalog_create, catalog_scan_staleness
+
+    a = catalog_create("a", _base_code(project))["hash"]
+    _edit_source(project)
+    set_auto_recalc(project, False)
+
+    out = catalog_scan_staleness()
+    assert a in out["stale"]  # still reports the stale set
+    assert out["orphan_stale"] == []  # but no orphan classification in manual mode
+
+
 def test_mcp_recalc_dry_run_previews_and_checkpoints_nothing(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     from tallyman_mcp.server import catalog_create, catalog_recalc
@@ -218,6 +256,28 @@ def test_companion_staleness_endpoint(fresh_companion_app, project, orders_parqu
     body = r.json()
     assert a in body["stale"]
     assert body["entries"][a]["stale"] is True
+
+
+def test_companion_staleness_classifies_orphans(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # Parity with the MCP scan-on-load surface: /api/staleness returns the same
+    # classified orphan_stale so the SPA can surface unexplained staleness on load.
+    from fastapi.testclient import TestClient
+
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)  # default ON
+    a = catalog_create("a", _base_code(project))["hash"]
+    _edit_source(project)
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/staleness")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert a in body["stale"]
+    orphans = {o["hash"]: o for o in body["orphan_stale"]}
+    assert a in orphans
+    assert "UNEXPLAINED" in orphans[a]["explanation"]
 
 
 def test_companion_recalc_commit_is_one_revision_and_repoints(

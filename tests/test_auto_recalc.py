@@ -201,6 +201,23 @@ def test_recalc_sub_report_shape(project, orders_parquet, monkeypatch):
     assert r["status"] == "ok"
 
 
+def test_auto_recalc_report_carries_real_checkpoint_step(project, orders_parquet, monkeypatch):
+    # The auto-path sub-report's `checkpoint_step` must be the step the cascade
+    # actually committed in. The walk takes no checkpoint of its own (the per-op
+    # dispatch decorator owns it, after the handler returns), so the report is
+    # built with checkpoint_step=None; the decorator backfills the real step it
+    # gets from checkpoint_catalog before returning the response.
+    _clean_env(monkeypatch)
+    _hash(catalog_create("a", _src_code(project)))
+    _hash(catalog_create("b", _child_code("a")))
+
+    out = catalog_revise("a", _src_code_v2(project))
+    assert out["recalc"]["remap"]  # something cascaded
+    # The head advance + cascade landed as one revision; that step is reported.
+    assert out["recalc"]["checkpoint_step"] is not None
+    assert out["recalc"]["checkpoint_step"] == current_step(project)
+
+
 # ---------------------------------------------------------------------------
 # 7. orphan-stale: an unrelated pre-existing stale entry is left alone, logged,
 #    and returned classified UNEXPLAINED (no matching error record)

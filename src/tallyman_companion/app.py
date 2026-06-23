@@ -387,6 +387,12 @@ def create_app(
             _invalidate_reset_caches()
             if buckaroo:
                 buckaroo.reload_project_sessions(project)
+            # checkpoint_step is None on the auto path: the checkpoint middleware
+            # commits the head advance + cascade as one revision *after* this
+            # handler returns, so the step isn't known here. The SSE event carries
+            # the remap (what the SPA refetches on); the step it ignores. Unlike
+            # the MCP decorator, the response body is already serialized when the
+            # middleware checkpoints, so there's nothing to backfill into.
             await publish(_recalc_sse_event(report["remap"], report.get("checkpoint_step")))
         return report
 
@@ -1230,14 +1236,22 @@ def create_app(
         map. The SPA fires this on project load / switch and after a recalc.
         """
         project = _validate_project(project)
+        from tallyman_core.config import auto_recalc_enabled  # noqa: PLC0415
         from tallyman_xorq import staleness  # noqa: PLC0415
+        from tallyman_xorq.recalc import classify_orphans  # noqa: PLC0415
 
         verdicts = staleness.scan(project)
+        # D5 scan-on-load backstop, parity with the MCP catalog_scan_staleness
+        # surface: classify the directly-stale set as orphans so the SPA can flag
+        # unexplained staleness on load. Gated on the switch — manual mode owns its
+        # own staleness, so a directly-stale follower is expected there, not a bug.
+        orphan_stale = classify_orphans(project, verdicts) if auto_recalc_enabled(project) else []
         return {
             "project": project,
             "stale": sorted(h for h, v in verdicts.items() if v.stale),
             "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
             "entries": {h: asdict(v) for h, v in verdicts.items()},
+            "orphan_stale": orphan_stale,
         }
 
     @app.post("/{project}/api/recalc")

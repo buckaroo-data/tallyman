@@ -47,7 +47,7 @@ from tallyman_core import (
     write_stat,
 )
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
-from tallyman_xorq.recalc import recalc
+from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
 COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
@@ -166,7 +166,15 @@ def _with_checkpoint(fn):
 
             project = _resolve_active_project()
             if project:
-                checkpoint_catalog(project, f"tallyman: {fn.__name__}")
+                step = checkpoint_catalog(project, f"tallyman: {fn.__name__}")
+                # An auto-path recalc sub-report (revise/promote_diff) is built by
+                # the checkpoint-free walk *before* this per-op checkpoint exists,
+                # so its checkpoint_step is None. This is the checkpoint that
+                # commits the head advance + cascade as one revision; backfill the
+                # real landed step the report couldn't yet know.
+                recalc_report = result.get("recalc") if isinstance(result, dict) else None
+                if isinstance(recalc_report, dict) and recalc_report.get("checkpoint_step") is None:
+                    recalc_report["checkpoint_step"] = step
         except Exception as exc:
             log.warning("checkpoint after %s failed: %s", fn.__name__, exc)
         return result
@@ -939,10 +947,17 @@ def catalog_scan_staleness() -> dict:
     """
     project = _resolve_active_project()
     verdicts = staleness.scan(project)
+    # D5 scan-on-load backstop: classify the directly-stale set as orphans so a
+    # project load surfaces unexplained staleness even when no revise has fired
+    # since (a bypass, a source edit). Gated on the switch: manual mode (flag off)
+    # owns its own staleness and a directly-stale follower is expected there, not
+    # a bug to flag. Same classifier auto-recalc uses, so the verdict is identical.
+    orphan_stale = classify_orphans(project, verdicts) if auto_recalc_enabled(project) else []
     return {
         "stale": sorted(h for h, v in verdicts.items() if v.stale),
         "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
         "entries": {h: asdict(v) for h, v in verdicts.items()},
+        "orphan_stale": orphan_stale,
     }
 
 

@@ -293,6 +293,21 @@ def _classify_orphan(project: str, content_hash: str, verdict: StaleVerdict) -> 
     }
 
 
+def classify_orphans(
+    project: str, verdicts: dict[str, StaleVerdict], recomputed: frozenset[str] = frozenset()
+) -> list[dict]:
+    """Classify every directly-stale entry an action did NOT recompute.
+
+    Each orphan runs through ``_classify_orphan`` (self-referential pin /
+    explained-by-error / UNEXPLAINED). ``auto_recalc`` passes the cone it just
+    rebuilt as *recomputed*, so only the leftovers are classified. The
+    scan-on-load surfaces pass nothing: at scan time no cascade ran, so every
+    directly-stale entry is an orphan to be accounted for (the D5 backstop —
+    a project load surfaces orphans even when no revise has happened since)."""
+    orphans = sorted(h for h, v in verdicts.items() if v.stale and h not in recomputed)
+    return [_classify_orphan(project, h, verdicts[h]) for h in orphans]
+
+
 def auto_recalc(project: str, name: str) -> dict:
     """Recompute the followers a revise of alias *name* made stale, **without**
     taking a checkpoint, and account for every other stale entry it did not touch.
@@ -308,14 +323,11 @@ def auto_recalc(project: str, name: str) -> dict:
     and the cross-process notify / SSE publish.
     """
     verdicts = scan(project)
-    directly_stale = [h for h, v in verdicts.items() if v.stale]
     roots = followers_of(project, name, verdicts)
 
     report = _run_walk(project, roots)  # checkpoint-free; caller commits
 
-    recomputed = set(report.cone)
-    orphans = sorted(h for h in directly_stale if h not in recomputed)
-    orphan_stale = [_classify_orphan(project, h, verdicts[h]) for h in orphans]
+    orphan_stale = classify_orphans(project, verdicts, recomputed=frozenset(report.cone))
     for o in orphan_stale:
         log.warning(
             "auto-recalc(%s): orphan-stale entry %s (alias=%s) left unrecomputed — %s; reasons=%s",

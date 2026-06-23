@@ -129,6 +129,7 @@ _NO_CHECKPOINT = frozenset(
         "catalog_diff",
         "catalog_scan_staleness",  # read-only staleness scan
         "catalog_recalc",  # self-checkpoints (arg-aware: dry-run takes none, a real run one)
+        "catalog_promote_diff",  # self-checkpoints one tx for the promote + cascade (no double-commit)
         "catalog_list_summary_stats",
         "catalog_list_post_processings",
         "catalog_run_post_processing",  # preview, persists nothing
@@ -909,7 +910,12 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     # checkpoint so that one revision sweeps the promote + the cascade together.
     recalc_report = _auto_recalc_after_head_advance(project, target_alias) if repointed else None
 
-    checkpoint_catalog(project, f"tallyman: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
+    # promote_diff is checkpoint-exempt (self-checkpoints): THIS is the single
+    # revision the promote + cascade land in. Stamp its step onto the recalc
+    # sub-report — the checkpoint-free walk built it before this commit existed.
+    step = checkpoint_catalog(project, f"tallyman: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
+    if recalc_report is not None:
+        recalc_report["checkpoint_step"] = step
     _notify("entry_added", content_hash=result.content_hash)
     out = {
         "alias": target_alias,

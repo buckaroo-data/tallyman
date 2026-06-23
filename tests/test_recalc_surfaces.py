@@ -364,5 +364,9 @@ def test_companion_revise_publishes_recalc_event(project, orders_parquet, monkey
     assert r.status_code == 200, r.text
     # The companion publishes the canonical recalc SSE event with the cascade's remap.
     assert captured, "no recalc event published"
-    remap, _step = captured[0]
+    remap, step = captured[0]
     assert remap == {b: get_alias(project, "b")}
+    # checkpoint_step is None by design on the companion auto path: the middleware
+    # commits the revision AFTER the handler returns, and (unlike the MCP decorator)
+    # the response is already serialized, so there's nothing to backfill into.
+    assert step is None

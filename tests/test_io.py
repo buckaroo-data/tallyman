@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from tallyman_xorq import ProjectDataNotFound, from_project, project_path
+from tallyman_xorq import ProjectDataNotFound, project_path, read_project_file
 
 
 def test_project_path_resolves(orders_parquet: Path, project: str, monkeypatch):
@@ -26,9 +26,9 @@ def test_project_path_traversal_blocked(project: str, monkeypatch):
         project_path("../../etc/passwd")
 
 
-def test_from_project_returns_xorq_expr(orders_parquet: Path, project: str, monkeypatch):
+def test_read_project_file_returns_xorq_expr(orders_parquet: Path, project: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    expr = from_project("orders.parquet")
+    expr = read_project_file("orders.parquet")
     schema = expr.schema()
     assert "region" in schema.names
     assert "price" in schema.names

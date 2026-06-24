@@ -357,24 +357,28 @@ ENTRY_ORDER = ["events_scan", "lowcard_scan", "union_wide", "small_limit", "agg_
 def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
     limit = max(int(SMALL_LIMIT * scale), 1_000)
     codes = {
-        "events_scan": "from tallyman_xorq.io import from_project\nexpr = from_project('events.parquet')\n",
-        "lowcard_scan": "from tallyman_xorq.io import from_project\nexpr = from_project('events_lowcard.parquet')\n",
+        "events_scan": "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('events.parquet')\n",
+        "lowcard_scan": (
+            "from tallyman_xorq.io import read_project_file\n"
+            "expr = read_project_file('events_lowcard.parquet')\n"
+        ),
         "union_wide": (
-            "from tallyman_xorq.io import from_project\n"
-            "a = from_project('wide_a.parquet')\n"
-            "b = from_project('wide_b.parquet')\n"
+            "from tallyman_xorq.io import read_project_file\n"
+            "a = read_project_file('wide_a.parquet')\n"
+            "b = read_project_file('wide_b.parquet')\n"
             "expr = a.union(b)\n"
         ),
         "small_limit": (
-            f"from tallyman_xorq.io import from_project\nexpr = from_project('events.parquet').limit({limit})\n"
+            f"from tallyman_xorq.io import read_project_file\n"
+            f"expr = read_project_file('events.parquet').limit({limit})\n"
         ),
         # Grouped approximate distinct count. The exact `nunique()` here is the
         # datafusion memory bomb (#46: ~37KB transient/group); `approx_nunique`
         # is the bounded-state alternative an entry should use. Kept on its own
         # small dataset regardless; keep it OFF the 4M-row events table.
         "agg_nunique": (
-            "from tallyman_xorq.io import from_project\n"
-            "t = from_project('agg_small.parquet')\n"
+            "from tallyman_xorq.io import read_project_file\n"
+            "t = read_project_file('agg_small.parquet')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
             "    n_days=t.issue_ts.approx_nunique(),\n"
@@ -385,8 +389,8 @@ def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
     if key == "agg_by_plate":
         events_hash = hashes["events_scan"]
         return (
-            "from tallyman_xorq.io import from_catalog\n"
-            f"t = from_catalog('{events_hash}')\n"
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            f"t = tracked_expr_from_alias('{events_hash}')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
             "    first_seen=t.issue_ts.min(),\n"

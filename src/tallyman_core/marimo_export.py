@@ -6,7 +6,7 @@ Each notebook cell becomes two Marimo cells:
      as the final expression so Marimo displays the DataFrame inline.
 
 The generated file is self-contained: it sets TALLYMAN_PROJECT via
-``os.environ.setdefault`` so ``from_project`` / ``from_catalog`` resolve
+``os.environ.setdefault`` so ``read_project_file`` / ``tracked_expr_from_alias`` resolve
 correctly when the user runs it outside the tallyman-notebooks environment.
 """
 

@@ -100,7 +100,7 @@ def rewrite_for_build(expr, project: str):
        exempt — re-reading a columnar source is already cheap.
     3. **Bake a top-level result cache when the expression is expensive.** The
        cache node becomes part of the durable recipe, so *every* loader — the
-       Buckaroo viewer, diffs, ``from_catalog`` chaining — reads the cached
+       Buckaroo viewer, diffs, ``tracked_expr_from_alias`` chaining — reads the cached
        result instead of re-running the whole DAG (the bug #71 papered over at
        read time). A cheap expression bakes nothing and recomputes ~free.
 

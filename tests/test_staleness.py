@@ -7,42 +7,50 @@ from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.staleness import entry_staleness, scan
 
 
-def _base_code(project: str) -> str:  # from_project root over orders.parquet
+def _base_code(project: str) -> str:  # read_project_file root over orders.parquet
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
 
 
 def _base_code_v2(project: str) -> str:  # a different graph → a new content hash
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price").mutate(extra=1)
 """
 
 
-def _child_code(parent: str) -> str:  # from_catalog child (alias name or literal hash)
+def _child_code(alias: str) -> str:  # tracked child off an alias
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({alias!r})
+expr = t.mutate(doubled=t.price * 2)
+"""
+
+
+def _pinned_child_code(content_hash: str) -> str:  # pinned (no lineage) child off a specific hash
+    return f"""
+from tallyman_xorq.io import pinned_expr_from_alias
+t = pinned_expr_from_alias({content_hash!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
 
 def _agg_child_code(parent: str) -> str:  # expensive (Aggregate) child → bakes a snapshot
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.group_by("region").aggregate(total=t.price.sum())
 """
 
 
 def _const_child_code(parent: str) -> str:  # cheap child, schema-independent
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(flag=1)
 """
 
@@ -80,7 +88,7 @@ def test_hash_pinned_parent_is_not_stale_when_alias_advances(project, orders_par
     base_v1 = _hash(catalog_create("base", _base_code(project)))
     # A literal-hash argument is recorded follow=False (a pin), so the alias
     # advancing must not make this child stale.
-    child_hash = _hash(catalog_create("child", _child_code(base_v1)))
+    child_hash = _hash(catalog_create("child", _pinned_child_code(base_v1)))
 
     _hash(catalog_revise("base", _base_code_v2(project)))
     assert get_alias(project, "base") != base_v1
@@ -122,9 +130,14 @@ def test_off_mode_reports_source_axis_unknown_not_fresh(project, orders_parquet,
 
 def test_scan_distinguishes_direct_from_transitive_staleness(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    # Opt out of auto-recalc-on-revise: this test needs the revise to advance "a"
+    # WITHOUT cascading, so the scan can observe b directly-stale and c only
+    # transitively-stale. With the cascade on (the default), the revise would
+    # recompute b and c, leaving no transitive-only node to classify.
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
     a_v1 = _hash(catalog_create("a", _base_code(project)))
     # b is an expensive (Aggregate) intermediate: reconstructing it reads its
-    # baked snapshot rather than re-running its recipe, so its from_catalog("a")
+    # baked snapshot rather than re-running its recipe, so its tracked_expr_from_alias("a")
     # edge does not leak into c. (A cheap intermediate re-runs inline, so c would
     # follow "a" directly and there would be no transitive-only node.)
     b = _hash(catalog_create("b", _agg_child_code("a")))

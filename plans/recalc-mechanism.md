@@ -16,7 +16,7 @@
 A tallyman project is a few raw sources and many derived entries. Two kinds of
 change leave derived entries silently wrong:
 
-1. **An upstream entry is revised.** `from_catalog("A")` binds the *value* alias A
+1. **An upstream entry is revised.** `tracked_expr_from_alias("A")` binds the *value* alias A
    had when the child was built. Revise A and the child keeps reading A's old
    version.
 2. **A raw source is edited in place.** xorq keys its caches on the path, not the
@@ -32,7 +32,7 @@ The consumer is split so the read side can run with no risk of mutation.
 - **Detect** (`staleness.py`, Stage 1, read-only). `scan(project)` returns a
   `StaleVerdict` per entry. An entry is *stale* when an input it recorded at build
   no longer matches the world, on either of two axes:
-  - **alias** — a `from_catalog("A")` parent (recorded `follow=True`) whose alias
+  - **alias** — a `tracked_expr_from_alias("A")` parent (recorded `follow=True`) whose alias
     head now resolves to a different hash than the one recorded.
   - **source** — a recorded `manifest.sources` digest that no longer matches the
     file on disk.
@@ -43,7 +43,7 @@ The consumer is split so the read side can run with no risk of mutation.
 
 ## The dependency graph
 
-`manifest.parents` records each entry's resolved `from_catalog` edges
+`manifest.parents` records each entry's resolved `tracked_expr_from_alias` edges
 (`{hash, ref, follow}`) at build time. `dependents.py` reads them:
 
 - `build_dag(project)` — forward edges `{child: [ParentRef]}`, enumerated over
@@ -86,7 +86,7 @@ The walk replays every entry in the cone, including ones that turn out not to
 change. That is safe because of two facts:
 
 - **A followed parent re-resolves to the advanced head.** A recipe names its
-  followed parent by alias (`from_catalog("A")`). `io.from_catalog` resolves that
+  followed parent by alias (`tracked_expr_from_alias("A")`). `io.tracked_expr_from_alias` resolves that
   to the alias's *current* head at build time (`get_alias`). Because the walk
   re-points alias A before it reaches A's children, each child's replay reads the
   advanced A. The new upstream content propagates into the child's expression
@@ -113,7 +113,7 @@ implemented.
 ## The cheap-chain source leak (why a "follower" can be directly stale)
 
 A *cheap* child inlines its parent's recipe rather than reading a baked snapshot.
-Building the child therefore re-runs the parent's `from_project`, which records the
+Building the child therefore re-runs the parent's `read_project_file`, which records the
 parent's source in the **child's** own `manifest.sources`. So editing a raw source
 makes every cheap descendant *directly* stale on the source axis, not merely
 transitively. This is expected (it falls out of the #74 reconstruction model) and
@@ -166,8 +166,8 @@ a `noop` with its verdict; the durable fix is the #83/#121 path, not this one.
 
 ## Worked examples
 
-**Source edit, cheap chain.** `a = from_project("orders.parquet")`,
-`b = from_catalog("a")` (cheap). Edit `orders.parquet`. Scan: both a and b
+**Source edit, cheap chain.** `a = read_project_file("orders.parquet")`,
+`b = tracked_expr_from_alias("a")` (cheap). Edit `orders.parquet`. Scan: both a and b
 directly stale (source; b via the cheap-chain leak). `recalc([a])`: cone `[a, b]`;
 a replays against the new file to a2 and alias `a` re-points; b replays, reads a2,
 and advances to b2 with alias `b` re-pointed. One checkpoint. Both `rebuilt`.
@@ -178,6 +178,6 @@ b directly stale (alias axis), c only transitively stale. `recalc([b])`: cone
 `[b, c]`; b replays against the new a head to b2 (alias `b` re-pointed), then c
 replays against b2 to c2 (alias `c` re-pointed).
 
-**Pinned child.** `b = from_catalog("<a-v1-hash>")` (literal hash, `follow=False`).
+**Pinned child.** `b = tracked_expr_from_alias("<a-v1-hash>")` (literal hash, `follow=False`).
 Advance a. `recalc([a])`: a rebuilds; b's replay re-resolves the literal hash to
 the same a-v1 entry, yields the same b hash, and is a `noop` — the pin holds.

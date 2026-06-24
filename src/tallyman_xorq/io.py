@@ -34,11 +34,13 @@ def project_path(rel_path: str, project: str | None = None) -> Path:
     return candidate
 
 
-def from_project(rel_path: str, project: str | None = None):
-    """Load a parquet file from `<project>/data/<rel_path>` as a xorq expression.
+def read_project_file(rel_path: str, project: str | None = None):
+    """Load a raw data file from `<project>/data/<rel_path>` as a xorq expression.
 
-    Use this in user code instead of `xo.deferred_read_parquet(absolute_path)`
-    so the catalog entry records a project-relative reference.
+    Use this to bring raw input files (parquet, csv, etc.) into the catalog's
+    expression layer. This is the root of the dependency DAG — the file has no
+    catalog hash, no recipe, no lineage entry. Everything built on top of it
+    flows through tracked_expr_from_alias.
 
     Source-content identity (see tallyman_xorq.source_identity): in `cas`
     mode the read goes through a content-addressed clone so the path xorq
@@ -55,12 +57,12 @@ def from_project(rel_path: str, project: str | None = None):
     if si.mode() == "cas":
         recorded = _reconstructing_source_digest(proj, rel_path)
         if recorded is not None:
-            # Reconstruction (#115): this from_project is re-running an already-built
+            # Reconstruction (#115): this read_project_file is re-running an already-built
             # entry's recipe (expr.py), not authoring a new entry. Resolve to the FROZEN
             # .cas clone the entry was built from — named by the digest in its
             # manifest.sources — instead of re-digesting the live file, which may have
             # been edited in place since the build. Note that same frozen digest (the
-            # source collector is independent of from_catalog's _RECONSTRUCTING-gated
+            # source collector is independent of tracked_expr_from_alias's _RECONSTRUCTING-gated
             # parent capture, so both fire) so a child build reconstructing this entry
             # records the frozen digest and gc_cas keeps the clone alive.
             si.note_source(rel_path, recorded)
@@ -80,7 +82,7 @@ def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
     Reads the per-entry ``{rel_path: digest}`` map ``result_cache._recipe_expr``
     threads through ``_RECON_SOURCES``. Returns None outside reconstruction (the build
     path), when the reconstructing entry belongs to a different project, or when this
-    source was not recorded — from_project then falls through to its live-file path.
+    source was not recorded — read_project_file then falls through to its live-file path.
     """
     from tallyman_xorq.result_cache import _RECON_SOURCES
 
@@ -93,53 +95,82 @@ def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
     return sources.get(rel_path)
 
 
-def from_catalog(alias_or_hash: str, project: str | None = None):
-    """Load an existing catalog entry's result as a xorq expression.
+def tracked_expr_from_alias(alias: str, project: str | None = None):
+    """Load a catalog entry by alias and record the parent edge in the manifest DAG.
 
-    This is how you chain catalog entries: build A, then build B from A's result.
-    Returns the entry's *expression* on the in-process default backend (#73/#75),
-    not a read of a materialised entry ``result.parquet``. An expensive parent
-    (Aggregate / Join / …) resolves to a direct read of its baked ``result_cache``
-    snapshot, so its work is computed once and shared; a cheap parent re-runs its
-    recipe (pushdown makes that ~free). Crucially both root on the *same* default
-    backend, so combining two ``from_catalog`` parents — or a ``from_catalog`` and
-    a ``from_project`` — in one ``union`` / ``join`` resolves to a single backend
-    rather than raising "Multiple backends found" (#75). Either way the child no
-    longer depends on the parent having a ``result.parquet`` on disk.
+    This is the standard way to chain catalog entries: build A, then build B
+    from A using ``tracked_expr_from_alias("a")``. The call records A as a
+    declared parent of B in ``manifest.parents``, which is how staleness
+    propagation and the lineage graph are maintained.
 
-    Because the child's build serialises the parent's source reads (cheap) or a
-    read of the parent's baked snapshot (expensive) rather than a path to the
-    parent entry, the inter-entry edge no longer survives in the child's
-    ``expr.yaml``. Instead this resolves the parent's build-time content hash and
-    records it (with the original ``ref`` and ``follow`` read-intent) via
-    ``parent_capture.note_parent``; ``build_and_persist`` persists it into
-    ``manifest.parents`` so ``tallyman_xorq.lineage.catalog_parents`` recovers the
-    DAG edge (#84).
+    Accepts an alias only (not a content hash). Resolves the alias to its
+    current head entry. Pass the alias name as it appears in ``catalog_list``.
+    To read by hash without tracking, use ``pinned_expr_from_alias``.
+
+    Returns the entry's expression on the in-process default backend — an
+    expensive parent (Aggregate / Join / ...) resolves to a direct read of its
+    baked result_cache snapshot, a cheap parent re-runs its recipe (pushdown
+    makes that ~free). Either way the materialization detail is hidden from
+    the caller.
+
+    The parent edge is suppressed during reconstruction (when ``_RECONSTRUCTING``
+    is True) so that re-running a child recipe to compute its expression doesn't
+    accidentally record grandparents as direct parents of the entry under
+    construction.
 
     Args:
-        alias_or_hash: An alias (e.g. "shoe_sales") or a content hash. Aliases
-            resolve to their *current* latest hash.
+        alias: A catalog alias (e.g. "shoe_sales"). Must be an alias, not a
+            content hash — pass hashes to pinned_expr_from_alias instead.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
     from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
-    # An argument that names an existing entry dir is a literal hash (a pin);
-    # otherwise it is an alias to follow.
+    if entry_dir(proj, alias).exists():
+        raise ProjectDataNotFound(
+            f"{alias!r} is a content hash; tracked_expr_from_alias only accepts aliases. "
+            "Use pinned_expr_from_alias for hash-based reads."
+        )
+    content_hash = get_alias(proj, alias)
+    if content_hash is None or not entry_dir(proj, content_hash).exists():
+        raise ProjectDataNotFound(f"catalog alias {alias!r} not found in project {proj!r}")
+    content_hash = _resolve_noncyclic_hash(proj, alias, content_hash)
+    if not _RECONSTRUCTING.get():
+        from tallyman_xorq import parent_capture as pc
+
+        pc.note_parent(content_hash, ref=alias, follow=True)
+    return cached_result_expr(proj, content_hash)
+
+
+def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
+    """Load a catalog entry by alias or content hash, recording a pinned (non-following) edge.
+
+    Like tracked_expr_from_alias but pinned: the dependency edge is recorded in
+    manifest.parents with follow=False, so recalc knows the child exists but will
+    not advance it when the parent alias moves. Use this when you want to stay on
+    a specific version of a parent rather than following alias changes.
+
+    Accepts an alias OR a content hash. Unlike tracked_expr_from_alias (alias-only,
+    follow=True), this records follow=False regardless of whether you pass an alias
+    or a hash — the caller is explicitly opting out of alias-following.
+
+    The parent edge is suppressed during reconstruction (same as tracked_expr_from_alias)
+    so re-running a child's recipe doesn't accidentally write to the manifest.
+
+    Args:
+        alias_or_hash: An alias (e.g. "shoe_sales") or a content hash.
+        project: Project name override (defaults to active TALLYMAN_PROJECT).
+    """
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
+
+    proj = resolve_project(project)
     is_hash = entry_dir(proj, alias_or_hash).exists()
     content_hash = alias_or_hash if is_hash else get_alias(proj, alias_or_hash)
     if content_hash is None or not entry_dir(proj, content_hash).exists():
         raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
-    # A recipe that reads from_catalog of its own (now-current) alias would
-    # resolve to itself and recurse forever; step back to the build-time parent (#74).
     content_hash = _resolve_noncyclic_hash(proj, alias_or_hash, content_hash)
-    # Record the cross-entry edge for the manifest DAG (#84), but only for the
-    # entry under construction: composing a parent reconstructs its recipe, which
-    # re-runs that parent's own from_catalog calls. Those resolve with
-    # _RECONSTRUCTING non-empty, so gating on it keeps grandparents out of the
-    # child's direct-parent list.
     if not _RECONSTRUCTING.get():
         from tallyman_xorq import parent_capture as pc
 
-        pc.note_parent(content_hash, ref=alias_or_hash, follow=not is_hash)
+        pc.note_parent(content_hash, ref=alias_or_hash, follow=False)
     return cached_result_expr(proj, content_hash)

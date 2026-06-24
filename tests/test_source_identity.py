@@ -28,7 +28,7 @@ def _write_parquet(path, n_rows: int) -> None:
 
 
 def _read_code(project: str, rel: str) -> str:
-    return f"from tallyman_xorq.io import from_project\nexpr = from_project({rel!r}, project={project!r})\n"
+    return f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel!r}, project={project!r})\n"
 
 
 def test_cas_is_default(monkeypatch):

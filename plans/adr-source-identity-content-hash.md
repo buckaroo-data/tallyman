@@ -7,7 +7,7 @@
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),
-  `src/tallyman_xorq/io.py` (`from_project`), `src/tallyman_xorq/build.py`
+  `src/tallyman_xorq/io.py` (`read_project_file`), `src/tallyman_xorq/build.py`
   (`build_and_persist`), `src/tallyman_core/manifest.py` (`sources` map)
 - **Related ADR:** `plans/adr-result-cache-cost-rubric.md` (relies on
   `content_hash` being a content-stable cache key)
@@ -18,7 +18,7 @@
 
 The original draft assumed xorq hashes a parquet source via
 `normalize_read_path_stat` (`(mtime, size, inode)`) and proposed passing
-`normalize_read_path_md5sum` in `from_project` / `from_catalog`. Measurement
+`normalize_read_path_md5sum` in `read_project_file` / `tracked_expr_from_alias`. Measurement
 disproved both halves:
 
 - The build hash never consults `normalize_method`. `content_hash` comes
@@ -46,7 +46,7 @@ tallyman-side.
 
 ## Decision
 
-Content-address the source read path itself. `from_project`:
+Content-address the source read path itself. `read_project_file`:
 
 1. digests the file (md5, memoized per `(mtime_ns, size, inode)` in
    `artifacts/source_digests.json`, so an unchanged file is hashed once,
@@ -62,7 +62,7 @@ new digest → new path → new hash. Every xorq-level key derived from the
 expression — the build hash, `ParquetSnapshotCache` keys, anything future —
 becomes content-honest with no further guards.
 
-`from_catalog` is unchanged: it already reads
+`tracked_expr_from_alias` is unchanged: it already reads
 `entries/<content_hash>/result.parquet`, so the parent's identity is in the
 path by construction.
 
@@ -78,7 +78,7 @@ flipping the default to `cas` after the consequences below are addressed.
 | self-heal faithful after source edit      | no                 | **yes**     | no          |
 | stat-preserving swap                      | stale, incoherent  | stale but coherent | stale, incoherent |
 | byte-identical rewrite keeps identity     | yes                | yes         | yes         |
-| `from_catalog` child stable; reset dedups | yes                | yes         | yes         |
+| `tracked_expr_from_alias` child stable; reset dedups | yes                | yes         | yes         |
 | build overhead (memo hit / new content)   | —                  | +13ms / +110ms per 71MB | same |
 
 "Self-heal faithful" is load-bearing for the result-cache ADR: its
@@ -94,7 +94,7 @@ data under the old identity.
   draft).** Ineffective: the snapshot hasher never consults
   `normalize_method` (see "What changed"). Rejected on measurement.
 - **Salt: mix tallyman-computed source digests into `content_hash`**
-  (`build_and_persist` collects digests recorded by `from_project` during
+  (`build_and_persist` collects digests recorded by `read_project_file` during
   user-code import). Passes the same identity invariants with the same
   overhead, and keeps human-readable `data/` paths in builds. Rejected
   because it fixes only the entry *name* while every xorq-level key stays
@@ -140,7 +140,7 @@ data under the old identity.
   under every mode — `pack`/`serve` portability needs its own decision.
 - **Caveat — the flip does NOT make cold reconstruction content-faithful.**
   `cached_result_expr` re-runs a cheap entry's recipe on every cold read
-  (`result_cache.py` `_recipe_expr` → `_import_script`), and `from_project`
+  (`result_cache.py` `_recipe_expr` → `_import_script`), and `read_project_file`
   re-digests the *live* source under `cas` (`io.py:55-60`), so an evicted or
   cheap entry still serves edited bytes under its old `content_hash`. The flip
   makes *build* identity content-aware (a rebuild forks the hash) — what

@@ -115,7 +115,7 @@ def _user_imports_bare_ibis(code: str) -> bool:
 
 
 # Read helpers the model reaches for on the wrong namespace. The project-aware
-# way is from_project/from_catalog; xo.deferred_read_parquet handles a raw path.
+# way is read_project_file/tracked_expr_from_alias; xo.deferred_read_parquet handles a raw path.
 _READ_FNS = frozenset(
     {"read_parquet", "read_csv", "read_in_memory", "read_delta", "deferred_read_parquet", "deferred_read_csv"}
 )
@@ -164,7 +164,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
       - `module 'xorq' has no attribute 'X'` — xorq is not the API entrypoint
         (`import xorq.api as xo`); `_` lives on `xorq.vendor.ibis`;
       - `module 'ibis' has no attribute 'X'` — math is a column method, reads
-        go through from_project/from_catalog, `ibis.case` is now `ibis.cases`;
+        go through read_project_file/tracked_expr_from_alias, `ibis.case` is now `ibis.cases`;
       - `cannot import name 'X' from 'tallyman_xorq.io'` — invented loader;
       - any duckdb reach — there is no duckdb backend, only datafusion;
       - `'Table' object has no attribute 'X'` — guessed a column name.
@@ -194,7 +194,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             hints.append(
                 f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint "
                 "(`import xorq.api as xo`). Read data with `from tallyman_xorq.io "
-                "import from_project, from_catalog`, or `xo.deferred_read_parquet"
+                "import read_project_file, tracked_expr_from_alias`, or `xo.deferred_read_parquet"
                 "(abs_path)` for a raw path."
             )
         else:
@@ -212,27 +212,28 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
         elif name in {"read_parquet", "read_csv", "read_table"}:
             hints.append(
                 f"`ibis.{name}` does not exist — read data with "
-                "`from tallyman_xorq.io import from_project, from_catalog`."
+                "`from tallyman_xorq.io import read_project_file, tracked_expr_from_alias`."
             )
         elif name == "case":
             hints.append("`ibis.case` is gone — use `ibis.cases((cond, val), ..., else_=default)`.")
         else:
             hints.append(
                 f"`ibis.{name}` does not exist on `xorq.vendor.ibis`. Many operations are column methods "
-                "(`col.method()`), and data is read via from_project/from_catalog."
+                "(`col.method()`), and data is read via read_project_file/tracked_expr_from_alias."
             )
 
     m = re.search(r"cannot import name '(\w+)' from 'tallyman_xorq\.io'", exc_msg)
     if m:
         hints.append(
-            f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports only `from_project` "
-            "(raw files under <project>/data/) and `from_catalog` (named entries / content hashes)."
+            f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `read_project_file` "
+            "(raw files under <project>/data/), `tracked_expr_from_alias` (alias → records lineage), "
+            "and `pinned_expr_from_alias` (alias or hash, no lineage)."
         )
 
     if "duckdb" in exc_msg.lower():
         hints.append(
             "there is no duckdb backend here — the only backend is xorq's built-in datafusion. "
-            "Build with the ibis expression API over from_project/from_catalog sources; "
+            "Build with the ibis expression API over read_project_file/tracked_expr_from_alias sources; "
             "do not use duckdb, `.sql()`, or `con.register()`."
         )
 
@@ -347,7 +348,7 @@ def build_and_persist(
 
     ensure_project(project)
 
-    # Collect source digests while user code imports (from_project notes each
+    # Collect source digests while user code imports (read_project_file notes each
     # file it reads); cas/salt identity modes consume them below.
     from tallyman_xorq import parent_capture as pc
     from tallyman_xorq import source_identity as si
@@ -358,7 +359,7 @@ def build_and_persist(
         module, tmp_script = _import_script(code)
     finally:
         sources = si.end_collect(collect_token)
-        # Resolved from_catalog parent edges captured during import (#84).
+        # Resolved tracked_expr_from_alias parent edges captured during import (#84).
         parents = pc.end_collect(parent_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
@@ -472,7 +473,7 @@ def build_and_persist(
             # Execute (#73). A worthy entry's build carries a baked result-cache
             # node (rewrite_for_build), so executing materialises it once into the
             # compute cache — and every later loader (the Buckaroo viewer, diffs,
-            # from_catalog) reads that cached result instead of re-running the DAG;
+            # tracked_expr_from_alias) reads that cached result instead of re-running the DAG;
             # baking evaluates every row, so count() there both validates and counts.
             # A cheap entry materialises nothing, so count() alone is satisfied from
             # source metadata and PRUNES the row projection — a failing cast /

@@ -109,8 +109,8 @@ def test_ensure_session_includes_project_root_in_load_expr_body(project: str, or
     from tallyman_xorq import build_and_persist
 
     code = f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
     res = build_and_persist(project, code)

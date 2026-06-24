@@ -19,7 +19,13 @@ from tallyman_xorq.diff import (
     stats_diff_polars,
     stats_diff_xorq,
 )
-from tallyman_xorq.io import ProjectDataNotFound, from_catalog, from_project, project_path
+from tallyman_xorq.io import (
+    ProjectDataNotFound,
+    pinned_expr_from_alias,
+    project_path,
+    read_project_file,
+    tracked_expr_from_alias,
+)
 
 __all__ = [
     "BuildError",
@@ -27,9 +33,10 @@ __all__ = [
     "ProjectDataNotFound",
     "build_and_persist",
     "code_diff",
-    "from_catalog",
-    "from_project",
     "full_diff",
+    "pinned_expr_from_alias",
+    "read_project_file",
+    "tracked_expr_from_alias",
     "head_diff",
     "head_diff_polars",
     "head_diff_xorq",

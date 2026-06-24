@@ -1,10 +1,10 @@
 """Side-channel for recording cross-entry parent edges during a build.
 
 Mirrors ``source_identity``'s source-digest collector. Since #73/#74,
-``from_catalog`` composes the parent's *expression* into the child instead of
+``tracked_expr_from_alias`` composes the parent's *expression* into the child instead of
 reading the parent's ``result.parquet``, so the child's ``expr.yaml`` carries no
 path naming the parent entry. The edge isn't lost, only implicit:
-``from_catalog`` resolves the parent's content hash at build time. This collector
+``tracked_expr_from_alias`` resolves the parent's content hash at build time. This collector
 captures that resolution so ``build_and_persist`` persists it into
 ``manifest.parents`` — durable provenance kept for a future lineage feature
 (#84; the inter-entry DAG view that read it was removed pending a proper rebuild).
@@ -12,16 +12,16 @@ captures that resolution so ``build_and_persist`` persists it into
 Each entry records ``{hash, ref, follow}``:
 
 - ``hash`` — the resolved build-time parent content hash (the DAG edge).
-- ``ref`` — the original ``from_catalog`` argument (an alias name or a literal
+- ``ref`` — the original ``tracked_expr_from_alias`` argument (an alias name or a literal
   hash), preserved as read-intent.
 - ``follow`` — ``True`` when the argument was an alias (the child should follow
   the alias head and go stale as it advances), ``False`` when it was a literal
   hash (the child pins that exact revision).
 
-Only *direct* parents are collected. ``from_catalog`` reconstructs a parent's
-recipe to compose it, which re-runs the parent's own ``from_catalog`` calls; the
+Only *direct* parents are collected. ``tracked_expr_from_alias`` reconstructs a parent's
+recipe to compose it, which re-runs the parent's own ``tracked_expr_from_alias`` calls; the
 caller gates those transitive resolutions out so a grandparent is not recorded
-as a direct parent (see ``tallyman_xorq.io.from_catalog``).
+as a direct parent (see ``tallyman_xorq.io.tracked_expr_from_alias``).
 """
 
 from __future__ import annotations

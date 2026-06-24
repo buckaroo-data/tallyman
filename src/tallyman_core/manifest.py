@@ -17,7 +17,7 @@ class ParentRef(BaseModel):
     """A resolved cross-entry parent edge recorded at build time (#84).
 
     ``hash`` is the build-time parent content hash (the DAG edge). ``ref`` is the
-    original ``from_catalog`` argument and ``follow`` its read-intent: an alias
+    original ``tracked_expr_from_alias`` argument and ``follow`` its read-intent: an alias
     argument (``follow=True``) follows the alias head and goes stale as it
     advances; a literal hash (``follow=False``) pins that exact revision.
     """
@@ -58,7 +58,7 @@ class Manifest(BaseModel):
     # rel data path -> content md5, recorded when a source-identity mode is
     # active (tallyman_xorq.source_identity); absent under mode=off.
     sources: dict[str, str] | None = None
-    # Resolved from_catalog parent edges ({hash, ref, follow}), recorded at build
+    # Resolved tracked_expr_from_alias parent edges ({hash, ref, follow}), recorded at build
     # time so the inter-entry DAG survives #73/#74; absent for root entries (#84).
     parents: list[ParentRef] | None = None
 

@@ -22,16 +22,16 @@ from tallyman_xorq.result_cache import baked_snapshot_path
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 """
@@ -39,8 +39,8 @@ expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 
 def _cheap_code(project: str) -> str:  # projection → cheap, bakes no snapshot
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
 

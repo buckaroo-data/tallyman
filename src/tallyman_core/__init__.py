@@ -13,6 +13,7 @@ from tallyman_core.aliases import (  # noqa: I001 (keep notebook import first)
     version_of_hash,
 )
 from tallyman_core.charts import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
+from tallyman_core.config import auto_recalc_enabled, read_config, set_auto_recalc, write_config
 from tallyman_core.display_klasses import (
     DisplayKlassError,
     list_display_klasses,
@@ -20,7 +21,7 @@ from tallyman_core.display_klasses import (
     write_display_klass,
 )
 from tallyman_core.entry_config import carry_forward_entry_config
-from tallyman_core.errors import clear_errors, get_error, list_errors, record_error
+from tallyman_core.errors import clear_errors, error_for_hash, errors_by_hash, get_error, list_errors, record_error
 from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.manifest import Manifest, read_manifest, write_manifest
 from tallyman_core.marimo_export import export_notebook_path, notebook_to_marimo
@@ -97,9 +98,15 @@ __all__ = [
     "alias_for_hash",
     "atomic_write_text",
     "artifacts_dir",
+    "auto_recalc_enabled",
     "catalog_dir",
     "clear_errors",
     "data_dir",
+    "error_for_hash",
+    "errors_by_hash",
+    "read_config",
+    "set_auto_recalc",
+    "write_config",
     "ensure_project",
     "entries_dir",
     "entry_dir",

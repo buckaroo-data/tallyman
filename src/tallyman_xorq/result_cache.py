@@ -103,7 +103,7 @@ def cache_worthy(project: str, content_hash: str) -> bool:
 
 
 # Entries currently being reconstructed by cached_result_expr, on this call
-# stack. ``from_catalog`` consults it to step a self-referential recipe (a
+# stack. ``tracked_expr_from_alias`` consults it to step a self-referential recipe (a
 # revise-in-place that chains off its own alias) back to the build-time parent
 # before it recurses without bound — the #74 ~50GB RSS spike that locked the box.
 # A set suffices: resolution walks alias history, not this stack's order.
@@ -115,14 +115,14 @@ _RECONSTRUCTING: contextvars.ContextVar[frozenset] = contextvars.ContextVar("_re
 _MAX_RECON_DEPTH = 64
 
 # The source digests ({rel_path: digest} from manifest.sources) the entry being
-# reconstructed on this stack was BUILT from, threaded into from_project so a cold
+# reconstructed on this stack was BUILT from, threaded into read_project_file so a cold
 # read resolves each source to the frozen data/.cas/<digest> clone it was built from —
 # not a re-digest of the (possibly edited-in-place) live file (#115). Set per-entry in
 # _recipe_expr alongside _RECONSTRUCTING and OVERWRITTEN (then restored) by each nested
-# reconstruction, so a grandparent's from_project sees the grandparent's recorded
-# sources. Carries the project so a from_project resolving a *different* project falls
+# reconstruction, so a grandparent's read_project_file sees the grandparent's recorded
+# sources. Carries the project so a read_project_file resolving a *different* project falls
 # through to the live path. None outside reconstruction (the build path); an entry that
-# recorded no sources (mode=off / pre-#86) yields an empty map, so from_project also
+# recorded no sources (mode=off / pre-#86) yields an empty map, so read_project_file also
 # falls through.
 _RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
     "_recon_sources", default=None
@@ -133,7 +133,7 @@ def _recorded_sources(project: str, content_hash: str) -> dict:
     """The entry's recorded ``manifest.sources`` ({rel_path: digest}), or ``{}``.
 
     Empty when the manifest is unreadable or the entry recorded no sources (mode=off,
-    or a build predating #86); from_project then falls through to its live-file path.
+    or a build predating #86); read_project_file then falls through to its live-file path.
     """
     from tallyman_core import read_manifest
     from tallyman_core.paths import entry_dir
@@ -145,23 +145,23 @@ def _recorded_sources(project: str, content_hash: str) -> dict:
 
 
 def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> str:
-    """The hash ``from_catalog`` should load, stepped out of any reconstruction cycle.
+    """The hash ``tracked_expr_from_alias`` should load, stepped out of any reconstruction cycle.
 
-    ``from_catalog(alias)`` resolves an alias to its *live* head. When an entry's
-    recipe reads ``from_catalog`` of the alias it is itself the head of (the
+    ``tracked_expr_from_alias(alias)`` resolves an alias to its *live* head. When an entry's
+    recipe reads ``tracked_expr_from_alias`` of the alias it is itself the head of (the
     chaining pattern ``catalog_revise`` documents), reconstructing it re-resolves
-    to itself and recurses forever (#74). At build time that ``from_catalog``
+    to itself and recurses forever (#74). At build time that ``tracked_expr_from_alias``
     meant the *previous* revision — the alias is repointed only after the build —
     so we recover the build-time binding by walking back through alias history to
     the nearest revision not already under reconstruction on this stack.
     """
     from tallyman_core.aliases import get_alias, previous_version
 
-    # `requested` is from_catalog's argument: an alias to follow, or a literal
-    # hash pin. Treat it as a lineage hint only when it names an alias, so a hash
-    # shared across histories steps back through the alias the caller asked for
-    # rather than whichever sorts first (#85). A hash pin has no lineage to
-    # follow, so it stays None and resolution keeps the dict-order fallback.
+    # `requested` is the caller's argument: an alias (from tracked_expr_from_alias) or a
+    # hash (from pinned_expr_from_alias). Treat it as a lineage hint only when it names
+    # an alias, so a hash shared across histories steps back through the alias the caller
+    # asked for rather than whichever sorts first (#85). A hash has no lineage to follow,
+    # so it stays None and resolution keeps the dict-order fallback.
     alias_hint = requested if get_alias(project, requested) is not None else None
     active = _RECONSTRUCTING.get()
     while (project, content_hash) in active:
@@ -170,7 +170,7 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
             from tallyman_xorq.build import BuildError
 
             raise BuildError(
-                f"from_catalog({requested!r}) in {project!r} resolves to an entry that "
+                f"tracked_expr_from_alias({requested!r}) in {project!r} resolves to an entry that "
                 "reconstructs itself with no prior revision to fall back to"
             )
         content_hash = parent
@@ -186,10 +186,10 @@ def _recipe_expr(project: str, content_hash: str):
 
     Symmetric with the original build's ``_import_script`` — same source code,
     same source-identity handling — so the reconstructed expression is
-    structurally identical to what was built. The recipe's ``from_project`` /
+    structurally identical to what was built. The recipe's ``read_project_file`` /
     deferred readers bind to the in-process *default* backend, so the returned
-    expression roots there and composes with ``from_project`` and other
-    ``from_catalog`` results as a single backend (#75).
+    expression roots there and composes with ``read_project_file`` and other
+    ``tracked_expr_from_alias`` results as a single backend (#75).
     """
     from tallyman_core.paths import entry_dir, project_dir
     from tallyman_xorq.build import BuildError, _import_script
@@ -198,17 +198,17 @@ def _recipe_expr(project: str, content_hash: str):
     active = _RECONSTRUCTING.get()
     if len(active) >= _MAX_RECON_DEPTH:
         raise BuildError(
-            f"from_catalog reconstruction nested past {_MAX_RECON_DEPTH} levels "
+            f"tracked_expr_from_alias reconstruction nested past {_MAX_RECON_DEPTH} levels "
             f"(at {content_hash} in {project!r}) — aborting a runaway recipe cycle"
         )
 
     code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
     # Mark this entry in-flight for the duration of the recipe exec, so any
-    # from_catalog the recipe issues can step back out of a self-reference (#74).
-    # In the SAME window, pin this entry's recorded sources so any from_project the
+    # tracked_expr_from_alias the recipe issues can step back out of a self-reference (#74).
+    # In the SAME window, pin this entry's recorded sources so any read_project_file the
     # recipe issues resolves to the frozen .cas clone it was built from, not a
     # re-digest of the edited-in-place live file (#115). Both contextvars must wrap
-    # _import_script — that is where the recipe's from_catalog / from_project run —
+    # _import_script — that is where the recipe's tracked_expr_from_alias / read_project_file run —
     # and reset in this finally, NOT the sys.modules-cleanup finally below.
     token = _RECONSTRUCTING.set(active | {(project, content_hash)})
     recon_token = _RECON_SOURCES.set((project, _recorded_sources(project, content_hash)))
@@ -511,7 +511,7 @@ def _heal_lock(project: str, content_hash: str) -> threading.Lock:
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as a single-backend expression on the default backend.
 
-    Reconstituting a catalog entry for chaining (``from_catalog``) or diffing
+    Reconstituting a catalog entry for chaining (``tracked_expr_from_alias``) or diffing
     must yield an expression rooted on the *one* in-process backend, so two
     entries combined in a ``union`` / ``join`` resolve to a single backend
     instead of raising "Multiple backends found" (#75). #73's predecessor loaded

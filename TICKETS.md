@@ -329,7 +329,7 @@ catalog entries and aliases). Tests cover both paths.
 
 ### ~~T-24 — `catalog_load_parquet` hard-codes the project name~~ ✅ 2026-05-11
 
-Fixed alongside T-03. The synthesized code now reads `from_project(rel_path)`
+Fixed alongside T-03. The synthesized code now reads `read_project_file(rel_path)`
 without an explicit `project=` argument, so a project rename or rehome
 no longer breaks the build.
 

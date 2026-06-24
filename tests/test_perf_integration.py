@@ -380,7 +380,7 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
     Returns *overlay_home*.
 
     *Every* built entry is mirrored, not just the measured subset — entries
-    chain (``from_catalog(parent_hash)``), and post-#73 a measured entry's build
+    chain (``tracked_expr_from_alias(parent_hash)``), and post-#73 a measured entry's build
     reads its parent's baked ``result_cache`` snapshot (or re-runs the parent's
     recipe via ``cached_result_expr``), not a parent ``result.parquet``; omitting
     parents breaks that resolution at execute time.
@@ -440,7 +440,7 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
 
     #73 materialises an entry by reconstructing it on the default backend
     (``cached_result_expr``): a cheap entry recomputes from source, an expensive
-    one reads its baked snapshot, and an entry that ``from_catalog``s an
+    one reads its baked snapshot, and an entry that ``tracked_expr_from_alias``s an
     expensive parent self-heals an evicted parent snapshot by re-running the
     recipe. Replaying the serialized build verbatim can't do that last case — its
     *bare* read of the parent's snapshot dangles on a cold compute cache ("At
@@ -501,7 +501,7 @@ def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
     # Mirror the live companion: ensure_session calls cached_result_expr before
     # Buckaroo replays the build via /load_expr (buckaroo_lifecycle.py), repopulating
-    # the baked snapshot a #73+ from_catalog build reads so the replay below isn't an
+    # the baked snapshot a #73+ tracked_expr_from_alias build reads so the replay below isn't an
     # empty read. A pre-#73 corpus instead embeds a parent result.parquet this can't
     # heal — rebuild it (scripts/rebuild_parking_catalog.py); see the module docstring.
     t0 = time.monotonic()

@@ -52,8 +52,8 @@ The model calls one of three tools (`server.py`):
   the companion's `put_code` code-edit path.
 
 The code is a Python string that must bind a variable `expr` to an
-ibis/xorq expression, typically built from `from_catalog("alias")` (another
-entry) or `from_project("file")` (a raw source). All three converge on
+ibis/xorq expression, typically built from `tracked_expr_from_alias("alias")` (another
+entry) or `read_project_file("file")` (a raw source). All three converge on
 `_run_and_record` → `build_and_persist(project, code, prompt)` (`build.py:328`).
 
 ## 2. Build + execute (`build_and_persist`, `build.py:328`)
@@ -61,8 +61,8 @@ entry) or `from_project("file")` (a raw source). All three converge on
 In order:
 
 1. **Import the user code** in a fresh module scope (`_import_script`,
-   `build.py:308`). During the import, `from_project` records each source file
-   it touches and `from_catalog` records each parent edge;
+   `build.py:308`). During the import, `read_project_file` records each source file
+   it touches and `tracked_expr_from_alias` records each parent edge;
    `source_identity` / `parent_capture` collect over the import
    (`build.py:355-362`) for the `cas` (default) / `salt` identity modes and the
    parent graph.
@@ -75,7 +75,7 @@ In order:
    dask-style token over the (rewritten) expression structure
    (`content_hash = build_path.name`, `build.py:403`). The hash is
    content-sensitive in two of the three identity modes. Under the `cas` default
-   each `from_project` read already went through a `data/.cas/<digest>` clone
+   each `read_project_file` read already went through a `data/.cas/<digest>` clone
    (`io.py:58`), so the digest is baked into the path xorq tokenizes; under
    `salt` the digests are folded in afterward (`si.salted_hash`, `build.py:407`)
    and no cache is baked; `off` leaves the hash path-only. `expr.py` keeps the
@@ -131,7 +131,7 @@ In order:
 | Prompt history | `<catalog>/prompts/<hash>.jsonl` | step 6 |
 | Chart / display config (if attached or carried forward) | `<catalog>/chart_specs/<hash>.vl.json`, `<catalog>/display_configs/<hash>.json` | UI, or `carry_forward_entry_config` on revise (§3) |
 | Source digests (cas/salt only) | `<project>/artifacts/source_digests.json` (stat-keyed memo) + `<entry>/manifest.json` `sources` map | `source_identity`, step 1 |
-| Content source clones (cas only) | `<project>/data/.cas/<digest>` (outside the catalog repo) | `from_project` → `ensure_cas_path`, step 1 |
+| Content source clones (cas only) | `<project>/data/.cas/<digest>` (outside the catalog repo) | `read_project_file` → `ensure_cas_path`, step 1 |
 | Alias | `<catalog>/aliases.jsonl` | `set_alias` (§3 below) |
 | Recipe zip + pointers + commit | `<catalog>/entries/<hash>.zip`, `entries.jsonl`, `compute_cache.jsonl` + a git commit | the checkpoint, step 7 |
 
@@ -200,7 +200,7 @@ The SPA issues `GET /{project}/api/entry/{hash-or-alias}`
    a cold compute cache (a fresh clone, or an entry the startup warmup didn't
    reach) it recomputes it once, single-flighted per `(project, content_hash)`
    under `_heal_lock` so two tabs hitting the same cold entry don't both run the
-   shared cache op (#79). This matters because a `from_catalog` chain off an
+   shared cache op (#79). This matters because a `tracked_expr_from_alias` chain off an
    expensive parent embeds a *bare* read of the parent's snapshot (#75 strips
    the parent's cache node to keep one backend), so without the snapshot the
    replay below would read zero rows. Done outside the session lock so a cold

@@ -21,16 +21,16 @@ from tallyman_xorq.result_cache import cached_result_expr
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
 """
@@ -240,6 +240,51 @@ def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet
     assert cfg["column_config_overrides"]["membership"]["merge_rule"] == "hidden"
 
 
+def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: str, orders_parquet: Path, monkeypatch):
+    # D5: catalog_promote_diff re-pointing an EXISTING alias is an auto-recalc
+    # trigger. Re-promoting onto the same target advances it, so its followers must
+    # cascade-recompute in the SAME revision (the walk runs before promote_diff's
+    # own checkpoint). This guards the ordering the atomicity depends on.
+    from tallyman_core.aliases import get_alias
+    from tallyman_core.catalog_state import current_step, reset_to
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+
+    catalog_create("ss", _agg_code(project))  # v1
+    catalog_revise("ss", _filter_code(project))  # v2
+    d1 = catalog_promote_diff("ss", alias="mydiff")["hash"]  # creates mydiff
+    foll = catalog_create(
+        "foll",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('mydiff')\nexpr = t.select('region')\n",
+    )["hash"]
+
+    catalog_revise("ss", _agg_code(project))  # v3 → the latest-two diff now differs
+    step_before = current_step(project)
+    out = catalog_promote_diff("ss", alias="mydiff")  # AliasExists → re-point mydiff → cascade
+
+    assert out["alias"] == "mydiff" and out["hash"] != d1  # mydiff advanced to a new diff
+    assert "recalc" in out  # the cascade fired
+    foll2 = get_alias(project, "foll")
+    assert foll2 != foll  # the follower was recomputed
+    assert out["recalc"]["remap"].get(foll) == foll2
+
+    # The reported checkpoint_step names the revision the promote + cascade landed
+    # in, AND it is exactly one revision — promote_diff self-checkpoints, so it
+    # must be checkpoint-exempt; a redundant dispatch-decorator checkpoint would
+    # both append a trailing empty commit and make the report name THAT step.
+    assert out["recalc"]["checkpoint_step"] == step_before + 1
+    assert current_step(project) == step_before + 1
+
+    # Atomic: reset_to before the re-promote restores BOTH the diff alias and the follower.
+    reset_to(project, step_before)
+    assert get_alias(project, "mydiff") == d1
+    assert get_alias(project, "foll") == foll
+
+
 def test_catalog_promote_diff_no_history_returns_error(project: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_promote_diff("nonexistent")
@@ -417,7 +462,7 @@ def test_marimo_export_loads_in_marimo_without_collisions(
     """The exported notebook must load in marimo without a MultipleDefinitionError.
 
     Each code cell inlines an ``expr.py`` that binds ``expr`` and imports
-    ``os`` / ``xo`` / ``from_project``. With more than one entry those names
+    ``os`` / ``xo`` / ``read_project_file``. With more than one entry those names
     used to leak into marimo's global dataflow graph and collide; the closure
     wrapper in ``marimo_export`` keeps them cell-local. String assertions
     alone never caught this — we have to actually build the marimo graph.

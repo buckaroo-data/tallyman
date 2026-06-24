@@ -15,7 +15,7 @@ The xorq MCP app that backs the Tallyman London 2026 talk *"The Future of Notebo
 > - Notebook tab (cells anchored on aliases, drag-reorder via SortableJS
 >   with ↑/↓ button fallback for accessibility, click-to-edit markdown,
 >   × remove; auto-append on `catalog_create`/`catalog_alias`).
-> - Lineage tab (catalog DAG via `from_catalog` parent edges, plus per-entry
+> - Lineage tab (catalog DAG via `tracked_expr_from_alias` parent edges, plus per-entry
 >   internal expression DAG; pure SVG, no Cytoscape dep yet).
 > - Diff tab (`/diff/<alias>[/<va>/<vb>]`): code diff (difflib unified),
 >   schema diff (added/removed/changed-type), per-column stats, key-joined

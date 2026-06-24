@@ -12,16 +12,16 @@ from tallyman_mcp.server import catalog_create
 
 def _agg(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _filter(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(n=f.count())
 """
@@ -29,9 +29,9 @@ expr = f.group_by("region").aggregate(n=f.count())
 
 def _nondeterministic(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
+from tallyman_xorq.io import read_project_file
 import xorq.vendor.ibis as ibis
-t = from_project("orders.parquet", project={project!r})
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.mutate(built_at=ibis.now())
 """
 

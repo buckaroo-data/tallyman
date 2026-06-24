@@ -183,7 +183,7 @@ def test_recipe_zip_byte_stable_across_rebuilds(project, orders_parquet, tmp_pat
 
 
 def test_recipe_zip_contains_expr_py(project, orders_parquet, tmp_path):
-    """expr.py is a durable zip member (D3): the from_catalog chaining path
+    """expr.py is a durable zip member (D3): the tracked_expr_from_alias chaining path
     re-execs it so a cheap entry's recompute roots on the shared in-process
     backend, and two entries union/join on one backend (#75)."""
     res = build_and_persist(project, _agg_code(orders_parquet))
@@ -202,8 +202,8 @@ def test_salt_zip_named_by_salted_hash(project, monkeypatch):
 
     write_shoe_orders(paths.data_dir(project) / "orders.parquet", n_rows=120, seed=1)
     code = (
-        "from tallyman_xorq.io import from_project\n"
-        "t = from_project('orders.parquet')\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        "t = read_project_file('orders.parquet')\n"
         "expr = t.group_by('region').aggregate(n=t.count())\n"
     )
     cs.genesis(project)
@@ -538,7 +538,7 @@ def test_checkpoint_skips_manifestless_entry_dir(project):
 def test_consistency_guard_surfaces_dangling_alias_hash(project, orders_parquet):
     """A committed ``aliases.jsonl`` whose latest/history hash names no durable
     recipe must fail the consistency guard, not reset clean (M1). A dangling
-    alias head later blows up the self-chaining ``from_catalog`` build, so
+    alias head later blows up the self-chaining ``tracked_expr_from_alias`` build, so
     ``reset_to`` must refuse to restore the step rather than mask the divergence."""
     from tallyman_core import aliases as al
 

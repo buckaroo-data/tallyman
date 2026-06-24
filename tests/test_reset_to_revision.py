@@ -229,12 +229,12 @@ def test_reset_prunes_compute_cache_to_warm_set(project):
     assert {p.name for p in cc.iterdir()} == {"baseline.parquet"}  # added pruned → cold
 
 
-def _from_project_code(project: str, rel: str) -> str:
-    return f"from tallyman_xorq.io import from_project\nexpr = from_project({rel!r}, project={project!r})\n"
+def _read_project_file_code(project: str, rel: str) -> str:
+    return f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel!r}, project={project!r})\n"
 
 
 def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
-    # #86: under the cas default a from_project build clones its source into
+    # #86: under the cas default a read_project_file build clones its source into
     # data/.cas/<digest>. That dir lives outside the catalog git repo, so the
     # reset's `git reset --hard` can't roll it back — reset_to's _gc_cas_clones
     # step reclaims clones no *surviving* entry references, keeping those a
@@ -248,14 +248,14 @@ def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
     cas = data_dir(project) / ".cas"
 
     # Baseline: an entry over orders.parquet, so its clone is live at step s1.
-    build_and_persist(project, _from_project_code(project, "orders.parquet"))
+    build_and_persist(project, _read_project_file_code(project, "orders.parquet"))
     s1 = cs.checkpoint_catalog(project, "baseline")
     base_clones = {p.name for p in cas.iterdir()}
     assert base_clones, "the cas-default build should have cloned orders.parquet into .cas"
 
     # A second entry over a *different* source — its clone is only live after s1.
     pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
-    build_and_persist(project, _from_project_code(project, "extra.parquet"))
+    build_and_persist(project, _read_project_file_code(project, "extra.parquet"))
     cs.checkpoint_catalog(project, "added later")
     assert {p.name for p in cas.iterdir()} > base_clones  # extra's clone is present now
 
@@ -275,10 +275,10 @@ def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_pa
     cs.ensure_catalog_repo(project)
     cas = data_dir(project) / ".cas"
 
-    build_and_persist(project, _from_project_code(project, "orders.parquet"))
+    build_and_persist(project, _read_project_file_code(project, "orders.parquet"))
     s1 = cs.checkpoint_catalog(project, "baseline")
     pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
-    build_and_persist(project, _from_project_code(project, "extra.parquet"))
+    build_and_persist(project, _read_project_file_code(project, "extra.parquet"))
     cs.checkpoint_catalog(project, "added later")
     before = {p.name for p in cas.iterdir()}
 
@@ -665,13 +665,13 @@ def test_reset_prune_self_heals_warmed_expensive_entry(project, orders_parquet, 
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = (
-        "from tallyman_xorq.io import from_project\n"
-        f"t = from_project('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file('orders.parquet', project={project!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
     )
     h = build_and_persist(project, code).content_hash
 
-    # Warm the LRU exactly as a view / from_catalog read does.
+    # Warm the LRU exactly as a view / tracked_expr_from_alias read does.
     expected = len(cached_result_expr(project, h).execute())
     snap = baked_snapshot_path(project, h)
     assert snap is not None and snap.exists()

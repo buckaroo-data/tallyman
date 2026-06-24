@@ -100,7 +100,7 @@ stage-2 instrumentation that does not exist yet.
 ## Stage 2 — #82: deep-chain build/reconstruct cost (report-only)
 
 In progress on `perf/82`. Not carried on this branch. Measurement, not a
-correctness fix: a synthetic `from_catalog` chain parameterised by depth and a
+correctness fix: a synthetic `tracked_expr_from_alias` chain parameterised by depth and a
 cheap/expensive mix, recording build/load/execute/reconstruct counts alongside
 wall-clock per #59's convention; report-only, marker-gated off CI.
 

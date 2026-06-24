@@ -20,6 +20,7 @@ from tallyman_core import (
     PostProcessingSourceError,
     StatSourceError,
     alias_for_hash,
+    auto_recalc_enabled,
     carry_forward_entry_config,
     entry_dir,
     entry_schema_path,
@@ -46,7 +47,7 @@ from tallyman_core import (
     write_stat,
 )
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
-from tallyman_xorq.recalc import recalc
+from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
 COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
@@ -128,6 +129,7 @@ _NO_CHECKPOINT = frozenset(
         "catalog_diff",
         "catalog_scan_staleness",  # read-only staleness scan
         "catalog_recalc",  # self-checkpoints (arg-aware: dry-run takes none, a real run one)
+        "catalog_promote_diff",  # self-checkpoints one tx for the promote + cascade (no double-commit)
         "catalog_list_summary_stats",
         "catalog_list_post_processings",
         "catalog_run_post_processing",  # preview, persists nothing
@@ -165,7 +167,17 @@ def _with_checkpoint(fn):
 
             project = _resolve_active_project()
             if project:
-                checkpoint_catalog(project, f"tallyman: {fn.__name__}")
+                step = checkpoint_catalog(project, f"tallyman: {fn.__name__}")
+                # catalog_revise's auto-path recalc sub-report is built by the
+                # checkpoint-free walk *before* this per-op checkpoint exists, so its
+                # checkpoint_step is None. This is the checkpoint that commits the head
+                # advance + cascade as one revision; backfill the real landed step the
+                # report couldn't yet know. (catalog_promote_diff is _NO_CHECKPOINT-
+                # exempt and self-checkpoints, so it stamps its own step and never
+                # reaches here.)
+                recalc_report = result.get("recalc") if isinstance(result, dict) else None
+                if isinstance(recalc_report, dict) and recalc_report.get("checkpoint_step") is None:
+                    recalc_report["checkpoint_step"] = step
         except Exception as exc:
             log.warning("checkpoint after %s failed: %s", fn.__name__, exc)
         return result
@@ -203,6 +215,33 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
         print(f"[tallyman_mcp] notify failed ({kind}): {exc}", file=sys.stderr)
 
 
+def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> dict | None:
+    """Cascade-recompute *name*'s stale followers right after an existing alias
+    head advanced — shared by every MCP path that re-points an existing alias
+    (``catalog_revise``, ``catalog_promote_diff``). ``tool`` names that surface so
+    a persisted cascade failure is attributed to the tool that actually ran.
+
+    The walk is **checkpoint-free**: it leaves the re-pointed dependents in the
+    working tree for the surrounding op's single checkpoint (the dispatch
+    decorator, or promote_diff's own checkpoint) to commit, so the head advance
+    and the whole cascade land as ONE git revision. Returns the recalc sub-report
+    (``catalog_recalc``'s shape plus ``orphan_stale``), or ``None`` when the
+    per-project ``auto_recalc`` switch is off. Best-effort cross-process notify so
+    the companion invalidates caches / reloads sessions / emits the SSE event.
+    """
+    if not auto_recalc_enabled(project):
+        return None
+    from tallyman_xorq.recalc import auto_recalc  # noqa: PLC0415
+
+    report = auto_recalc(project, name, tool=tool)
+    if report.get("remap"):
+        # Flat kwargs: _notify packs **extra into the wire `extra`, and the
+        # companion handler reads extra.remap / extra.step. A literal extra={...}
+        # would nest as extra.extra and silently drop both (#129 follow-up).
+        _notify("recalc", remap=report["remap"], step=report.get("checkpoint_step"))
+    return report
+
+
 @mcp.tool()
 @_tag_project
 def catalog_run(code: str, prompt: str = "") -> dict:
@@ -213,10 +252,10 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     PREFERRED pattern:
 
-        from tallyman_xorq.io import from_project, from_catalog
+        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
         import xorq.vendor.ibis as ibis
-        t = from_catalog("alias_name")            # named catalog entry (alias or hash)
-        t = from_project("file.parquet")          # raw file under <project>/data/
+        t = tracked_expr_from_alias("alias_name")      # named catalog entry by alias (records lineage)
+        t = read_project_file("file.parquet")          # raw file under <project>/data/
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
 
     THREE NAMESPACES — mixing these up is the #1 build failure:
@@ -225,7 +264,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
                                          # xo.memtable, xo.deferred_read_parquet, xo.connect
         import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
                                          # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
-        from tallyman_xorq.io import from_project, from_catalog   # reading data
+        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias   # reading data
 
         t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
         # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
@@ -233,19 +272,24 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
         #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
         # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
-        # Read data only via from_project / from_catalog (no xo.read_parquet / ibis.read_parquet).
+        # Read data only via read_project_file / tracked_expr_from_alias (no xo.read_parquet / ibis.read_parquet).
 
     ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
-    everything with the ibis expression API over from_project/from_catalog.
+    everything with the ibis expression API over read_project_file/tracked_expr_from_alias.
 
-    DATA SOURCING — choose between `from_catalog` and `from_project`:
-      - `from_catalog("name")` resolves catalog aliases AND bare content hashes.
-        Use this when the source appears in `catalog_list` output.
-      - `from_project("file.parquet")` reads raw files under `<project>/data/`.
+    DATA SOURCING — three functions, each with a distinct role:
+      - `tracked_expr_from_alias("name")` reads a catalog entry by alias and records it
+        as a parent in the lineage DAG. Use this for normal recipe chaining — the
+        standard way to build on top of another catalog entry.
+      - `read_project_file("file.parquet")` reads raw files under `<project>/data/`.
         Use this only for raw files visible on disk (not catalog aliases).
+      - `pinned_expr_from_alias("name_or_hash")` reads a catalog entry by alias or
+        content hash and records a pinned (follow=False) parent edge. Use when you
+        want to stay on a specific version — recalc will find the entry but won't
+        advance it when the parent alias moves.
       - When in doubt, call `catalog_list` first. A name that looks like a file
-        is often actually an alias — `from_project` on an alias raises
+        is often actually an alias — `read_project_file` on an alias raises
         `ProjectDataNotFound`.
 
     COLUMN NAMES — do not guess. The source step returns a `schema`, and
@@ -409,7 +453,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         import xorq.expr.datatypes as dt
         from xorq.ml import deferred_fit_predict_sklearn, train_test_splits
         from sklearn.linear_model import LinearRegression
-        t = from_catalog("diamond_features")
+        t = tracked_expr_from_alias("diamond_features")
         train, test = train_test_splits(t, test_sizes=0.25, random_seed=42)
         deferred = deferred_fit_predict_sklearn(cls=LinearRegression, return_type=dt.float64)
         instance = deferred(train, target="price", features=["carat", "depth", "x", "y", "z"])
@@ -424,7 +468,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         - fabricate placeholder values that look like real output (e.g. a
           memtable of zeros) when you cannot compute the requested result —
           return an error or a clearly-labelled column instead.
-        - pass a project= argument to from_project/from_catalog; the active
+        - pass a project= argument to read_project_file/tracked_expr_from_alias; the active
           project is implicit.
 
     Args:
@@ -464,7 +508,7 @@ def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dic
     project = _resolve_active_project()
     if name and get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
-    code = f"from tallyman_xorq.io import from_project\nexpr = from_project({rel_path!r})\n"
+    code = f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel_path!r})\n"
     out = _run_and_record(project, code, prompt, tool="catalog_load_parquet")
     if "error" in out:
         return out
@@ -552,7 +596,7 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     in the catalog as a forensic artifact and is recorded in alias_history.
 
     Code conventions and gotchas are documented in `catalog_run`. The same
-    rules apply here. Use `from_catalog(name)` to chain off the previous
+    rules apply here. Use `tracked_expr_from_alias(name)` to chain off the previous
     version of the alias (or any other named entry).
 
     Args:
@@ -577,6 +621,12 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     if carried:
         out["carried_over"] = carried
     _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
+    # Auto-recalc: cascade-recompute name's stale followers in this op's single
+    # checkpoint (the dispatch decorator commits the head advance + the cascade as
+    # one revision). Off → the explicit scan→recalc path. See plans/auto-recalc-on-revise.md.
+    recalc_report = _auto_recalc_after_head_advance(project, name, tool="catalog_revise")
+    if recalc_report is not None:
+        out["recalc"] = recalc_report
     return out
 
 
@@ -839,10 +889,12 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     except BuildError as exc:
         return {"error": str(exc)}
 
+    repointed = False
     try:
         set_alias(project, target_alias, result.content_hash, expect_exists=False)
     except AliasExists:
         set_alias(project, target_alias, result.content_hash)
+        repointed = True  # re-pointed an existing alias → its followers may go stale
 
     set_display_config(
         project,
@@ -860,9 +912,22 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         },
     )
 
-    checkpoint_catalog(project, f"tallyman: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
+    # D5: every existing-alias head-mover triggers auto-recalc via the shared
+    # helper. A fresh target_alias (expect_exists=False) has no followers; only
+    # the re-point branch can. The checkpoint-free walk runs BEFORE this op's
+    # checkpoint so that one revision sweeps the promote + the cascade together.
+    recalc_report = (
+        _auto_recalc_after_head_advance(project, target_alias, tool="catalog_promote_diff") if repointed else None
+    )
+
+    # promote_diff is checkpoint-exempt (self-checkpoints): THIS is the single
+    # revision the promote + cascade land in. Stamp its step onto the recalc
+    # sub-report — the checkpoint-free walk built it before this commit existed.
+    step = checkpoint_catalog(project, f"tallyman: catalog_promote_diff {name} V{a_idx}→V{b_idx}")
+    if recalc_report is not None:
+        recalc_report["checkpoint_step"] = step
     _notify("entry_added", content_hash=result.content_hash)
-    return {
+    out = {
         "alias": target_alias,
         "hash": result.content_hash,
         "source_alias": name,
@@ -873,6 +938,9 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
         "keys": keys,
         "row_count": result.row_count,
     }
+    if recalc_report is not None:
+        out["recalc"] = recalc_report
+    return out
 
 
 @mcp.tool()
@@ -881,7 +949,7 @@ def catalog_scan_staleness() -> dict:
     """Scan every catalog entry for staleness against its recorded inputs.
 
     Read-only. An entry is *stale* when an input it was built against moved:
-    a followed alias (built with ``from_catalog("name")``) advanced past the
+    a followed alias (built with ``tracked_expr_from_alias("name")``) advanced past the
     recorded head, or a recorded source file's content drifted on disk. A
     *directly* stale entry has its own input moved; a *transitively* stale entry
     is a clean descendant of a stale ancestor. Use ``catalog_recalc`` to act.
@@ -895,10 +963,17 @@ def catalog_scan_staleness() -> dict:
     """
     project = _resolve_active_project()
     verdicts = staleness.scan(project)
+    # D5 scan-on-load backstop: classify the directly-stale set as orphans so a
+    # project load surfaces unexplained staleness even when no revise has fired
+    # since (a bypass, a source edit). Gated on the switch: manual mode (flag off)
+    # owns its own staleness and a directly-stale follower is expected there, not
+    # a bug to flag. Same classifier auto-recalc uses, so the verdict is identical.
+    orphan_stale = classify_orphans(project, verdicts) if auto_recalc_enabled(project) else []
     return {
         "stale": sorted(h for h, v in verdicts.items() if v.stale),
         "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
         "entries": {h: asdict(v) for h, v in verdicts.items()},
+        "orphan_stale": orphan_stale,
     }
 
 
@@ -941,10 +1016,12 @@ def catalog_recalc(roots: list[str] | None = None, dry_run: bool = True) -> dict
         }
     report = recalc(project, roots, dry_run=dry_run)
     if not dry_run and report.remap:
-        # Forward both the remap and the checkpoint step so the companion can
+        # Forward remap + checkpoint step as FLAT kwargs so the companion can
         # republish the same normalized {kind, remap, step} SSE event the
-        # in-process /api/recalc route emits (see app._recalc_sse_event).
-        _notify("recalc", extra={"remap": report.remap, "step": report.checkpoint_step})
+        # in-process /api/recalc route emits (see app._recalc_sse_event). _notify
+        # packs **extra into the wire `extra`; a literal extra={...} would nest as
+        # extra.extra and the handler's extra.remap read would drop it.
+        _notify("recalc", remap=report.remap, step=report.checkpoint_step)
     return asdict(report)
 
 

@@ -1,6 +1,6 @@
 """Round-trip test for ``scripts/rebuild_native_catalog.py``.
 
-Builds a small native catalog (an alias with a revision, a from_catalog child,
+Builds a small native catalog (an alias with a revision, a tracked_expr_from_alias child,
 a chart, prompt history), rebuilds it through the script's importable core, and
 asserts the rebuild re-execs every recipe, reconstructs the decomposed surface,
 and leaves a consistent native store. A same-path rebuild is hash-stable (the
@@ -48,8 +48,8 @@ def _agg(parquet: Path, *, avg: bool = False) -> str:
 
 def _child(alias: str, project: str) -> str:
     return (
-        "from tallyman_xorq import from_catalog\n"
-        f"expr = from_catalog({alias!r}, {project!r}).filter(lambda r: r.n > 0)\n"
+        "from tallyman_xorq import tracked_expr_from_alias\n"
+        f"expr = tracked_expr_from_alias({alias!r}, {project!r}).filter(lambda r: r.n > 0)\n"
     )
 
 
@@ -76,7 +76,7 @@ def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parque
     # Every original entry was rebuilt.
     assert set(remap) == set(before.values())
     # A same-path rebuild is hash-stable for the recipe-deterministic roots. The
-    # from_catalog child bakes its aggregate parent's snapshot, whose bytes are
+    # tracked_expr_from_alias child bakes its aggregate parent's snapshot, whose bytes are
     # not datafusion-order-deterministic, so its hash may drift — the rebuild
     # remaps it (and re-points aliases) rather than relying on exact preservation.
     assert remap[before["a"]] == before["a"]
@@ -96,7 +96,7 @@ def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parque
     assert get_chart(project, before["a2"]) is not None
     assert [p["prompt"] for p in read_prompts(project, before["a2"])] == ["add avg"]
 
-    # Every rebuilt entry — including the from_catalog child — reloads.
+    # Every rebuilt entry — including the tracked_expr_from_alias child — reloads.
     for h in new_hashes:
         assert len(cached_result_expr(project, h).execute()) >= 0
 
@@ -117,7 +117,7 @@ def test_rebuild_dry_run_writes_nothing(project, orders_parquet):
 def test_rebuild_toposort_orders_parents_before_children(project, orders_parquet):
     rb = _load_rebuild()
     recipes = {
-        "child1": "from tallyman_xorq import from_catalog\nexpr = from_catalog('base')\n",
+        "child1": "from tallyman_xorq import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('base')\n",
         "base000child": "import xorq.api as xo\nexpr = xo.memtable({'a': [1]})\n",
     }
     # "base" alias points at the root hash; the child must sort after it.
@@ -132,7 +132,7 @@ def test_toposort_self_chaining_revise_resolves_to_prior_revision(project):
     rb = _load_rebuild()
     recipes = {
         "v1aaaaaaaaaa": "import xorq.api as xo\nexpr = xo.memtable({'x': [1]})\n",
-        "v2bbbbbbbbbb": "from tallyman_xorq import from_catalog\nexpr = from_catalog('a')\n",
+        "v2bbbbbbbbbb": "from tallyman_xorq import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('a')\n",
     }
     aliases = {"a": "v2bbbbbbbbbb"}  # latest is v2
     history = {"a": ["v1aaaaaaaaaa", "v2bbbbbbbbbb"]}

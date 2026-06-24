@@ -12,13 +12,13 @@ them head to head:
 ``TALLYMAN_SOURCE_IDENTITY`` env:
 
 - ``off`` (default): current behavior, path-identity only.
-- ``cas``: ``from_project`` reads through a content-addressed clone at
+- ``cas``: ``read_project_file`` reads through a content-addressed clone at
   ``data/.cas/<digest><suffix>``. The path xorq hashes then *is* the content
   identity, every xorq-level key (build hash, snapshot cache keys) becomes
   content-honest for free, and because the clone is a copy-on-write snapshot
   (APFS clonefile), an old entry's recompute still reads the bytes it was
   built from even after the user edits the source in place.
-- ``salt``: ``from_project`` records each source's digest during user-code
+- ``salt``: ``read_project_file`` records each source's digest during user-code
   import, and ``build_and_persist`` mixes the digests into the entry's
   ``content_hash``. Builds keep their human-readable ``data/`` paths, but
   xorq-level keys stay path-only — see ``result_cache`` for the snapshot-key

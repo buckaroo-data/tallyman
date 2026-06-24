@@ -41,7 +41,7 @@ Scenario map (each is independent; run one with -k):
     stat_swap            content swap preserving (mtime, size, inode)
     selfheal_after_edit  evicted result regenerated after the source changed
     reset_roundtrip      reset-to back/forward across built entries + caches
-    parent_regen         from_catalog chain after parent result regeneration
+    parent_regen         tracked_expr_from_alias chain after parent result regeneration
     wide_compile         cheap to execute, expensive to compile (deep DAG)
     heavy_execute        expensive to execute, cheap to compile (skewed self-join)
     sizing               results whose size defies structural intuition
@@ -173,7 +173,7 @@ def _warm_xorq_once(staged_data: Path) -> None:
     shutil.copy2(staged_data / "stations.parquet", dd / "stations.parquet")
     build_and_persist(
         "lab-warmup",
-        _prelude("lab-warmup") + 'expr = from_project("stations.parquet", project=_P).select("station_id")\n',
+        _prelude("lab-warmup") + 'expr = read_project_file("stations.parquet", project=_P).select("station_id")\n',
     )
     _WARMED = True
 
@@ -292,7 +292,8 @@ def md5_file(path: Path) -> str:
 
 def _prelude(project: str) -> str:
     return (
-        f"from tallyman_xorq.io import from_project, from_catalog\nimport xorq.vendor.ibis as ibis\n_P = {project!r}\n"
+        "from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, pinned_expr_from_alias\n"
+        f"import xorq.vendor.ibis as ibis\n_P = {project!r}\n"
     )
 
 
@@ -306,8 +307,8 @@ def treadmill_code(project: str, edit: int) -> str:
     """
     parts = [
         _prelude(project),
-        'trips = from_project("trips.parquet", project=_P)\n'
-        'stations = from_project("stations.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'stations = read_project_file("stations.parquet", project=_P)\n'
         "t = trips.filter(trips.start_station_id != trips.end_station_id)\n"
         "j = t.join(stations, t.start_station_id == stations.station_id)\n"
         "j = j.mutate(trip_minutes=(j.ended_at.cast('int64') - j.started_at.cast('int64')) / 60_000_000)\n",
@@ -350,8 +351,8 @@ def flow_imbalance_code(project: str) -> str:
     lineage, tiny (~600 row) result. The high-value cache archetype.
     """
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
-        'stations = from_project("stations.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'stations = read_project_file("stations.parquet", project=_P)\n'
         "t = trips.mutate(day=trips.started_at.truncate('D'))\n"
         "dep = t.group_by(['start_station_id', 'day']).aggregate(departures=t.ride_id.count())\n"
         "arr = t.group_by(['end_station_id', 'day']).aggregate(arrivals=t.ride_id.count())\n"
@@ -367,8 +368,8 @@ def flow_imbalance_code(project: str) -> str:
 def weather_mix_code(project: str) -> str:
     """Trips joined to hourly weather on the truncated hour, bucketed."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
-        'wx = from_project("weather.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'wx = read_project_file("weather.parquet", project=_P)\n'
         "t = trips.mutate(obs=trips.started_at.truncate('h'))\n"
         "j = t.join(wx, t.obs == wx.obs_hour)\n"
         "j = j.mutate(minutes=(j.ended_at.cast('int64') - j.started_at.cast('int64')) / 60_000_000)\n"
@@ -387,7 +388,7 @@ def od_matrix_code(project: str, order: str = "name") -> str:
         "none": "expr = od\n",
     }[order]
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "t = trips.filter(trips.start_station_id != trips.end_station_id)\n"
         "t = t.mutate(minutes=(t.ended_at.cast('int64') - t.started_at.cast('int64')) / 60_000_000)\n"
         "od = t.group_by(['start_station_name', 'end_station_name']).aggregate(\n"
@@ -398,7 +399,7 @@ def od_matrix_code(project: str, order: str = "name") -> str:
 def member_count_code(project: str) -> str:
     """Smallest honest aggregate; used where the scenario isn't about the expr."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "expr = trips.group_by('member_casual').aggregate(n=trips.ride_id.count())\n"
     )
 
@@ -406,8 +407,8 @@ def member_count_code(project: str) -> str:
 def utilization_code(project: str) -> str:
     """Trips-per-dock against the fixed-width capacity table (swap scenario)."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
-        'cap = from_project("capacity.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'cap = read_project_file("capacity.parquet", project=_P)\n'
         "g = trips.group_by('start_station_id').aggregate(n_starts=trips.ride_id.count())\n"
         "j = g.join(cap, g.start_station_id == cap.station_id)\n"
         "expr = j.select('start_station_id', 'n_starts', 'capacity',\n"
@@ -416,9 +417,9 @@ def utilization_code(project: str) -> str:
 
 
 def cleaned_trips_code(project: str) -> str:
-    """Parent of a from_catalog chain: filter + projection only (no join/agg/sort)."""
+    """Parent of a tracked_expr_from_alias chain: filter + projection only (no join/agg/sort)."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "t = trips.filter((trips.start_station_id != trips.end_station_id)\n"
         "                 & (trips.ended_at > trips.started_at))\n"
         "expr = t.select('ride_id', 'rideable_type', 'started_at', 'ended_at',\n"
@@ -428,7 +429,7 @@ def cleaned_trips_code(project: str) -> str:
 
 def child_of_catalog_code(project: str, parent_hash: str) -> str:
     return _prelude(project) + (
-        f"base = from_catalog({parent_hash!r}, project=_P)\n"
+        f"base = pinned_expr_from_alias({parent_hash!r}, project=_P)\n"
         "base = base.mutate(minutes=(base.ended_at.cast('int64') - base.started_at.cast('int64')) / 60_000_000)\n"
         "expr = base.group_by(['start_station_id', 'rideable_type']).aggregate(\n"
         "    n=base.ride_id.count(), avg_minutes=base.minutes.mean())\n"
@@ -442,7 +443,7 @@ def wide_compile_code(project: str, depth: int) -> str:
     in a loop without thinking about plan size.
     """
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "f = trips.mutate(minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000,\n"
         "                 hour=trips.started_at.hour())\n"
         "for h in range(24):\n"
@@ -466,7 +467,7 @@ def dock_contention_code(project: str) -> str:
     and the result is one row per station.
     """
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "week = trips.filter(trips.started_at < ibis.timestamp('2025-09-08 00:00:00'))\n"
         "a = week.select(sid='start_station_id', ride='ride_id', ts='started_at')\n"
         "b = week.view().select(sid2='start_station_id', ride2='ride_id', ts2='started_at')\n"
@@ -480,8 +481,8 @@ def event_annotate_code(project: str) -> str:
     """'Annotate each trip with its start station's maintenance events' —
     reads as an enrichment, is actually a row multiplier (~8 events/station)."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
-        'ev = from_project("events.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'ev = read_project_file("events.parquet", project=_P)\n'
         "j = trips.join(ev, trips.start_station_id == ev.station_id)\n"
         "expr = j.select('ride_id', 'start_station_id', 'started_at', 'member_casual',\n"
         "                'event_type', 'event_date', 'crew')\n"
@@ -491,7 +492,7 @@ def event_annotate_code(project: str) -> str:
 def groups_galore_code(project: str) -> str:
     """An Aggregate that barely reduces: group keys ≈ row identity."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "t = trips.mutate(day=trips.started_at.truncate('D'), hour=trips.started_at.hour(),\n"
         "                 minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000)\n"
         "expr = t.group_by(['start_station_id', 'end_station_id', 'day', 'hour']).aggregate(\n"
@@ -502,7 +503,7 @@ def groups_galore_code(project: str) -> str:
 def label_balloon_code(project: str) -> str:
     """Row-wise string assembly: output bytes balloon past the input's."""
     return _prelude(project) + (
-        'trips = from_project("trips.parquet", project=_P)\n'
+        'trips = read_project_file("trips.parquet", project=_P)\n'
         "t = trips.mutate(minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000)\n"
         "t = t.mutate(route_label=t.start_station_name.concat(' -> ').concat(t.end_station_name))\n"
         "t = t.mutate(trip_summary=t.member_casual.concat(' ').concat(t.rideable_type)\n"
@@ -513,7 +514,7 @@ def label_balloon_code(project: str) -> str:
 
 def distinct_tiny_code(project: str) -> str:
     return _prelude(project) + (
-        "trips = from_project(\"trips.parquet\", project=_P)\nexpr = trips.select('rideable_type').distinct()\n"
+        "trips = read_project_file(\"trips.parquet\", project=_P)\nexpr = trips.select('rideable_type').distinct()\n"
     )
 
 
@@ -755,7 +756,7 @@ def test_reset_roundtrip(lab):
 
 
 def test_parent_regen(lab):
-    """from_catalog chain identity across parent result regeneration — the
+    """tracked_expr_from_alias chain identity across parent result regeneration — the
     interaction the two ADRs have to get right together. If the regenerated
     parent result is not byte-identical, a content-keyed child forks; a
     stat-keyed child forks regardless (new inode)."""

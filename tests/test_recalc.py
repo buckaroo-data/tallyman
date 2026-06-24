@@ -31,24 +31,32 @@ from tallyman_xorq.staleness import scan
 
 def _base_code(project: str) -> str:  # root over orders.parquet
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price")
 """
 
 
 def _base_code_v2(project: str) -> str:  # a different graph → a new content hash, same source
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.select("region", "price").mutate(extra=1)
 """
 
 
-def _child_code(parent: str) -> str:  # from_catalog child (alias name or literal hash)
+def _child_code(alias: str) -> str:  # tracked child off an alias
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({alias!r})
+expr = t.mutate(doubled=t.price * 2)
+"""
+
+
+def _pinned_child_code(content_hash: str) -> str:  # pinned child off a specific hash
+    return f"""
+from tallyman_xorq.io import pinned_expr_from_alias
+t = pinned_expr_from_alias({content_hash!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
@@ -170,7 +178,7 @@ def test_hash_pinned_child_is_left_on_its_pin(project, orders_parquet, monkeypat
     a1 = _hash(catalog_create("a", _base_code(project)))
     # A literal-hash argument records follow=False — the child asked for THIS
     # revision, so a recalc that advances the alias must not advance the child.
-    b1 = _hash(catalog_create("b", _child_code(a1)))
+    b1 = _hash(catalog_create("b", _pinned_child_code(a1)))
 
     a2 = _hash(catalog_revise("a", _base_code_v2(project)))
     assert a2 != a1

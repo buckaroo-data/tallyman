@@ -29,24 +29,24 @@ from tallyman_xorq import build_and_persist
 
 def _code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _chain_parent_code(project: str) -> str:  # Aggregate → expensive → baked snapshot
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("orders.parquet", project={project!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _chain_child_code(parent: str) -> str:  # cheap child chaining off an expensive parent
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(total2=t.total * 2)
 """
 
@@ -341,7 +341,7 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
     to ``/load_expr``, so the buckaroo grid isn't empty on a cold compute cache.
 
     The build buckaroo replays embeds a *bare* read of an expensive parent's
-    snapshot (a ``from_catalog`` chain — #75 strips the parent ``CachedNode`` to
+    snapshot (a ``tracked_expr_from_alias`` chain — #75 strips the parent ``CachedNode`` to
     keep the composed expression on one backend). On a cold cache (fresh clone /
     not-yet-warmed entry) that read resolves to zero files, so the grid renders
     empty — the same zero-row symptom as the unexpanded-build_dir case above, a
@@ -358,7 +358,7 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _chain_parent_code(project))  # expensive parent (Aggregate)
-    catalog_create("chain", _chain_child_code("agg"))  # from_catalog child off it
+    catalog_create("chain", _chain_child_code("agg"))  # tracked_expr_from_alias child off it
     child_h = list_entries(project)[0]["content_hash"]  # most-recent build == chain
 
     # Cold start, as a fresh clone / not-yet-warmed entry has: evict every baked

@@ -92,7 +92,7 @@ def test_catalog_load_parquet_name_collision_rejected(project: str, orders_parqu
 
 
 def test_catalog_load_parquet_records_relative_path_only(project: str, orders_parquet, monkeypatch):
-    """The synthesized code uses `from_project(rel_path)` without an explicit
+    """The synthesized code uses `read_project_file(rel_path)` without an explicit
     project= arg, so a project rename wouldn't invalidate the build. (T-24.)"""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_load_parquet("orders.parquet")
@@ -100,4 +100,4 @@ def test_catalog_load_parquet_records_relative_path_only(project: str, orders_pa
 
     code = (entry_dir(project, out["hash"]) / "expr.py").read_text()
     assert "project=" not in code
-    assert "from_project('orders.parquet')" in code
+    assert "read_project_file('orders.parquet')" in code

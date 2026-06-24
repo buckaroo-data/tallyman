@@ -1,10 +1,10 @@
-"""Tier-B perf measurement of ``from_catalog`` chain-depth build/reconstruct cost (#82).
+"""Tier-B perf measurement of ``tracked_expr_from_alias`` chain-depth build/reconstruct cost (#82).
 
 Issue #82 (Stage 2 of the catalog-perf-reactive work, and the ADR's "Deep-chain
 build cost" open question) asks for a *number* on how much #74's composition path
-costs as a function of ``from_catalog`` chain depth.
+costs as a function of ``tracked_expr_from_alias`` chain depth.
 
-Pre-#74, ``from_catalog`` read the parent's materialised ``result.parquet`` as a
+Pre-#74, ``tracked_expr_from_alias`` read the parent's materialised ``result.parquet`` as a
 bare ``deferred_read_parquet`` — every entry truncated the graph at a parquet
 boundary, so build/reconstruct cost was depth-independent by construction. #74
 (and #104, which made ``cached_result_expr`` the *sole* read path) dropped that:
@@ -41,9 +41,9 @@ compute cache (recipe re-imported); warm = the ``_resolve_result_plan`` LRU is h
 reconstructed in the chain.
 
 Why a *synthetic* chain, not the parking corpus. The parking corpus is deep in
-*revisions*, not in ``from_catalog`` chaining (its deepest chain is ~4), so it
+*revisions*, not in ``tracked_expr_from_alias`` chaining (its deepest chain is ~4), so it
 can't sweep depth. Per #82 we build the chain explicitly via
-``catalog_create`` + ``from_catalog`` at parameterised depth, in an isolated temp
+``catalog_create`` + ``tracked_expr_from_alias`` at parameterised depth, in an isolated temp
 ``TALLYMAN_HOME``. The reconstruct/build cost (H1) is row-count-independent
 (it's graph construction), so a modest seed keeps the build fast; ``TALLYMAN_PERF_CHAIN_ROWS``
 raises it for a realistic execute denominator (H3).
@@ -142,32 +142,32 @@ def _count_cold_reads():
 
 def _root_code() -> str:  # cheap: parquet read + projection (no expensive op)
     return f"""
-from tallyman_xorq.io import from_project
-t = from_project("seed.parquet", project={PROJECT!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file("seed.parquet", project={PROJECT!r})
 expr = t.select("region", "price", "qty")
 """
 
 
-def _cheap_child_code(parent: str, i: int) -> str:  # cheap: row-wise mutate off a from_catalog parent
+def _cheap_child_code(parent: str, i: int) -> str:  # cheap: row-wise mutate off a pinned parent hash
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import pinned_expr_from_alias
+t = pinned_expr_from_alias({parent!r})
 expr = t.mutate(d{i}=t.price + {i})
 """
 
 
 def _expensive_code(parent: str) -> str:  # Aggregate → cache_worthy → bakes a snapshot (the truncating boundary)
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import pinned_expr_from_alias
+t = pinned_expr_from_alias({parent!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _cheap_over_expensive_code(parent: str) -> str:  # cheap leaf above the expensive boundary
     return f"""
-from tallyman_xorq.io import from_catalog
-t = from_catalog({parent!r})
+from tallyman_xorq.io import pinned_expr_from_alias
+t = pinned_expr_from_alias({parent!r})
 expr = t.mutate(total2=t.total * 2)
 """
 
@@ -185,11 +185,11 @@ def _build_corpus() -> dict:
     """Build both chain shapes in one project; return the hashes to measure.
 
     Shape A — an all-cheap chain ``a0 → a1 → … → aMAX`` (each ``ak`` is
-    ``from_catalog(a{k-1}).mutate(...)``). ``shape_a[k]`` is the entry at depth k.
+    ``tracked_expr_from_alias(a{k-1}).mutate(...)``). ``shape_a[k]`` is the entry at depth k.
 
     Shape B — for each measured depth k, an expensive ``Aggregate`` ``eb_k`` over
     shape A's ``ak`` (so the cheap chain ``a0..ak`` sits *below* the boundary),
-    then a cheap leaf ``lb_k = from_catalog(eb_k).mutate(...)`` *above* it.
+    then a cheap leaf ``lb_k = tracked_expr_from_alias(eb_k).mutate(...)`` *above* it.
     ``shape_b[k]`` is ``lb_k``. The H2 truncation test is whether ``shape_b[k]``'s
     *execute* stays flat as the cheap chain below the boundary deepens (k low→high) —
     it reads only the baked aggregate snapshot — while ``shape_a[k]`` (no boundary)
@@ -409,7 +409,7 @@ def _hypotheses(rows_a: list[dict], rows_b: list[dict]) -> list[str]:
 
 def _render(rows_a: list[dict], rows_b: list[dict]) -> str:
     L = [
-        "# tallyman from_catalog chain-depth perf report (#82)",
+        "# tallyman tracked_expr_from_alias chain-depth perf report (#82)",
         "",
         f"project `{PROJECT}` · seed {ROWS:,} rows · depths {DEPTHS}",
         "",

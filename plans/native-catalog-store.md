@@ -45,7 +45,7 @@ verify. Where reality diverged from the plan text:
   does **not** reproduce the old content hashes (the build pipeline + xorq
   serialization have moved, and the hash is sensitive to the absolute source
   path), so the rebuild remaps every hash-keyed artifact old→new, rewrites literal
-  `from_catalog(<hash>)` refs, and expands the persisted `${TALLYMAN_PROJECT_ROOT}`
+  `tracked_expr_from_alias(<hash>)` refs, and expands the persisted `${TALLYMAN_PROJECT_ROOT}`
   placeholder; alias-ref recipes survive untouched.
 
 ## Post-implementation hardening (bug-hunt pass, 2026-06-17)
@@ -79,7 +79,7 @@ test-first:
 Out of scope (pre-existing, filed for separate decision, **not** fixed here):
 reset-then-recheckpoint skips a step number and orphans the future-step tag;
 `build_and_persist(project=X)` doesn't anchor X for the recipe's ambient
-`project_path`/`from_catalog` resolution; `label_step` accepts `main` (the pinned
+`project_path`/`tracked_expr_from_alias` resolution; `label_step` accepts `main` (the pinned
 branch name); `version_of_hash`/`previous_version` use first-match `list.index`;
 corrupt tracked JSON surfaces as a bare HTTP 500.
 
@@ -154,7 +154,7 @@ After this PR, tallyman code touches xorq's catalog **never**:
 The honest boundary: this severs the *catalog*, not the *engine*. Entry contents
 are still xorq build artifacts (`build_expr`/`load_expr` produce the dir we zip;
 `vendor.ibis` runs it), all catalog-free. The one asterisk on "never": a
-`from_catalog` reconstruction re-execs a recipe whose `import xorq.api as xo`
+`tracked_expr_from_alias` reconstruction re-execs a recipe whose `import xorq.api as xo`
 *passively loads* (never calls) the catalog package — see Decision D4.
 
 ## Confirmed facts the design rests on
@@ -163,7 +163,7 @@ are still xorq build artifacts (`build_expr`/`load_expr` produce the dir we zip;
    `_tracked_recipe_hashes` (`catalog_state.py:433`), which reads *names* via
    `git ls-files`. `load_expr` consumes the expanded build *dir*, never the
    archive. So the zip format is entirely ours.
-2. **Two load paths read different files.** `from_catalog`/chaining
+2. **Two load paths read different files.** `tracked_expr_from_alias`/chaining
    (`cached_result_expr` → `_recipe_expr`, `result_cache.py:148`) re-imports
    `entry_dir/expr.py`; the Buckaroo viewer (`load_entry`) reads
    `entry_dir/xorq_build/`. Both `expr.py` and `xorq_build/` must therefore be in
@@ -372,7 +372,7 @@ output order isn't deterministic).
 - **D3 — archive scope:** the recipe allowlist `{expr.py, xorq_build/,
   schema.json, manifest.json}` as one immutable zip (fixes the wrong-artifact
   durability gap from fact 2). **`expr.py` is durable, not regenerated from
-  `xorq_build/`.** The `from_catalog` chaining path re-execs it so a cheap entry's
+  `xorq_build/`.** The `tracked_expr_from_alias` chaining path re-execs it so a cheap entry's
   recompute expression roots on the *shared* in-process backend and two entries
   `union`/`join` on one backend (#75). Reconstructing the way xorq's own catalog
   does — `load_expr` per entry — gives each its *own* backend and raises
@@ -446,7 +446,7 @@ output order isn't deterministic).
 | 10 | Existing corpus is #48-inconsistent; two zip formats coexist | Low | Rebuild from scratch (project rule). |
 | 11 | Deterministic-archive claim untested — a defaulted `ZipInfo` mtime silently re-churns the content-addressed git blob on every rebuild | High | `test_recipe_zip_byte_stable_across_rebuilds` (commit 1b): build the same code twice, assert byte-identical archives. |
 | 12 | Zip-member allowlist is the "only guard against leak" but lives only as D3 prose; a denylist impl that skips today's three known names passes existence checks yet leaks a future artifact | High | `test_recipe_zip_members_are_allowlist` (commit 1b): assert `namelist()` equals exactly the four members; reject an unknown `foo.bin`. (Distinct surface from `test_unlisted_path_not_tracked`, which guards the git-tracked repo root, not the zip bytes.) |
-| 13 | D3 half (b) — `expr.py`-via-zip durability for chaining — untested in the gating suite; the only `reset`+`from_catalog` file is marker-deselected (`pyproject.toml:77`), so a `load_expr`-per-entry refactor would pass the fast suite and silently break chaining | High | `test_two_entries_union_after_reset` + `test_recipe_zip_contains_expr_py` (commit 1b), carrying **no** `integration`/`cache_lab`/`perf` marker. |
+| 13 | D3 half (b) — `expr.py`-via-zip durability for chaining — untested in the gating suite; the only `reset`+`tracked_expr_from_alias` file is marker-deselected (`pyproject.toml:77`), so a `load_expr`-per-entry refactor would pass the fast suite and silently break chaining | High | `test_two_entries_union_after_reset` + `test_recipe_zip_contains_expr_py` (commit 1b), carrying **no** `integration`/`cache_lab`/`perf` marker. |
 | 14 | `display_configs` is the one decomposed section with no survives-reset test today; its only coverage is the capture/materialize round-trip tests step 4 deletes | Med | `test_display_config_survives_reset` (commit 1b) — new reset test so net coverage doesn't regress. |
 | 15 | Commit-1 failing-first is internally inconsistent with the TDD rule: some named tests fail by collection error (`test_unlisted_path_not_tracked` → missing API), false-green (`test_uses_no_subprocess` build path swallowed at `build.py:477-478`; `test_prompt_history_survives_reset` survives via bullpen until step-3 `.gitignore`) | High | Split into commit 1a (assertion-red today) and 1b (lands API/`.gitignore` stubs in-commit); build-path guard asserts `spy.call_count == 0`, scoped to the xorq argv (exempt the `cp -c` clone at `source_identity.py:111`). |
 
@@ -501,7 +501,7 @@ before relying on any `subprocess.run` monkeypatch.
      once `entries/*/` is gitignored (pre-staged in this commit); the loose
      `entry_dir/prompts.jsonl` is then lost on reset. (Verify the bullpen copytree
      does not otherwise preserve it before relying on this.)
-   - `test_two_entries_union_after_reset` — two `from_catalog` entries `union` after a
+   - `test_two_entries_union_after_reset` — two `tracked_expr_from_alias` entries `union` after a
      `reset_to` that restores `expr.py` from the zip only (D3 half (b)). **Carries no
      `integration`/`cache_lab`/`perf` marker** — CI runs bare `uv run pytest` and
      deselects those (`pyproject.toml:77`), so a marked test would share the existing

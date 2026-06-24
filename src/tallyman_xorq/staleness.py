@@ -1,7 +1,7 @@
 """Decide whether a catalog entry is stale relative to its recorded inputs (#89).
 
 Everything the consumer needs is already captured at build: ``manifest.parents``
-(the resolved ``from_catalog`` edges and their read-intent) and
+(the resolved ``tracked_expr_from_alias`` edges and their read-intent) and
 ``manifest.sources`` (each source's content digest). Nothing reads it. This is
 the read-only half — no recompute — of the reactive consumer: compare the
 recorded inputs against the current world and report what moved.
@@ -29,11 +29,9 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 
 from tallyman_core import aliases
-from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import entry_dir
 from tallyman_xorq import source_identity
 from tallyman_xorq.build import list_entries
-from tallyman_xorq.dependents import descendant_cone
+from tallyman_xorq.dependents import descendant_cone, parents_of, sources_of
 from tallyman_xorq.io import ProjectDataNotFound, project_path
 
 # digest_for memoizes on (mtime_ns, size, inode); a same-stat in-place content
@@ -74,13 +72,17 @@ def _force_source_rehash():
 
 
 def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
-    """Whether *content_hash*'s own recorded inputs have moved (read-only)."""
-    manifest = read_manifest(entry_dir(project, content_hash))
+    """Whether *content_hash*'s own recorded inputs have moved (read-only).
+
+    Both axes read through the ``dependents`` manifest reader (``parents_of`` /
+    ``sources_of``) rather than the raw manifest, so that module stays the single
+    seam over the recorded DAG.
+    """
     reasons: list[StaleReason] = []
     unknown: list[str] = []
 
     # Axis 1: a followed alias advanced past the recorded head.
-    for parent in manifest.parents or []:
+    for parent in parents_of(project, content_hash):
         if not parent.follow:
             continue  # a hash pin is never stale on this axis
         head = aliases.get_alias(project, parent.ref)
@@ -90,11 +92,12 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
             reasons.append(StaleReason(axis="alias", ref=parent.ref, was=parent.hash, now=head))
 
     # Axis 2: a recorded source drifted on disk.
-    if manifest.sources is None:
+    sources = sources_of(project, content_hash)
+    if sources is None:
         unknown.append("source")  # built under mode=off; the axis is unavailable
     else:
         with _force_source_rehash():
-            for rel_path, recorded in manifest.sources.items():
+            for rel_path, recorded in sources.items():
                 try:
                     current = source_identity.digest_for(project, project_path(rel_path, project))
                 except ProjectDataNotFound:

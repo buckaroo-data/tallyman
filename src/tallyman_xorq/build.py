@@ -480,21 +480,35 @@ def build_and_persist(
             # arithmetic / UDF would never evaluate at build, committing + aliasing a
             # broken entry that throws only on the first materialising read. Stream
             # the full result and discard it to force row-level evaluation at author
-            # time (constant memory; the one pass also yields the exact row count).
-            from tallyman_xorq.result_cache import count_and_result_digest, result_digest  # noqa: PLC0415
+            # time (constant memory; the one pass yields the exact row count).
+            #
+            # result_digest (ADR adr-result-digest-canonical-ordering): for worthy
+            # entries the baked snapshot is sorted by original_row_order before
+            # materialisation, so its bytes are deterministic run-to-run and we
+            # hash the file directly (cheap, ~0.3s). Cheap entries record no digest
+            # — their result has no snapshot to hash.
+            from tallyman_xorq.result_cache import snapshot_file_digest, stream_row_count  # noqa: PLC0415
 
             t0 = time.monotonic()
             try:
                 arrow_schema = loaded.schema().to_pyarrow()
                 if cache_worthy_v:
+                    # Sort by original_row_order (if present) before baking so the
+                    # snapshot bytes are canonical and the file hash is stable.
+                    snap_expr = loaded
+                    if "original_row_order" in [f.name for f in loaded.schema().to_pyarrow()]:
+                        snap_expr = loaded.order_by("original_row_order")
                     # count() bakes the snapshot (the cache node forces full
-                    # materialisation); digest the baked result as the #83 axis.
-                    row_count = int(loaded.count().execute())
-                    result_digest_v = result_digest(loaded)
+                    # materialisation); then hash the baked file for the digest.
+                    row_count = int(snap_expr.count().execute())
+                    snap_path = _cached_node_path(snap_expr)
+                    result_digest_v: str | None = snapshot_file_digest(snap_path) if snap_path and snap_path.exists() else None
                 else:
-                    # One streaming pass forces row-level evaluation, counts, and
-                    # digests the executed bytes (#83) — no extra execution.
-                    row_count, result_digest_v = count_and_result_digest(loaded)
+                    # Stream full result to force row-level evaluation (catch a
+                    # failing cast / arithmetic at build time) and count rows.
+                    # No digest for cheap entries — no snapshot to hash.
+                    row_count = stream_row_count(loaded)
+                    result_digest_v = None
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc

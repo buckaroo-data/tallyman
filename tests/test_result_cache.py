@@ -626,55 +626,80 @@ def _overwrite_orders(project: str, seed: int) -> None:
 
 
 def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch):
-    # #83: every build records a result_digest — a content digest of the executed
-    # bytes, the second identity axis the structural content_hash can't see. It is
-    # recorded for cheap and expensive entries alike and is stable: the same recipe
-    # over the same source digests identically run-to-run.
+    # ADR adr-result-digest-canonical-ordering: worthy entries record a result_digest
+    # (SHA-256 of the baked snapshot file bytes, stable run-to-run because the
+    # snapshot is sorted by original_row_order before baking). Cheap entries record
+    # no digest — they have no snapshot to hash.
     from tallyman_core import entry_dir, read_manifest
-    from tallyman_xorq.result_cache import cached_result_expr, result_digest
+    from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
 
-    for name, code in (("proj", _project_code(project)), ("agg", _agg_code(project))):
-        catalog_create(name, code)
-        h = _hash_of(project)
-        digest = read_manifest(entry_dir(project, h)).result_digest
-        assert digest, f"{name} entry recorded no result_digest"
-        # Recomputing the same entry's result hashes to the recorded digest.
-        cached_result_expr.cache_clear()
-        assert result_digest(cached_result_expr(project, h)) == digest
+    # Worthy entry (Aggregate): must record a digest equal to the snapshot file hash.
+    catalog_create("agg", _agg_code(project))
+    h = _hash_of(project)
+    digest = read_manifest(entry_dir(project, h)).result_digest
+    assert digest, "worthy entry recorded no result_digest"
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    assert snapshot_file_digest(snap) == digest, "recorded digest does not match snapshot file hash"
+
+    # Cheap entry (projection only): must record NO digest.
+    catalog_create("proj", _project_code(project))
+    h2 = _hash_of(project)
+    cheap_digest = read_manifest(entry_dir(project, h2)).result_digest
+    assert not cheap_digest, f"cheap entry unexpectedly recorded result_digest: {cheap_digest!r}"
 
 
 def test_verify_result_faithful_true_for_deterministic_entry(project, orders_parquet, monkeypatch):
-    # #83: a deterministic entry's served bytes match its build-time digest, so the
-    # faithfulness predicate is True. None would mean "no digest recorded"; False
-    # would mean drift — neither is right for a clean entry.
+    # ADR adr-result-digest-canonical-ordering: for a worthy (snapshot-baking) entry,
+    # verify_result_faithful compares the snapshot file's SHA-256 to the recorded
+    # digest and returns True for a clean, deterministic build. A cheap entry records
+    # no digest, so verify_result_faithful returns None for it.
     from tallyman_xorq.result_cache import verify_result_faithful
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("proj", _project_code(project))
+
+    # Worthy entry: digest recorded at build; verify_result_faithful checks the file.
+    catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
     assert verify_result_faithful(project, h) is True
 
+    # Cheap entry: no digest recorded; verify_result_faithful returns None.
+    catalog_create("proj", _project_code(project))
+    h2 = _hash_of(project)
+    assert verify_result_faithful(project, h2) is None
 
-def test_verify_result_faithful_detects_recompute_drift(project, orders_parquet, monkeypatch):
-    # #83: the soundness hole. A cheap entry recomputes on read; if its source
-    # drifts under it, the recompute serves different bytes under the SAME
-    # content_hash — invisible to the structural hash. The result_digest catches
-    # it: verify_result_faithful flips True -> False once the bytes change.
-    from tallyman_xorq.result_cache import cached_result_expr, verify_result_faithful
+
+def test_verify_result_faithful_detects_snapshot_drift(project, orders_parquet, monkeypatch):
+    # ADR adr-result-digest-canonical-ordering: verify_result_faithful checks the
+    # baked snapshot file's SHA-256 against the recorded digest. For a worthy entry
+    # whose snapshot has been tampered with (bytes differ from build time), it
+    # returns False. A cheap entry always returns None (no digest recorded).
+    from tallyman_xorq.result_cache import baked_snapshot_path, verify_result_faithful
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("proj", _project_code(project))
+
+    # Worthy entry: starts faithful.
+    catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
     assert verify_result_faithful(project, h) is True
 
-    _overwrite_orders(project, seed=1)  # recompute now reads different bytes
-    cached_result_expr.cache_clear()
+    # Overwrite the snapshot with garbage bytes — the file hash now differs.
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    snap.write_bytes(b"corrupted")
     assert verify_result_faithful(project, h) is False
+
+    # Cheap entry: always None, even after source change.
+    catalog_create("proj", _project_code(project))
+    h2 = _hash_of(project)
+    assert verify_result_faithful(project, h2) is None
+    _overwrite_orders(project, seed=1)
+    assert verify_result_faithful(project, h2) is None
 
 
 def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkeypatch, caplog):
@@ -1291,38 +1316,26 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
     assert cached_result_expr.cache_info().currsize == 0
 
 
-def test_result_digest_is_framing_independent_and_order_sensitive(project, orders_parquet, monkeypatch):
-    # #83: the digest hashes row tuples in order, not the arrow IPC framing, so two
-    # reads that batch differently agree — but it IS sensitive to row order, because
-    # an unordered query that reshuffles produces different materialised bytes, which
-    # is real drift, not a false positive.
-    from tallyman_xorq.result_cache import _digest_init, _digest_update, cached_result_expr, result_digest
+def test_result_digest_is_snapshot_file_hash(project, orders_parquet, monkeypatch):
+    # ADR adr-result-digest-canonical-ordering: the result_digest for a worthy entry
+    # is the SHA-256 of the baked snapshot file bytes (not a per-row repr() hash).
+    # It equals snapshot_file_digest(baked_snapshot_path(...)) and is stable because
+    # the snapshot is sorted by original_row_order before baking.
+    from tallyman_core import entry_dir, read_manifest
+    from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("proj", _project_code(project))
+    catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
 
-    expr = cached_result_expr(project, h)
-    base = result_digest(expr)
+    recorded = read_manifest(entry_dir(project, h)).result_digest
+    assert recorded, "worthy entry must record a result_digest"
 
-    # Framing independence: digest the SAME rows re-batched at two different chunk
-    # sizes and assert equality — the digest must hash row tuples, not IPC framing.
-    tbl = expr.to_pyarrow()
-
-    def _digest_at(chunk):
-        hh = _digest_init(expr.schema())
-        for b in tbl.to_batches(max_chunksize=chunk):
-            _digest_update(hh, b)
-        return hh.hexdigest()
-
-    assert _digest_at(7) == _digest_at(50) == base
-
-    # Order sensitivity: reversing the row order changes the digest (real drift —
-    # an unordered reshuffle materialises different bytes, not a false positive).
-    first_col = list(expr.schema().names)[0]
-    reordered = expr.order_by([expr[first_col].desc()])
-    assert result_digest(reordered) != base
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    # The recorded digest must equal the file hash, not a per-row repr() hash.
+    assert snapshot_file_digest(snap) == recorded
 
 
 def _literal_nondeterministic_code(project: str) -> str:
@@ -1404,3 +1417,70 @@ def test_self_heal_warning_labels_structural_for_baked_literal(project, orders_p
     assert len(df) > 0
     msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
     assert any("UNFAITHFUL" in m and h in m and "structural (#88)" in m for m in msgs), msgs
+
+
+# ---------------------------------------------------------------------------
+# ADR adr-result-digest-canonical-ordering — new contract tests
+# ---------------------------------------------------------------------------
+
+
+def test_cheap_entry_records_no_digest(project, orders_parquet, monkeypatch):
+    # ADR adr-result-digest-canonical-ordering: a cheap entry (no Aggregate/Join/Sort/UDF)
+    # bakes no snapshot, so there is nothing to hash. The manifest must record no
+    # result_digest (None / falsy).
+    from tallyman_core import entry_dir, read_manifest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("proj", _project_code(project))
+    h = _hash_of(project)
+    assert not read_manifest(entry_dir(project, h)).result_digest, (
+        "cheap entry must record no result_digest"
+    )
+
+
+
+def _ordered_agg_code(project: str) -> str:
+    # Aggregate + explicit order_by: the output is fully deterministic run-to-run.
+    # original_row_order is present in the raw read but is aggregated away, so the
+    # sort-before-bake in build.py does not apply; the explicit order_by stabilises
+    # the snapshot bytes instead, which is fine — Sort adds a Sort op making it
+    # expensive/worthy regardless.
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count()).order_by("region")
+"""
+
+
+def test_result_digest_stable_run_to_run(project, orders_parquet, monkeypatch):
+    # ADR adr-result-digest-canonical-ordering: the result_digest for a worthy entry
+    # with a deterministic (explicitly ordered) result is stable across two independent
+    # materialisations. Uses an explicitly-ordered aggregate (Sort op) so the snapshot
+    # bytes are deterministic and the file hash should be identical on self-heal.
+    from tallyman_core import entry_dir, read_manifest
+    from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+
+    catalog_create("agg_ord", _ordered_agg_code(project))
+    h = _hash_of(project)
+    digest1 = read_manifest(entry_dir(project, h)).result_digest
+    assert digest1, "worthy entry must record a result_digest"
+
+    # Delete the snapshot and self-heal to get a second materialisation.
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    snap.unlink()
+
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    cached_result_expr.cache_clear()
+    cached_result_expr(project, h).execute()  # forces self-heal → rematerialises snapshot
+
+    assert snap.exists(), "self-heal must rematerialise the snapshot"
+    digest2 = snapshot_file_digest(snap)
+    assert digest2 == digest1, (
+        f"result_digest changed between materialisations: {digest1!r} vs {digest2!r}"
+    )

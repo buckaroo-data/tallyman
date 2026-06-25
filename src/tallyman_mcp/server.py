@@ -1549,6 +1549,9 @@ def main() -> None:
         level=os.environ.get("TALLYMAN_LOG_LEVEL", "INFO"),
         format="[%(name)s] %(message)s",
     )
+    from tallyman_core.version import git_revision  # noqa: PLC0415
+
+    log.info("tallyman_mcp revision %s", git_revision())
     mcp.run()
 
 

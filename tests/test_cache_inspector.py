@@ -45,6 +45,14 @@ expr = t.select("region", "price")
 """
 
 
+def _child_code(project: str, parent: str) -> str:  # tracked_expr_from_alias → records a parent edge
+    return f"""
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r}, project={project!r})
+expr = t.mutate(double=t.total * 2)
+"""
+
+
 def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
@@ -261,3 +269,31 @@ def test_entry_cache_unknown_hash_404_malformed_400(fresh_companion_app, project
     assert c.get(f"/{project}/api/entry_cache/deadbeef").status_code == 404
     # Non-hex, non-alias → 400, matching the other alias-or-hash entry routes.
     assert c.get(f"/{project}/api/entry_cache/NOPE-not-a-hash").status_code == 400
+
+
+def test_entry_cache_lineage_and_enrichment(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # #134: the metadata tab links the entry's parents and dependent children and
+    # carries source-size / last-modified / cheap-vs-expensive enrichment.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    base = catalog_create("base", _agg_code(project))  # root: reads orders.parquet
+    child = catalog_create("base_child", _child_code(project, "base"))  # tracked edge → base
+    base_h = base["hash"]
+    child_h = child["hash"]
+
+    c = TestClient(fresh_companion_app)
+
+    # The child links up to its parent (by hash, with the alias resolved).
+    child_meta = c.get(f"/{project}/api/entry_cache/{child_h}").json()
+    assert base_h in {p["hash"] for p in child_meta["parents"]}
+    assert any(p["alias"] == "base" for p in child_meta["parents"])
+
+    # The parent links down to its dependent child (reverse index).
+    base_meta = c.get(f"/{project}/api/entry_cache/{base_h}").json()
+    assert child_h in {ch["hash"] for ch in base_meta["children"]}
+
+    # Enrichment fields are present and typed.
+    assert isinstance(base_meta["source_tracked"], bool)
+    assert isinstance(base_meta["sources"], list)
+    assert "cache_worthy_why" in base_meta
+    assert "modified_at" in base_meta
+    assert "source_formatted" in base_meta

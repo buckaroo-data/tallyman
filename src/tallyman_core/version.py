@@ -12,8 +12,9 @@ bakes its build-time revision and warns when the two disagree.
 from __future__ import annotations
 
 import functools
-import subprocess
 from pathlib import Path
+
+from tallyman_core.git_util import run_git
 
 # version.py lives at <repo>/src/tallyman_core/version.py.
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -27,20 +28,20 @@ def git_revision() -> str:
     actually running, not wherever ``HEAD`` moves later in the process's life.
     ``git describe --always --dirty`` yields the abbreviated commit, suffixed
     ``-dirty`` when there are *tracked* working-tree changes (untracked files are
-    ignored, so a stray scratch file doesn't flag drift). Returns ``"unknown"``
-    when git or the repo isn't available — versioning must never break a start.
+    ignored, so a stray scratch file doesn't flag drift). Routed through
+    ``git_util.run_git`` (fork-safe ``posix_spawn``, the sanctioned primitive —
+    no bare ``subprocess`` git in src/). Returns ``"unknown"`` when git or the
+    repo isn't available — versioning must never break a start.
     """
     try:
-        out = subprocess.run(
-            ["git", "-C", str(_REPO_ROOT), "describe", "--always", "--dirty", "--abbrev=7"],
-            capture_output=True,
-            text=True,
-            timeout=2,
-            check=True,
-        ).stdout.strip()
-    except (OSError, subprocess.SubprocessError):
+        rc, out, _ = run_git(
+            ["describe", "--always", "--dirty", "--abbrev=7"],
+            cwd=_REPO_ROOT,
+            timeout=2.0,
+        )
+    except OSError:
         return "unknown"
-    return out or "unknown"
+    return out if (rc == 0 and out) else "unknown"
 
 
 def version_info() -> dict:

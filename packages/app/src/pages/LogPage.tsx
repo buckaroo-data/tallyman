@@ -28,7 +28,7 @@ function fmtTime(ts: string): string {
 function summarize(e: LogEvent): string {
   switch (e.kind) {
     case "build_error":
-      return `build failed · ${e.tool ?? "?"} · ${(e.message ?? "").split("\n")[0].slice(0, 120)}`;
+      return `build failed · ${e.tool ?? "?"} · ${(e.message ?? "").split("\n")[0]}`;
     case "build_ok":
       return `ran · ${e.tool ?? "?"}${e.hash ? ` · ${e.hash.slice(0, 12)}` : ""}`;
     case "alias_set":
@@ -41,7 +41,7 @@ function summarize(e: LogEvent): string {
 }
 
 function hasDetail(e: LogEvent): boolean {
-  return Boolean(e.code || e.prompt || e.traceback || e.detail || e.load_ms != null || e.hash);
+  return Boolean(e.code || e.prompt || e.traceback || e.detail || e.message || e.load_ms != null || e.hash);
 }
 
 export function LogPage() {
@@ -130,10 +130,21 @@ export function LogPage() {
               const detail = hasDetail(e);
               return (
                 <li key={key} className={`log-row kind-${e.kind}`}>
-                  <button
-                    type="button"
+                  <div
                     className="log-head"
-                    onClick={() => detail && toggleExpand(key)}
+                    role={detail ? "button" : undefined}
+                    tabIndex={detail ? 0 : undefined}
+                    aria-expanded={detail ? open : undefined}
+                    onClick={() => {
+                      // Don't toggle if the user is selecting text to copy.
+                      if (detail && !window.getSelection()?.toString()) toggleExpand(key);
+                    }}
+                    onKeyDown={(ev) => {
+                      if (detail && (ev.key === "Enter" || ev.key === " ")) {
+                        ev.preventDefault();
+                        toggleExpand(key);
+                      }
+                    }}
                     style={{ cursor: detail ? "pointer" : "default" }}
                   >
                     <span className="log-time">{fmtTime(e.ts)}</span>
@@ -152,7 +163,7 @@ export function LogPage() {
                     ) : null}
                     <span className="log-summary">{summarize(e)}</span>
                     {detail && <span className="log-caret">{open ? "▾" : "▸"}</span>}
-                  </button>
+                  </div>
                   {open && (
                     <div className="log-detail">
                       {e.prompt && (
@@ -172,10 +183,16 @@ export function LogPage() {
                           {e.load_expr_ms != null && ` · ${e.load_expr_ms}ms load_expr`}
                         </div>
                       )}
+                      {e.message && (
+                        <>
+                          <div className="meta">message</div>
+                          <pre className="code log-message">{e.message}</pre>
+                        </>
+                      )}
                       {e.code && (
                         <>
                           <div className="meta">code</div>
-                          <pre className="code">{e.code}</pre>
+                          <pre className="code log-message">{e.code}</pre>
                         </>
                       )}
                       {e.traceback && (
@@ -183,6 +200,12 @@ export function LogPage() {
                           <div className="meta">traceback</div>
                           <pre className="code log-traceback">{e.traceback}</pre>
                         </>
+                      )}
+                      {e.kind === "build_error" && !e.traceback && (
+                        <div className="meta">
+                          no stacktrace stored for this build — full tracebacks are captured only for
+                          failures recorded after the activity-log change; this one predates it.
+                        </div>
                       )}
                     </div>
                   )}

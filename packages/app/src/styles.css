@@ -562,3 +562,28 @@ table.cache-table .muted { color: var(--muted); }
 .cache-lineage h4 { margin: 0 0 4px; }
 .lineage-list { margin: 0; padding-left: 18px; }
 .lineage-list li { margin: 2px 0; }
+
+/* project activity log */
+.log-page { max-width: 1100px; }
+.log-filters { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 12px; }
+.log-filters .chip { background: var(--panel); border: 1px solid var(--line); color: var(--muted); border-radius: 12px; padding: 2px 10px; font: inherit; font-size: 12px; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; }
+.log-filters .chip.on { color: var(--fg); border-color: var(--accent); background: var(--accent-soft); }
+.log-sep { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+.session-dot { width: 8px; height: 8px; border-radius: 50%; display: inline-block; }
+.log-list { list-style: none; margin: 0; padding: 0; }
+.log-row { border-bottom: 1px solid var(--line); }
+.log-head { width: 100%; background: none; border: none; color: inherit; font: inherit; text-align: left; display: flex; align-items: center; gap: 10px; padding: 5px 4px; }
+.log-head:hover { background: var(--accent-soft); }
+.log-time { color: var(--muted); font-family: ui-monospace, monospace; font-size: 12px; flex-shrink: 0; }
+.cat-badge { font-size: 11px; border-radius: 3px; padding: 1px 6px; flex-shrink: 0; white-space: nowrap; }
+.cat-badge.cat-mcp { background: #2d3a4f; color: #9ec5ff; }
+.cat-badge.cat-alias { background: #2f4030; color: #9fe0a6; }
+.cat-badge.cat-buckaroo { background: #4a3a2a; color: #e0b07e; }
+.kind-build_error .cat-badge { background: #5a1e1e; color: #ffb4b4; }
+.session-badge { font-size: 11px; border: 1px solid; border-radius: 3px; padding: 0 5px; flex-shrink: 0; font-family: ui-monospace, monospace; }
+.session-badge.muted { color: var(--muted); border-color: var(--line); }
+.log-summary { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; font-size: 13px; }
+.log-caret { color: var(--muted); flex-shrink: 0; }
+.log-detail { padding: 6px 12px 12px 28px; }
+.log-prompt { margin-bottom: 6px; }
+.log-traceback { color: #ffd9d9; background: #2a1818; max-height: 360px; overflow: auto; }

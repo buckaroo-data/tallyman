@@ -7,6 +7,7 @@ import { CatalogPage } from "./pages/CatalogPage";
 import { NotebookPage } from "./pages/NotebookPage";
 import { DiffPage } from "./pages/DiffPage";
 import { CachePage } from "./pages/CachePage";
+import { LogPage } from "./pages/LogPage";
 import { EmptyStatePage } from "./pages/EmptyStatePage";
 import { ProjectsPage } from "./pages/ProjectsPage";
 import { api } from "./api";
@@ -51,6 +52,7 @@ export default function App() {
                 <Route path="errors/:errorId" element={<CatalogPage />} />
                 <Route path="notebook" element={<NotebookPage />} />
                 <Route path="cache" element={<CachePage />} />
+                <Route path="log" element={<LogPage />} />
                 <Route path="diff/:alias" element={<DiffPage />} />
                 <Route path="diff/:alias/:va/:vb" element={<DiffPage />} />
                 <Route path="*" element={<Navigate to="catalog" replace />} />

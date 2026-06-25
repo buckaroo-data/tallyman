@@ -3,6 +3,7 @@ import type {
   AppError,
   EntryDetail,
   EntryCache,
+  ActivityLog,
   SessionResult,
   NotebookFull,
   DiffData,
@@ -62,6 +63,14 @@ export const api = {
 
   entryCache: (project: string, hash: string): Promise<EntryCache> =>
     get(`/${project}/api/entry_cache/${hash}`),
+
+  log: (project: string, opts?: { categories?: string[]; sessions?: string[] }): Promise<ActivityLog> => {
+    const p = new URLSearchParams();
+    if (opts?.categories?.length) p.set("categories", opts.categories.join(","));
+    if (opts?.sessions?.length) p.set("sessions", opts.sessions.join(","));
+    const qs = p.toString();
+    return get(`/${project}/api/log${qs ? `?${qs}` : ""}`);
+  },
 
   diskUsage: (project: string): Promise<{ formatted: Record<string, string> }> =>
     get(`/${project}/api/disk_usage`),

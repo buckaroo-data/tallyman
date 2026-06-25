@@ -224,6 +224,39 @@ export interface SessionResult {
   detail: string;
 }
 
+export interface LogEvent {
+  ts: string;
+  kind: "build_ok" | "build_error" | "alias_set" | "buckaroo" | string;
+  category: "mcp" | "alias" | "buckaroo" | string;
+  session?: string | null;
+  origin?: string | null;
+  tool?: string | null;
+  alias?: string | null;
+  version?: number | null;
+  hash?: string | null;
+  prompt?: string | null;
+  code?: string | null;
+  message?: string | null;
+  traceback?: string | null;
+  status?: string | null;
+  detail?: string | null;
+  error_id?: string | null;
+  load_ms?: number | null;
+  load_expr_ms?: number | null;
+}
+
+export interface LogSession {
+  session: string;
+  count: number;
+  last_ts: string;
+}
+
+export interface ActivityLog {
+  project: string;
+  events: LogEvent[];
+  sessions: LogSession[];
+}
+
 export interface Projects {
   active: string | null;
   available: string[];

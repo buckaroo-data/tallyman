@@ -838,13 +838,13 @@ def create_app(
         from tallyman_core.display_configs import get_display_config  # noqa: PLC0415
 
         display_config = get_display_config(project, content_hash)
-        column_config_overrides = (display_config or {}).get("column_config_overrides")
 
-        buckaroo_session = (
-            buckaroo.ensure_session(content_hash, project, column_config_overrides=column_config_overrides)
-            if buckaroo
-            else None
-        )
+        # The Buckaroo session is loaded lazily by the SPA via GET
+        # /api/session/{hash}, so the detail request never blocks on the snapshot
+        # bake + /load_expr POST — that synchronous path was the multi-minute
+        # hang in #133. The payload stays metadata-only; buckaroo_session is kept
+        # for shape compatibility (always None now).
+        buckaroo_session = None
         buckaroo_ws_base = buckaroo.ws_base_url if buckaroo and buckaroo.is_running else None
 
         # #73: row count comes from the manifest, not a result.parquet (cheap
@@ -891,13 +891,27 @@ def create_app(
 
     @app.get("/{project}/api/session/{content_hash}")
     def get_session(project: str, content_hash: str):
+        """Load the Buckaroo session for an entry, with a typed status.
+
+        Returns ``{"status", "ws_url", "detail"}`` (#133): ``ok`` carries the
+        ws_url; ``timeout``/``error``/``unavailable``/``no_build`` carry a
+        human-readable ``detail`` so the SPA shows a precise message and a retry
+        instead of a silent empty grid. Blocks until the session resolves or
+        fails — the SPA shows a spinner meanwhile.
+        """
         project = _validate_project(project)
         if buckaroo is None or not buckaroo.is_running:
-            return {"ws_url": None}
-        session_id = buckaroo.ensure_session(content_hash, project)
-        if session_id is None:
-            return {"ws_url": None}
-        return {"ws_url": f"{buckaroo.ws_base_url}/ws/{session_id}"}
+            return {
+                "status": "unavailable",
+                "ws_url": None,
+                "detail": "Buckaroo is not running — start tallyman with --buckaroo.",
+            }
+        from tallyman_core.display_configs import get_display_config  # noqa: PLC0415
+
+        overrides = (get_display_config(project, content_hash) or {}).get("column_config_overrides")
+        result = buckaroo.load_session(content_hash, project, column_config_overrides=overrides)
+        ws_url = f"{buckaroo.ws_base_url}/ws/{result['session_id']}" if result["session_id"] else None
+        return {"status": result["status"], "ws_url": ws_url, "detail": result["detail"]}
 
     @app.get("/{project}/api/notebook")
     def api_notebook(project: str):

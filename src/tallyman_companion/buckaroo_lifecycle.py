@@ -482,7 +482,30 @@ class BuckarooManager:
         project: str,
         column_config_overrides: dict | None = None,
     ) -> str | None:
-        """Return a Buckaroo session_id for ``content_hash``, creating it if needed.
+        """Session id for ``content_hash`` (creating it if needed), or None.
+
+        Thin wrapper over :meth:`load_session` for callers that only need the id
+        and fall back to the pandas preview on failure (api_data, diff, promote).
+        Surfacing *why* a load failed — for the catalog detail spinner/retry
+        (#133) — goes through :meth:`load_session` directly.
+        """
+        return self.load_session(content_hash, project, column_config_overrides)["session_id"]
+
+    def load_session(
+        self,
+        content_hash: str,
+        project: str,
+        column_config_overrides: dict | None = None,
+    ) -> dict:
+        """Load (or reuse) a Buckaroo session, returning a typed status.
+
+        ``{"status", "session_id", "detail"}`` where ``status`` is one of
+        ``ok`` (``session_id`` set), ``unavailable`` (Buckaroo not running),
+        ``no_build`` (entry has no xorq build), ``timeout`` (the ``/load_expr``
+        POST timed out), or ``error`` (Buckaroo rejected the load). The companion
+        surfaces this so the detail page shows a spinner, a precise error, and a
+        retry instead of a bare "not available" fallback (#133) — never raising,
+        so a Buckaroo hiccup can't take down the page.
 
         Posts an expanded xorq build dir to Buckaroo's ``/load_expr`` endpoint so
         the session is backed by an xorq expression (push-down sort/search
@@ -501,20 +524,24 @@ class BuckarooManager:
         ``column_config_overrides`` is passed to ``/load_expr`` when provided
         (e.g. for promoted diff entries that carry Buckaroo coloring state).
 
-        Returns None (instead of raising) if Buckaroo isn't running or the load
-        fails — the companion falls back to the pandas.to_html preview in that
-        case. We don't want a Buckaroo hiccup to take down the whole detail page.
-
         If the subprocess died since the last call (mid-session crash, OOM,
         or signal), one restart attempt is made — throttled by
         ``_restart_cooldown`` to avoid thrashing on a persistent failure.
         """
         self._maybe_restart()
         if not self.is_running or self.bound_port is None:
-            return None
+            return {
+                "status": "unavailable",
+                "session_id": None,
+                "detail": "Buckaroo is not running — start tallyman with --buckaroo.",
+            }
         build_dir = entry_build_dir(project, content_hash)
         if not build_dir.is_dir():
-            return None
+            return {
+                "status": "no_build",
+                "session_id": None,
+                "detail": "This entry has no xorq build to load.",
+            }
         # Materialise the entry's baked snapshot before buckaroo replays the
         # build via /load_expr. A tracked_expr_from_alias chain off an expensive parent
         # embeds a *bare* read of the parent's snapshot (#75 strips the parent
@@ -536,7 +563,7 @@ class BuckarooManager:
             if cached:
                 # Within one Buckaroo lifetime cached sessions are valid by
                 # construction; start() resets the map on restart.
-                return cached["session_id"]
+                return {"status": "ok", "session_id": cached["session_id"], "detail": ""}
             # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable
             # per-entry dir (not a random tmp dir) so the expanded path is
             # identical across server restarts — xorq embeds the build_dir path
@@ -576,12 +603,23 @@ class BuckarooManager:
                 )
                 resp.raise_for_status()
                 session_id = resp.json()["session"]
+            except httpx.TimeoutException as exc:
+                log.warning("buckaroo /load_expr timed out for %s: %s", content_hash, exc)
+                return {
+                    "status": "timeout",
+                    "session_id": None,
+                    "detail": "Buckaroo timed out loading this entry (10s) — it may be slow to materialise.",
+                }
             except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
                 log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)
-                return None
+                return {
+                    "status": "error",
+                    "session_id": None,
+                    "detail": f"Buckaroo could not load this entry: {type(exc).__name__}: {exc}",
+                }
             self._sessions[content_hash] = {"session_id": session_id, "project": project}
             self._persist_sessions()
-            return session_id
+            return {"status": "ok", "session_id": session_id, "detail": ""}
 
     # ------------------------------------------------------------------
     # introspection

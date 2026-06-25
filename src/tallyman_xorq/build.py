@@ -503,7 +503,9 @@ def build_and_persist(
                     # wraps the sorted expression and loaded bakes in canonical order.
                     row_count = int(loaded.count().execute())
                     snap_path = _cached_node_path(loaded)
-                    result_digest_v: str | None = snapshot_file_digest(snap_path) if snap_path and snap_path.exists() else None
+                    result_digest_v: str | None = (
+                        snapshot_file_digest(snap_path) if snap_path and snap_path.exists() else None
+                    )
                 else:
                     # Stream full result to force row-level evaluation (catch a
                     # failing cast / arithmetic at build time) and count rows.

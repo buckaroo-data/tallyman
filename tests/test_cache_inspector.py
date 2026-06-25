@@ -186,3 +186,78 @@ def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_
     for bad in ("NOPE-not-a-hash", "Deadbeef", "abc def"):
         r = c.delete(f"/{project}/api/result_cache/{bad}")
         assert r.status_code == 400, f"{bad!r} should be a 400, got {r.status_code}"
+
+
+# GET /{project}/api/entry_cache/{hash} is the per-expression footprint behind
+# the catalog-detail "metadata" tab: one entry's on-disk bytes split into
+# reclaimable cache (result.parquet, the xorq snapshot, the Buckaroo stat cache)
+# vs. the build artifact, plus any diff stat caches it participates in. Distinct
+# from /api/result_cache (the project-wide listing) — this one is per-entry and
+# resolves an alias to its current head. Restored alongside the metadata tab
+# (#132); the rendering is the SPA's job, this pins the JSON contract.
+
+
+def test_entry_cache_expensive_breakdown(fresh_companion_app, project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
+    h = list_entries(project)[0]["content_hash"]
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()  # precondition: it baked
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/entry_cache/{h}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["content_hash"] == h
+    assert body["cache_worthy"] is True
+
+    comps = {comp["key"]: comp for comp in body["components"]}
+    # The build artifact is always present and explicitly not reclaimable.
+    assert comps["build"]["kind"] == "artifact"
+    assert comps["build"]["reclaimable"] is False
+    assert comps["build"]["bytes"] > 0
+    # An expensive entry's snapshot is applicable and sized from the baked file.
+    snap_comp = comps["snapshot_cache"]
+    assert snap_comp["applicable"] is True
+    assert snap_comp["exists"] is True
+    assert snap_comp["bytes"] > 0
+    # Totals reconcile across the three buckets.
+    assert body["total_bytes"] == body["cache_bytes"] + body["artifact_bytes"] + body["diff_cache_bytes"]
+    assert body["cache_bytes"] >= snap_comp["bytes"]
+    assert body["total_formatted"]
+
+
+def test_entry_cache_cheap_marks_snapshot_inapplicable(fresh_companion_app, project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    cheap = catalog_create("cheap_one", _cheap_code(project))  # projection → no snapshot
+    h = cheap["hash"]
+
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/entry_cache/{h}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["cache_worthy"] is False
+    snap_comp = next(comp for comp in body["components"] if comp["key"] == "snapshot_cache")
+    assert snap_comp["applicable"] is False  # no snapshot copy for a cheap entry
+    # The build artifact is still present and sized.
+    assert any(comp["key"] == "build" and comp["bytes"] > 0 for comp in body["components"])
+
+
+def test_entry_cache_resolves_alias(fresh_companion_app, project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    h = list_entries(project)[0]["content_hash"]
+
+    c = TestClient(fresh_companion_app)
+    by_alias = c.get(f"/{project}/api/entry_cache/shoe_sales")
+    assert by_alias.status_code == 200, by_alias.text
+    assert by_alias.json()["content_hash"] == h  # alias resolved to its current head
+
+
+def test_entry_cache_unknown_hash_404_malformed_400(fresh_companion_app, project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    c = TestClient(fresh_companion_app)
+    # Well-formed hex, no such entry → 404 (not the SPA index.html fallthrough).
+    assert c.get(f"/{project}/api/entry_cache/deadbeef").status_code == 404
+    # Non-hex, non-alias → 400, matching the other alias-or-hash entry routes.
+    assert c.get(f"/{project}/api/entry_cache/NOPE-not-a-hash").status_code == 400

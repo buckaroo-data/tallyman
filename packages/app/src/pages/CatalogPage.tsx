@@ -6,7 +6,7 @@ import { recalcTarget } from "../recalcRefresh";
 import { CatalogSidebar } from "../components/CatalogSidebar";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
 import { VegaChart } from "../components/VegaChart";
-import type { Entry, AppError, EntryDetail, EntryCache } from "../types";
+import type { Entry, AppError, EntryDetail, EntryCache, SessionResult } from "../types";
 
 // ── Error banner ──────────────────────────────────────────────────────────────
 
@@ -91,11 +91,16 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
       .catch(() => setLoading(false));
   }, [project, hash]);
 
-  if (loading) return <div className="meta">loading…</div>;
+  if (loading)
+    return (
+      <div className="spinner-row">
+        <span className="spinner" /> loading…
+      </div>
+    );
   if (!detail) return <div className="meta">entry not found</div>;
 
   const { manifest, alias, version, forensic_history, prompt_history, chart_spec,
-    display_config, build_artifacts, total_rows, buckaroo_session, buckaroo_ws_base, code } = detail;
+    display_config, build_artifacts, total_rows, code } = detail;
   const diffProvenance = display_config?.diff_provenance;
 
   const handleSaveCode = async () => {
@@ -108,9 +113,6 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
       setCodeStatus(`build failed: ${e instanceof Error ? e.message.slice(0, 200) : e}`);
     }
   };
-
-  const wsUrl =
-    buckaroo_session && buckaroo_ws_base ? `${buckaroo_ws_base}/ws/${buckaroo_session}` : null;
 
   return (
     <div className="detail entry-detail">
@@ -234,15 +236,7 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
             {" "}matched
           </div>
         )}
-        {wsUrl ? (
-          <BuckarooEmbed wsUrl={wsUrl} className="buckaroo-embed" />
-        ) : (
-          <div className="meta">
-            {total_rows > 0
-              ? `${total_rows} rows (Buckaroo not available — run tallyman with --buckaroo)`
-              : "no rows"}
-          </div>
-        )}
+        <BuckarooDataPane project={project} hash={manifest.content_hash} totalRows={total_rows} />
       </div>
 
       {tab === "code" && (
@@ -302,6 +296,85 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
           <EntryCacheView project={project} hash={manifest.content_hash} />
         </div>
       )}
+    </div>
+  );
+}
+
+// ── Lazy Buckaroo grid: spinner → grid, or a precise error + retry (#133) ─────
+
+function BuckarooDataPane({ project, hash, totalRows }: { project: string; hash: string; totalRows: number }) {
+  const [result, setResult] = useState<SessionResult | null>(null);
+  const [attempt, setAttempt] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setResult(null);
+    api
+      .session(project, hash)
+      .then((d) => {
+        if (!cancelled) setResult(d);
+      })
+      .catch((e) => {
+        if (!cancelled)
+          setResult({ status: "error", ws_url: null, detail: e instanceof Error ? e.message : String(e) });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [project, hash, attempt]);
+
+  if (result === null) {
+    return (
+      <div className="buckaroo-loading">
+        <span className="spinner" /> loading data…
+      </div>
+    );
+  }
+  if (result.status === "ok" && result.ws_url) {
+    return <BuckarooEmbed wsUrl={result.ws_url} className="buckaroo-embed" />;
+  }
+
+  const retry = () => setAttempt((n) => n + 1);
+
+  if (result.status === "unavailable" || result.status === "no_build") {
+    return (
+      <div className="meta">
+        {result.status === "no_build"
+          ? "no build for this entry"
+          : totalRows > 0
+            ? `${totalRows} rows (Buckaroo not available — run tallyman with --buckaroo)`
+            : "no rows"}
+        {result.status === "unavailable" && (
+          <>
+            {" · "}
+            <button type="button" className="link-btn" onClick={retry}>
+              retry
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
+
+  // timeout | error — surface what went wrong and a way out.
+  return (
+    <div className="buckaroo-error">
+      <strong>
+        {result.status === "timeout"
+          ? "Buckaroo timed out loading this entry."
+          : "Buckaroo couldn’t load this entry."}
+      </strong>
+      {result.detail && <div className="meta detail">{result.detail}</div>}
+      <div className="meta">
+        <button type="button" className="link-btn" onClick={retry}>
+          retry
+        </button>
+        {" · to debug, check "}
+        <code>~/.tallyman-notebooks/projects/{project}/buckaroo.log</code>
+        {" and the companion log, or run the "}
+        <code>debug-tallyman</code>
+        {" skill."}
+      </div>
     </div>
   );
 }

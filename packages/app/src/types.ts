@@ -187,6 +187,12 @@ export interface EntryCache {
   total_formatted: string;
 }
 
+export interface SessionResult {
+  status: "ok" | "unavailable" | "no_build" | "timeout" | "error";
+  ws_url: string | null;
+  detail: string;
+}
+
 export interface Projects {
   active: string | null;
   available: string[];

@@ -3,6 +3,7 @@ import type {
   AppError,
   EntryDetail,
   EntryCache,
+  SessionResult,
   NotebookFull,
   DiffData,
   ResultCache,
@@ -124,7 +125,7 @@ export const api = {
       return r.json() as Promise<{ project: string; cleared: number }>;
     }),
 
-  session: (project: string, hash: string): Promise<{ ws_url: string | null }> =>
+  session: (project: string, hash: string): Promise<SessionResult> =>
     get(`/${project}/api/session/${hash}`),
 
   resultCache: (project: string): Promise<ResultCache> =>

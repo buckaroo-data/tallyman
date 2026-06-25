@@ -534,6 +534,16 @@ table.cache-table .muted { color: var(--muted); }
 .danger-btn:hover:not(:disabled) { background: #7a2525; }
 .danger-btn:disabled { opacity: 0.4; cursor: default; }
 
+/* loading spinner + lazy Buckaroo grid states (#133) */
+@keyframes tm-spin { to { transform: rotate(360deg); } }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: tm-spin 0.7s linear infinite; vertical-align: -2px; }
+.spinner-row { color: var(--muted); display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+.buckaroo-loading { color: var(--muted); display: flex; align-items: center; gap: 8px; min-height: 120px; }
+.buckaroo-error { background: #3a1e1e; border: 1px solid #7a3a3a; border-radius: 4px; padding: 12px; color: #ffd9d9; }
+.buckaroo-error .detail { color: #e8b4b8; margin: 4px 0; white-space: pre-wrap; }
+.buckaroo-error code { background: rgba(0, 0, 0, 0.25); padding: 1px 4px; border-radius: 3px; }
+.link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; text-decoration: underline; }
+
 /* per-expression cache metadata tab */
 .cache-meta { padding: 2px; }
 .cache-meta .cache-detail { font-size: 11px; white-space: normal; max-width: 420px; }

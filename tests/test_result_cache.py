@@ -462,26 +462,36 @@ def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache
 
 
 def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):
-    """A revise-in-place recipe that reads ``tracked_expr_from_alias`` of its OWN alias must
-    not self-recurse forever when later reconstructed.
+    """A self-referential recipe (reads ``tracked_expr_from_alias`` of its OWN alias) must
+    not self-recurse forever when reconstructed by ``cached_result_expr``.
 
-    ``catalog_revise`` repoints the alias to the new head *after* building, so a
-    recipe that chains off ``tracked_expr_from_alias(name)`` (the pattern its own docstring
-    recommends) resolves to the *previous* revision at build time but to *itself*
-    afterwards. #73 made ``cached_result_expr`` re-import the raw recipe and
-    re-resolve ``tracked_expr_from_alias`` against the live head, so post-revise
-    reconstruction (diff, further chaining) recursed without bound — a ~50GB RSS
-    spike that locked a 48GB machine. The fix resolves a self-referential
-    ``tracked_expr_from_alias`` to the build-time parent revision.
+    #135 made ``catalog_revise`` reject such a recipe at the server layer, so the
+    only way an alias can come to point at a self-referential recipe is to build it
+    and repoint the alias directly — the pre-#135 ``catalog_revise`` path the server
+    no longer exposes. We do exactly that here (``build_and_persist`` + ``set_alias``,
+    skipping the guard) to keep the result_cache recursion-termination guard under
+    end-to-end test: a self-referential ``tracked_expr_from_alias`` resolves to the
+    build-time parent revision (#73/#85).
+
+    The hazard: ``catalog_revise`` repointed the alias to the new head *after*
+    building, so a recipe chaining off ``tracked_expr_from_alias(name)`` resolved to
+    the *previous* revision at build time but to *itself* afterwards. #73 made
+    ``cached_result_expr`` re-import the raw recipe and re-resolve
+    ``tracked_expr_from_alias`` against the live head, so post-revise reconstruction
+    (diff, further chaining) recursed without bound — a ~50GB RSS spike that locked
+    a 48GB machine.
     """
-    from tallyman_core.aliases import get_alias
+    from tallyman_core.aliases import get_alias, set_alias
+    from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("tpd", _project_code(project))  # v1: region, price
     v1 = get_alias(project, "tpd")
-    catalog_revise("tpd", _self_chain_code("tpd"))  # v2: tracked_expr_from_alias('tpd').mutate(doubled=price*2)
-    v2 = get_alias(project, "tpd")
+    # tracked_expr_from_alias('tpd') still resolves to v1 here (alias not yet moved),
+    # so the build chains off v1 — the build-time binding catalog_revise produced.
+    v2 = build_and_persist(project=project, code=_self_chain_code("tpd")).content_hash
+    set_alias(project, "tpd", v2, expect_exists=True)  # now 'tpd' points at the self-referential head
     assert v2 != v1
 
     # Pre-fix: infinite recursion (guarded so the failure is a fast RecursionError,

@@ -2,6 +2,8 @@
 
 Spike for the Tallyman London 2026 talk *"The Future of Notebooks in a Claude Code World"*.
 The plan and proposal live in `plan.md` / `proposal.md`. This README covers the V0 spike only.
+For the system architecture — subsystem map, on-disk layout, data-flow paths, and an
+index of all the docs — start with [docs/architecture.md](docs/architecture.md).
 
 ## V0 scope
 

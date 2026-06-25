@@ -336,10 +336,62 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
         worthy = _cw(project, content_hash)
     except Exception:  # noqa: BLE001
         worthy = False
+
+    # Enrichment (#134): the recipe's raw source files, last-modified, the
+    # cheap/expensive reason, and clickable lineage (parents + dependent
+    # children). dependents_index walks every manifest — fine at single-entry,
+    # single-user scale; revisit if it ever paginates.
+    from datetime import datetime, timezone  # noqa: PLC0415
+
+    from tallyman_core.paths import data_dir as _data_dir  # noqa: PLC0415
+    from tallyman_xorq.dependents import dependents_index, parents_of, sources_of  # noqa: PLC0415
+
+    manifest: dict = {}
+    try:
+        manifest = json.loads((entry / "manifest.json").read_text())
+    except (OSError, ValueError):
+        pass
+
+    # Raw source files the recipe reads. None under source-identity mode=off —
+    # kept distinct from "reads no files" so the UI can say "not tracked".
+    src_digests = sources_of(project, content_hash)
+    sources: list[dict] = []
+    source_bytes = 0
+    if src_digests is not None:
+        dd = _data_dir(project)
+        for rel in sorted(src_digests):
+            sp = dd / rel
+            sz = _path_size(sp)
+            source_bytes += sz
+            sources.append({"path": rel, "bytes": sz, "formatted": _fmt_bytes(sz), "exists": sp.exists()})
+
+    # Last-modified across the entry's on-disk artifacts (a snapshot self-heal
+    # makes this later than created_at).
+    mtimes: list[float] = []
+    for p in (snap_path if (applicable and snap_path) else None, entry / "xorq_build", entry / ".buckaroo_stat_cache"):
+        if p is not None and p.exists():
+            try:
+                mtimes.append(p.stat().st_mtime)
+            except OSError:
+                pass
+    modified_at = datetime.fromtimestamp(max(mtimes), tz=timezone.utc).isoformat() if mtimes else None
+
+    parents = [
+        {"hash": pr.hash, "ref": pr.ref, "follow": pr.follow, "alias": alias_for_hash(project, pr.hash)}
+        for pr in parents_of(project, content_hash)
+    ]
+    children = [
+        {"hash": ch, "alias": alias_for_hash(project, ch)}
+        for ch in sorted(dependents_index(project).get(content_hash, set()))
+    ]
+
     return {
         "project": project,
         "content_hash": content_hash,
         "cache_worthy": worthy,
+        "cache_worthy_why": manifest.get("cache_worthy_why"),
+        "created_at": manifest.get("created_at"),
+        "modified_at": modified_at,
         "components": components,
         "diff_caches": diff_caches,
         "cache_bytes": cache_bytes,
@@ -348,6 +400,12 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
         "artifact_formatted": _fmt_bytes(artifact_bytes),
         "diff_cache_bytes": diff_cache_bytes,
         "diff_cache_formatted": _fmt_bytes(diff_cache_bytes),
+        "source_bytes": source_bytes,
+        "source_formatted": _fmt_bytes(source_bytes),
+        "source_tracked": src_digests is not None,
+        "sources": sources,
+        "parents": parents,
+        "children": children,
         "total_bytes": total_bytes,
         "total_formatted": _fmt_bytes(total_bytes),
     }

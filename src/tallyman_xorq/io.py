@@ -1,11 +1,10 @@
 """Project-aware data loading helpers.
 
 Convention: every project owns its data under `<project_dir>/data/`. User code
-references files by *relative* name. The current implementation still embeds
-absolute paths in the xorq build (so the artifact isn't portable across
-machines yet — see plan.md), but recording the relative path here lays the
-groundwork for a future `tallyman pack` step that rewrites the build to be
-machine-independent.
+references files by *relative* name. The build rewrites absolute filesystem
+paths to `${TALLYMAN_PROJECT_ROOT}` placeholders on write and expands them on
+load, so recording the relative intent here is what makes the artifact portable
+across machines (and packable via `tallyman pack`; see docs/architecture.md).
 """
 
 from __future__ import annotations

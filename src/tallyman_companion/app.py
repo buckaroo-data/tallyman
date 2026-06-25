@@ -39,6 +39,7 @@ from tallyman_core import (
 )
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
+from tallyman_core.version import git_revision, version_info
 from tallyman_xorq import (
     full_diff,
     list_entries,
@@ -499,6 +500,21 @@ def create_app(
     if (_REACT_DIST / "assets").is_dir():
         app.mount("/assets", StaticFiles(directory=str(_REACT_DIST / "assets")), name="spa-assets")
 
+    @app.middleware("http")
+    async def _stamp_revision(request, call_next):
+        # Every companion response carries the git revision it was served from,
+        # so a client (or curl -I) can see which source the backend runs — and
+        # the SPA compares it against its own baked build revision to catch the
+        # stale-bundle drift behind #132.
+        response = await call_next(request)
+        response.headers["X-Tallyman-Revision"] = git_revision()
+        return response
+
+    @app.get("/api/version")
+    def api_version():
+        """The git revision this companion process was launched from (#132)."""
+        return {"component": "companion", **version_info()}
+
     def _current_project() -> str | None:
         return resolve_project() or seed
 
@@ -611,6 +627,10 @@ def create_app(
         except Exception as exc:
             log.warning("checkpoint after %s %s failed: %s", request.method, path, exc)
         return response
+
+    @app.on_event("startup")
+    async def _log_revision():
+        log.info("tallyman companion revision %s", git_revision())
 
     @app.on_event("startup")
     async def _warm_expr_cache():

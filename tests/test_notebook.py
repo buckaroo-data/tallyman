@@ -385,6 +385,9 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
         def ensure_session(self, content_hash, project):
             return f"sess-{content_hash[:6]}"
 
+        def load_session(self, content_hash, project, column_config_overrides=None):
+            return {"status": "ok", "session_id": f"sess-{content_hash[:6]}", "detail": ""}
+
     app = create_app(project, buckaroo=_StubBuckaroo())  # type: ignore[arg-type]
     c = TestClient(app)
     r = c.get(f"/{project}/api/notebook_full")

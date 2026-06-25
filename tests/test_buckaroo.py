@@ -733,20 +733,29 @@ class _StubBuckaroo:
     def ensure_session(self, content_hash: str, project: str, column_config_overrides=None) -> str | None:
         return self.session
 
+    def load_session(self, content_hash: str, project: str, column_config_overrides=None) -> dict:
+        return {"status": "ok", "session_id": self.session, "detail": ""}
 
-def test_entry_detail_embeds_react_widget_when_buckaroo_present(project: str, orders_parquet: Path):
-    """API returns buckaroo_session and buckaroo_ws_base when Buckaroo is running."""
+
+def test_entry_detail_decoupled_grid_session_via_session_endpoint(project: str, orders_parquet: Path):
+    """The detail payload is metadata-only; the grid session loads lazily via
+    /api/session so the detail request never blocks on Buckaroo (#133)."""
     from tallyman_companion import create_app
 
     res = build_and_persist(project, _code(project))
     bk: Any = _StubBuckaroo(session="abc123", port=8700)
     app = create_app(project, buckaroo=bk)
     c = TestClient(app)
-    r = c.get(f"/{project}/api/entry/{res.content_hash}")
-    assert r.status_code == 200
-    body = r.json()
-    assert body["buckaroo_session"] == "abc123"
+
+    # Detail no longer carries a session — it's decoupled.
+    body = c.get(f"/{project}/api/entry/{res.content_hash}").json()
+    assert body["buckaroo_session"] is None
     assert body["buckaroo_ws_base"] == "ws://127.0.0.1:8700"
+
+    # The session endpoint provides the widget on demand, with a typed status.
+    sr = c.get(f"/{project}/api/session/{res.content_hash}").json()
+    assert sr["status"] == "ok"
+    assert sr["ws_url"] == "ws://127.0.0.1:8700/ws/abc123"
 
 
 def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_parquet: Path):

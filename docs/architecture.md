@@ -121,19 +121,12 @@ random free port) and exits when its stdin closes. It also provides `serve`
 (portable tarball excluding cache and session state), `reset-to` / `revisions`,
 and storyboard `replay` for deterministic rehearsal. See [installing.md](installing.md).
 
-**Frontend** (`packages/app/` and `packages/embed/`) is the React 18 + Vite SPA
-plus a standalone Buckaroo embed library. The SPA (`packages/app`) builds to
-`dist/` and is served by FastAPI as a catch-all; it drives refetches off an SSE
-version counter rather than polling, defers grid loads until scroll via
+**Frontend** (`packages/app/`) is the React 18 + Vite SPA. It builds to `dist/`
+and is served by FastAPI as a catch-all; it drives refetches off an SSE version
+counter rather than polling, defers grid loads until scroll via
 `LazyBuckarooEmbed`, and remaps views to new hashes when a recalc event arrives.
 Its `BuckarooEmbed` component mounts `BuckarooServerView` from `buckaroo-js-core`
-directly and connects over WebSocket. `packages/embed` is a separate library
-build that bundles React + `buckaroo-js-core` into `static/buckaroo-embed.{js,css}`
-(gitignored, not committed); it is **not** on the live SPA's code path today —
-the only references to it are a stale docstring in `buckaroo_lifecycle.py` and
-the README's embed section, both of which predate the direct-import SPA. Treat
-`packages/embed` as legacy until that's reconciled. No dedicated frontend doc
-yet.
+directly and connects over WebSocket. No dedicated frontend doc yet.
 
 ## On-disk catalog layout
 
@@ -401,30 +394,20 @@ when in doubt, the code wins.
 [plotting-testcases.md](../plans/plotting-testcases.md),
 [xorq-sklearn-assessment.md](../plans/xorq-sklearn-assessment.md),
 [ds-demo-scripts.md](../plans/ds-demo-scripts.md),
-[demo/datasets.md](../demo/datasets.md),
-[demo/script.md](../demo/script.md). These are historical; staleness mostly
+[demo/datasets.md](../demo/datasets.md). These are historical; staleness mostly
 doesn't apply, except where they assert current system behavior (a few reference
 the removed `result.parquet` and the old `~/.tallyman/` path).
 
 ### Root & meta
 
-- [README.md](../README.md) — V0 spike overview and run instructions.
-  **Partially stale:** lists `/catalog`, `/lineage`, etc. as HTTP routes (they
-  are React-only routes; the backend serves `/api/*`); puts
-  `buckaroo_sessions.json` under `catalog/` (it's global at
-  `~/.tallyman-notebooks/`); points at a `tests/test_portable.py` that no longer
-  exists.
+- [README.md](../README.md) — V0 spike overview and run instructions. **Current.**
 - [proposal.md](../proposal.md) — the talk pitch. **Current** (it's a pitch, not
   a spec).
-- [plan.md](../plan.md) — the original V0.6 plan. **Substantially stale:**
-  describes Jinja2 templates (now a React SPA), `~/.tallyman/` + per-entry
-  `result.parquet` + `aliases.json`/`alias_history.json` (all changed), "Seven
-  Python packages" (there are five), 16 MCP tools (now ~29), and `buckaroo
-  0.14.6` (now 0.15.1). Read it as design rationale, not current state.
-- [TICKETS.md](../TICKETS.md) — the V0 punchlist. **Substantially stale:** much
-  of it predates the React SPA migration (SortableJS → @dnd-kit, server-rendered
-  markdown → `marked`, the size-toggle template feature) and the
-  `result.parquet` removal.
+
+The original `plan.md` (V0.6 plan) and `TICKETS.md` (V0 punchlist) were removed
+as stale cruft — they predated the React SPA migration, the `result.parquet`
+removal, and the JSONL catalog format. This doc supersedes them as the
+architecture reference.
 
 > Gaps: there is no dedicated reference for the REST API, the CLI, the frontend
 > SPA architecture, or the extension points (custom display klasses, summary

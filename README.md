@@ -1,84 +1,81 @@
 # tallyman-notebooks
 
 Spike for the Tallyman London 2026 talk *"The Future of Notebooks in a Claude Code World"*.
-The plan and proposal live in `plan.md` / `proposal.md`. This README covers the V0 spike only.
+The proposal lives in `proposal.md`. This README covers the V0 spike only.
 For the system architecture — subsystem map, on-disk layout, data-flow paths, and an
 index of all the docs — start with [docs/architecture.md](docs/architecture.md).
 
 ## V0 scope
 
 End-to-end: a Claude Code MCP tool that compiles a xorq expression, materializes
-a parquet to a content-hashed catalog entry on disk, and pushes a live update
+a result to a content-hashed catalog entry on disk, and pushes a live update
 to a browser companion via SSE.
 
 What's working:
 
-- **MCP tools:**
+- **MCP tools** (FastMCP over stdio):
   - Catalog: `catalog_run`, `catalog_load_parquet`, `catalog_create`,
     `catalog_revise`, `catalog_alias`, `catalog_rename`, `catalog_unalias`,
-    `catalog_list`, `catalog_diff`.
+    `catalog_list`, `catalog_diff`, `catalog_chart`, `catalog_recalc`, plus the
+    summary-stat / post-processing / display-klass authoring tools.
   - Notebook: `notebook_reorder`, `notebook_remove`, `notebook_edit_markdown`.
-- **Companion** (FastAPI on `:7860`):
-  - `/catalog`, `/catalog/<hash>` or `/catalog/<alias>` — entry list and detail
-    with V_n chips, forensic history, and a link to internal lineage.
-  - `/notebook` — curated narrative: cells anchored on aliases, vertical layout,
-    inline markdown editor, ↑/↓ reorder, × remove.
-  - `/lineage` and `/lineage/<hash>` — catalog DAG (cross-entry parents derived
-    from `tracked_expr_from_alias`) and per-entry internal expression DAG. Pure SVG, no
-    Cytoscape dep.
-  - `/diff/<alias>[/<va>/<vb>]` — version diff with code diff, schema diff,
-    per-column stats, key-joined side-by-side, and head() side-by-side.
-  - `/errors/<id>` — build-failure detail.
-  - `/api/{entries,aliases,errors,notebook,lineage,catalog_dag}` — JSON.
-  - `/api/sse` — live updates (`new_entry`, `build_failed`, `alias_changed`,
-    `notebook_changed`).
+  - Project: `project_list`, `project_new`, `project_switch`.
+
+    See [docs/architecture.md](docs/architecture.md) for the full tool surface.
+- **Companion** (FastAPI on `:7860`) — serves the React SPA
+  (`packages/app/dist`) as a catch-all and exposes a JSON API + SSE under
+  `/{project}/api/*`:
+  - SPA tabs: **Catalog** (entry list + detail with V_n chips and forensic
+    history), **Notebook** (curated narrative anchored on aliases, drag-reorder,
+    inline markdown editor, × remove), **Diff** (code diff, schema diff,
+    per-column stats, key-joined side-by-side, head() side-by-side), **Cache**
+    (per-entry cache footprint), and **Log** (linear, filterable activity view).
+  - JSON: `/{project}/api/{entries,entry/<hash>,aliases,notebook,errors,log,
+    data/<hash>,diff_data/...,disk_usage,result_cache,staleness}`, plus the
+    mutation routes (`PATCH notebook`, `PUT code/<alias>`,
+    `PUT markdown/<cell_id>`, `POST reset`, `POST recalc`,
+    `POST promote_diff/...`).
+  - `/{project}/api/sse` — live updates (`new_entry`, `build_failed`,
+    `alias_changed`, `notebook_changed`, `recalc`, `summary_stat_changed`).
+  - `/internal/notify` — the MCP server's notification hook; fans out to SSE.
 - **Buckaroo subprocess** — `tallyman run` spawns `python -m buckaroo.server`
   on `:8700` (falls back to a random port if busy), watches for the
   `BUCKAROO_PORT=...` handshake, and lazily creates per-entry sessions on
   first view by POSTing the entry's `xorq_build/` dir to Buckaroo's
   `/load_expr` endpoint (PR 776) — sort/search push down to the xorq
-  backend rather than paging over a materialised parquet. The build dir
-  is expanded into a tmp copy first so `${TALLYMAN_PROJECT_ROOT}`
-  placeholders are resolved before xorq's loader sees them. Sessions are
-  persisted under `catalog/buckaroo_sessions.json` and invalidated by
-  start-time when Buckaroo restarts; tmp dirs are cleaned on
-  `BuckarooManager.stop()`. Tear-down rides along with the companion.
-  Disable with `--no-buckaroo`.
+  backend rather than paging over a materialised parquet. The build dir is
+  expanded into a stable per-entry path (`.xorq_build_expanded/`, gated by a
+  `.complete` marker) so `${TALLYMAN_PROJECT_ROOT}` placeholders are resolved
+  before xorq's loader sees them. Sessions are persisted in a global
+  `~/.tallyman-notebooks/buckaroo_sessions.json` (keyed by content hash, shared
+  across projects) and invalidated by start-time when Buckaroo restarts.
+  Tear-down rides along with the companion. Disable with `--no-buckaroo`.
 - **Build artifacts are portable.** xorq's absolute filesystem paths are
   rewritten to `${TALLYMAN_PROJECT_ROOT}` on write and expanded back on load.
 - **`tallyman serve <project_dir>`** — read-only companion against a project
   directory that may live anywhere on disk. Mutation routes return 403.
 
-What's NOT yet implemented (see `TICKETS.md` for the full punchlist):
+What's NOT yet implemented:
 
-1. SortableJS drag-reorder for the notebook (current ↑/↓ buttons are the
-   accessibility fallback; drag is the headline UX).
-2. Column-level lineage (xorq has the data; current view is op-level only).
-3. `tallyman pack` / `tallyman replay` (today's hand-off is `cp -r` / `tar`).
-4. ML training pipeline (storyboard beats 7-8).
+1. Column-level lineage (xorq has the data; there is no lineage view today).
+2. ML training pipeline (storyboard beats 7-8).
 
 ## Running the spike
 
+Build the React companion UI once. The FastAPI server serves its `dist/`; Node +
+pnpm are install-time prerequisites and the build artifact is not committed:
+
+```sh
+cd packages/app && pnpm install && pnpm build   # writes packages/app/dist/
+```
+
+Then start the stack:
+
 ```sh
 uv sync
-uv run tallyman init spike            # creates ~/.tallyman/projects/spike/ + fixture
+uv run tallyman init spike            # creates ~/.tallyman-notebooks/projects/spike/ + fixture
 uv run tallyman run --project spike   # edit-mode companion on http://127.0.0.1:7860
 ```
-
-The companion's dataframe embed is a Vite React library in `packages/embed/`
-that builds into `src/tallyman_companion/static/buckaroo-embed.{js,css}`. The
-build artifact is **not** committed — Node + pnpm are install-time
-prerequisites:
-
-```sh
-cd packages/embed && pnpm install && pnpm build      # one-time per checkout
-# or, for active embed development:
-cd packages/embed && pnpm dev                        # vite build --watch
-```
-
-Bump `buckaroo-js-core` in `packages/embed/package.json` to match the
-Python `buckaroo` pin in `pyproject.toml` and rebuild whenever either
-side moves.
 
 In another terminal, launch Claude Code from this directory; it picks up
 `.mcp.json` and exposes the `tallyman` MCP server.
@@ -98,10 +95,10 @@ forensic history.
 
 ### Serving a project as an artifact
 
-Once you've authored a project, hand it off:
+Once you've authored a project, pack it and hand it off:
 
 ```sh
-tar czf my-project.tgz -C ~/.tallyman/projects spike
+uv run tallyman pack spike -o my-project.tgz   # portable .tgz, ${TALLYMAN_PROJECT_ROOT} preserved
 # colleague extracts somewhere
 tar xzf my-project.tgz -C ~/projects/
 uv run tallyman serve ~/projects/spike
@@ -129,6 +126,6 @@ affordances. Mutation routes return 403.
 ## Tests
 
 ```sh
-uv run pytest               # 76 tests, ~5s
-uv run pytest tests/test_portable.py    # the portability proof
+uv run pytest                       # full suite
+uv run pytest tests/test_pack.py    # the pack / portability proof
 ```

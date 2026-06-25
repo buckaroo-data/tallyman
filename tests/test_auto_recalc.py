@@ -54,14 +54,6 @@ expr = t.mutate(doubled=t.price * 2)
 """
 
 
-def _self_chain_code(alias: str) -> str:  # documented revise-in-place pattern: chain off own alias
-    return f"""
-from tallyman_xorq.io import tracked_expr_from_alias
-t = tracked_expr_from_alias({alias!r})
-expr = t.mutate(doubled=t.price * 2)
-"""
-
-
 def _hash(result: dict) -> str:
     assert "hash" in result, result
     return result["hash"]
@@ -343,32 +335,43 @@ def test_read_config_tolerates_unreadable_file(project, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# tie-back robustness: self-referential revise + skipped-but-directly-stale
+# tie-back robustness: self-referential head + skipped-but-directly-stale
 # ---------------------------------------------------------------------------
 
 
-def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parquet, monkeypatch):
-    # The documented revise-in-place pattern (a recipe that reads tracked_expr_from_alias of
-    # its OWN alias) leaves the new head permanently alias-stale by design (#74/#85:
-    # the self-pin can never refresh). Auto-recalc must NOT (a) pointlessly replay
-    # it on the self-revise, nor (b) flag it UNEXPLAINED ("file a bug") on every
-    # later unrelated revise — that would make the UNEXPLAINED signal untrustworthy.
+def test_self_referential_head_is_not_a_recalc_root_and_not_unexplained(project, orders_parquet, monkeypatch):
+    # A self-referential head (recipe reads tracked_expr_from_alias of its OWN alias)
+    # is permanently alias-stale by design (#74/#85: the self-pin can never refresh).
+    # #135 stops one being *created* through catalog_revise, but the recalc engine
+    # still defends against a head constructed directly (the pre-#135 path the server
+    # no longer exposes): _is_self_ref must keep it out of the auto-recalc roots
+    # (replaying it is a no-op) and classify it "self-referential ... expected",
+    # never UNEXPLAINED ("file a bug"). Build it directly to keep that branch covered.
+    from tallyman_core.aliases import set_alias
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.recalc import followers_of
+
     _clean_env(monkeypatch)
     _second_source(project, "widgets.parquet", seed=1)
-    _hash(catalog_create("tpd", _src_code(project)))  # has a price column
+    _hash(catalog_create("tpd", _src_code(project)))  # v1: a real source projection
     _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
 
-    self_out = catalog_revise("tpd", _self_chain_code("tpd"))
-    tpd_head = get_alias(project, "tpd")
-    # (a) the self-chained head is not pointlessly carried into its own cascade cone
-    assert tpd_head not in self_out["recalc"]["cone"]
+    # tracked_expr_from_alias('tpd') resolves to v1 here (alias not yet moved); repoint
+    # tpd onto the result so its head now follows its OWN alias — the pre-#135 self-revise.
+    self_head = build_and_persist(project=project, code=_child_code("tpd")).content_hash
+    set_alias(project, "tpd", self_head, expect_exists=True)
 
-    # (b) a later, unrelated revise must not flag it UNEXPLAINED
+    # (a) excluded from the auto-recalc roots: replaying a self-pin is a no-op that
+    # can never refresh, so it must never be a cascade root.
+    assert self_head not in followers_of(project, "tpd")
+
+    # (b) a later, unrelated revise must account for it as an orphan without flagging
+    # it UNEXPLAINED — the self-referential explanation keeps UNEXPLAINED trustworthy.
     out = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
     orphans = {o["hash"]: o for o in out["recalc"]["orphan_stale"]}
-    assert tpd_head in orphans  # it IS directly (self-)stale, so it is accounted for
-    assert "UNEXPLAINED" not in orphans[tpd_head]["explanation"]
-    assert "self-referential" in orphans[tpd_head]["explanation"].lower()
+    assert self_head in orphans  # it IS directly (self-)stale, so it is accounted for
+    assert "UNEXPLAINED" not in orphans[self_head]["explanation"]
+    assert "self-referential" in orphans[self_head]["explanation"].lower()
 
 
 def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orders_parquet, monkeypatch):

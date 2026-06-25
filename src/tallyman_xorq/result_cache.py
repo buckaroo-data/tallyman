@@ -33,12 +33,30 @@ from __future__ import annotations
 
 import contextvars
 import functools
+import hashlib
 import logging
 import re
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
+
+from xorq.expr.api import deferred_read_parquet
+from xorq.ibis_yaml.compiler import build_expr
+
+from tallyman_core import read_manifest
+from tallyman_core.aliases import get_alias, previous_version
+from tallyman_core.paths import entry_build_dir, entry_dir, project_dir
+from tallyman_xorq import source_identity as si
+from tallyman_xorq.build import BuildError, _import_script
+from tallyman_xorq.portable import PLACEHOLDER
+from tallyman_xorq.source_cache import rewrite_for_build
+
+# These same-package imports (build, source_cache, source_identity) look like a
+# cycle but aren't: build/source_cache/io reach back into result_cache only at
+# *function* level, never module-top, so result_cache always finishes loading
+# after them regardless of which module is imported first.
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
@@ -97,8 +115,6 @@ def classify_build(build_dir: Path) -> dict:
 
 
 def cache_worthy(project: str, content_hash: str) -> bool:
-    from tallyman_core.paths import entry_build_dir
-
     return classify_build(entry_build_dir(project, content_hash))["worthy"]
 
 
@@ -124,9 +140,7 @@ _MAX_RECON_DEPTH = 64
 # through to the live path. None outside reconstruction (the build path); an entry that
 # recorded no sources (mode=off / pre-#86) yields an empty map, so read_project_file also
 # falls through.
-_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
-    "_recon_sources", default=None
-)
+_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar("_recon_sources", default=None)
 
 
 def _recorded_sources(project: str, content_hash: str) -> dict:
@@ -135,9 +149,6 @@ def _recorded_sources(project: str, content_hash: str) -> dict:
     Empty when the manifest is unreadable or the entry recorded no sources (mode=off,
     or a build predating #86); read_project_file then falls through to its live-file path.
     """
-    from tallyman_core import read_manifest
-    from tallyman_core.paths import entry_dir
-
     try:
         return read_manifest(entry_dir(project, content_hash)).sources or {}
     except (OSError, ValueError):
@@ -155,8 +166,6 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
     so we recover the build-time binding by walking back through alias history to
     the nearest revision not already under reconstruction on this stack.
     """
-    from tallyman_core.aliases import get_alias, previous_version
-
     # `requested` is the caller's argument: an alias (from tracked_expr_from_alias) or a
     # hash (from pinned_expr_from_alias). Treat it as a lineage hint only when it names
     # an alias, so a hash shared across histories steps back through the alias the caller
@@ -167,8 +176,6 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
     while (project, content_hash) in active:
         parent = previous_version(project, content_hash, alias=alias_hint)
         if parent is None:
-            from tallyman_xorq.build import BuildError
-
             raise BuildError(
                 f"tracked_expr_from_alias({requested!r}) in {project!r} resolves to an entry that "
                 "reconstructs itself with no prior revision to fall back to"
@@ -191,10 +198,6 @@ def _recipe_expr(project: str, content_hash: str):
     expression roots there and composes with ``read_project_file`` and other
     ``tracked_expr_from_alias`` results as a single backend (#75).
     """
-    from tallyman_core.paths import entry_dir, project_dir
-    from tallyman_xorq.build import BuildError, _import_script
-    from tallyman_xorq.portable import PLACEHOLDER
-
     active = _RECONSTRUCTING.get()
     if len(active) >= _MAX_RECON_DEPTH:
         raise BuildError(
@@ -262,12 +265,8 @@ def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
     value-per-byte denominator); other callers use it to find the snapshot
     without reconstructing the read expression.
     """
-    from tallyman_xorq import source_identity as si
-
     if si.mode() == "salt" or not cache_worthy(project, content_hash):
         return None
-
-    from tallyman_xorq.source_cache import rewrite_for_build
 
     return _cached_node_path(rewrite_for_build(_recipe_expr(project, content_hash), project))
 
@@ -293,8 +292,6 @@ def result_digest(expr) -> str:
 
 
 def _digest_init(schema):
-    import hashlib
-
     h = hashlib.sha256()
     h.update(repr(list(zip(schema.names, [str(t) for t in schema.types]))).encode())
     return h
@@ -323,9 +320,6 @@ def count_and_result_digest(expr) -> tuple[int, str]:
 
 
 def _recorded_result_digest(project: str, content_hash: str) -> str | None:
-    from tallyman_core import read_manifest
-    from tallyman_core.paths import entry_dir
-
     try:
         return read_manifest(entry_dir(project, content_hash)).result_digest
     except (OSError, ValueError):
@@ -354,13 +348,7 @@ def _reconstructed_hash(project: str, content_hash: str) -> str | None:
     any step fails (a warning enrichment must never break the read). Tokenize only,
     no execute.
     """
-    import tempfile
-
     try:
-        from xorq.ibis_yaml.compiler import build_expr
-
-        from tallyman_xorq.source_cache import rewrite_for_build
-
         rewritten = rewrite_for_build(_recipe_expr(project, content_hash), project)
         with tempfile.TemporaryDirectory(prefix="tallyman_rehash_") as d:
             return Path(build_expr(rewritten, builds_dir=Path(d))).name
@@ -389,8 +377,6 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
     tell those apart, and an impure UDF's nondeterminism is execution-level anyway
     (#83), so a UDF entry's drift is attributed execution, never structural.
     """
-    from tallyman_core.paths import entry_build_dir
-
     # classify_build's why carries "udf:<names>" when the serialized build holds a
     # UDF (the same detection cache_worthy uses, #81). Reuse it rather than re-walk.
     # Best-effort, like _reconstructed_hash below: classify_build does unguarded
@@ -427,8 +413,6 @@ def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -
     if not recorded:
         return
     try:
-        from xorq.expr.api import deferred_read_parquet
-
         actual = result_digest(deferred_read_parquet(str(path)))
     except Exception:
         return
@@ -477,8 +461,6 @@ def _resolve_result_plan(project: str, content_hash: str):
     # rewrite_for_build wraps the expression in a ParquetSnapshotCache whose
     # structural key matches the file baked at build time, so storage/calc_key
     # give its on-disk path without re-executing.
-    from tallyman_xorq.source_cache import rewrite_for_build
-
     baked = rewrite_for_build(raw, project)
     path = _cached_node_path(baked)
     if path is None:
@@ -550,8 +532,6 @@ def cached_result_expr(project: str, content_hash: str):
     perf-namespace cold-read tag (#87) is emitted from the memoised half, so it
     still fires once per genuine reconstruct.
     """
-    from xorq.expr.api import deferred_read_parquet
-
     plan = _resolve_result_plan(project, content_hash)
     if plan[0] == "recompute":
         return plan[1]

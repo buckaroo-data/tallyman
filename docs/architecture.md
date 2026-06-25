@@ -111,8 +111,9 @@ auto-checkpoints at the dispatch boundary unless it is on the no-checkpoint
 list. The active project is session-sticky (seeded on first tool call, surviving
 disk changes within the session), and project lifecycle changes are POSTed to
 the companion rather than written directly so SSE stays honest. Notifications to
-the companion are best-effort and never raise. The tool surface is enumerated in
-the root [README.md](../README.md).
+the companion are best-effort and never raise. Every tool, its parameters, and
+its side effects (checkpoint, SSE notify, auto-recalc) are documented in
+[mcp-server.md](mcp-server.md).
 
 **tallyman_cli** (`src/tallyman_cli/`) is the Click command-line interface
 (entry point `tallyman`). It initializes projects (with synthetic fixture data),
@@ -369,6 +370,8 @@ when in doubt, the code wins.
 - [caching.md](caching.md) — the caches across the stack and their invalidation.
   **Mostly current.**
 - [installing.md](installing.md) — install and run the spike. **Mostly current.**
+- [mcp-server.md](mcp-server.md) — every MCP tool and prompt Claude Code drives,
+  with parameters, return shapes, and per-tool side effects. **Current.**
 
 ### Design records / ADRs (`plans/`)
 
@@ -431,6 +434,8 @@ as stale cruft — they predated the React SPA migration, the `result.parquet`
 removal, and the JSONL catalog format. This doc supersedes them as the
 architecture reference.
 
-> Gaps: there is no dedicated reference for the REST API, the CLI, the frontend
-> SPA architecture, or the extension points (custom display klasses, summary
-> stats, post-processing). See the project's gap tracking for the current list.
+> Gaps: there is no dedicated reference for the REST API, the CLI, or the
+> frontend SPA architecture. (The MCP tool surface and the authoring extension
+> points it exposes — display klasses, summary stats, post-processing — are now
+> covered in [mcp-server.md](mcp-server.md).) See the project's gap tracking for
+> the current list.

@@ -37,6 +37,7 @@ from tallyman_core import (
     resolve_project,
     version_of_hash,
 )
+from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_core.version import git_revision, version_info
@@ -967,7 +968,20 @@ def create_app(
         from tallyman_core.display_configs import get_display_config  # noqa: PLC0415
 
         overrides = (get_display_config(project, content_hash) or {}).get("column_config_overrides")
+        _t0 = time.perf_counter()
         result = buckaroo.load_session(content_hash, project, column_config_overrides=overrides)
+        # One activity-log event per grid load: the companion-visible timing
+        # (total + the /load_expr POST). Deeper pipeline timing → buckaroo#943.
+        record_event(
+            project,
+            "buckaroo",
+            origin="companion",
+            status=result["status"],
+            hash=content_hash,
+            detail=result.get("detail") or None,
+            load_ms=round((time.perf_counter() - _t0) * 1000, 1),
+            load_expr_ms=result.get("load_expr_ms"),
+        )
         ws_url = f"{buckaroo.ws_base_url}/ws/{result['session_id']}" if result["session_id"] else None
         return {"status": result["status"], "ws_url": ws_url, "detail": result["detail"]}
 
@@ -1265,6 +1279,28 @@ def create_app(
     def api_errors(project: str, limit: int = 20):
         project = _validate_project(project)
         return {"project": project, "errors": list_errors(project, limit=limit)}
+
+    @app.get("/{project}/api/log")
+    def api_log(
+        project: str,
+        categories: str | None = None,
+        sessions: str | None = None,
+        limit: int = 300,
+    ):
+        """The project activity log: a linear, cross-session feed of MCP build
+        runs (success/failure with traceback), alias creations, and Buckaroo
+        grid loads. ``categories`` (mcp,alias,buckaroo) and ``sessions`` are
+        comma-separated filters; the response also lists the distinct sessions
+        seen, for the UI's per-session filter.
+        """
+        project = _validate_project(project)
+        cats = [c for c in categories.split(",") if c] if categories else None
+        sess = [s for s in sessions.split(",") if s] if sessions else None
+        return {
+            "project": project,
+            "events": read_events(project, categories=cats, sessions=sess, limit=limit),
+            "sessions": list_sessions(project),
+        }
 
     @app.delete("/{project}/api/errors")
     def api_clear_errors(project: str):

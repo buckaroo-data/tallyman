@@ -595,6 +595,7 @@ class BuckarooManager:
             }
             if column_config_overrides is not None:
                 payload["column_config_overrides"] = column_config_overrides
+            _t_post = time.perf_counter()
             try:
                 resp = self._client.post(
                     f"{self.base_url}/load_expr",
@@ -619,7 +620,15 @@ class BuckarooManager:
                 }
             self._sessions[content_hash] = {"session_id": session_id, "project": project}
             self._persist_sessions()
-            return {"status": "ok", "session_id": session_id, "detail": ""}
+            # load_expr_ms: the companion-visible slice of the grid load — the POST
+            # to buckaroo only. The in-buckaroo timing (stats, row requests) needs
+            # buckaroo-side telemetry (buckaroo-data/buckaroo#943).
+            return {
+                "status": "ok",
+                "session_id": session_id,
+                "detail": "",
+                "load_expr_ms": round((time.perf_counter() - _t_post) * 1000, 1),
+            }
 
     # ------------------------------------------------------------------
     # introspection

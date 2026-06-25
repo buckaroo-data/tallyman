@@ -21,14 +21,17 @@ def record_error(
     prompt: str | None = None,
     tool: str | None = None,
     hash: str | None = None,
+    traceback: str | None = None,
 ) -> dict:
     """Append a build-failure record. Returns the recorded entry (with id).
 
     ``hash`` ties the failure to the catalog entry that failed to (re)build — set
     by recalc/auto-recalc so a later staleness scan can attribute a lingering
     stale entry to a known prior failure (``error_for_hash``) instead of flagging
-    it UNEXPLAINED. ``errors.jsonl`` lives in ``artifacts_dir``, outside the
-    catalog git repo, so a recorded failure survives ``reset_to``.
+    it UNEXPLAINED. ``traceback`` is the full ``format_exc`` (the activity log's
+    expandable stacktrace, #log); ``message`` stays the one-line summary.
+    ``errors.jsonl`` lives in ``artifacts_dir``, outside the catalog git repo, so
+    a recorded failure survives ``reset_to``.
     """
     ensure_project(project)
     entry = {
@@ -39,6 +42,7 @@ def record_error(
         "message": message,
         "tool": tool,
         "hash": hash,
+        "traceback": traceback,
     }
     p = _errors_path(project)
     with p.open("a") as fh:

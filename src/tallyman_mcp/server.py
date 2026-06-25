@@ -5,6 +5,8 @@ import json
 import logging
 import os
 import sys
+import traceback
+import uuid
 from dataclasses import asdict
 
 import httpx
@@ -46,11 +48,17 @@ from tallyman_core import (
     write_post_processing,
     write_stat,
 )
+from tallyman_core.events import record_event
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
 COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
+
+# Identifies this MCP process in the project activity log. Claude Code spawns one
+# `tallyman mcp` per session, so one process == one session; multiple sessions
+# writing to the same project are told apart by this id in events.jsonl.
+SESSION_ID = uuid.uuid4().hex[:8]
 
 mcp = FastMCP("tallyman")
 
@@ -483,6 +491,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     if "error" in out:
         return out
     out.pop("_build", None)
+    record_event(project, "build_ok", session=SESSION_ID, tool="catalog_run", prompt=prompt or None, hash=out["hash"])
     _notify("new_entry", content_hash=out["hash"])
     return out
 
@@ -534,7 +543,19 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
     try:
         result = build_and_persist(project=project, code=code, prompt=prompt or None)
     except BuildError as exc:
-        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool)
+        tb = traceback.format_exc()
+        rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool, traceback=tb)
+        record_event(
+            project,
+            "build_error",
+            session=SESSION_ID,
+            tool=tool,
+            prompt=prompt or None,
+            code=code,
+            message=str(exc),
+            traceback=tb,
+            error_id=rec["id"],
+        )
         _notify("build_failed", error_id=rec["id"], tool=tool)
         return {"error": str(exc), "error_id": rec["id"]}
     reply = {
@@ -578,6 +599,10 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     if "error" in out:
         return out
     info = set_alias(project, name, out["hash"], expect_exists=False)
+    record_event(
+        project, "alias_set", session=SESSION_ID, tool="catalog_create",
+        alias=name, version=info["version"], hash=out["hash"], prompt=prompt or None,
+    )
     notebook.append(project, name, markdown=prompt or "")
     out.pop("_build", None)
     out["alias"] = info["name"]
@@ -612,6 +637,10 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     if "error" in out:
         return out
     info = set_alias(project, name, out["hash"], expect_exists=True)
+    record_event(
+        project, "alias_set", session=SESSION_ID, tool="catalog_revise",
+        alias=name, version=info["version"], hash=out["hash"], prompt=prompt or None,
+    )
     out.pop("_build", None)
     out["alias"] = info["name"]
     out["version"] = info["version"]

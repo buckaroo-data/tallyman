@@ -148,3 +148,96 @@ def test_tallyman_read_csv_digest_is_stable(project, sample_csv, monkeypatch):
     assert healed_digest == recorded_digest, (
         f"digest changed between build and self-heal: {recorded_digest!r} vs {healed_digest!r}"
     )
+
+
+@pytest.fixture
+def repartitioned_csv(project: str) -> tuple[Path, int]:
+    """A CSV large enough that datafusion repartitions the scan across threads.
+
+    The marker column holds the source row index (0..N-1) in file order, so a
+    correct ``original_row_order`` must line up with it row-for-row. The file is
+    sized well over datafusion's ~10 MB ``repartition_file_min_size`` default;
+    above that threshold (and with >1 core) the parallel CSV scan emits rows in
+    nondeterministic arrival order, which a bare ``ibis.row_number()`` would
+    capture instead of file order. Below the threshold the scan is single-
+    partition and order is preserved incidentally — which is exactly why the
+    3-row fixture cannot catch the bug.
+    """
+    n = 120_000
+    pad = "x" * 160  # widen rows so N stays modest while the file clears ~10 MB
+    p = data_dir(project) / "big.csv"
+    lines = ["marker,pad"]
+    lines += [f"{i},{pad}" for i in range(n)]
+    p.write_text("\n".join(lines) + "\n")
+    assert p.stat().st_size > 12_000_000, p.stat().st_size  # safely over the repartition threshold
+    return p, n
+
+
+def _big_read_csv_code(csv_path: Path) -> str:
+    return f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import tallyman_read_csv
+schema = ibis.schema({{"marker": "int64", "pad": "string"}})
+expr = tallyman_read_csv({str(csv_path)!r}, schema=schema)
+"""
+
+
+def test_tallyman_read_csv_preserves_file_order_under_repartition(project, repartitioned_csv, monkeypatch):
+    """original_row_order must equal true file order even when the scan repartitions.
+
+    Regression for the canonical-ordering bug: a bare ``ibis.row_number()`` over a
+    repartitioned datafusion CSV scan numbers rows in nondeterministic arrival
+    order, so ``order_by("original_row_order")`` reproduces that arbitrary order
+    rather than file order. With the marker column = source row index, the baked
+    snapshot's row at ``original_row_order == k`` must carry ``marker == k``.
+    """
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.result_cache import baked_snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    csv_path, n = repartitioned_csv
+    res = catalog_create("big_csv", _big_read_csv_code(csv_path))
+    assert "error" not in res, res
+    h = _hash_of(project)
+
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists(), "worthy entry must bake a snapshot"
+
+    table = pq.read_table(str(snap)).sort_by("original_row_order")
+    oro = table.column("original_row_order").to_pylist()
+    marker = table.column("marker").to_pylist()
+    assert oro == list(range(n)), "original_row_order must be 0..N-1, contiguous"
+    # The crux: row k of the source file must land at original_row_order == k.
+    assert marker == list(range(n)), (
+        "original_row_order does not match true file order — the scan reshuffle "
+        "leaked into the row index (first divergence at "
+        f"{next((i for i, m in enumerate(marker) if m != i), None)})"
+    )
+
+
+def test_tallyman_read_csv_digest_stable_under_repartition(project, repartitioned_csv, monkeypatch):
+    """The snapshot digest is byte-stable across two independent materialisations of a repartitioned read."""
+    from tallyman_core import read_manifest
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, snapshot_file_digest
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    csv_path, _ = repartitioned_csv
+
+    res = catalog_create("big_csv", _big_read_csv_code(csv_path))
+    assert "error" not in res, res
+    h = _hash_of(project)
+    recorded = read_manifest(entry_dir(project, h)).result_digest
+    assert recorded, "worthy entry must record a result_digest"
+
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    snap.unlink()
+    cached_result_expr.cache_clear()
+    cached_result_expr(project, h).execute()  # self-heal → second materialisation
+
+    assert snap.exists()
+    assert snapshot_file_digest(snap) == recorded, (
+        "snapshot digest drifted across materialisations of a repartitioned read"
+    )

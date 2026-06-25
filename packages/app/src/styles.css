@@ -533,3 +533,15 @@ table.cache-table .muted { color: var(--muted); }
 .danger-btn { background: #5a1e1e; color: #ffb4b4; border: 1px solid #7a3a3a; border-radius: 4px; padding: 6px 16px; font-family: inherit; font-size: 13px; cursor: pointer; }
 .danger-btn:hover:not(:disabled) { background: #7a2525; }
 .danger-btn:disabled { opacity: 0.4; cursor: default; }
+
+/* per-expression cache metadata tab */
+.cache-meta { padding: 2px; }
+.cache-meta .cache-detail { font-size: 11px; white-space: normal; max-width: 420px; }
+.cache-meta table.cache-table td { white-space: normal; }
+.pill-cache { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-soft); }
+.pill-artifact { color: var(--muted); }
+.cache-bar-track { width: 90px; height: 8px; background: var(--line); border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; }
+.cache-bar-fill { height: 100%; background: var(--accent); border-radius: 4px; }
+.cache-diffs { margin-top: 18px; }
+.cache-diffs h4 { margin: 0 0 4px; }
+.cache-diffs p.meta { margin: 0 0 8px; max-width: 560px; }

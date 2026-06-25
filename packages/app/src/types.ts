@@ -149,6 +149,44 @@ export interface ResultCache {
   total_formatted: string;
 }
 
+export interface EntryCacheComponent {
+  key: string;
+  label: string;
+  kind: "cache" | "artifact";
+  reclaimable: boolean;
+  exists: boolean;
+  bytes: number;
+  formatted: string;
+  detail: string;
+  /** Only present on the snapshot_cache component. */
+  applicable?: boolean;
+}
+
+export interface EntryDiffCache {
+  pair: string;
+  other_hash_prefix: string;
+  other_hash: string | null;
+  other_alias: string | null;
+  bytes: number;
+  formatted: string;
+}
+
+export interface EntryCache {
+  project: string;
+  content_hash: string;
+  cache_worthy: boolean;
+  components: EntryCacheComponent[];
+  diff_caches: EntryDiffCache[];
+  cache_bytes: number;
+  cache_formatted: string;
+  artifact_bytes: number;
+  artifact_formatted: string;
+  diff_cache_bytes: number;
+  diff_cache_formatted: string;
+  total_bytes: number;
+  total_formatted: string;
+}
+
 export interface Projects {
   active: string | null;
   available: string[];

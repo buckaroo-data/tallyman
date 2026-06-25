@@ -6,7 +6,7 @@ import { recalcTarget } from "../recalcRefresh";
 import { CatalogSidebar } from "../components/CatalogSidebar";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
 import { VegaChart } from "../components/VegaChart";
-import type { Entry, AppError, EntryDetail } from "../types";
+import type { Entry, AppError, EntryDetail, EntryCache } from "../types";
 
 // ── Error banner ──────────────────────────────────────────────────────────────
 
@@ -66,7 +66,7 @@ function ErrorBanner({
 
 // ── Entry detail pane ─────────────────────────────────────────────────────────
 
-type DetailTab = "data" | "code";
+type DetailTab = "data" | "code" | "metadata";
 
 function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
   const navigate = useNavigate();
@@ -205,6 +205,15 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
         >
           code
         </button>
+        <button
+          type="button"
+          role="tab"
+          aria-selected={tab === "metadata"}
+          className={`detail-tab${tab === "metadata" ? " active" : ""}`}
+          onClick={() => setTab("metadata")}
+        >
+          metadata
+        </button>
       </div>
 
       {/* Keep the data pane mounted (hidden when inactive) so switching to the
@@ -285,6 +294,127 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
               ))}
             </details>
           )}
+        </div>
+      )}
+
+      {tab === "metadata" && (
+        <div className="tab-panel metadata-section" role="tabpanel">
+          <EntryCacheView project={project} hash={manifest.content_hash} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Per-expression cache footprint (metadata tab) ─────────────────────────────
+
+function ShareBar({ value, total }: { value: number; total: number }) {
+  const pct = total > 0 ? Math.max(value > 0 ? 2 : 0, (value / total) * 100) : 0;
+  return (
+    <div className="cache-bar-track" aria-hidden="true">
+      <div className="cache-bar-fill" style={{ width: `${pct}%` }} />
+    </div>
+  );
+}
+
+function EntryCacheView({ project, hash }: { project: string; hash: string }) {
+  const [data, setData] = useState<EntryCache | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    setData(null);
+    setError(null);
+    api
+      .entryCache(project, hash)
+      .then(setData)
+      .catch((e) => setError(e instanceof Error ? e.message : String(e)));
+  }, [project, hash]);
+
+  if (error) return <div className="meta">could not load cache metadata: {error}</div>;
+  if (!data) return <div className="meta">measuring on-disk footprint…</div>;
+
+  return (
+    <div className="cache-meta">
+      <div className="cache-summary">
+        <strong>{data.total_formatted} on disk for this expression</strong>
+        <span className="meta">
+          {data.cache_formatted} reclaimable cache · {data.artifact_formatted} build artifact
+          {data.diff_cache_bytes > 0 && <> · {data.diff_cache_formatted} shared diff cache</>}
+        </span>
+        <span className="meta cache-note">
+          {data.cache_worthy
+            ? "Expensive expression: its result is kept in the xorq snapshot cache and recomputed on a miss."
+            : "Cheap expression: no snapshot copy — the result is recomputed from the build on every read."}
+        </span>
+      </div>
+
+      <table className="data-table cache-table">
+        <thead>
+          <tr>
+            <th>Component</th>
+            <th>Type</th>
+            <th className="num">Size</th>
+            <th className="num">Share</th>
+          </tr>
+        </thead>
+        <tbody>
+          {data.components.map((c) => {
+            const na = c.key === "snapshot_cache" && c.applicable === false;
+            return (
+              <tr key={c.key}>
+                <td>
+                  <div>{c.label}</div>
+                  <div className="meta cache-detail">
+                    {na ? "not applicable to a cheap expression" : c.detail}
+                  </div>
+                </td>
+                <td>
+                  <span className={`pill ${c.kind === "cache" ? "pill-cache" : "pill-artifact"}`}>
+                    {c.kind === "cache" ? "cache · reclaimable" : "artifact · kept"}
+                  </span>
+                </td>
+                <td className="num size">{na ? "—" : c.formatted}</td>
+                <td className="num">
+                  {na ? <span className="muted">—</span> : <ShareBar value={c.bytes} total={data.total_bytes} />}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+
+      {data.diff_caches.length > 0 && (
+        <div className="cache-diffs">
+          <h4>diff stat caches involving this entry</h4>
+          <p className="meta">
+            Keyed by a version pair, so each is shared with the other version and counted apart from the
+            per-expression subtotal above.
+          </p>
+          <table className="data-table cache-table">
+            <thead>
+              <tr>
+                <th>Paired with</th>
+                <th className="num">Size</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.diff_caches.map((d) => (
+                <tr key={d.pair}>
+                  <td>
+                    {d.other_alias ? <span className="alias-name">{d.other_alias}</span> : null}{" "}
+                    {d.other_hash ? (
+                      <Link className="hash" to={`/${project}/catalog/${d.other_hash}`}>
+                        {d.other_hash.slice(0, 12)}
+                      </Link>
+                    ) : (
+                      <code className="hash">{d.other_hash_prefix}…</code>
+                    )}
+                  </td>
+                  <td className="num size">{d.formatted}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       )}
     </div>

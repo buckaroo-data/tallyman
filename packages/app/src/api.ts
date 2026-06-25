@@ -2,6 +2,7 @@ import type {
   Entry,
   AppError,
   EntryDetail,
+  EntryCache,
   NotebookFull,
   DiffData,
   ResultCache,
@@ -57,6 +58,9 @@ export const api = {
 
   entryDetail: (project: string, hash: string): Promise<EntryDetail> =>
     get(`/${project}/api/entry/${hash}`),
+
+  entryCache: (project: string, hash: string): Promise<EntryCache> =>
+    get(`/${project}/api/entry_cache/${hash}`),
 
   diskUsage: (project: string): Promise<{ formatted: Record<string, string> }> =>
     get(`/${project}/api/disk_usage`),

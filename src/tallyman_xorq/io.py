@@ -75,6 +75,31 @@ def read_project_file(rel_path: str, project: str | None = None):
     return deferred_read_parquet(str(path))
 
 
+def tallyman_read_csv(path: str, schema=None, **kwargs):
+    """Read a CSV into a xorq expression with ``original_row_order`` injected.
+
+    Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. It adds
+    a 0-based ``original_row_order`` column (the source file's row sequence)
+    which serves as the canonical total order for snapshot baking — making
+    the entry's result digest byte-stable across builds.
+
+    Because ``original_row_order`` requires a ``RowNumber`` window op, entries
+    built with this function are classified as snapshot-worthy and bake a
+    sorted parquet snapshot on first build. Subsequent reads are fast
+    (parquet scan, not CSV re-parse).
+
+    Args:
+        path: Absolute path to the CSV file.
+        schema: Optional ibis schema for the columns (same as deferred_read_csv).
+        **kwargs: Forwarded to ``xo.deferred_read_csv``.
+    """
+    import xorq.api as xo
+    import xorq.vendor.ibis as ibis
+
+    t = xo.deferred_read_csv(path, schema=schema, **kwargs)
+    return t.mutate(original_row_order=ibis.row_number()).order_by("original_row_order")
+
+
 def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
     """The digest *rel_path* was built with, if a recipe for *proj* is being
     reconstructed on this call stack (#115); otherwise None.

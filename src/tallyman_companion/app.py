@@ -88,6 +88,21 @@ def _dir_size(path: Path) -> int:
     return total
 
 
+def _path_size(path: Path) -> int:
+    """Bytes occupied by a path, whether it's a single file or a directory.
+
+    The xorq snapshot cache stores a result as either a parquet file or a
+    directory of parts depending on backend, so the per-expression breakdown
+    can't assume one shape.
+    """
+    try:
+        if path.is_dir():
+            return _dir_size(path)
+        return path.stat().st_size
+    except OSError:
+        return 0
+
+
 # A catalog entry's content hash is the lowercase-hex name of its entry dir
 # (xorq's build_path.name). Used to reject path-param junk before it can name
 # anything under the entries tree.
@@ -183,6 +198,157 @@ def _compute_disk_usage(project: str) -> dict:
             "diff_cache": _fmt_bytes(diff_cache),
             "total": _fmt_bytes(total),
         },
+    }
+
+
+def _snapshot_cache_path(project: str, content_hash: str):
+    """Resolve the xorq snapshot-cache path for one entry, without materialising.
+
+    Returns ``(applicable, path | None, note)``. Delegates to
+    ``result_cache.baked_snapshot_path``, which returns None for an entry that
+    bakes no snapshot — a cheap expression, salt identity mode, or a worthiness
+    disagreement — and the snapshot path otherwise (the very file a cold read
+    returns). It never calls ``.execute()``, so a cold expensive entry reports an
+    absent (0 B) snapshot rather than being forced to materialise just because
+    someone opened the metadata tab.
+    """
+    try:
+        from tallyman_xorq.result_cache import baked_snapshot_path  # noqa: PLC0415
+
+        path = baked_snapshot_path(project, content_hash)
+    except Exception as exc:  # noqa: BLE001 — best-effort sizing, never 500 the tab
+        return True, None, f"snapshot path unresolved: {type(exc).__name__}"
+    if path is None:
+        return False, None, "cheap entry — recomputed from the build, no snapshot copy"
+    return True, path, ""
+
+
+def _compute_entry_cache(project: str, content_hash: str) -> dict:
+    """Per-expression storage breakdown: how much disk this one entry occupies.
+
+    Separates *reclaimable cache* (the xorq snapshot copy and Buckaroo's
+    per-entry stat cache — each self-heals or recomputes if deleted) from the
+    *artifact* (xorq_build/, the portable expression that is the source of truth
+    and must not be reclaimed). Diff stat caches keyed on a pair that includes
+    this hash are reported separately: they're shared with the paired version,
+    so folding them into a single expression's subtotal would double-count
+    across the pair.
+    """
+    from tallyman_core.paths import diff_stat_cache_root as _diff_root  # noqa: PLC0415
+    from tallyman_core.paths import entry_dir as _entry_dir  # noqa: PLC0415
+
+    entry = _entry_dir(project, content_hash)
+    components: list[dict] = []
+
+    def add(key: str, label: str, path: Path, kind: str, reclaimable: bool, detail: str) -> None:
+        size = _path_size(path)
+        components.append(
+            {
+                "key": key,
+                "label": label,
+                "kind": kind,
+                "reclaimable": reclaimable,
+                "exists": path.exists(),
+                "bytes": size,
+                "formatted": _fmt_bytes(size),
+                "detail": detail,
+            }
+        )
+
+    applicable, snap_path, note = _snapshot_cache_path(project, content_hash)
+    snap_size = _path_size(snap_path) if (applicable and snap_path is not None) else 0
+    snap_exists = bool(applicable and snap_path is not None and snap_path.exists())
+    components.append(
+        {
+            "key": "snapshot_cache",
+            "label": "xorq snapshot cache",
+            "kind": "cache",
+            "reclaimable": True,
+            "applicable": applicable,
+            "exists": snap_exists,
+            "bytes": snap_size,
+            "formatted": _fmt_bytes(snap_size),
+            "detail": note or "expensive entry — a cached copy in compute_cache/, recomputed on a miss",
+        }
+    )
+
+    add(
+        "buckaroo_stat_cache",
+        ".buckaroo_stat_cache/ (summary stats)",
+        entry / ".buckaroo_stat_cache",
+        "cache",
+        True,
+        "Buckaroo's per-column summary stats for this entry",
+    )
+    add(
+        "build",
+        "xorq_build/ (expression artifact)",
+        entry / "xorq_build",
+        "artifact",
+        False,
+        "the portable expression — source of truth, not reclaimable",
+    )
+
+    # snapshot_cache carries its own (applicable/exists) keys, so it's already
+    # in `components`; everything else went through add().
+    cache_bytes = sum(c["bytes"] for c in components if c["kind"] == "cache")
+    artifact_bytes = sum(c["bytes"] for c in components if c["kind"] == "artifact")
+
+    # Diff stat caches whose pair name includes this hash's 12-char prefix.
+    h12 = content_hash[:12]
+    diff_caches: list[dict] = []
+    diff_root = _diff_root(project)
+    if diff_root.is_dir():
+        # Map entry-dir prefixes → full hash so we can name the other side.
+        prefix_map: dict[str, str] = {}
+        ent_root = _entry_dir(project, content_hash).parent
+        if ent_root.is_dir():
+            for d in ent_root.iterdir():
+                if d.is_dir():
+                    prefix_map[d.name[:12]] = d.name
+        for pair in diff_root.iterdir():
+            if not pair.is_dir():
+                continue
+            parts = pair.name.split("-")
+            if len(parts) != 2 or h12 not in parts:
+                continue
+            other12 = parts[1] if parts[0] == h12 else parts[0]
+            size = _dir_size(pair)
+            other_hash = prefix_map.get(other12)
+            diff_caches.append(
+                {
+                    "pair": pair.name,
+                    "other_hash_prefix": other12,
+                    "other_hash": other_hash,
+                    "other_alias": alias_for_hash(project, other_hash) if other_hash else None,
+                    "bytes": size,
+                    "formatted": _fmt_bytes(size),
+                }
+            )
+    diff_caches.sort(key=lambda d: -d["bytes"])
+    diff_cache_bytes = sum(d["bytes"] for d in diff_caches)
+
+    total_bytes = cache_bytes + artifact_bytes + diff_cache_bytes
+    try:
+        from tallyman_xorq.result_cache import cache_worthy as _cw  # noqa: PLC0415
+
+        worthy = _cw(project, content_hash)
+    except Exception:  # noqa: BLE001
+        worthy = False
+    return {
+        "project": project,
+        "content_hash": content_hash,
+        "cache_worthy": worthy,
+        "components": components,
+        "diff_caches": diff_caches,
+        "cache_bytes": cache_bytes,
+        "cache_formatted": _fmt_bytes(cache_bytes),
+        "artifact_bytes": artifact_bytes,
+        "artifact_formatted": _fmt_bytes(artifact_bytes),
+        "diff_cache_bytes": diff_cache_bytes,
+        "diff_cache_formatted": _fmt_bytes(diff_cache_bytes),
+        "total_bytes": total_bytes,
+        "total_formatted": _fmt_bytes(total_bytes),
     }
 
 
@@ -682,6 +848,26 @@ def create_app(
             "buckaroo_session": buckaroo_session,
             "buckaroo_ws_base": buckaroo_ws_base,
         }
+
+    @app.get("/{project}/api/entry_cache/{content_hash}")
+    def api_entry_cache(project: str, content_hash: str):
+        """Per-expression cache/storage breakdown for the metadata tab.
+
+        Resolves an alias to its current hash, then attributes the entry's
+        on-disk footprint across reclaimable caches vs. the build artifact.
+        Computed on demand (it may reconstruct the expression to locate the
+        snapshot path), so it's a separate route from the always-loaded entry
+        detail.
+        """
+        project = _validate_project(project)
+        aliases = load_aliases(project)
+        if content_hash in aliases:
+            content_hash = aliases[content_hash]
+        else:
+            _require_hash(content_hash)
+        if not entry_dir(project, content_hash).exists():
+            raise HTTPException(404, f"entry {content_hash!r} not found")
+        return _compute_entry_cache(project, content_hash)
 
     @app.get("/{project}/api/session/{content_hash}")
     def get_session(project: str, content_hash: str):

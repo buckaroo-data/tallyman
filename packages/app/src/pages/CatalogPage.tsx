@@ -414,10 +414,18 @@ function EntryCacheView({ project, hash }: { project: string; hash: string }) {
           {data.cache_formatted} reclaimable cache · {data.artifact_formatted} build artifact
           {data.diff_cache_bytes > 0 && <> · {data.diff_cache_formatted} shared diff cache</>}
         </span>
+        <span className="meta">
+          {data.source_tracked
+            ? `${data.source_formatted} raw source${data.sources.length > 1 ? ` (${data.sources.length} files)` : ""}`
+            : "raw source size not tracked (source-identity off)"}
+          {data.modified_at && <> · last modified {data.modified_at.slice(0, 19).replace("T", " ")}</>}
+        </span>
         <span className="meta cache-note">
+          <strong>{data.cache_worthy ? "Expensive" : "Cheap"} alias.</strong>{" "}
           {data.cache_worthy
-            ? "Expensive expression: its result is kept in the xorq snapshot cache and recomputed on a miss."
-            : "Cheap expression: no snapshot copy — the result is recomputed from the build on every read."}
+            ? "Its result is kept in the xorq snapshot cache and recomputed on a miss."
+            : "No snapshot copy — the result is recomputed from the build on every read."}
+          {data.cache_worthy_why && <span className="cache-why"> ({data.cache_worthy_why})</span>}
         </span>
       </div>
 
@@ -488,6 +496,37 @@ function EntryCacheView({ project, hash }: { project: string; hash: string }) {
               ))}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {(data.parents.length > 0 || data.children.length > 0) && (
+        <div className="cache-lineage">
+          {data.parents.length > 0 && (
+            <div>
+              <h4>built from</h4>
+              <ul className="lineage-list">
+                {data.parents.map((p) => (
+                  <li key={p.hash}>
+                    <Link to={`/${project}/catalog/${p.hash}`}>{p.alias ?? p.ref ?? p.hash.slice(0, 12)}</Link>
+                    {p.alias && p.ref !== p.alias && <span className="meta"> (as {p.ref})</span>}
+                    <span className="meta"> · {p.follow ? "follows alias" : "pinned"}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {data.children.length > 0 && (
+            <div>
+              <h4>used by</h4>
+              <ul className="lineage-list">
+                {data.children.map((ch) => (
+                  <li key={ch.hash}>
+                    <Link to={`/${project}/catalog/${ch.hash}`}>{ch.alias ?? ch.hash.slice(0, 12)}</Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
         </div>
       )}
     </div>

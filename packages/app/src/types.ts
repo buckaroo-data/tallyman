@@ -171,10 +171,32 @@ export interface EntryDiffCache {
   formatted: string;
 }
 
+export interface EntrySource {
+  path: string;
+  bytes: number;
+  formatted: string;
+  exists: boolean;
+}
+
+export interface EntryParent {
+  hash: string;
+  ref: string;
+  follow: boolean;
+  alias: string | null;
+}
+
+export interface EntryChild {
+  hash: string;
+  alias: string | null;
+}
+
 export interface EntryCache {
   project: string;
   content_hash: string;
   cache_worthy: boolean;
+  cache_worthy_why: string | null;
+  created_at: string | null;
+  modified_at: string | null;
   components: EntryCacheComponent[];
   diff_caches: EntryDiffCache[];
   cache_bytes: number;
@@ -183,6 +205,12 @@ export interface EntryCache {
   artifact_formatted: string;
   diff_cache_bytes: number;
   diff_cache_formatted: string;
+  source_bytes: number;
+  source_formatted: string;
+  source_tracked: boolean;
+  sources: EntrySource[];
+  parents: EntryParent[];
+  children: EntryChild[];
   total_bytes: number;
   total_formatted: string;
 }

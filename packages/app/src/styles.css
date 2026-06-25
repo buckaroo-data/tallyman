@@ -555,3 +555,8 @@ table.cache-table .muted { color: var(--muted); }
 .cache-diffs { margin-top: 18px; }
 .cache-diffs h4 { margin: 0 0 4px; }
 .cache-diffs p.meta { margin: 0 0 8px; max-width: 560px; }
+.cache-why { color: var(--muted); }
+.cache-lineage { margin-top: 18px; display: flex; gap: 36px; flex-wrap: wrap; }
+.cache-lineage h4 { margin: 0 0 4px; }
+.lineage-list { margin: 0; padding-left: 18px; }
+.lineage-list li { margin: 2px 0; }

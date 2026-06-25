@@ -46,7 +46,9 @@ in-memory catalog state, and the companion holds only its SSE subscriber list.
 The typical loop: Claude Code calls an MCP tool to create or revise an entry,
 the MCP server compiles the xorq expression and writes a content-addressed
 entry plus a git checkpoint, then notifies the companion. The companion emits a
-Server-Sent Event, the SPA refetches the affected data, and when the user opens
+Server-Sent Event (SSE, a push message over an HTTP stream the browser holds
+open; see [Live updates over SSE](#live-updates-over-sse)), the SPA refetches
+the affected data, and when the user opens
 an entry the companion warms a Buckaroo session so the grid loads. See
 [expression-lifecycle.md](expression-lifecycle.md) for the full
 create-to-view path.
@@ -266,6 +268,26 @@ does a hard git reset to a commit and then reconciles untracked build artifacts
 back to the recorded pointers, evicting to or restoring from the bullpen without
 recompute (a forward reset copies back from the bullpen). Live operations never
 read the bullpen.
+
+**Live updates over SSE.** The companion pushes changes to the browser with
+Server-Sent Events (SSE): the SPA opens one long-lived HTTP stream to
+`GET /{project}/api/sse` through the browser's native `EventSource`, and the
+server writes named event messages down it. This is the inverse of polling. The
+browser never asks "anything new?" on a timer; it holds the stream open and the
+server speaks when something changes. The SPA registers listeners for these
+kinds: `new_entry`, `build_failed`, `notebook_changed`, `chart_attached`,
+`post_processing_changed`, `summary_stat_changed`, `recalc`, and
+`project_switched` (plus `hello` and `ping`, which open and keep the connection
+alive). An event is a signal, not a data payload: every one increments a
+monotonic `version` counter held in a React context (`SSEContext.tsx`), and
+components key their effects on that counter, so a bump triggers exactly one
+refetch of the affected REST resource. That is what "refetches off an SSE
+version counter rather than polling" means. Two events also carry state the
+refetch cannot derive: `recalc` ships the `{oldHash: newHash}` remap so an open
+entry view can follow its entry to the new hash, and `project_switched` ships
+the project name to navigate to. If the stream drops, the context flips to
+`offline`. Sources: `SSEContext.tsx` on the browser side, the `/{project}/api/sse`
+route and the `/internal/notify` fan-out in `app.py` on the server side.
 
 ## Request and data-flow paths
 

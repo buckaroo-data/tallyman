@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
+from tallyman_core.errors import record_error
 from tallyman_core.events import read_events, record_event
 from tallyman_mcp.server import catalog_create, catalog_revise, catalog_run
 
@@ -77,3 +78,36 @@ def test_events_are_session_filterable(project, orders_parquet, monkeypatch):
     record_event(project, "build_ok", session="bbb", tool="catalog_run", hash="h2")
     got = read_events(project, sessions=["aaa"])
     assert got and all(e["session"] == "aaa" for e in got)
+
+
+def test_api_log_backfills_errors_from_errors_jsonl(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # The Log tab must show build failures even when no event was recorded for
+    # them — e.g. an older MCP that wrote errors.jsonl but not events.jsonl.
+    # /api/log backfills build_error from errors.jsonl (#log), marked history.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    rec = record_error(project, code="expr = undefined_zzz", message="boom", tool="catalog_run", prompt="p")
+
+    c = TestClient(fresh_companion_app)
+    body = c.get(f"/{project}/api/log").json()
+    be = [e for e in body["events"] if e["kind"] == "build_error" and e.get("error_id") == rec["id"]]
+    assert be, "errors.jsonl failure backfilled into the log"
+    assert be[0]["category"] == "mcp"
+    assert be[0]["message"] == "boom"
+    assert be[0]["origin"] == "history"
+    # also filterable under the mcp category
+    only_mcp = c.get(f"/{project}/api/log?categories=mcp").json()["events"]
+    assert any(e.get("error_id") == rec["id"] for e in only_mcp)
+
+
+def test_api_log_dedups_error_present_in_both_stores(fresh_companion_app, project, orders_parquet, monkeypatch):
+    # When the new MCP recorded a build_error event AND errors.jsonl has the
+    # same id, it must appear once — the rich event wins over the backfill.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    rec = record_error(project, code="x", message="boom", tool="catalog_run")
+    record_event(project, "build_error", session="s1", error_id=rec["id"], tool="catalog_run", message="boom")
+
+    c = TestClient(fresh_companion_app)
+    body = c.get(f"/{project}/api/log").json()
+    matches = [e for e in body["events"] if e.get("error_id") == rec["id"]]
+    assert len(matches) == 1, f"error should appear once, got {len(matches)}"
+    assert matches[0]["session"] == "s1"  # the rich events.jsonl event, not the backfill

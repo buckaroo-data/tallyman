@@ -520,6 +520,58 @@ def _serve_spa() -> HTMLResponse:
     )
 
 
+def _backfilled_log_events(project: str, seen_error_ids: set, seen_hashes: set) -> list[dict]:
+    """Activity-log events synthesised from the pre-existing stores.
+
+    The Log tab should show build failures and entries even when events.jsonl
+    didn't capture them — e.g. recorded before the activity log existed, or by an
+    MCP process that predates the event-emitting change (it writes errors.jsonl /
+    manifests but not events.jsonl). Backfills ``build_error`` from errors.jsonl
+    and ``build_ok`` / ``alias_set`` from entry manifests, skipping anything
+    already in events.jsonl (deduped by error_id / content hash so the rich event
+    wins). Backfilled rows carry no session id and are marked ``origin=history``.
+    """
+    out: list[dict] = []
+    for err in list_errors(project, limit=1_000_000_000):
+        if err.get("id") in seen_error_ids:
+            continue
+        out.append(
+            {
+                "ts": err.get("created_at", ""),
+                "kind": "build_error",
+                "category": "mcp",
+                "session": None,
+                "origin": "history",
+                "tool": err.get("tool"),
+                "prompt": err.get("prompt"),
+                "code": err.get("code"),
+                "message": err.get("message"),
+                "traceback": err.get("traceback"),
+                "error_id": err.get("id"),
+                "hash": err.get("hash"),
+            }
+        )
+    for ent in list_entries(project):
+        h = ent.get("content_hash")
+        if not h or h in seen_hashes:
+            continue
+        ev = {
+            "ts": ent.get("created_at", ""),
+            "category": "mcp",
+            "session": None,
+            "origin": "history",
+            "prompt": ent.get("prompt"),
+            "hash": h,
+        }
+        info = version_of_hash(project, h)
+        if info:
+            ev.update(kind="alias_set", category="alias", alias=info[0], version=info[1])
+        else:
+            ev["kind"] = "build_ok"
+        out.append(ev)
+    return out
+
+
 def create_app(
     project: str | None = None,
     *,
@@ -1296,9 +1348,22 @@ def create_app(
         project = _validate_project(project)
         cats = [c for c in categories.split(",") if c] if categories else None
         sess = [s for s in sessions.split(",") if s] if sessions else None
+        # events.jsonl (rich: session, traceback, timing) merged with a backfill
+        # from the pre-existing stores, so build failures and entries show even
+        # when no event was recorded for them. Read raw + unfiltered to dedup,
+        # then filter / sort / limit the merged feed.
+        raw = read_events(project, limit=1_000_000_000)
+        seen_error_ids = {e["error_id"] for e in raw if e.get("error_id")}
+        seen_hashes = {e["hash"] for e in raw if e.get("hash") and e.get("kind") in ("build_ok", "alias_set")}
+        merged = raw + _backfilled_log_events(project, seen_error_ids, seen_hashes)
+        if cats:
+            merged = [e for e in merged if e.get("category") in cats]
+        if sess:
+            merged = [e for e in merged if e.get("session") in sess]
+        merged.sort(key=lambda e: e.get("ts", ""), reverse=True)
         return {
             "project": project,
-            "events": read_events(project, categories=cats, sessions=sess, limit=limit),
+            "events": merged[:limit],
             "sessions": list_sessions(project),
         }
 

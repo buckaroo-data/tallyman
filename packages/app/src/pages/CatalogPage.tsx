@@ -6,6 +6,7 @@ import { recalcTarget } from "../recalcRefresh";
 import { CatalogSidebar } from "../components/CatalogSidebar";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
 import { VegaChart } from "../components/VegaChart";
+import { linkifyRefs } from "../codeLinks";
 import type { Entry, AppError, EntryDetail, EntryCache, SessionResult } from "../types";
 
 // ── Error banner ──────────────────────────────────────────────────────────────
@@ -272,7 +273,23 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
               {codeStatus && <div className="meta" style={{ marginTop: 4 }}>{codeStatus}</div>}
             </>
           ) : (
-            <pre className="code">{code}</pre>
+            <>
+              {manifest.parents && manifest.parents.length > 0 && (
+                <p className="meta code-refs-note">
+                  loads {manifest.parents.length === 1 ? "a catalog entry" : "catalog entries"}:{" "}
+                  {manifest.parents.map((p, i) => (
+                    <span key={p.hash}>
+                      {i > 0 && ", "}
+                      <Link to={`/${project}/catalog/${p.hash}`}>{p.ref}</Link>
+                      {" @ "}
+                      <code className="hash">{p.hash.slice(0, 12)}</code>
+                      {p.follow ? " (alias head at build)" : " (pinned)"}
+                    </span>
+                  ))}
+                </p>
+              )}
+              <CodeWithLinks code={code} project={project} parents={manifest.parents} />
+            </>
           )}
 
           {build_artifacts.length > 0 && (
@@ -297,6 +314,38 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
         </div>
       )}
     </div>
+  );
+}
+
+// ── Code with clickable catalog refs (#135) ──────────────────────────────────
+
+function CodeWithLinks({
+  code,
+  project,
+  parents,
+}: {
+  code: string;
+  project: string;
+  parents?: { hash: string; ref: string; follow: boolean }[] | null;
+}) {
+  const segments = linkifyRefs(code, parents ?? null);
+  return (
+    <pre className="code">
+      {segments.map((seg, i) =>
+        typeof seg === "string" ? (
+          seg
+        ) : (
+          <Link
+            key={i}
+            to={`/${project}/catalog/${seg.hash}`}
+            className="code-ref"
+            title={`${seg.ref} → ${seg.hash}${seg.follow ? " (alias head at build time)" : " (pinned revision)"}`}
+          >
+            "{seg.ref}"
+          </Link>
+        ),
+      )}
+    </pre>
   );
 }
 

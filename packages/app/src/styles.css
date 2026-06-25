@@ -543,6 +543,8 @@ table.cache-table .muted { color: var(--muted); }
 .buckaroo-error .detail { color: #e8b4b8; margin: 4px 0; white-space: pre-wrap; }
 .buckaroo-error code { background: rgba(0, 0, 0, 0.25); padding: 1px 4px; border-radius: 3px; }
 .link-btn { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; padding: 0; text-decoration: underline; }
+.code-ref { color: var(--accent); text-decoration: underline; }
+.code-refs-note { margin: 0 0 8px; }
 
 /* per-expression cache metadata tab */
 .cache-meta { padding: 2px; }

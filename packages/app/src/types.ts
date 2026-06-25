@@ -38,6 +38,9 @@ export interface EntryDetail {
     execute_seconds: number;
     created_at: string;
     prompt: string | null;
+    // Recorded tracked_expr_from_alias parent edges (raw manifest shape — no
+    // resolved alias). Used to linkify the code's catalog refs (#135).
+    parents?: { hash: string; ref: string; follow: boolean }[] | null;
   };
   schema: Schema;
   code: string;

@@ -1542,6 +1542,21 @@ def create_app(
             rec = _record_error(project, code=code, message=str(exc), tool="api_code")
             await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
             raise HTTPException(400, str(exc))
+        from tallyman_xorq.dependents import references_own_alias  # noqa: PLC0415
+
+        if references_own_alias(project, res.content_hash, alias):
+            from tallyman_core import record_error as _record_error  # noqa: PLC0415
+
+            msg = (
+                f"this revision references its own alias {alias!r}, which makes an opaque, "
+                f"permanently-stale (follows-its-own-head) entry. Write a self-contained recipe: "
+                f"inline the source (read_project_file / read_csv …) for a source-shaped entry, or "
+                f"reference the previous version by hash with pinned_expr_from_alias({prev_hash!r}) "
+                f"for an expensive one."
+            )
+            rec = _record_error(project, code=code, message=msg, tool="api_code")
+            await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "api_code"})
+            raise HTTPException(400, msg)
         info = _set_alias(project, alias, res.content_hash, expect_exists=True)
         # Chart + display config are keyed by content hash; seed the new version
         # from the previous one so they follow the alias across revisions.

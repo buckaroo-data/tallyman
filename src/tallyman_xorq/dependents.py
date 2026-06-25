@@ -31,6 +31,19 @@ def parents_of(project: str, content_hash: str) -> list[ParentRef]:
     return list(read_manifest(entry_dir(project, content_hash)).parents or [])
 
 
+def references_own_alias(project: str, content_hash: str, alias: str) -> bool:
+    """True if the entry references its own ``alias`` *by name* (#135).
+
+    A revision of alias X whose recipe calls ``tracked_expr_from_alias("X")`` /
+    ``pinned_expr_from_alias("X")`` records a parent edge with ``ref == X``. That
+    makes the entry an opaque self-reference — and a permanently-stale,
+    follows-its-own-head entry — so ``catalog_revise`` rejects it. A reference to
+    a prior version *by hash* records ``ref == <hash>`` (not the alias name) and
+    is allowed.
+    """
+    return any(p.ref == alias for p in parents_of(project, content_hash))
+
+
 def sources_of(project: str, content_hash: str) -> dict[str, str] | None:
     """The recorded source-leaf digests of one entry (``{rel_path: digest}``).
 

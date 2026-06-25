@@ -50,6 +50,7 @@ from tallyman_core import (
 )
 from tallyman_core.events import record_event
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
+from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
@@ -617,12 +618,22 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
 def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     """Persist a NEW VERSION of an existing alias.
 
-    The alias is repointed to the new content hash. The previous hash remains
-    in the catalog as a forensic artifact and is recorded in alias_history.
+    The alias is repointed to the new content hash; the previous hash remains as
+    a forensic artifact in alias_history.
 
-    Code conventions and gotchas are documented in `catalog_run`. The same
-    rules apply here. Use `tracked_expr_from_alias(name)` to chain off the previous
-    version of the alias (or any other named entry).
+    Write the revision as a SELF-CONTAINED recipe — start from this entry's
+    current code and extend it, so the code tab reads as the full state of this
+    version in one view. A revision that references its OWN alias by name
+    (`tracked_expr_from_alias("<name>")` / `pinned_expr_from_alias("<name>")`) is
+    rejected (#135) — it makes an opaque, follows-its-own-head entry. Two good
+    shapes instead:
+      - source-shaped entry -> inline the source: `read_project_file(...)` /
+        `read_csv` plus the transforms, then your change.
+      - expensive parent (Aggregate/Join/Sort/window/UDF) -> reference the
+        previous version by its content HASH: `pinned_expr_from_alias("<hash>")`,
+        which reads its baked snapshot instead of re-running the computation.
+
+    Code conventions and gotchas are documented in `catalog_run`.
 
     Args:
         name: An existing alias.
@@ -636,6 +647,26 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     out = _run_and_record(project, code, prompt, tool="catalog_revise")
     if "error" in out:
         return out
+    if references_own_alias(project, out["hash"], name):
+        msg = (
+            f"this revision references its own alias {name!r}, which makes an opaque, "
+            f"permanently-stale (follows-its-own-head) entry. Write a self-contained recipe: "
+            f"inline the source (read_project_file / read_csv …) for a source-shaped entry, or "
+            f"reference the previous version by hash with pinned_expr_from_alias({prev_hash!r}) "
+            f"for an expensive one."
+        )
+        rec = record_error(project, code=code, message=msg, prompt=prompt or None, tool="catalog_revise")
+        record_event(
+            project,
+            "build_error",
+            session=SESSION_ID,
+            tool="catalog_revise",
+            prompt=prompt or None,
+            code=code,
+            message=msg,
+            error_id=rec["id"],
+        )
+        return {"error": msg, "error_id": rec["id"]}
     info = set_alias(project, name, out["hash"], expect_exists=True)
     record_event(
         project, "alias_set", session=SESSION_ID, tool="catalog_revise",

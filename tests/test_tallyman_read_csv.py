@@ -86,7 +86,7 @@ def test_tallyman_read_csv_always_bakes_snapshot(project, sample_csv, monkeypatc
 
 def test_tallyman_read_csv_snapshot_is_sorted(project, sample_csv, monkeypatch):
     """The baked snapshot rows are in ascending original_row_order order."""
-    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+    from tallyman_xorq.result_cache import baked_snapshot_path
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("csv_entry", _read_csv_code(sample_csv))
@@ -116,7 +116,7 @@ def test_tallyman_read_csv_digest_is_stable(project, sample_csv, monkeypatch):
     row numbers, sort by them, and bake — so the file hash must match.
     """
     from tallyman_core import read_manifest
-    from tallyman_xorq.result_cache import snapshot_file_digest, baked_snapshot_path
+    from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -137,8 +137,6 @@ def test_tallyman_read_csv_digest_is_stable(project, sample_csv, monkeypatch):
     )
 
     # Evict and self-heal to get a second materialisation.
-    import shutil
-    from tallyman_core.paths import compute_cache_dir
     from tallyman_xorq.result_cache import cached_result_expr
 
     snap.unlink()

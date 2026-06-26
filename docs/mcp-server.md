@@ -143,6 +143,13 @@ The compile-and-persist family. The `code` argument is a self-contained Python
 script that binds a top-level `expr` to a xorq/ibis expression;
 `catalog_run`'s docstring is the canonical cookbook for writing it (namespaces,
 the datafusion-only backend, data sourcing, and the `xorq.ml` MODELING section).
+Data sourcing inside `code` uses four helpers from `tallyman_xorq.io`:
+`tracked_expr_from_alias` (a catalog entry, recorded as a lineage parent),
+`pinned_expr_from_alias` (a catalog entry by alias or hash, no following),
+`read_project_file` (a raw parquet under `data/`), and `tallyman_read_csv` (CSV
+ingest — injects an `original_row_order` column so the baked snapshot is
+byte-stable across builds; use it for all CSV reads instead of
+`xo.deferred_read_csv`, #137).
 
 ### `catalog_run(code, prompt="") -> dict`
 Execute an expression and persist it as an **unnamed (scratch)** entry. Claude's

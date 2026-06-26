@@ -211,11 +211,17 @@ unique by construction, Buckaroo sessions are keyed globally by content hash,
 not per project. The source-identity mode (`off` / `cas` / `salt`, default
 `cas`) is decided in [adr-source-identity-content-hash.md](../plans/adr-source-identity-content-hash.md).
 
-**Result digest.** A second identity axis. The content hash keys the expression
-graph; the `result_digest` (a content hash of the executed rows, in order) keys
-the executed bytes. A mismatch during a cache self-heal points at execution
-nondeterminism (sampling, `now()`, unordered limits, impure UDFs) rather than a
-structural change.
+**Result digest.** A second identity axis, recorded for *worthy* (snapshot-baking)
+entries only. The content hash keys the expression graph; the `result_digest`
+keys the executed *bytes* as a row **multiset**, not a sequence. It is the
+SHA-256 of the entry's baked snapshot parquet (`snapshot_file_digest`), which the
+bake writes after sorting on a synthetic `original_row_order` and pinning the
+parquet write settings, so the bytes are reproducible run-to-run and the file
+hash is order-insensitive. Cheap, row-preserving entries record no digest — they
+have no snapshot to hash and recompute live. A mismatch when an evicted snapshot
+self-heals points at execution nondeterminism (sampling, `now()`, an impure UDF,
+source drift), not the unordered-scan row reshuffling the canonical ordering now
+absorbs. Design: [adr-result-digest-canonical-ordering.md](../plans/adr-result-digest-canonical-ordering.md).
 
 **Alias and V_n versions.** An alias is a named, mutable pointer (for example
 `sales`) to the latest content hash of a logical entry. Each alias carries an
@@ -385,6 +391,11 @@ when in doubt, the code wins.
   a *proposed* cost-vs-size cache rubric. **Partially stale / not adopted:** the
   structural `cache_worthy` admission test it proposes to remove is still the
   live gatekeeper, and `ensure_result` it names was removed (#73).
+- [adr-result-digest-canonical-ordering.md](../plans/adr-result-digest-canonical-ordering.md)
+  — `result_digest` as a row multiset via a canonically-ordered snapshot hash,
+  replacing the per-row Python digest (#137). **Current** (implemented: the
+  digest is now `snapshot_file_digest`, and `tallyman_read_csv` injects
+  `original_row_order`).
 
 ### Plans (`plans/`)
 
@@ -412,6 +423,14 @@ when in doubt, the code wins.
 
 ### Research notes / experiment logs (`plans/`, `demo/`) — point-in-time records
 
+The digest investigation behind #137 (current):
+[datafusion-scan-order-findings.md](../plans/datafusion-scan-order-findings.md)
+— why a parallel datafusion scan emits rows in a different order each run, and
+the polars-ingest decision — and
+[result-digest-vs-xorq-staleness.md](../plans/result-digest-vs-xorq-staleness.md)
+— why `result_digest` can't reuse xorq's content-aware cache staleness.
+
+Older, historical:
 [eda-prompt-research.md](../plans/eda-prompt-research.md),
 [eda-codegen-run1.md](../plans/eda-codegen-run1.md),
 [haiku-codegen-findings.md](../plans/haiku-codegen-findings.md),

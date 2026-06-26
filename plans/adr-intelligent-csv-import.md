@@ -135,17 +135,21 @@ dtype  := "int64" | "date" | … | "infer"
   `Price`→`Date` when you keep name-binding) is a downstream `expr.rename(...)`,
   not a reader concern.
 
-### D4 — #10 / opacity: a curated dialect vocabulary, no passthrough
+### D4 — #10 / opacity: a curated dialect vocabulary, no passthrough (DEFERRED)
 
-The dialect half of the config surface is a **curated, engine-agnostic** set of
-named parameters — `delimiter`, `quote`, `escape`, `has_header`, `skip_rows`,
+The dialect half of the config surface should be a **curated, engine-agnostic** set
+of named parameters — `delimiter`, `quote`, `escape`, `has_header`, `skip_rows`,
 `comment`, `encoding`, `null_values`, `decimal`, `thousands` (drawn from the
-research config-matrix's agreed vocabulary) — each translated to the engine. **No
-raw `**kwargs` passthrough.** A CSV that needs an option the vocabulary lacks is a
-**bug** (file it, add the agnostic param), never a passthrough that couples
-recipes to polars. (#137 added raw `**kwargs → scan_csv`; D4 replaces it. The
-former #10 test asserting `separator=";"` is reworded to the agnostic
-`delimiter=";"` — tests are ours to change.)
+research config-matrix's agreed vocabulary) — each translated to the engine, with
+**no raw `**kwargs` passthrough**: a CSV that needs an option the vocabulary lacks
+is a **bug** (file it, add the agnostic param), never a passthrough that couples
+recipes to polars.
+
+**Status: deferred, not in this PR.** #137 already forwards raw `**kwargs → scan_csv`
+(the #10 fix), which works and is the status quo. Replacing it with the curated
+vocabulary is opacity *hygiene*, not a filed bug, so it is documented here as the
+target and left for a follow-up (reword the #10 test to the agnostic `delimiter=`
+at that time). Until then recipes can still pass polars-specific reader kwargs.
 
 ### D5 — Source identity: durable parquet, verify trusts it, drift is a flagged error
 
@@ -252,8 +256,12 @@ sub-µs precision the ibis type declares.
 3. **fix #144 + #145** — type coverage + timestamp tz/precision (self-contained
    `_IBIS_TO_POLARS`/`_polars_overrides` extensions).
 4. **fix #141** — the schema-spec normaliser (dict/tuple/None, `&rest`, `&begin`
-   specced, totality + header-mismatch error); reword the #10 test to `delimiter=`.
+   specced, totality + header-mismatch error).
 5. **fix #143** — the escalation ladder + suggestion engine + the D7 error string.
+
+D4 (curated dialect vocabulary) and the D5 hash/drift-detection enhancement are
+decided but deferred to follow-ups (see those sections); #142 ragged is deferred to
+the edge-case pass.
 
 ## Testing plan
 

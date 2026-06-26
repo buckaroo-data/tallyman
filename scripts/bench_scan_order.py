@@ -77,7 +77,12 @@ def section_read(csv, schema, runs):
     out = {}
     for label, configure in VARIANTS:
         con = _make_backend(configure)
-        wall, cpu, n = _best(runs, lambda: sum(b.num_rows for b in con.read_csv(csv, schema=schema).to_pyarrow_batches()))
+
+        def run():
+            t = con.read_csv(csv, schema=schema)
+            return sum(b.num_rows for b in t.to_pyarrow_batches())
+
+        wall, cpu, n = _best(runs, run)
         out[label] = (wall, cpu / wall)
         print(f"  {label:<44} {wall:6.2f}s  {cpu / wall:5.1f} cores  rows={n:,}", flush=True)
 
@@ -111,9 +116,14 @@ def section_agg(csv, schema, group_cols, runs):
             out[(gcol, label)] = (wall, cpu / wall)
             print(f"  {label:<44} {wall:6.2f}s  {cpu / wall:5.1f} cores  groups={g:,}", flush=True)
 
-        wall, cpu, g = _best(runs, lambda: pl.scan_csv(csv, infer_schema=False).group_by(gcol).agg(pl.len()).collect().height)
+        def run_pl():
+            lf = pl.scan_csv(csv, infer_schema=False)
+            return lf.group_by(gcol).agg(pl.len()).collect().height
+
+        wall, cpu, g = _best(runs, run_pl)
         out[(gcol, "polars group_by.agg.collect()")] = (wall, cpu / wall)
-        print(f"  {'polars group_by.agg.collect()':<44} {wall:6.2f}s  {cpu / wall:5.1f} cores  groups={g:,}", flush=True)
+        pl_label = "polars group_by.agg.collect()"
+        print(f"  {pl_label:<44} {wall:6.2f}s  {cpu / wall:5.1f} cores  groups={g:,}", flush=True)
     return out
 
 

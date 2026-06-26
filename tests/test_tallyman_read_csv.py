@@ -241,3 +241,72 @@ def test_tallyman_read_csv_digest_stable_under_repartition(project, repartitione
     assert snapshot_file_digest(snap) == recorded, (
         "snapshot digest drifted across materialisations of a repartitioned read"
     )
+
+
+def test_tallyman_read_csv_reconstructs_after_source_deleted(project, sample_csv, monkeypatch):
+    """#6: once the ordered parquet is baked, reconstruction must not touch the CSV.
+
+    The CSV is read exactly once — at ingest. After the snapshot is baked, deleting
+    (or moving) the source CSV must not break path reconstruction: baked_snapshot_path
+    and verify_result_faithful re-run the recipe (-> tallyman_read_csv), and that must
+    resolve the already-written intermediate instead of stat-ing the now-absent CSV.
+    """
+    from tallyman_xorq.result_cache import baked_snapshot_path, verify_result_faithful
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = catalog_create("csv_entry", _read_csv_code(sample_csv))
+    assert "error" not in res, res
+    h = _hash_of(project)
+    assert baked_snapshot_path(project, h) is not None
+
+    # Delete the source CSV; the baked snapshot and the ordered intermediate remain.
+    sample_csv.unlink()
+
+    # Reconstruction must still resolve the snapshot (pre-fix: FileNotFoundError on src.stat()).
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists(), "snapshot must resolve without the source CSV"
+    assert verify_result_faithful(project, h) is True, "faithful check must work without the CSV"
+
+
+def test_ordered_csv_intermediate_lives_outside_project_dir(project, sample_csv, monkeypatch):
+    """#9: the ordered-CSV intermediate is keyed on the CSV path, not the active project.
+
+    Placing it under a project's artifacts dir (via resolve_project(None)) means a
+    reconstruction under a *different* active project looks in the wrong dir and
+    re-reads the CSV. It must live in a project-independent location.
+    """
+    from tallyman_core import artifacts_dir
+    from tallyman_core.paths import tallyman_home
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = catalog_create("csv_entry", _read_csv_code(sample_csv))
+    assert "error" not in res, res
+
+    shared = list((tallyman_home() / "csv_ordered").glob("*.parquet"))
+    assert shared, "ordered-CSV intermediate must live under TALLYMAN_HOME/csv_ordered"
+    proj_csv_ordered = artifacts_dir(project) / "csv_ordered"
+    assert not proj_csv_ordered.exists(), "intermediate must NOT be under the project artifacts dir"
+
+
+def test_tallyman_read_csv_forwards_reader_kwargs(project, monkeypatch):
+    """#10: reader options (separator, skip_rows, ...) are forwarded to polars scan_csv.
+
+    The rewrite dropped **kwargs; a documented call like tallyman_read_csv(path, schema,
+    separator=';') must parse the alternate delimiter instead of raising TypeError.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "semi.csv"
+    p.write_text("id;name\n3;charlie\n1;alice\n2;bob\n")
+    code = f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import tallyman_read_csv
+schema = ibis.schema({{"id": "int64", "name": "string"}})
+expr = tallyman_read_csv({str(p)!r}, schema=schema, separator=";")
+"""
+    res = catalog_create("semi", code)
+    assert "error" not in res, res
+    fields = {f["name"] for f in res["schema"]["fields"]}
+    assert {"id", "name", "original_row_order"} <= fields, (
+        f"separator=';' not forwarded — columns did not split: {fields}"
+    )

@@ -41,7 +41,7 @@ def test_polars_overrides_covers_time_decimal_and_nonnull():
     )
     ov = _polars_overrides(schema)
     assert ov["t"] == pl.Time
-    assert ov["d"] == pl.Decimal(10, 2)
+    assert ov["d"] == pl.Float64  # decimal -> float64 for now; exact decimal deferred to UI (#150)
     assert ov["n"] == pl.Int64
 
 

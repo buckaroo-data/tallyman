@@ -117,10 +117,11 @@ def _polars_dtype(dtype):
     """Translate one ibis dtype to a concrete polars dtype.
 
     Inspects the dtype *object* (predicates + attributes) rather than its string
-    form, so parametric and non-nullable types map correctly: ``decimal(p, s)``
-    keeps its precision/scale (#144), ``timestamp`` keeps tz + sub-µs precision
-    (#145), and a non-nullable ``!int64`` strips the marker before the primitive
-    lookup (#144 — a CSV column is nullable regardless of the schema's intent).
+    form, so parametric and non-nullable types map correctly: ``timestamp`` keeps
+    tz + sub-µs precision (#145), and a non-nullable ``!int64`` strips the marker
+    before the primitive lookup (#144 — a CSV column is nullable regardless of the
+    schema's intent). ``decimal`` reads as ``float64`` for now — exact-decimal
+    parsing is deferred to a future UI-driven buckaroo autoclean step (#150).
     An unmapped type still raises loudly, so a schema mistake fails fast.
     """
     import polars as pl
@@ -128,7 +129,7 @@ def _polars_dtype(dtype):
     if dtype.is_timestamp():
         return pl.Datetime(_ts_time_unit(dtype.scale), time_zone=dtype.timezone)
     if dtype.is_decimal():
-        return pl.Decimal(dtype.precision, dtype.scale if dtype.scale is not None else 0)
+        return pl.Float64  # exact decimal deferred to a UI autoclean step (#150)
     if dtype.is_time():
         return pl.Time
     if dtype.is_date():

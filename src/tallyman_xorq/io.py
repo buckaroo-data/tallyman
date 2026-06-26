@@ -288,6 +288,86 @@ def _normalize_schema(spec, header: list[str]) -> dict:
     return {"overrides": overrides, "rename": {}, "out_names": list(header), "all_pinned": not inferred}
 
 
+_ESCALATED_INFER = 10_000  # the middle rung of the #143 infer ladder; whole-file (None) is the terminal
+
+
+def _polars_to_ibis(dt) -> str:
+    """A polars dtype -> an ibis type string, for the suggested-schema hint."""
+    import polars as pl
+
+    table = {
+        pl.Int8: "int8", pl.Int16: "int16", pl.Int32: "int32", pl.Int64: "int64",
+        pl.UInt8: "uint8", pl.UInt16: "uint16", pl.UInt32: "uint32", pl.UInt64: "uint64",
+        pl.Float32: "float32", pl.Float64: "float64",
+        pl.Boolean: "boolean", pl.String: "string", pl.Date: "date", pl.Time: "time",
+    }
+    for pl_dt, name in table.items():
+        if dt == pl_dt:
+            return name
+    if isinstance(dt, pl.Datetime):
+        return "timestamp"
+    if isinstance(dt, pl.Decimal):
+        return "decimal"
+    return "string"  # safe fallback — an unmapped column still reads as string
+
+
+def _suggest_schema_dsl(src: Path, scan_kwargs: dict) -> str:
+    """Whole-file-infer *src* and render it as the paste-ready tuple-of-tuples DSL."""
+    import polars as pl
+
+    inferred = pl.scan_csv(str(src), infer_schema_length=None, **scan_kwargs).collect_schema()
+    pairs = tuple((name, _polars_to_ibis(dt)) for name, dt in inferred.items())
+    return repr(pairs)
+
+
+def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
+    """Read *src* into a row-order-stable parquet at *tmp_path* (#143).
+
+    Inference mode (no schema, or a spec with inferred columns) escalates the
+    infer window on a parse failure — 100 -> 10k -> whole-file — because a value
+    that breaks an *inferred* type is tallyman's to resolve; whole-file infer
+    always resolves (a mixed column falls back to string). Explicit mode (every
+    column pinned) never escalates: a pinned type that cannot parse is the
+    caller's mistake, so it raises with a paste-ready suggested schema.
+    """
+    import polars as pl
+
+    plan = None
+    explicit_only = False
+    if schema is not None:
+        header = list(pl.scan_csv(str(src), **scan_kwargs).collect_schema().names())
+        plan = _normalize_schema(schema, header)
+        explicit_only = plan["all_pinned"]
+
+    def _ordered(infer_len):
+        if schema is None:
+            lf = pl.scan_csv(str(src), infer_schema_length=infer_len, **scan_kwargs)
+            lf = lf.with_row_index("original_row_order")
+            cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
+        else:
+            il = 0 if plan["all_pinned"] else infer_len
+            lf = pl.scan_csv(str(src), schema_overrides=plan["overrides"], infer_schema_length=il, **scan_kwargs)
+            lf = lf.with_row_index("original_row_order")
+            if plan["rename"]:
+                lf = lf.rename(plan["rename"])
+            cols = plan["out_names"]
+        # original_row_order last and cast to int64 (with_row_index yields uint32).
+        return lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
+
+    ladder = [_DEFAULT_INFER] if explicit_only else [_DEFAULT_INFER, _ESCALATED_INFER, None]
+    last_exc = None
+    for infer_len in ladder:
+        try:
+            _ordered(infer_len).sink_parquet(str(tmp_path), **_CSV_PARQUET_WRITE)
+            return
+        except pl.exceptions.ComputeError as exc:
+            last_exc = exc
+    raise ValueError(
+        f"tallyman_read_csv: the schema does not parse {src.name}: {last_exc}. "
+        f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs)}"
+    )
+
+
 def _csv_ordered_dir() -> Path:
     """Project-independent home for the ordered-CSV intermediates.
 
@@ -341,8 +421,6 @@ def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
     import os
     import uuid
 
-    import polars as pl
-
     src = Path(path)
     out_dir = _csv_ordered_dir()
     key = _ordered_csv_key(path, schema, scan_kwargs)
@@ -363,33 +441,12 @@ def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
         # mtime changed → fall through and re-materialise (#8)
 
     st = src.stat()  # the single point that touches the CSV; it must be present here
-    if schema is None:
-        lf = pl.scan_csv(
-            str(src), infer_schema_length=_DEFAULT_INFER, **scan_kwargs
-        ).with_row_index("original_row_order")
-        cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
-    else:
-        header = list(pl.scan_csv(str(src), **scan_kwargs).collect_schema().names())
-        plan = _normalize_schema(schema, header)
-        lf = pl.scan_csv(
-            str(src),
-            schema_overrides=plan["overrides"],
-            infer_schema_length=0 if plan["all_pinned"] else _DEFAULT_INFER,
-            **scan_kwargs,
-        ).with_row_index("original_row_order")
-        if plan["rename"]:
-            lf = lf.rename(plan["rename"])
-        cols = plan["out_names"]
-    # original_row_order last (matches the prior mutate-appends-a-column shape)
-    # and cast to int64 (with_row_index yields uint32) for the documented schema.
-    lf = lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
-
     # Unique temp name (not a fixed {key}.parquet.tmp) so two builds writing the
     # same key concurrently can't corrupt each other's partial file (#7); the
     # rename is atomic and last-writer-wins on identical bytes.
     tmp = out_dir / f"{key}.{uuid.uuid4().hex}.tmp"
     try:
-        lf.sink_parquet(str(tmp), **_CSV_PARQUET_WRITE)
+        _materialize_ordered(src, schema, scan_kwargs, tmp)
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)

@@ -117,11 +117,18 @@ class BuckarooManager:
         port: int = 8700,
         startup_timeout: float = 8.0,
         log_file: Path | None = None,
+        companion_base_url: str | None = None,
     ):
         self.requested_port = port
         self.bound_port: int | None = None
         self.startup_timeout = startup_timeout
         self.log_file = log_file
+        # Base URL (scheme://host:port, no trailing slash) the Buckaroo server
+        # can reach the companion at, so /load_expr can be told where to POST
+        # per-grid-load perf spans (buckaroo#943). None → telemetry not wired
+        # (tests, or a companion that didn't pass its own address); the load
+        # still works, buckaroo just emits no spans for it.
+        self.companion_base_url = companion_base_url.rstrip("/") if companion_base_url else None
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
         # Schema: {<content_hash>: {"session_id": str, "project": str}}.
@@ -595,6 +602,13 @@ class BuckarooManager:
             }
             if column_config_overrides is not None:
                 payload["column_config_overrides"] = column_config_overrides
+            if self.companion_base_url is not None:
+                # buckaroo#943: the server fire-and-forget POSTs one record per
+                # firstpull.* perf span (expr load, stats pipeline + cache
+                # hit/miss, WS first payload) to this URL, keyed by the session
+                # id it mints below. Per-project so the receiver knows which
+                # telemetry.jsonl to append to. Older buckaroo ignores the field.
+                payload["telemetry_url"] = f"{self.companion_base_url}/{project}/api/telemetry"
             _t_post = time.perf_counter()
             try:
                 resp = self._client.post(

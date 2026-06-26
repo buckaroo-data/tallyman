@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useSSE } from "../SSEContext";
-import type { ActivityLog, LogEvent } from "../types";
+import type { ActivityLog, LogEvent, TelemetrySpan } from "../types";
 
 // The project activity log: a linear, cross-session feed of MCP build runs
 // (success/failure with the full traceback), alias creations, and Buckaroo grid
@@ -41,7 +41,84 @@ function summarize(e: LogEvent): string {
 }
 
 function hasDetail(e: LogEvent): boolean {
-  return Boolean(e.code || e.prompt || e.traceback || e.detail || e.message || e.load_ms != null || e.hash);
+  return Boolean(
+    e.code || e.prompt || e.traceback || e.detail || e.message || e.load_ms != null || e.hash || e.session_id,
+  );
+}
+
+// Strip the common firstpull. prefix so the span column reads compactly.
+function spanLabel(name: string): string {
+  return name.replace(/^firstpull\./, "");
+}
+
+// A compact key=value rendering of the attrs a span carries — most usefully the
+// summary-stat cache signal (buckaroo#944): cache_status / cache_hits / misses.
+function fmtAttrs(attrs: Record<string, unknown> | null | undefined): string {
+  if (!attrs) return "";
+  return Object.entries(attrs)
+    .filter(([, v]) => v !== null && v !== undefined && v !== "")
+    .map(([k, v]) => `${k}=${v}`)
+    .join(" ");
+}
+
+// The per-grid-load span waterfall (buckaroo#943). Buckaroo POSTs firstpull.*
+// spans to /api/telemetry as the load progresses; we fetch them by the load's
+// session id (the span `trace`) and lay them out on a shared time axis so the
+// expr-load → stats → first-payload breakdown is visible. Fetched lazily, only
+// when the buckaroo row is expanded.
+function SpanWaterfall({ project, trace }: { project: string; trace: string }) {
+  const [spans, setSpans] = useState<TelemetrySpan[] | null>(null);
+  const [err, setErr] = useState(false);
+
+  useEffect(() => {
+    let live = true;
+    api
+      .telemetry(project, trace)
+      .then((r) => live && setSpans(r.spans))
+      .catch(() => live && setErr(true));
+    return () => {
+      live = false;
+    };
+  }, [project, trace]);
+
+  if (err) return <div className="meta">telemetry unavailable</div>;
+  if (spans === null) return <div className="meta">loading spans…</div>;
+  if (spans.length === 0)
+    return <div className="meta">no spans recorded for this load (buckaroo &lt;0.15.3, or load failed early).</div>;
+
+  const ordered = [...spans].sort((a, b) => a.t_start_ms - b.t_start_ms);
+  const t0 = Math.min(...ordered.map((s) => s.t_start_ms));
+  const t1 = Math.max(...ordered.map((s) => s.t_end_ms));
+  const span = Math.max(t1 - t0, 0.001); // guard divide-by-zero on a zero-width set
+
+  return (
+    <div className="span-waterfall">
+      <div className="meta">grid-load timeline · {Math.round(t1 - t0)}ms total</div>
+      {ordered.map((s, i) => {
+        const left = ((s.t_start_ms - t0) / span) * 100;
+        const width = Math.max(((s.t_end_ms - s.t_start_ms) / span) * 100, 0.5);
+        const ms = Math.round(s.t_end_ms - s.t_start_ms);
+        const attrs = fmtAttrs(s.attrs);
+        const errored = s.attrs?.errored === "true" || s.attrs?.errored === true;
+        return (
+          <div key={`${s.name}-${i}`} className="span-row">
+            <span className="span-name" title={s.name}>
+              {spanLabel(s.name)}
+            </span>
+            <span className="span-track">
+              <span
+                className={`span-bar${errored ? " errored" : ""}`}
+                style={{ left: `${left}%`, width: `${width}%` }}
+                title={`${s.name} · ${ms}ms${attrs ? ` · ${attrs}` : ""}`}
+              />
+            </span>
+            <span className="span-ms">{ms}ms</span>
+            {attrs && <span className="span-attrs meta">{attrs}</span>}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export function LogPage() {
@@ -181,7 +258,11 @@ export function LogPage() {
                         <div className="meta">
                           timing:{e.load_ms != null && ` ${e.load_ms}ms total`}
                           {e.load_expr_ms != null && ` · ${e.load_expr_ms}ms load_expr`}
+                          {" (companion-visible)"}
                         </div>
+                      )}
+                      {e.kind === "buckaroo" && e.session_id && (
+                        <SpanWaterfall project={project} trace={e.session_id} />
                       )}
                       {e.message && (
                         <>

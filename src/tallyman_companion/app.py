@@ -40,6 +40,7 @@ from tallyman_core import (
 from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
+from tallyman_core.telemetry import read_spans, record_span
 from tallyman_core.version import git_revision, version_info
 from tallyman_xorq import (
     full_diff,
@@ -704,6 +705,10 @@ def create_app(
             return True  # SSE plumbing + project lifecycle (genesis covers new)
         if "/api/result_cache" in path or path.endswith("/api/errors"):
             return True  # cache/log clears, not authored state
+        if path.endswith("/api/telemetry"):
+            # buckaroo perf-span ingest (#943): observability, not authored
+            # state — and many spans/load, so a checkpoint each would flood git.
+            return True
         if path.endswith("/api/reset"):
             return True  # reset moves `current`; it is not a new step
         if path.endswith("/api/recalc"):
@@ -1033,6 +1038,11 @@ def create_app(
             detail=result.get("detail") or None,
             load_ms=round((time.perf_counter() - _t0) * 1000, 1),
             load_expr_ms=result.get("load_expr_ms"),
+            # The buckaroo session id is the telemetry `trace` key (buckaroo#943):
+            # the Log UI joins this event to the firstpull.* spans buckaroo POSTs
+            # back to /api/telemetry. None when the load failed before a session
+            # was minted.
+            session_id=result.get("session_id"),
         )
         ws_url = f"{buckaroo.ws_base_url}/ws/{result['session_id']}" if result["session_id"] else None
         return {"status": result["status"], "ws_url": ws_url, "detail": result["detail"]}
@@ -1366,6 +1376,33 @@ def create_app(
             "events": merged[:limit],
             "sessions": list_sessions(project),
         }
+
+    @app.post("/{project}/api/telemetry")
+    async def api_telemetry_ingest(project: str, payload: dict):
+        """Receive one grid-load perf span from the Buckaroo server (buckaroo#943).
+
+        Buckaroo fire-and-forget POSTs ``{trace, source, name, t_start_ms,
+        t_end_ms, attrs}`` here as each ``firstpull.*`` span closes (we pass this
+        URL on ``/load_expr``). ``trace`` is the buckaroo session id, matching the
+        ``session_id`` on the parent ``buckaroo`` activity-log event, so the Log
+        UI joins a load to its spans. Always 200 (even on a rejected record) so a
+        best-effort telemetry POST never reads as a server error on buckaroo's
+        side. Not gated on ``read_only``: buckaroo only runs in ``tallyman run``,
+        but accepting the span is pure observability, never authored state.
+        """
+        project = _validate_project(project)
+        stored = record_span(project, payload)
+        return {"ok": stored is not None}
+
+    @app.get("/{project}/api/telemetry")
+    def api_telemetry_read(project: str, trace: str | None = None, limit: int = 500):
+        """Persisted grid-load spans, newest-first, optionally one ``trace``.
+
+        The Log UI calls this with ``trace=<session_id>`` to render the per-load
+        span waterfall when a ``buckaroo`` event is expanded.
+        """
+        project = _validate_project(project)
+        return {"project": project, "trace": trace, "spans": read_spans(project, trace=trace, limit=limit)}
 
     @app.delete("/{project}/api/errors")
     def api_clear_errors(project: str):

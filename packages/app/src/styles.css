@@ -589,3 +589,16 @@ table.cache-table .muted { color: var(--muted); }
 .log-traceback { color: #ffd9d9; background: #2a1818; max-height: 360px; overflow: auto; }
 .log-message { white-space: pre-wrap; word-break: break-word; max-height: 360px; overflow: auto; user-select: text; }
 .log-time, .cat-badge, .session-badge, .log-caret { flex-shrink: 0; }
+
+/* Per-grid-load span waterfall (buckaroo#943), shown when a buckaroo log row is expanded. */
+.span-waterfall { margin-top: 8px; display: flex; flex-direction: column; gap: 3px; }
+.span-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.span-name {
+  flex: 0 0 150px; font-family: ui-monospace, monospace; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.span-track { flex: 1 1 auto; position: relative; height: 12px; background: var(--bg); border-radius: 2px; }
+.span-bar { position: absolute; top: 1px; height: 10px; background: var(--accent); border-radius: 2px; min-width: 2px; }
+.span-bar.errored { background: #c0564a; }
+.span-ms { flex: 0 0 52px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+.span-attrs { flex: 0 0 auto; font-family: ui-monospace, monospace; }

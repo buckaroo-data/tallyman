@@ -97,6 +97,10 @@ parse validates the inferred types against the whole file (a row that violates
 aborts → escalation, D6) and the typed parquet is then durable, a no-schema
 success is deterministic for that file.
 
+The echo is the build result's existing `schema` field — a no-schema call's result
+schema *is* the inferred schema — so there is no separate `inferred_schema` field or
+"pin this" nudge; a structured suggestion rides with the #5 UI followon (D7).
+
 ### D3 — #141: a schema spec that is total, name-bound by default, position-bound on request
 
 `schema` accepts three shapes, routed by Python type (the universal
@@ -196,22 +200,29 @@ errors). **Alternative — a structured `csv_suggestion` field on the MCP return
 (machine-readable, UI-renderable) — is deferred to the #5 UI followon; it needs
 `BuildError` to carry a structured attribute that `_run_and_record` surfaces.
 
-### D8 — #144: cover `time`, `decimal`, and non-nullable ibis types
+### D8 — #144: cover `time`, non-nullable, and `decimal` (as float) ibis types
 
-Extend `_IBIS_TO_POLARS` / `_polars_overrides` so a valid ibis schema never
-spuriously raises: map `time` → `pl.Time`, `decimal(p, s)` → `pl.Decimal(p, s)`
-(parameterised, not a fixed precision), and strip ibis nullability (`!`-suffixed
+`_polars_overrides` inspects the ibis dtype object so a valid schema never
+spuriously raises: map `time` → `pl.Time`, and strip ibis nullability (`!`-suffixed
 types like `int64` non-null) before lookup — polars CSV columns are nullable
-regardless, and a non-nullable *intent* is not a CSV parse concern. An unmapped
-type still raises the loud, listed error (the escape hatch stays honest).
+regardless, so a non-nullable *intent* is a **no-op label** at the parse layer
+(constraint validation is a future UI-guided concern, not raised here). `decimal`
+maps to **`pl.Float64`**, not an exact `pl.Decimal`: exact-decimal parsing is
+deferred to a UI-driven buckaroo autoclean step (**#150**). An unmapped type still
+raises the loud, listed error (the escape hatch stays honest).
 
-### D9 — #145: preserve timestamp tz and precision
+### D9 — #145: preserve timestamp tz and precision (with two punted gotchas)
 
 Map `timestamp` → `pl.Datetime("us")` (naive) but `timestamp(scale)` → the
-matching `pl.Datetime` precision (`s`/`ms`→"ms" where representable, `us`, `ns`),
-and `timestamp('UTC')` / tz-aware → `pl.Datetime(time_unit, time_zone=tz)`,
-instead of flattening everything to naive `pl.Datetime`. Round-trips the tz and
-sub-µs precision the ibis type declares.
+matching `pl.Datetime` precision (scale `≤3`→"ms", `≤6`→"us", else "ns"), and
+`timestamp('UTC')` / tz-aware → `pl.Datetime(time_unit, time_zone=tz)`, instead of
+flattening everything to naive `pl.Datetime`. Two polars-CSV-reader behaviours are
+**known and punted** (verified empirically, not guarded — the behaviour is
+defensible and a guard would mean sniffing the data): (a) a tz-aware override on
+*offset-less naive* text **attaches** the tz to the wall-clock rather than
+converting (wrong only if naive-local data is mislabelled with a tz); (b) `ns`
+precision is silently truncated to `µs` by `scan_csv` (the `ns` dtype label is kept
+but sub-µs digits are dropped). Bad values still raise loudly, never null.
 
 ## Alternatives considered
 
@@ -236,9 +247,10 @@ sub-µs precision the ibis type declares.
 
 ## Consequences / open questions
 
-- **#144/#145 defaults (D8/D9) were not grilled** — they surfaced only in the full
-  review list. The mappings above are defensible defaults; revisit if a different
-  tz/precision or decimal policy is wanted.
+- **#144/#145 were reviewed after the fact** (they surfaced only in the full review
+  list). Outcomes: `decimal` → `float64` with exact-decimal deferred to UI (#150);
+  non-nullable left a no-op label (constraint validation is UI-guided); the two
+  timestamp tz/precision gotchas (D9) punted, shipped un-guarded.
 - **#142 ragged is deferred** to the holistic edge-case pass that ports the
   pandas/polars/duckdb pathology suites onto tallyman. The empirical detection
   finding (polars cannot raise on short rows; `pyarrow.csv` is the fail-loud,

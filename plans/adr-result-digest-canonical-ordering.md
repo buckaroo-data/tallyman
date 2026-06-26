@@ -9,7 +9,9 @@
 - **Related:** `plans/89-determinism-prereqs-execution.md` (#83 result-digest,
   #88 determinism lint, #89 epic), `plans/adr-result-cache-cost-rubric.md` (#30
   cheap/worthy classification), `plans/adr-source-identity-content-hash.md`
-  (`content_hash` as cache key)
+  (`content_hash` as cache key),
+  `plans/datafusion-scan-order-findings.md` (ingest-reader decision: polars; the
+  datafusion scan-order config research and benchmarks behind open question #4)
 
 ## Problem
 
@@ -190,9 +192,43 @@ default canonical order is source order via `original_row_order`.
   pinned, which is Option A.
 - **Switch the ingest reader to polars.** `scan_csv → sink_parquet` is ~5s,
   order-preserving, and byte-deterministic across 5 runs, versus
-  `xo.to_parquet` at ~16s and not byte-stable. Out of scope for this ADR
-  (identity model), but noted as a strong candidate for the ingest root and
+  `xo.to_parquet` at ~16s and not byte-stable. A force-full-decode read is
+  ~2.6–3.7s at 3–4 cores — polars ties datafusion's *parallel* default while
+  preserving file order, so unlike the datafusion config knobs (next bullet) it
+  gives deterministic ingest order without serializing. Out of scope for this
+  ADR (identity model), but noted as a strong candidate for the ingest root and
   recorded here so it is not re-discovered.
+- **Pin datafusion's scan order via session config instead of a canonical sort.**
+  xorq exposes the underlying datafusion knobs through
+  `xo.connect(session_config=...)` — `SessionConfig().with_target_partitions(1)`,
+  `.with_repartition_file_scans(False)`, plus a generic `.set(key, value)` for any
+  `datafusion.*` option (e.g. `enable_round_robin_repartition`) — and setting them
+  does not move the backend profile hash, so the route is reachable and
+  content-hash-safe. It is, however, the *slowest* path to a deterministic ingest.
+  For a single input file the only source of scan parallelism is splitting that file
+  into byte ranges across partitions, and that same split is what reorders the rows,
+  so every knob that pins order also serializes the scan. Measured on the
+  parking_2015 CSV (warm cache, 14-core box, best of 2; reproduce with
+  `scripts/bench_scan_order.py`):
+
+  | full read (force full decode, 43 cols) | wall | avg cores |
+  | --- | --- | --- |
+  | datafusion default | 2.5s | 4.5 |
+  | `target_partitions=1` | 6.9s | 1.0 |
+  | `repartition_file_scans=false` | 7.0s | 1.0 |
+  | polars `scan_csv.collect()` | 2.6–3.2s | 3–4 |
+
+  The serialization is not confined to the scan. A downstream `group_by(plate_id)`
+  aggregate (3.1M groups) runs at ~11 cores / 0.5s under the default but collapses to
+  ~1 core / 3.4–3.9s under either flag: datafusion does not fan the single scan
+  partition back out for the aggregate, so the whole pipeline runs serially.
+  (`repartition_file_scans=false` would keep parallelism only with *multiple* input
+  files, where each file stays its own partition — not tallyman's single-CSV ingest.)
+  There is thus no datafusion config that buys deterministic order *and* parallelism
+  for a single-file source; the two are the same mechanism. Rejected as the ingest
+  lever — it pays a ~2.7× read tax (and serializes everything downstream) for an order
+  the canonical sort already delivers at the bake, where a materialization pass runs
+  anyway.
 
 ## Open questions (for review)
 
@@ -206,8 +242,15 @@ default canonical order is source order via `original_row_order`.
 3. **Cheap entries that bake nothing.** Skip the digest entirely when the #88
    lint proves the recipe deterministic, or always compute Option B? Skipping is
    cheaper; always-on is uniform.
-4. **Ingest reader swap (polars).** Adopt now alongside this change, or keep
-   datafusion and impose order via `ORDER BY original_row_order` on the bake?
+4. **Ingest reader — RESOLVED (2026-06-25): polars.** Of the three measured options —
+   (a) keep datafusion's parallel read and impose order with
+   `.order_by(original_row_order)` on the bake; (b) swap the ingest reader to polars
+   (order-preserving *and* multi-threaded, ~2.6–3.7s); (c) pin datafusion's scan order
+   via session config (reachable + hash-safe, but ~2.7× slower because pinning order
+   *is* serializing the single-file scan) — we take **(b)**. It is the only lever that
+   gives a deterministic, file-order read without surrendering parallelism. Full
+   write-up, benchmarks, and the datafusion config research in
+   `plans/datafusion-scan-order-findings.md`.
 
 ## Testing
 

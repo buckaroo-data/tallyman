@@ -98,24 +98,54 @@ _IBIS_TO_POLARS = {
 }
 
 
-def _polars_overrides(schema):
-    """Translate an ibis schema to polars ``schema_overrides`` dtypes."""
+def _ts_time_unit(scale: int | None) -> str:
+    """ibis timestamp scale (sub-second digits) -> a polars Datetime time_unit.
+
+    polars supports only ``ms``/``us``/``ns``; ibis scale is 0..9. Round each ibis
+    scale up to the nearest representable polars unit (#145).
+    """
+    if scale is None:
+        return "us"
+    if scale <= 3:
+        return "ms"
+    if scale <= 6:
+        return "us"
+    return "ns"
+
+
+def _polars_dtype(dtype):
+    """Translate one ibis dtype to a concrete polars dtype.
+
+    Inspects the dtype *object* (predicates + attributes) rather than its string
+    form, so parametric and non-nullable types map correctly: ``decimal(p, s)``
+    keeps its precision/scale (#144), ``timestamp`` keeps tz + sub-µs precision
+    (#145), and a non-nullable ``!int64`` strips the marker before the primitive
+    lookup (#144 — a CSV column is nullable regardless of the schema's intent).
+    An unmapped type still raises loudly, so a schema mistake fails fast.
+    """
     import polars as pl
 
-    overrides = {}
-    for name, dtype in zip(schema.names, schema.types):
-        key = str(dtype)
-        if key.startswith("timestamp"):
-            overrides[name] = pl.Datetime
-            continue
-        pl_name = _IBIS_TO_POLARS.get(key)
-        if pl_name is None:
-            raise ValueError(
-                f"tallyman_read_csv: column {name!r} has ibis type {key!r}, which has no "
-                f"polars mapping. Supported: {sorted(_IBIS_TO_POLARS)} (+ timestamp*)."
-            )
-        overrides[name] = getattr(pl, pl_name)
-    return overrides
+    if dtype.is_timestamp():
+        return pl.Datetime(_ts_time_unit(dtype.scale), time_zone=dtype.timezone)
+    if dtype.is_decimal():
+        return pl.Decimal(dtype.precision, dtype.scale if dtype.scale is not None else 0)
+    if dtype.is_time():
+        return pl.Time
+    if dtype.is_date():
+        return pl.Date
+    key = str(dtype).lstrip("!")  # drop the non-nullable marker before the primitive lookup
+    pl_name = _IBIS_TO_POLARS.get(key)
+    if pl_name is None:
+        raise ValueError(
+            f"tallyman_read_csv: column type {key!r} has no polars mapping. Supported: "
+            f"{sorted(_IBIS_TO_POLARS)} (+ date, time, decimal[(p, s)], timestamp[(scale[, tz])])."
+        )
+    return getattr(pl, pl_name)
+
+
+def _polars_overrides(schema):
+    """Translate an ibis schema to polars ``schema_overrides`` dtypes (by name)."""
+    return {name: _polars_dtype(dtype) for name, dtype in zip(schema.names, schema.types)}
 
 
 def _csv_ordered_dir() -> Path:

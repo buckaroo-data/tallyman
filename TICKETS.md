@@ -476,6 +476,45 @@ This is correct but undocumented. Users will be confused when revising
   binding; consider a `--reparent-scratch` flag for `catalog_revise`
   that re-runs scratch entries against the new latest.
 
+### T-43 — Lint ordering non-determinism from Aggregation / JoinChain / Union
+
+`_nondeterminism_warnings` in `src/tallyman_xorq/build.py` currently covers
+value-level non-determinism (`now()`, `random()`, `uuid()`, `sample()`). It
+does not flag ops whose output ordering is unspecified: `Aggregation`,
+`JoinChain`, `Union`. A consumer that depends on row order (diff, recalc
+comparison) can silently see different bytes across cold-cache builds even
+though no value changed.
+
+Design question before implementing: the lint should only fire when no `Sort`
+node follows the flagged op — flagging a `union().order_by(...)` would be a
+false positive. The check is "does a `Sort` appear strictly above the flagged
+op in the tree?" rather than "does any `Sort` exist anywhere?" That walk is
+straightforward but needs a test for the sort-above / no-sort-above cases.
+
+Punted from the reactive-recalc PR (PR #129 context). Implement separately.
+
+- **Fix:** extend `_NONDETERMINISTIC_OPS` (or a parallel `_ORDERING_OPS` set)
+  with `Aggregation`, `JoinChain`, `Union`; suppress the warning when a `Sort`
+  ancestor is present.
+- **Files:** `src/tallyman_xorq/build.py`, `tests/test_build.py`.
+- **Verify:** `catalog_run` with a bare `union()` emits the lint warning; a
+  `union().order_by(...)` does not.
+
+### T-44 — Require an ordering key when a UDF is present
+
+UDF expressions are non-deterministic in row order (and potentially in value
+if the UDF is impure). The recalc / diff machinery relies on a stable row
+order to compare builds. When a UDF is present the caller should be required
+to supply an `order_by` at the outermost level.
+
+- **Fix:** in `_nondeterminism_warnings` (or a new `_validate_expr` gate that
+  hard-errors before execution), detect UDF ops (`ElementWiseVectorizedUDF`,
+  `ReductionVectorizedUDF`, `AnalyticVectorizedUDF`, `ScalarUDF`) and check
+  that the root op is a `Sort`. Error (not warn) if not.
+- **Files:** `src/tallyman_xorq/build.py`, `tests/test_build.py`.
+- **Verify:** `catalog_run` with a UDF and no `order_by` is rejected with a
+  clear message; adding `.order_by(key)` at the end passes.
+
 ### T-29 — Multi-notebook per project
 
 V1 = one default notebook per project. V2 needs a tab selector and

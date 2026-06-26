@@ -33,30 +33,12 @@ from __future__ import annotations
 
 import contextvars
 import functools
-import hashlib
 import logging
 import re
 import sys
-import tempfile
 import threading
 import time
 from pathlib import Path
-
-from xorq.expr.api import deferred_read_parquet
-from xorq.ibis_yaml.compiler import build_expr
-
-from tallyman_core import read_manifest
-from tallyman_core.aliases import get_alias, previous_version
-from tallyman_core.paths import entry_build_dir, entry_dir, project_dir
-from tallyman_xorq import source_identity as si
-from tallyman_xorq.build import BuildError, _import_script
-from tallyman_xorq.portable import PLACEHOLDER
-from tallyman_xorq.source_cache import rewrite_for_build
-
-# These same-package imports (build, source_cache, source_identity) look like a
-# cycle but aren't: build/source_cache/io reach back into result_cache only at
-# *function* level, never module-top, so result_cache always finishes loading
-# after them regardless of which module is imported first.
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
@@ -115,6 +97,8 @@ def classify_build(build_dir: Path) -> dict:
 
 
 def cache_worthy(project: str, content_hash: str) -> bool:
+    from tallyman_core.paths import entry_build_dir
+
     return classify_build(entry_build_dir(project, content_hash))["worthy"]
 
 
@@ -140,7 +124,9 @@ _MAX_RECON_DEPTH = 64
 # through to the live path. None outside reconstruction (the build path); an entry that
 # recorded no sources (mode=off / pre-#86) yields an empty map, so read_project_file also
 # falls through.
-_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar("_recon_sources", default=None)
+_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
+    "_recon_sources", default=None
+)
 
 
 def _recorded_sources(project: str, content_hash: str) -> dict:
@@ -149,6 +135,9 @@ def _recorded_sources(project: str, content_hash: str) -> dict:
     Empty when the manifest is unreadable or the entry recorded no sources (mode=off,
     or a build predating #86); read_project_file then falls through to its live-file path.
     """
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
     try:
         return read_manifest(entry_dir(project, content_hash)).sources or {}
     except (OSError, ValueError):
@@ -166,6 +155,8 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
     so we recover the build-time binding by walking back through alias history to
     the nearest revision not already under reconstruction on this stack.
     """
+    from tallyman_core.aliases import get_alias, previous_version
+
     # `requested` is the caller's argument: an alias (from tracked_expr_from_alias) or a
     # hash (from pinned_expr_from_alias). Treat it as a lineage hint only when it names
     # an alias, so a hash shared across histories steps back through the alias the caller
@@ -176,6 +167,8 @@ def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> 
     while (project, content_hash) in active:
         parent = previous_version(project, content_hash, alias=alias_hint)
         if parent is None:
+            from tallyman_xorq.build import BuildError
+
             raise BuildError(
                 f"tracked_expr_from_alias({requested!r}) in {project!r} resolves to an entry that "
                 "reconstructs itself with no prior revision to fall back to"
@@ -198,6 +191,10 @@ def _recipe_expr(project: str, content_hash: str):
     expression roots there and composes with ``read_project_file`` and other
     ``tracked_expr_from_alias`` results as a single backend (#75).
     """
+    from tallyman_core.paths import entry_dir, project_dir
+    from tallyman_xorq.build import BuildError, _import_script
+    from tallyman_xorq.portable import PLACEHOLDER
+
     active = _RECONSTRUCTING.get()
     if len(active) >= _MAX_RECON_DEPTH:
         raise BuildError(
@@ -265,61 +262,54 @@ def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
     value-per-byte denominator); other callers use it to find the snapshot
     without reconstructing the read expression.
     """
+    from tallyman_xorq import source_identity as si
+
     if si.mode() == "salt" or not cache_worthy(project, content_hash):
         return None
+
+    from tallyman_xorq.source_cache import rewrite_for_build
 
     return _cached_node_path(rewrite_for_build(_recipe_expr(project, content_hash), project))
 
 
-def result_digest(expr) -> str:
-    """Order-sensitive content digest of an expression's executed result (#83).
+def snapshot_file_digest(path: Path) -> str:
+    """SHA-256 of a snapshot parquet file's raw bytes.
 
-    The second identity axis beyond ``content_hash``: the hash keys on the
-    expression *graph* (a ``SnapshotStrategy`` tokenization that can't see
-    execution), this keys on the executed *bytes*. Recorded at build and
-    re-checked when an evicted snapshot self-heals, so execution nondeterminism —
-    ``sample()`` / ``now()`` / an unordered ``limit`` / an impure UDF — that the
-    structural hash is blind to surfaces as a digest mismatch instead of silently
-    serving different bytes than were built.
-
-    Independent of arrow batch *framing* (it hashes row tuples in order, not the
-    IPC stream, so reading the baked snapshot and recomputing the recipe agree on
-    identical rows even if the two chunk differently) but sensitive to row
-    *order* — an unordered query that reshuffles is, correctly, drift, because its
-    materialised parquet bytes did change.
+    The new ``result_digest`` for worthy entries (ADR
+    ``adr-result-digest-canonical-ordering.md``): the bake sorts by
+    ``original_row_order`` before materialising, so the file bytes are
+    deterministic run-to-run and the file hash is a sound multiset identity.
+    ~0.3s for a 400 MB file — far cheaper than the retired per-row
+    ``repr()``+sha256 loop.  Cheap entries record no digest (their
+    recompute is live; there is no snapshot to hash).
     """
-    return count_and_result_digest(expr)[1]
+    import hashlib
 
-
-def _digest_init(schema):
     h = hashlib.sha256()
-    h.update(repr(list(zip(schema.names, [str(t) for t in schema.types]))).encode())
-    return h
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
-def _digest_update(h, batch) -> int:
-    cols = [batch.column(i).to_pylist() for i in range(batch.num_columns)]
-    for row in zip(*cols):
-        h.update(repr(row).encode())
-    return batch.num_rows
+def stream_row_count(expr) -> int:
+    """Stream the result once, counting rows, without hashing.
 
-
-def count_and_result_digest(expr) -> tuple[int, str]:
-    """Stream the result once, returning ``(row_count, result_digest)``.
-
-    The build's cheap path already streams every row to force evaluation and
-    count; folding the digest into that one pass keeps the second identity axis
-    (#83) free of an extra execution. See ``result_digest`` for the hash's
-    framing-independence / order-sensitivity properties.
+    The cheap-entry build path uses this to force row-level evaluation (catch a
+    failing cast / arithmetic at build time) and get the exact row count — the
+    only obligation the build has for a cheap entry.  No digest is recorded for
+    cheap entries; their result has no snapshot to hash.
     """
-    h = _digest_init(expr.schema())
     n = 0
     for batch in expr.to_pyarrow_batches():
-        n += _digest_update(h, batch)
-    return n, h.hexdigest()
+        n += batch.num_rows
+    return n
 
 
 def _recorded_result_digest(project: str, content_hash: str) -> str | None:
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
     try:
         return read_manifest(entry_dir(project, content_hash)).result_digest
     except (OSError, ValueError):
@@ -327,19 +317,21 @@ def _recorded_result_digest(project: str, content_hash: str) -> str | None:
 
 
 def verify_result_faithful(project: str, content_hash: str) -> bool | None:
-    """Whether the entry's currently-served result matches its build-time digest.
+    """Whether the entry's baked snapshot matches its build-time digest.
 
-    Reconstructs the read expression (recompute for a cheap entry, the baked
-    snapshot for an expensive one) and digests it. Returns True when it matches
-    the recorded ``result_digest``, False on drift — the recipe is
-    execution-nondeterministic (#83) and is serving different bytes under the same
-    ``content_hash`` — and None when no digest was recorded (an entry built before
-    #83), i.e. the answer is unknown rather than faithful.
+    Only meaningful for worthy (snapshot-baking) entries: returns True when the
+    snapshot file's SHA-256 matches the recorded ``result_digest``, False on
+    drift, and None when no digest was recorded (cheap entry, or built before
+    the canonical-order ADR — ``adr-result-digest-canonical-ordering.md``).
+    Cheap entries record no digest, so this always returns None for them.
     """
     recorded = _recorded_result_digest(project, content_hash)
     if not recorded:
         return None
-    return result_digest(cached_result_expr(project, content_hash)) == recorded
+    snap = baked_snapshot_path(project, content_hash)
+    if snap is None or not snap.exists():
+        return None
+    return snapshot_file_digest(snap) == recorded
 
 
 def _reconstructed_hash(project: str, content_hash: str) -> str | None:
@@ -348,7 +340,13 @@ def _reconstructed_hash(project: str, content_hash: str) -> str | None:
     any step fails (a warning enrichment must never break the read). Tokenize only,
     no execute.
     """
+    import tempfile
+
     try:
+        from xorq.ibis_yaml.compiler import build_expr
+
+        from tallyman_xorq.source_cache import rewrite_for_build
+
         rewritten = rewrite_for_build(_recipe_expr(project, content_hash), project)
         with tempfile.TemporaryDirectory(prefix="tallyman_rehash_") as d:
             return Path(build_expr(rewritten, builds_dir=Path(d))).name
@@ -377,6 +375,8 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
     tell those apart, and an impure UDF's nondeterminism is execution-level anyway
     (#83), so a UDF entry's drift is attributed execution, never structural.
     """
+    from tallyman_core.paths import entry_build_dir
+
     # classify_build's why carries "udf:<names>" when the serialized build holds a
     # UDF (the same detection cache_worthy uses, #81). Reuse it rather than re-walk.
     # Best-effort, like _reconstructed_hash below: classify_build does unguarded
@@ -408,12 +408,16 @@ def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -
     ``tallyman.perf`` warning — without ever breaking the read (best-effort),
     attributing the drift as structural (#88: the recipe's graph hash itself moves)
     vs execution (#83: a fixed graph that runs differently).
+
+    The digest is now the SHA-256 of the snapshot file bytes (ADR
+    ``adr-result-digest-canonical-ordering.md``), so we hash the newly-landed
+    file directly — no extra expression execution.
     """
     recorded = _recorded_result_digest(project, content_hash)
     if not recorded:
         return
     try:
-        actual = result_digest(deferred_read_parquet(str(path)))
+        actual = snapshot_file_digest(path)
     except Exception:
         return
     if actual != recorded:
@@ -461,6 +465,8 @@ def _resolve_result_plan(project: str, content_hash: str):
     # rewrite_for_build wraps the expression in a ParquetSnapshotCache whose
     # structural key matches the file baked at build time, so storage/calc_key
     # give its on-disk path without re-executing.
+    from tallyman_xorq.source_cache import rewrite_for_build
+
     baked = rewrite_for_build(raw, project)
     path = _cached_node_path(baked)
     if path is None:
@@ -532,6 +538,8 @@ def cached_result_expr(project: str, content_hash: str):
     perf-namespace cold-read tag (#87) is emitted from the memoised half, so it
     still fires once per genuine reconstruct.
     """
+    from xorq.expr.api import deferred_read_parquet
+
     plan = _resolve_result_plan(project, content_hash)
     if plan[0] == "recompute":
         return plan[1]

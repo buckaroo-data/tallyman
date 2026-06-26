@@ -194,8 +194,9 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             hints.append(
                 f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint "
                 "(`import xorq.api as xo`). Read data with `from tallyman_xorq.io "
-                "import read_project_file, tracked_expr_from_alias`, or `xo.deferred_read_parquet"
-                "(abs_path)` for a raw path."
+                "import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
+                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs and "
+                "`xo.deferred_read_parquet(abs_path)` for a raw parquet path."
             )
         else:
             hints.append(
@@ -212,7 +213,8 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
         elif name in {"read_parquet", "read_csv", "read_table"}:
             hints.append(
                 f"`ibis.{name}` does not exist — read data with "
-                "`from tallyman_xorq.io import read_project_file, tracked_expr_from_alias`."
+                "`from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
+                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs."
             )
         elif name == "case":
             hints.append("`ibis.case` is gone — use `ibis.cases((cond, val), ..., else_=default)`.")
@@ -227,7 +229,8 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
         hints.append(
             f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `read_project_file` "
             "(raw files under <project>/data/), `tracked_expr_from_alias` (alias → records lineage), "
-            "and `pinned_expr_from_alias` (alias or hash, no lineage)."
+            "`pinned_expr_from_alias` (alias or hash, no lineage), and `tallyman_read_csv` "
+            "(CSV ingest with original_row_order for stable digests)."
         )
 
     if "duckdb" in exc_msg.lower():
@@ -480,21 +483,35 @@ def build_and_persist(
             # arithmetic / UDF would never evaluate at build, committing + aliasing a
             # broken entry that throws only on the first materialising read. Stream
             # the full result and discard it to force row-level evaluation at author
-            # time (constant memory; the one pass also yields the exact row count).
-            from tallyman_xorq.result_cache import count_and_result_digest, result_digest  # noqa: PLC0415
+            # time (constant memory; the one pass yields the exact row count).
+            #
+            # result_digest (ADR adr-result-digest-canonical-ordering): for worthy
+            # entries the baked snapshot is sorted by original_row_order before
+            # materialisation, so its bytes are deterministic run-to-run and we
+            # hash the file directly (cheap, ~0.3s). Cheap entries record no digest
+            # — their result has no snapshot to hash.
+            from tallyman_xorq.result_cache import snapshot_file_digest, stream_row_count  # noqa: PLC0415
 
             t0 = time.monotonic()
             try:
                 arrow_schema = loaded.schema().to_pyarrow()
                 if cache_worthy_v:
                     # count() bakes the snapshot (the cache node forces full
-                    # materialisation); digest the baked result as the #83 axis.
+                    # materialisation); then hash the baked file for the digest.
+                    # The sort-before-bake is applied to author_expr before
+                    # rewrite_for_build (see above), so the CachedNode already
+                    # wraps the sorted expression and loaded bakes in canonical order.
                     row_count = int(loaded.count().execute())
-                    result_digest_v = result_digest(loaded)
+                    snap_path = _cached_node_path(loaded)
+                    result_digest_v: str | None = (
+                        snapshot_file_digest(snap_path) if snap_path and snap_path.exists() else None
+                    )
                 else:
-                    # One streaming pass forces row-level evaluation, counts, and
-                    # digests the executed bytes (#83) — no extra execution.
-                    row_count, result_digest_v = count_and_result_digest(loaded)
+                    # Stream full result to force row-level evaluation (catch a
+                    # failing cast / arithmetic at build time) and count rows.
+                    # No digest for cheap entries — no snapshot to hash.
+                    row_count = stream_row_count(loaded)
+                    result_digest_v = None
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc

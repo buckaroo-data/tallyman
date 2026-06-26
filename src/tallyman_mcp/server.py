@@ -273,7 +273,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
                                          # xo.memtable, xo.deferred_read_parquet, xo.connect
         import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
                                          # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
-        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias   # reading data
+        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, tallyman_read_csv   # reading data
 
         t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
         # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
@@ -287,12 +287,15 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
     everything with the ibis expression API over read_project_file/tracked_expr_from_alias.
 
-    DATA SOURCING — three functions, each with a distinct role:
+    DATA SOURCING — four functions, each with a distinct role:
       - `tracked_expr_from_alias("name")` reads a catalog entry by alias and records it
         as a parent in the lineage DAG. Use this for normal recipe chaining — the
         standard way to build on top of another catalog entry.
       - `read_project_file("file.parquet")` reads raw files under `<project>/data/`.
         Use this only for raw files visible on disk (not catalog aliases).
+      - `tallyman_read_csv("/abs/path/to/file.csv", schema=...)` reads a CSV and
+        injects ``original_row_order`` so the snapshot is byte-stable across builds.
+        Use this for ALL CSV ingests instead of ``xo.deferred_read_csv``.
       - `pinned_expr_from_alias("name_or_hash")` reads a catalog entry by alias or
         content hash and records a pinned (follow=False) parent edge. Use when you
         want to stay on a specific version — recalc will find the entry but won't
@@ -326,9 +329,23 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     LOADING RAW CSV FILES — always inspect first:
 
-        Before writing a schema for deferred_read_csv, run `head -5 <file>` to
-        verify the actual column names and order. Do NOT guess — yfinance and
-        similar sources produce non-obvious layouts:
+        Use ``tallyman_read_csv`` (not ``xo.deferred_read_csv``) for all CSV
+        ingests. It adds an ``original_row_order`` column that makes the
+        snapshot byte-stable across builds:
+
+            from tallyman_xorq.io import tallyman_read_csv
+            import xorq.vendor.ibis as ibis
+            schema = ibis.schema({"Date": "date", "Close": "float64"})
+            t = tallyman_read_csv("/abs/path/to/file.csv", schema=schema)
+
+        Extra keyword arguments are forwarded to ``polars.scan_csv`` as reader
+        options (``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
+        ``has_header``, ``encoding``, ...), e.g.
+        ``tallyman_read_csv(path, schema=schema, separator=";", skip_rows=2)``.
+
+        Before writing a schema, run `head -5 <file>` to verify the actual
+        column names and order. Do NOT guess — yfinance and similar sources
+        produce non-obvious layouts:
 
         - yfinance multi-download CSVs have two extra header rows (a "Price"
           label row and a ticker row) before the real headers. Detect this with
@@ -338,7 +355,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         - The first column is often literally named "Price" in raw yfinance output,
           not "Date".
 
-        ALWAYS use an explicit schema with deferred_read_csv — without one, type
+        ALWAYS use an explicit schema with tallyman_read_csv — without one, type
         inference silently misassigns types (e.g. date columns become timestamps).
 
         DATE-ONLY COLUMNS — use 'date', never 'timestamp':

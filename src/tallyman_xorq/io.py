@@ -75,6 +75,184 @@ def read_project_file(rel_path: str, project: str | None = None):
     return deferred_read_parquet(str(path))
 
 
+# Pinned polars parquet-write settings for the ordered-CSV intermediate. Held
+# constant so the bytes — and therefore the snapshot digest — are reproducible
+# run-to-run within an environment. A polars/library upgrade may change the
+# bytes; rebuild-is-fine here per the project's single-user rule.
+_CSV_PARQUET_WRITE = {
+    "compression": "zstd",
+    "compression_level": 3,
+    "row_group_size": 122880,
+    "statistics": True,
+}
+
+# ibis primitive -> polars dtype, for reading a CSV with an explicit schema.
+# Covers the types the MCP documents for tallyman_read_csv; an unmapped type
+# raises rather than silently inferring, so a schema mistake fails loudly.
+_IBIS_TO_POLARS = {
+    "int8": "Int8", "int16": "Int16", "int32": "Int32", "int64": "Int64",
+    "uint8": "UInt8", "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64",
+    "float32": "Float32", "float64": "Float64",
+    "string": "String", "bool": "Boolean", "boolean": "Boolean",
+    "date": "Date",
+}
+
+
+def _polars_overrides(schema):
+    """Translate an ibis schema to polars ``schema_overrides`` dtypes."""
+    import polars as pl
+
+    overrides = {}
+    for name, dtype in zip(schema.names, schema.types):
+        key = str(dtype)
+        if key.startswith("timestamp"):
+            overrides[name] = pl.Datetime
+            continue
+        pl_name = _IBIS_TO_POLARS.get(key)
+        if pl_name is None:
+            raise ValueError(
+                f"tallyman_read_csv: column {name!r} has ibis type {key!r}, which has no "
+                f"polars mapping. Supported: {sorted(_IBIS_TO_POLARS)} (+ timestamp*)."
+            )
+        overrides[name] = getattr(pl, pl_name)
+    return overrides
+
+
+def _csv_ordered_dir() -> Path:
+    """Project-independent home for the ordered-CSV intermediates.
+
+    Keyed on the absolute CSV path (+ schema + reader options), so the same file
+    resolves to the same intermediate regardless of which project is active —
+    unlike a per-project artifacts dir, which makes a reconstruction running
+    under a *different* active project miss the cache and re-read the CSV (#9).
+    Per-test isolation still holds: ``TALLYMAN_HOME`` points at a tmp dir.
+    """
+    from tallyman_core.paths import tallyman_home
+
+    out_dir = tallyman_home() / "csv_ordered"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _ordered_csv_key(path: str, schema, scan_kwargs: dict) -> str:
+    """Stable, CSV-stat-independent key for the ordered intermediate.
+
+    Derived from the absolute path, the schema, and the reader options only —
+    NOT the CSV's mtime/size — so a reconstruction can resolve the intermediate
+    without touching (or even stat-ing) the source CSV. Freshness is a separate,
+    best-effort mtime sidecar (see ``_ordered_csv_parquet``).
+    """
+    import hashlib
+
+    schema_sig = repr(sorted(zip(schema.names, [str(t) for t in schema.types]))) if schema is not None else "none"
+    kwargs_sig = repr(sorted((k, repr(v)) for k, v in scan_kwargs.items()))
+    raw = f"{Path(path).resolve()}|{schema_sig}|{kwargs_sig}"
+    return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 — cache key, not a security boundary
+
+
+def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
+    """Materialise *path* to a row-order-stable parquet and return its path.
+
+    The CSV is read exactly once — at first ingest (and again only if its mtime
+    changes). The intermediate is addressed by (absolute path, schema, reader
+    options), not by the CSV's stat, so a faithful reconstruction resolves it
+    without re-reading or even stat-ing the CSV; if the source has since been
+    moved or deleted the existing intermediate is still served rather than
+    raising (#6). A sidecar records the *source* CSV's mtime so a changed CSV
+    re-materialises (#8 — mtime invalidates; bytes/size are unnecessary). The
+    sidecar tracks the source's mtime, never a derived parquet's, so the
+    result-digest / snapshot bake can never bump it into a re-ingest loop.
+
+    polars ``scan_csv -> with_row_index -> sink_parquet`` preserves source file
+    order (unlike datafusion's parallel scan, whose row order is nondeterministic
+    above the repartition threshold), so ``original_row_order`` is the true
+    0..N-1 file sequence and the bytes are reproducible. See
+    ``plans/adr-result-digest-canonical-ordering.md``.
+    """
+    import os
+    import uuid
+
+    import polars as pl
+
+    src = Path(path)
+    out_dir = _csv_ordered_dir()
+    key = _ordered_csv_key(path, schema, scan_kwargs)
+    target = out_dir / f"{key}.parquet"
+    stamp = out_dir / f"{key}.mtime"
+
+    if target.exists():
+        try:
+            current = str(src.stat().st_mtime_ns)
+        except OSError:
+            return target  # source gone — the baked intermediate IS the source of truth (#6)
+        try:
+            recorded = stamp.read_text()
+        except OSError:
+            recorded = None
+        if recorded == current:
+            return target  # unchanged source — reuse, never re-read the CSV (#6)
+        # mtime changed → fall through and re-materialise (#8)
+
+    st = src.stat()  # the single point that touches the CSV; it must be present here
+    overrides: dict = {}
+    if schema is not None:
+        overrides = {"schema_overrides": _polars_overrides(schema), "infer_schema_length": 0}
+    lf = pl.scan_csv(str(src), **{**overrides, **scan_kwargs}).with_row_index("original_row_order")
+    if schema is not None:
+        cols = list(schema.names)
+    else:
+        cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
+    # original_row_order last (matches the prior mutate-appends-a-column shape)
+    # and cast to int64 (with_row_index yields uint32) for the documented schema.
+    lf = lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
+
+    # Unique temp name (not a fixed {key}.parquet.tmp) so two builds writing the
+    # same key concurrently can't corrupt each other's partial file (#7); the
+    # rename is atomic and last-writer-wins on identical bytes.
+    tmp = out_dir / f"{key}.{uuid.uuid4().hex}.tmp"
+    try:
+        lf.sink_parquet(str(tmp), **_CSV_PARQUET_WRITE)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    stamp.write_text(str(st.st_mtime_ns))
+    return target
+
+
+def tallyman_read_csv(path: str, schema=None, **kwargs):
+    """Read a CSV into a xorq expression with a stable ``original_row_order``.
+
+    Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. It adds a
+    0-based ``original_row_order`` column holding the source file's true row
+    sequence, which serves as the canonical total order for snapshot baking —
+    making the entry's result digest byte-stable across builds.
+
+    The CSV is read exactly once, at ingest: an order-preserving polars read
+    (``scan_csv -> with_row_index``) materialises it to a parquet intermediate,
+    and the returned expression is a ``deferred_read_parquet`` of that file with
+    a top-level ``order_by("original_row_order")``. All downstream computation
+    (the recipe, the snapshot bake, the result digest) runs on the parquet, never
+    the CSV. polars is used rather than ``ibis.row_number()`` because a bare
+    datafusion ``ROW_NUMBER() OVER ()`` numbers rows in the nondeterministic
+    arrival order of a parallel CSV scan (any file over datafusion's ~10 MB
+    repartition threshold), so it would not pin file order at all. See
+    ``plans/adr-result-digest-canonical-ordering.md``.
+
+    Args:
+        path: Absolute path to the CSV file.
+        schema: Optional ibis schema for the columns (same as deferred_read_csv).
+            When omitted, polars infers types.
+        **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
+            ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
+            ``has_header``, ``encoding``. They participate in the intermediate's
+            cache key, so changing one re-ingests.
+    """
+    import xorq.api as xo
+
+    parquet_path = _ordered_csv_parquet(path, schema, kwargs)
+    return xo.deferred_read_parquet(str(parquet_path)).order_by("original_row_order")
+
+
 def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
     """The digest *rel_path* was built with, if a recipe for *proj* is being
     reconstructed on this call stack (#115); otherwise None.

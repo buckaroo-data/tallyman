@@ -127,7 +127,7 @@ def test_tuple_schema_renames_by_position(project, monkeypatch):
     assert "error" not in res, res
     types = _types_of(res)
     assert "Date" in types and "Price" not in types  # col 0 renamed positionally
-    assert types["Date"] == "date"
+    assert types["Date"].startswith("date")  # date32[day] in the serialized schema
 
 
 def test_tuple_schema_rest_infers_tail(project, monkeypatch):
@@ -138,7 +138,7 @@ def test_tuple_schema_rest_infers_tail(project, monkeypatch):
     res = _build("rest_tail", p, '(("when", "date"), ("&rest", "infer"))')
     assert "error" not in res, res
     types = _types_of(res)
-    assert types["when"] == "date"  # col 0 renamed + pinned
+    assert types["when"].startswith("date")  # col 0 renamed + pinned (date32[day])
     assert types["b"] == "int64"  # tail kept name, inferred int
     assert types["c"] == "string"  # tail kept name, inferred string
 

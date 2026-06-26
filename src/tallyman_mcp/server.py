@@ -338,6 +338,11 @@ def catalog_run(code: str, prompt: str = "") -> dict:
             schema = ibis.schema({"Date": "date", "Close": "float64"})
             t = tallyman_read_csv("/abs/path/to/file.csv", schema=schema)
 
+        Extra keyword arguments are forwarded to ``polars.scan_csv`` as reader
+        options (``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
+        ``has_header``, ``encoding``, ...), e.g.
+        ``tallyman_read_csv(path, schema=schema, separator=";", skip_rows=2)``.
+
         Before writing a schema, run `head -5 <file>` to verify the actual
         column names and order. Do NOT guess — yfinance and similar sources
         produce non-obvious layouts:

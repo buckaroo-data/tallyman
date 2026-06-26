@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tallyman_core import artifacts_dir, data_dir, entry_dir, get_alias, resolve_project
+from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
 
 
 class ProjectDataNotFound(FileNotFoundError):
@@ -118,37 +118,86 @@ def _polars_overrides(schema):
     return overrides
 
 
-def _ordered_csv_parquet(path: str, schema) -> Path:
-    """Materialise *path* to a row-order-stable parquet, keyed on the CSV's stat
-    signature, and return its path (idempotent — skips the write if it exists).
+def _csv_ordered_dir() -> Path:
+    """Project-independent home for the ordered-CSV intermediates.
+
+    Keyed on the absolute CSV path (+ schema + reader options), so the same file
+    resolves to the same intermediate regardless of which project is active —
+    unlike a per-project artifacts dir, which makes a reconstruction running
+    under a *different* active project miss the cache and re-read the CSV (#9).
+    Per-test isolation still holds: ``TALLYMAN_HOME`` points at a tmp dir.
+    """
+    from tallyman_core.paths import tallyman_home
+
+    out_dir = tallyman_home() / "csv_ordered"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    return out_dir
+
+
+def _ordered_csv_key(path: str, schema, scan_kwargs: dict) -> str:
+    """Stable, CSV-stat-independent key for the ordered intermediate.
+
+    Derived from the absolute path, the schema, and the reader options only —
+    NOT the CSV's mtime/size — so a reconstruction can resolve the intermediate
+    without touching (or even stat-ing) the source CSV. Freshness is a separate,
+    best-effort mtime sidecar (see ``_ordered_csv_parquet``).
+    """
+    import hashlib
+
+    schema_sig = repr(sorted(zip(schema.names, [str(t) for t in schema.types]))) if schema is not None else "none"
+    kwargs_sig = repr(sorted((k, repr(v)) for k, v in scan_kwargs.items()))
+    raw = f"{Path(path).resolve()}|{schema_sig}|{kwargs_sig}"
+    return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 — cache key, not a security boundary
+
+
+def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
+    """Materialise *path* to a row-order-stable parquet and return its path.
+
+    The CSV is read exactly once — at first ingest (and again only if its mtime
+    changes). The intermediate is addressed by (absolute path, schema, reader
+    options), not by the CSV's stat, so a faithful reconstruction resolves it
+    without re-reading or even stat-ing the CSV; if the source has since been
+    moved or deleted the existing intermediate is still served rather than
+    raising (#6). A sidecar records the *source* CSV's mtime so a changed CSV
+    re-materialises (#8 — mtime invalidates; bytes/size are unnecessary). The
+    sidecar tracks the source's mtime, never a derived parquet's, so the
+    result-digest / snapshot bake can never bump it into a re-ingest loop.
 
     polars ``scan_csv -> with_row_index -> sink_parquet`` preserves source file
     order (unlike datafusion's parallel scan, whose row order is nondeterministic
-    above the repartition threshold), so ``original_row_order`` is the true 0..N-1
-    file sequence and the written bytes are reproducible. See
+    above the repartition threshold), so ``original_row_order`` is the true
+    0..N-1 file sequence and the bytes are reproducible. See
     ``plans/adr-result-digest-canonical-ordering.md``.
     """
-    import hashlib
+    import os
+    import uuid
 
     import polars as pl
 
     src = Path(path)
-    st = src.stat()
-    schema_sig = repr(sorted(zip(schema.names, [str(t) for t in schema.types]))) if schema is not None else "none"
-    key = hashlib.md5(  # noqa: S324 — naming key, not a security boundary
-        f"{src.resolve()}|{st.st_mtime_ns}|{st.st_size}|{schema_sig}".encode()
-    ).hexdigest()
-
-    out_dir = artifacts_dir(resolve_project(None)) / "csv_ordered"
-    out_dir.mkdir(parents=True, exist_ok=True)
+    out_dir = _csv_ordered_dir()
+    key = _ordered_csv_key(path, schema, scan_kwargs)
     target = out_dir / f"{key}.parquet"
-    if target.exists():
-        return target
+    stamp = out_dir / f"{key}.mtime"
 
-    lf = pl.scan_csv(
-        str(src),
-        **({"schema_overrides": _polars_overrides(schema), "infer_schema_length": 0} if schema is not None else {}),
-    ).with_row_index("original_row_order")
+    if target.exists():
+        try:
+            current = str(src.stat().st_mtime_ns)
+        except OSError:
+            return target  # source gone — the baked intermediate IS the source of truth (#6)
+        try:
+            recorded = stamp.read_text()
+        except OSError:
+            recorded = None
+        if recorded == current:
+            return target  # unchanged source — reuse, never re-read the CSV (#6)
+        # mtime changed → fall through and re-materialise (#8)
+
+    st = src.stat()  # the single point that touches the CSV; it must be present here
+    overrides: dict = {}
+    if schema is not None:
+        overrides = {"schema_overrides": _polars_overrides(schema), "infer_schema_length": 0}
+    lf = pl.scan_csv(str(src), **{**overrides, **scan_kwargs}).with_row_index("original_row_order")
     if schema is not None:
         cols = list(schema.names)
     else:
@@ -157,13 +206,20 @@ def _ordered_csv_parquet(path: str, schema) -> Path:
     # and cast to int64 (with_row_index yields uint32) for the documented schema.
     lf = lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
 
-    tmp = target.with_suffix(".parquet.tmp")
-    lf.sink_parquet(str(tmp), **_CSV_PARQUET_WRITE)
-    tmp.replace(target)  # atomic — a crash mid-write never leaves a partial at `target`
+    # Unique temp name (not a fixed {key}.parquet.tmp) so two builds writing the
+    # same key concurrently can't corrupt each other's partial file (#7); the
+    # rename is atomic and last-writer-wins on identical bytes.
+    tmp = out_dir / f"{key}.{uuid.uuid4().hex}.tmp"
+    try:
+        lf.sink_parquet(str(tmp), **_CSV_PARQUET_WRITE)
+        os.replace(tmp, target)
+    finally:
+        tmp.unlink(missing_ok=True)
+    stamp.write_text(str(st.st_mtime_ns))
     return target
 
 
-def tallyman_read_csv(path: str, schema=None):
+def tallyman_read_csv(path: str, schema=None, **kwargs):
     """Read a CSV into a xorq expression with a stable ``original_row_order``.
 
     Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. It adds a
@@ -171,27 +227,29 @@ def tallyman_read_csv(path: str, schema=None):
     sequence, which serves as the canonical total order for snapshot baking —
     making the entry's result digest byte-stable across builds.
 
-    The ordering is produced by an order-preserving polars read
-    (``scan_csv -> with_row_index``) materialised to a stat-addressed parquet,
-    *not* by ``ibis.row_number()``: a bare datafusion ``ROW_NUMBER() OVER ()``
-    numbers rows in the nondeterministic arrival order of a parallel CSV scan
-    (any file over datafusion's ~10 MB repartition threshold), so it would not
-    pin file order at all. See ``plans/adr-result-digest-canonical-ordering.md``.
-
-    The returned expression is a ``deferred_read_parquet`` of that stable file
-    with a top-level ``order_by("original_row_order")``, so it is classified
-    snapshot-worthy and bakes a canonically-ordered parquet snapshot on build;
-    the trailing sort also re-imposes the canonical order even if the parquet
-    scan itself reparallelises.
+    The CSV is read exactly once, at ingest: an order-preserving polars read
+    (``scan_csv -> with_row_index``) materialises it to a parquet intermediate,
+    and the returned expression is a ``deferred_read_parquet`` of that file with
+    a top-level ``order_by("original_row_order")``. All downstream computation
+    (the recipe, the snapshot bake, the result digest) runs on the parquet, never
+    the CSV. polars is used rather than ``ibis.row_number()`` because a bare
+    datafusion ``ROW_NUMBER() OVER ()`` numbers rows in the nondeterministic
+    arrival order of a parallel CSV scan (any file over datafusion's ~10 MB
+    repartition threshold), so it would not pin file order at all. See
+    ``plans/adr-result-digest-canonical-ordering.md``.
 
     Args:
         path: Absolute path to the CSV file.
         schema: Optional ibis schema for the columns (same as deferred_read_csv).
             When omitted, polars infers types.
+        **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
+            ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
+            ``has_header``, ``encoding``. They participate in the intermediate's
+            cache key, so changing one re-ingests.
     """
     import xorq.api as xo
 
-    parquet_path = _ordered_csv_parquet(path, schema)
+    parquet_path = _ordered_csv_parquet(path, schema, kwargs)
     return xo.deferred_read_parquet(str(parquet_path)).order_by("original_row_order")
 
 

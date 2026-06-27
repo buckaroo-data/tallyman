@@ -156,7 +156,16 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
     bk: BuckarooManager | None = None
     if buckaroo:
         buckaroo_log = project_dir(project_name) / "buckaroo.log"
-        bk = BuckarooManager(port=buckaroo_port, log_file=buckaroo_log)
+        # Address the Buckaroo subprocess uses to POST per-grid-load telemetry
+        # back to us (buckaroo#943). When bound to 0.0.0.0 (all interfaces), the
+        # subprocess must still reach us on the loopback, not the wildcard.
+        telemetry_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
+        companion_base_url = f"http://{telemetry_host}:{port}"
+        bk = BuckarooManager(
+            port=buckaroo_port,
+            log_file=buckaroo_log,
+            companion_base_url=companion_base_url,
+        )
         try:
             bk.start()
             # T-35: include PID + bound port so `ps`/`lsof` disambiguation is

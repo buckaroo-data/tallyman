@@ -9,6 +9,7 @@ import type {
   DiffData,
   ResultCache,
   Projects,
+  TelemetryResponse,
 } from "./types";
 
 async function get<T>(url: string): Promise<T> {
@@ -71,6 +72,9 @@ export const api = {
     const qs = p.toString();
     return get(`/${project}/api/log${qs ? `?${qs}` : ""}`);
   },
+
+  telemetry: (project: string, trace: string): Promise<TelemetryResponse> =>
+    get(`/${project}/api/telemetry?trace=${encodeURIComponent(trace)}`),
 
   diskUsage: (project: string): Promise<{ formatted: Record<string, string> }> =>
     get(`/${project}/api/disk_usage`),

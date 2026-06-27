@@ -243,6 +243,25 @@ export interface LogEvent {
   error_id?: string | null;
   load_ms?: number | null;
   load_expr_ms?: number | null;
+  session_id?: string | null;
+}
+
+// One perf span pushed from the Buckaroo server during a grid load (buckaroo#943),
+// keyed back to a `buckaroo` LogEvent by `trace` === event.session_id.
+export interface TelemetrySpan {
+  received_at: string;
+  trace?: string | null;
+  source?: string | null;
+  name: string;
+  t_start_ms: number;
+  t_end_ms: number;
+  attrs?: Record<string, unknown> | null;
+}
+
+export interface TelemetryResponse {
+  project: string;
+  trace: string | null;
+  spans: TelemetrySpan[];
 }
 
 export interface LogSession {

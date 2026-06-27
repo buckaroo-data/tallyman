@@ -49,9 +49,9 @@ _IN_MEMORY_MSG = (
     "expression reads in-memory data (read_in_memory / ibis.memtable). This "
     "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
     "handed to xorq in memory, instead of a native deferred reader. Read the "
-    "file with xo.deferred_read_csv(path, schema=...) (or deferred_read_parquet "
-    "for parquet) so the source round-trips through the portable build and is "
-    "cached at the read."
+    "file with tallyman_read_csv(abs_path, schema=...) for CSVs or "
+    "xo.deferred_read_parquet(abs_path) for parquet, so the source round-trips "
+    "through the portable build and is cached at the read."
 )
 
 

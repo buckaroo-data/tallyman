@@ -53,16 +53,22 @@ def _build_yaml(project: str, content_hash: str) -> str:
     return (entry_dir(project, content_hash) / "xorq_build" / "expr.yaml").read_text()
 
 
-def test_csv_read_gets_source_cache_but_stays_cheap(project, sales_csv, monkeypatch):
+def test_deferred_read_csv_is_banned(project, sales_csv, monkeypatch):
+    # xo.deferred_read_csv is banned — tallyman_read_csv is the only CSV ingest path.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    res = build_and_persist(project, _csv_projection(project))
-    # The non-parquet read is wrapped in a cache node...
-    assert "op: CachedNode" in _build_yaml(project, res.content_hash)
-    # ...but a plain projection is not itself worth a result cache.
-    assert cache_worthy(project, res.content_hash) is False
-    # No build-time result.parquet, and the row count came through fine.
-    assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
-    assert res.row_count == 4
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _csv_projection(project))
+    assert "deferred_read_csv" in str(exc.value)
+    assert "tallyman_read_csv" in str(exc.value)
+
+
+def test_deferred_read_csv_banned_for_aggregate(project, sales_csv, monkeypatch):
+    # Ban applies regardless of how the CSV expression is used downstream.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _csv_aggregate(project))
+    assert "deferred_read_csv" in str(exc.value)
+    assert "tallyman_read_csv" in str(exc.value)
 
 
 def test_parquet_read_has_no_source_cache(project, orders_parquet, monkeypatch):
@@ -72,15 +78,6 @@ def test_parquet_read_has_no_source_cache(project, orders_parquet, monkeypatch):
     # cache node is injected and nothing is materialised.
     assert "op: CachedNode" not in _build_yaml(project, res.content_hash)
     assert cache_worthy(project, res.content_hash) is False
-
-
-def test_expensive_csv_bakes_source_and_result_cache(project, sales_csv, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    res = build_and_persist(project, _csv_aggregate(project))
-    # Both the source-read cache and the baked result cache are present.
-    assert _build_yaml(project, res.content_hash).count("op: CachedNode") == 2
-    assert cache_worthy(project, res.content_hash) is True
-    assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
 
 
 def test_in_memory_read_is_rejected(project, monkeypatch):
@@ -93,7 +90,6 @@ expr = xo.memtable(pd.DataFrame({"a": [1, 2, 3]}))
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, code)
     assert "in-memory" in str(exc.value)
-    assert "deferred_read_csv" in str(exc.value)
 
 
 def test_should_cache_read_treats_json_like_csv_not_exempt():

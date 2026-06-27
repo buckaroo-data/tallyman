@@ -195,8 +195,9 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
                 f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint "
                 "(`import xorq.api as xo`). Read data with `from tallyman_xorq.io "
                 "import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
-                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs and "
-                "`xo.deferred_read_parquet(abs_path)` for a raw parquet path."
+                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs (the only "
+                "supported CSV ingest) and `xo.deferred_read_parquet(abs_path)` "
+                "for a raw parquet path."
             )
         else:
             hints.append(
@@ -269,6 +270,34 @@ _NONDETERMINISTIC_OPS = {
     "RandomUUID": "uuid()",
     "Sample": "sample()",
 }
+
+
+def _csv_direct_read_check(expr) -> None:
+    """Raise BuildError if the recipe calls xo.deferred_read_csv directly.
+
+    tallyman_read_csv is the only supported CSV ingest path — it bakes an
+    order-stable polars intermediate so result_digest is byte-reproducible
+    across builds. A raw deferred_read_csv bypasses that and produces a
+    nondeterministic row order above datafusion's repartition threshold.
+    """
+    try:
+        from xorq.expr.relations import Read
+
+        csv_nodes = [
+            node
+            for node in expr.op().find(Read)
+            if node.name.startswith("ibis_xorq-read_csv_")
+        ]
+    except Exception:
+        return  # if the walk fails, don't block the build
+    if csv_nodes:
+        raise BuildError(
+            "xo.deferred_read_csv is not allowed in tallyman recipes — "
+            "use tallyman_read_csv(abs_path, schema=...) instead. "
+            "tallyman_read_csv bakes an order-stable polars intermediate so "
+            "result_digest is byte-reproducible; deferred_read_csv gives "
+            "nondeterministic row order above datafusion's repartition threshold."
+        )
 
 
 def _nondeterminism_warnings(expr) -> list[str]:
@@ -372,6 +401,10 @@ def build_and_persist(
     # Advisory nondeterminism lint (#88) on the author's expression, before the
     # rewrite wraps it in cache nodes. Surfaced on the result, never fatal.
     lint_warnings = _nondeterminism_warnings(expr_obj)
+
+    # Fatal: raw deferred_read_csv is banned — tallyman_read_csv is the only
+    # supported CSV ingest path (order-stable polars intermediate).
+    _csv_direct_read_check(expr_obj)
 
     # Rewrite-then-build (#73): cache each non-parquet source read, bake a
     # top-level result cache when the expression is expensive (so every loader,

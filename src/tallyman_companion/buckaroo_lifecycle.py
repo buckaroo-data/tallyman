@@ -53,7 +53,8 @@ from tallyman_core import (
     entry_expanded_build_dir,
     entry_stat_cache_dir,
 )
-from tallyman_core.paths import artifacts_dir, project_dir
+from tallyman_core.manifest import read_manifest
+from tallyman_core.paths import artifacts_dir, entry_manifest_path, project_dir
 
 
 def _entry_exists(project: str, content_hash: str) -> bool:
@@ -609,12 +610,20 @@ class BuckarooManager:
                 # id it mints below. Per-project so the receiver knows which
                 # telemetry.jsonl to append to. Older buckaroo ignores the field.
                 payload["telemetry_url"] = f"{self.companion_base_url}/{project}/api/telemetry"
+            _row_count = 0
+            _mpath = entry_manifest_path(project, content_hash)
+            if _mpath.exists():
+                try:
+                    _row_count = read_manifest(_mpath.parent).row_count or 0
+                except Exception:
+                    pass
+            _load_timeout = 3.0 + _row_count / 1_000_000
             _t_post = time.perf_counter()
             try:
                 resp = self._client.post(
                     f"{self.base_url}/load_expr",
                     json=payload,
-                    timeout=10.0,
+                    timeout=_load_timeout,
                 )
                 resp.raise_for_status()
                 session_id = resp.json()["session"]
@@ -623,7 +632,9 @@ class BuckarooManager:
                 return {
                     "status": "timeout",
                     "session_id": None,
-                    "detail": "Buckaroo timed out loading this entry (10s) — it may be slow to materialise.",
+                    "detail": (
+                        f"Buckaroo timed out loading this entry ({_load_timeout:.1f}s) — it may be slow to materialise."
+                    ),
                 }
             except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
                 log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)

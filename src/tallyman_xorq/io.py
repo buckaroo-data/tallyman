@@ -293,16 +293,22 @@ _ESCALATED_INFER = 10_000  # the middle rung of the #143 infer ladder; whole-fil
 
 
 def _polars_to_ibis(dt) -> str:
-    """A polars dtype -> an ibis type string, for the suggested-schema hint."""
+    """A polars dtype -> an ibis type string, for the suggested-schema hint.
+
+    The primitive table is derived by inverting ``_IBIS_TO_POLARS`` (the reader's
+    forward map) so the two can't drift — a suggestion can never name a type the
+    reader then rejects. ``date``/``time`` are added because the reader maps those
+    via predicates in ``_polars_dtype`` rather than the name table; many-to-one
+    ibis spellings (bool/boolean) collapse to the canonical name that appears last
+    in ``_IBIS_TO_POLARS``.
+    """
     import polars as pl
 
-    table = {
-        pl.Int8: "int8", pl.Int16: "int16", pl.Int32: "int32", pl.Int64: "int64",
-        pl.UInt8: "uint8", pl.UInt16: "uint16", pl.UInt32: "uint32", pl.UInt64: "uint64",
-        pl.Float32: "float32", pl.Float64: "float64",
-        pl.Boolean: "boolean", pl.String: "string", pl.Date: "date", pl.Time: "time",
-    }
-    for pl_dt, name in table.items():
+    # polars dtype class -> canonical ibis name (last forward entry wins a collision).
+    reverse = {getattr(pl, pl_name): ibis_name for ibis_name, pl_name in _IBIS_TO_POLARS.items()}
+    reverse.setdefault(pl.Date, "date")
+    reverse.setdefault(pl.Time, "time")
+    for pl_dt, name in reverse.items():
         if dt == pl_dt:
             return name
     if isinstance(dt, pl.Datetime):
@@ -321,6 +327,44 @@ def _suggest_schema_dsl(src: Path, scan_kwargs: dict) -> str:
     return repr(pairs)
 
 
+def _validate_existing_row_order(src: Path, scan_kwargs: dict) -> None:
+    """The CSV already has an ``original_row_order`` column, colliding with the row
+    index tallyman would add via ``with_row_index`` (a raw polars ``DuplicateError``
+    the infer ladder does not catch). Reuse the column only if it *is* the canonical
+    order — the contiguous ``0..N-1`` file sequence tallyman itself writes, each row
+    exactly one more than the last. Otherwise the name is a coincidence carrying
+    foreign data, so raise loudly rather than trust a non-canonical order.
+    """
+    import polars as pl
+
+    reserved = (
+        f"tallyman_read_csv: {src.name} already has a column named 'original_row_order', which is "
+        "reserved for tallyman's canonical row index. {why} Rename the column in the source CSV."
+    )
+    try:
+        series = (
+            pl.scan_csv(
+                str(src),
+                schema_overrides={"original_row_order": pl.Int64},
+                infer_schema_length=0,
+                **scan_kwargs,
+            )
+            .select("original_row_order")
+            .collect()
+            .to_series()
+        )
+    except pl.exceptions.ComputeError as exc:
+        raise ValueError(reserved.format(why=f"Its values are not integers ({exc}).")) from exc
+    n = series.len()
+    expected = pl.int_range(0, n, dtype=pl.Int64, eager=True)
+    if series.null_count() or not (series == expected).all():
+        raise ValueError(
+            reserved.format(
+                why=f"Its values are not the contiguous 0..{n - 1} sequence (each row must be one more than the last)."
+            )
+        )
+
+
 def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
     """Read *src* into a row-order-stable parquet at *tmp_path* (#143).
 
@@ -333,26 +377,35 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     """
     import polars as pl
 
+    # Header (names only) drives both the schema plan and the row-index collision
+    # check; infer_schema_length=0 reads just the header line, no type sampling.
+    header = list(pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs).collect_schema().names())
+    has_row_order = "original_row_order" in header
+    if has_row_order:
+        _validate_existing_row_order(src, scan_kwargs)  # reuse it, or raise — never with_row_index over it
+
     plan = None
     explicit_only = False
     if schema is not None:
-        header = list(pl.scan_csv(str(src), **scan_kwargs).collect_schema().names())
         plan = _normalize_schema(schema, header)
         explicit_only = plan["all_pinned"]
 
     def _ordered(infer_len):
         if schema is None:
             lf = pl.scan_csv(str(src), infer_schema_length=infer_len, **scan_kwargs)
-            lf = lf.with_row_index("original_row_order")
+            if not has_row_order:
+                lf = lf.with_row_index("original_row_order")
             cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
         else:
             il = 0 if plan["all_pinned"] else infer_len
             lf = pl.scan_csv(str(src), schema_overrides=plan["overrides"], infer_schema_length=il, **scan_kwargs)
-            lf = lf.with_row_index("original_row_order")
+            if not has_row_order:
+                lf = lf.with_row_index("original_row_order")
             if plan["rename"]:
                 lf = lf.rename(plan["rename"])
-            cols = plan["out_names"]
-        # original_row_order last and cast to int64 (with_row_index yields uint32).
+            cols = [c for c in plan["out_names"] if c != "original_row_order"]
+        # original_row_order last and cast to int64 (a fresh with_row_index yields
+        # uint32; a reused in-CSV column is stripped from `cols` and re-appended here).
         return lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
 
     ladder = [_DEFAULT_INFER] if explicit_only else [_DEFAULT_INFER, _ESCALATED_INFER, None]

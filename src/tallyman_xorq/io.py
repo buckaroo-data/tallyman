@@ -98,24 +98,328 @@ _IBIS_TO_POLARS = {
 }
 
 
-def _polars_overrides(schema):
-    """Translate an ibis schema to polars ``schema_overrides`` dtypes."""
+def _ts_time_unit(scale: int | None) -> str:
+    """ibis timestamp scale (sub-second digits) -> a polars Datetime time_unit.
+
+    polars supports only ``ms``/``us``/``ns``; ibis scale is 0..9. Round each ibis
+    scale up to the nearest representable polars unit (#145).
+    """
+    if scale is None:
+        return "us"
+    if scale <= 3:
+        return "ms"
+    if scale <= 6:
+        return "us"
+    return "ns"
+
+
+def _polars_dtype(dtype):
+    """Translate one ibis dtype to a concrete polars dtype.
+
+    Inspects the dtype *object* (predicates + attributes) rather than its string
+    form, so parametric and non-nullable types map correctly: ``timestamp`` keeps
+    tz + sub-µs precision (#145), and a non-nullable ``!int64`` strips the marker
+    before the primitive lookup (#144 — a CSV column is nullable regardless of the
+    schema's intent). ``decimal`` reads as ``float64`` for now — exact-decimal
+    parsing is deferred to a future UI-driven buckaroo autoclean step (#150).
+    An unmapped type still raises loudly, so a schema mistake fails fast.
+    """
     import polars as pl
 
-    overrides = {}
-    for name, dtype in zip(schema.names, schema.types):
-        key = str(dtype)
-        if key.startswith("timestamp"):
-            overrides[name] = pl.Datetime
-            continue
-        pl_name = _IBIS_TO_POLARS.get(key)
-        if pl_name is None:
+    if dtype.is_timestamp():
+        return pl.Datetime(_ts_time_unit(dtype.scale), time_zone=dtype.timezone)
+    if dtype.is_decimal():
+        return pl.Float64  # exact decimal deferred to a UI autoclean step (#150)
+    if dtype.is_time():
+        return pl.Time
+    if dtype.is_date():
+        return pl.Date
+    key = str(dtype).lstrip("!")  # drop the non-nullable marker before the primitive lookup
+    pl_name = _IBIS_TO_POLARS.get(key)
+    if pl_name is None:
+        raise ValueError(
+            f"tallyman_read_csv: column type {key!r} has no polars mapping. Supported: "
+            f"{sorted(_IBIS_TO_POLARS)} (+ date, time, decimal[(p, s)], timestamp[(scale[, tz])])."
+        )
+    return getattr(pl, pl_name)
+
+
+def _polars_overrides(schema):
+    """Translate an ibis schema to polars ``schema_overrides`` dtypes (by name)."""
+    return {name: _polars_dtype(dtype) for name, dtype in zip(schema.names, schema.types)}
+
+
+# Rows polars samples to infer an unpinned column's type. The cheap first try;
+# the #143 escalation ladder widens it on a parse failure.
+_DEFAULT_INFER = 100
+_INFER = "infer"  # dtype token: keep a column's name/position but infer its type
+_REST = "&rest"  # wildcard closure: the remaining tail columns (ADR D3)
+_BEGIN = "&begin"  # wildcard closure: the leading head columns (specced, not yet implemented)
+
+
+def _spec_sig(spec) -> str:
+    """A stable string for the cache key, covering every schema-spec shape.
+
+    Order matters for the positional tuple form (it binds by index) so it is not
+    sorted; the by-name forms are sorted (binding is order-independent).
+    """
+    if spec is None:
+        return "none"
+    if isinstance(spec, (tuple, list)):
+        return "pos:" + repr([(str(n), str(d)) for n, d in spec])
+    if hasattr(spec, "names") and hasattr(spec, "types"):  # ibis schema
+        return "name:" + repr(sorted((n, str(t)) for n, t in zip(spec.names, spec.types)))
+    if isinstance(spec, dict):
+        return "name:" + repr(sorted((str(k), str(v)) for k, v in spec.items()))
+    raise ValueError(f"tallyman_read_csv: unsupported schema spec type {type(spec).__name__!r}.")
+
+
+def _resolve_spec_dtype(value):
+    """A spec dtype value -> a polars dtype, or None for the ``"infer"`` token."""
+    if isinstance(value, str) and value == _INFER:
+        return None
+    import xorq.vendor.ibis as ibis
+
+    return _polars_dtype(ibis.dtype(value) if isinstance(value, str) else value)
+
+
+def _spec_pairs(spec):
+    """Normalise a by-name spec (ibis schema or plain dict) to a list of (name, dtype-value)."""
+    if hasattr(spec, "names") and hasattr(spec, "types"):
+        return list(zip(spec.names, spec.types))
+    return list(spec.items())
+
+
+def _normalize_schema(spec, header: list[str]) -> dict:
+    """Resolve a schema spec against the CSV *header* into a polars parse plan.
+
+    Returns ``{overrides, rename, out_names, all_pinned}``:
+      - ``overrides``  — ``{header_name: polars_dtype}`` for pinned columns, keyed by the
+        name polars reads (positional renames are applied *after* the read).
+      - ``rename``     — ``{header_name: output_name}`` where they differ (positional only).
+      - ``out_names``  — output column names in column order (the final ``select``).
+      - ``all_pinned`` — True if no column is inferred (then ``infer_schema_length=0``).
+
+    Raises the actionable ValueError on a by-name miss, a non-total spec, or an
+    over-long positional spec — these are the #143 error-contract surfaces.
+    """
+    overrides: dict = {}
+    rename: dict = {}
+    inferred = False
+
+    if isinstance(spec, (tuple, list)):  # ---------------- bind BY POSITION ----------------
+        cells = [(str(n), d) for n, d in spec]
+        if cells and cells[0][0] == _BEGIN:
             raise ValueError(
-                f"tallyman_read_csv: column {name!r} has ibis type {key!r}, which has no "
-                f"polars mapping. Supported: {sorted(_IBIS_TO_POLARS)} (+ timestamp*)."
+                "tallyman_read_csv: '&begin' is specced but not yet implemented (ADR D3); use explicit "
+                "leading cells plus a trailing ('&rest', ...) instead."
             )
-        overrides[name] = getattr(pl, pl_name)
-    return overrides
+        rest_dtype = None
+        if cells and cells[-1][0] == _REST:
+            rest_dtype = cells[-1][1]
+            cells = cells[:-1]
+        if any(n in (_REST, _BEGIN) for n, _ in cells):
+            raise ValueError("tallyman_read_csv: '&rest' must be the last cell and '&begin' the first.")
+        if len(cells) > len(header):
+            raise ValueError(
+                f"tallyman_read_csv: positional schema has {len(cells)} columns but the CSV header has "
+                f"{len(header)} {list(header)}."
+            )
+        if rest_dtype is None and len(cells) != len(header):
+            uncovered = list(header[len(cells):])
+            raise ValueError(
+                f"tallyman_read_csv: schema is not total — it leaves column(s) {uncovered} unspecified. "
+                'Name every column, or close the spec with ("&rest", "infer").'
+            )
+        out_names = []
+        for i, (out_name, dt) in enumerate(cells):
+            orig = header[i]
+            out_names.append(out_name)
+            if out_name != orig:
+                rename[orig] = out_name
+            pl_dt = _resolve_spec_dtype(dt)
+            if pl_dt is None:
+                inferred = True
+            else:
+                overrides[orig] = pl_dt
+        for orig in header[len(cells):]:  # the &rest tail keeps its header name
+            out_names.append(orig)
+            pl_dt = _resolve_spec_dtype(rest_dtype)
+            if pl_dt is None:
+                inferred = True
+            else:
+                overrides[orig] = pl_dt
+        return {"overrides": overrides, "rename": rename, "out_names": out_names, "all_pinned": not inferred}
+
+    # ---------------- bind BY NAME (ibis schema or dict) ----------------
+    rest_dtype = None
+    named: dict = {}
+    for name, dt in _spec_pairs(spec):
+        if str(name) == _BEGIN:
+            raise ValueError("tallyman_read_csv: '&begin' is positional; it is not valid in a by-name schema.")
+        if str(name) == _REST:
+            rest_dtype = dt
+            continue
+        named[str(name)] = dt
+    missing = [n for n in named if n not in header]
+    if missing:
+        raise ValueError(
+            f"tallyman_read_csv: schema column(s) {sorted(missing)} are not in the CSV header {list(header)}. "
+            "Bind by name only when the names match the header; to rename by position pass a tuple-of-tuples "
+            'schema, e.g. schema=(("Date", "date"), ("&rest", "infer")).'
+        )
+    uncovered = [h for h in header if h not in named]
+    if rest_dtype is None and uncovered:
+        raise ValueError(
+            f"tallyman_read_csv: schema is not total — it leaves column(s) {uncovered} unspecified. "
+            'Name every column, or close the spec with "&rest": "infer".'
+        )
+    for name, dt in named.items():
+        pl_dt = _resolve_spec_dtype(dt)
+        if pl_dt is None:
+            inferred = True
+        else:
+            overrides[name] = pl_dt
+    for name in uncovered:
+        pl_dt = _resolve_spec_dtype(rest_dtype)
+        if pl_dt is None:
+            inferred = True
+        else:
+            overrides[name] = pl_dt
+    return {"overrides": overrides, "rename": {}, "out_names": list(header), "all_pinned": not inferred}
+
+
+_ESCALATED_INFER = 10_000  # the middle rung of the #143 infer ladder; whole-file (None) is the terminal
+
+
+def _polars_to_ibis(dt) -> str:
+    """A polars dtype -> an ibis type string, for the suggested-schema hint.
+
+    The primitive table is derived by inverting ``_IBIS_TO_POLARS`` (the reader's
+    forward map) so the two can't drift — a suggestion can never name a type the
+    reader then rejects. ``date``/``time`` are added because the reader maps those
+    via predicates in ``_polars_dtype`` rather than the name table; many-to-one
+    ibis spellings (bool/boolean) collapse to the canonical name that appears last
+    in ``_IBIS_TO_POLARS``.
+    """
+    import polars as pl
+
+    # polars dtype class -> canonical ibis name (last forward entry wins a collision).
+    reverse = {getattr(pl, pl_name): ibis_name for ibis_name, pl_name in _IBIS_TO_POLARS.items()}
+    reverse.setdefault(pl.Date, "date")
+    reverse.setdefault(pl.Time, "time")
+    for pl_dt, name in reverse.items():
+        if dt == pl_dt:
+            return name
+    if isinstance(dt, pl.Datetime):
+        return "timestamp"
+    if isinstance(dt, pl.Decimal):
+        return "decimal"
+    return "string"  # safe fallback — an unmapped column still reads as string
+
+
+def _suggest_schema_dsl(src: Path, scan_kwargs: dict) -> str:
+    """Whole-file-infer *src* and render it as the paste-ready tuple-of-tuples DSL."""
+    import polars as pl
+
+    inferred = pl.scan_csv(str(src), infer_schema_length=None, **scan_kwargs).collect_schema()
+    pairs = tuple((name, _polars_to_ibis(dt)) for name, dt in inferred.items())
+    return repr(pairs)
+
+
+def _validate_existing_row_order(src: Path, scan_kwargs: dict) -> None:
+    """The CSV already has an ``original_row_order`` column, colliding with the row
+    index tallyman would add via ``with_row_index`` (a raw polars ``DuplicateError``
+    the infer ladder does not catch). Reuse the column only if it *is* the canonical
+    order — the contiguous ``0..N-1`` file sequence tallyman itself writes, each row
+    exactly one more than the last. Otherwise the name is a coincidence carrying
+    foreign data, so raise loudly rather than trust a non-canonical order.
+    """
+    import polars as pl
+
+    reserved = (
+        f"tallyman_read_csv: {src.name} already has a column named 'original_row_order', which is "
+        "reserved for tallyman's canonical row index. {why} Rename the column in the source CSV."
+    )
+    try:
+        series = (
+            pl.scan_csv(
+                str(src),
+                schema_overrides={"original_row_order": pl.Int64},
+                infer_schema_length=0,
+                **scan_kwargs,
+            )
+            .select("original_row_order")
+            .collect()
+            .to_series()
+        )
+    except pl.exceptions.ComputeError as exc:
+        raise ValueError(reserved.format(why=f"Its values are not integers ({exc}).")) from exc
+    n = series.len()
+    expected = pl.int_range(0, n, dtype=pl.Int64, eager=True)
+    if series.null_count() or not (series == expected).all():
+        raise ValueError(
+            reserved.format(
+                why=f"Its values are not the contiguous 0..{n - 1} sequence (each row must be one more than the last)."
+            )
+        )
+
+
+def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
+    """Read *src* into a row-order-stable parquet at *tmp_path* (#143).
+
+    Inference mode (no schema, or a spec with inferred columns) escalates the
+    infer window on a parse failure — 100 -> 10k -> whole-file — because a value
+    that breaks an *inferred* type is tallyman's to resolve; whole-file infer
+    always resolves (a mixed column falls back to string). Explicit mode (every
+    column pinned) never escalates: a pinned type that cannot parse is the
+    caller's mistake, so it raises with a paste-ready suggested schema.
+    """
+    import polars as pl
+
+    # Header (names only) drives both the schema plan and the row-index collision
+    # check; infer_schema_length=0 reads just the header line, no type sampling.
+    header = list(pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs).collect_schema().names())
+    has_row_order = "original_row_order" in header
+    if has_row_order:
+        _validate_existing_row_order(src, scan_kwargs)  # reuse it, or raise — never with_row_index over it
+
+    plan = None
+    explicit_only = False
+    if schema is not None:
+        plan = _normalize_schema(schema, header)
+        explicit_only = plan["all_pinned"]
+
+    def _ordered(infer_len):
+        if schema is None:
+            lf = pl.scan_csv(str(src), infer_schema_length=infer_len, **scan_kwargs)
+            if not has_row_order:
+                lf = lf.with_row_index("original_row_order")
+            cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
+        else:
+            il = 0 if plan["all_pinned"] else infer_len
+            lf = pl.scan_csv(str(src), schema_overrides=plan["overrides"], infer_schema_length=il, **scan_kwargs)
+            if not has_row_order:
+                lf = lf.with_row_index("original_row_order")
+            if plan["rename"]:
+                lf = lf.rename(plan["rename"])
+            cols = [c for c in plan["out_names"] if c != "original_row_order"]
+        # original_row_order last and cast to int64 (a fresh with_row_index yields
+        # uint32; a reused in-CSV column is stripped from `cols` and re-appended here).
+        return lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
+
+    ladder = [_DEFAULT_INFER] if explicit_only else [_DEFAULT_INFER, _ESCALATED_INFER, None]
+    last_exc = None
+    for infer_len in ladder:
+        try:
+            _ordered(infer_len).sink_parquet(str(tmp_path), **_CSV_PARQUET_WRITE)
+            return
+        except pl.exceptions.ComputeError as exc:
+            last_exc = exc
+    raise ValueError(
+        f"tallyman_read_csv: the schema does not parse {src.name}: {last_exc}. "
+        f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs)}"
+    )
 
 
 def _csv_ordered_dir() -> Path:
@@ -144,9 +448,8 @@ def _ordered_csv_key(path: str, schema, scan_kwargs: dict) -> str:
     """
     import hashlib
 
-    schema_sig = repr(sorted(zip(schema.names, [str(t) for t in schema.types]))) if schema is not None else "none"
     kwargs_sig = repr(sorted((k, repr(v)) for k, v in scan_kwargs.items()))
-    raw = f"{Path(path).resolve()}|{schema_sig}|{kwargs_sig}"
+    raw = f"{Path(path).resolve()}|{_spec_sig(schema)}|{kwargs_sig}"
     return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 — cache key, not a security boundary
 
 
@@ -172,8 +475,6 @@ def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
     import os
     import uuid
 
-    import polars as pl
-
     src = Path(path)
     out_dir = _csv_ordered_dir()
     key = _ordered_csv_key(path, schema, scan_kwargs)
@@ -194,24 +495,12 @@ def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
         # mtime changed → fall through and re-materialise (#8)
 
     st = src.stat()  # the single point that touches the CSV; it must be present here
-    overrides: dict = {}
-    if schema is not None:
-        overrides = {"schema_overrides": _polars_overrides(schema), "infer_schema_length": 0}
-    lf = pl.scan_csv(str(src), **{**overrides, **scan_kwargs}).with_row_index("original_row_order")
-    if schema is not None:
-        cols = list(schema.names)
-    else:
-        cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
-    # original_row_order last (matches the prior mutate-appends-a-column shape)
-    # and cast to int64 (with_row_index yields uint32) for the documented schema.
-    lf = lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
-
     # Unique temp name (not a fixed {key}.parquet.tmp) so two builds writing the
     # same key concurrently can't corrupt each other's partial file (#7); the
     # rename is atomic and last-writer-wins on identical bytes.
     tmp = out_dir / f"{key}.{uuid.uuid4().hex}.tmp"
     try:
-        lf.sink_parquet(str(tmp), **_CSV_PARQUET_WRITE)
+        _materialize_ordered(src, schema, scan_kwargs, tmp)
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)

@@ -1029,13 +1029,16 @@ def catalog_scan_staleness() -> dict:
     a followed alias (built with ``tracked_expr_from_alias("name")``) advanced past the
     recorded head, or a recorded source file's content drifted on disk. A
     *directly* stale entry has its own input moved; a *transitively* stale entry
-    is a clean descendant of a stale ancestor. Use ``catalog_recalc`` to act.
+    is a clean descendant of a stale ancestor. Only current alias heads are
+    directly stale (#154): a superseded historical version reports ``live=False``
+    and is never listed, since recomputing it re-points no alias. Use
+    ``catalog_recalc`` to act.
 
     Returns:
         stale: hashes that are directly stale (the natural recalc roots).
         transitively_stale: clean descendants carried by a stale ancestor.
         entries: ``{hash: verdict}`` for every live entry, where a verdict is
-            ``{stale, reasons:[{axis, ref, was, now}], unknown_axes,
+            ``{stale, live, reasons:[{axis, ref, was, now}], unknown_axes,
             transitively_stale}``.
     """
     project = _resolve_active_project()

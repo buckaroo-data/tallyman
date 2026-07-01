@@ -118,6 +118,25 @@ def _preview_action(content_hash: str, verdict, cone: set[str], dag: dict) -> st
     return "unchanged"  # pinned to an out-of-cone parent, or a non-stale root
 
 
+def _live_cone(cone: list[str], roots: list[str], verdicts: dict[str, StaleVerdict]) -> list[str]:
+    """The cone with dragged-in husks removed (#154). ``descendant_cone`` re-expands
+    from a stale head through *every* recorded parent edge, so a superseded husk that
+    follows that head (via a since-advanced alias) is pulled back in even though the
+    head-gate dropped it from the root set. Replaying such a husk re-resolves its
+    followed alias to the advanced head and manufactures a junk entry that heads no
+    alias and re-points nothing — the f2dd/cb24 regression. Drop every non-head cone
+    member; an explicitly-named root is exempt (a user-supplied root is a deliberate
+    request, not scan-driven drag-in — the revise/recalc defaults never pass one).
+
+    Safe because a *live* entry can depend on a husk only through a ``follow=False``
+    hash pin (nothing can follow a headless husk by name), and a hash pin replays to
+    the same parent whether or not the husk itself was rebuilt — so nothing downstream
+    is stranded by skipping it. Order is preserved, so the topological walk stays valid.
+    """
+    roots_set = set(roots)
+    return [h for h in cone if h in roots_set or verdicts[h].live]
+
+
 def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcReport:
     """Recompute *roots* and their dependents, in dependency order.
 
@@ -146,6 +165,7 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
         # the project), then index into it for the cone. Keeps the staleness
         # semantics in one tested place rather than re-deriving them here.
         verdicts = scan(project)
+        cone = _live_cone(cone, roots, verdicts)  # drop dragged-in husks so preview matches the real walk (#154)
         cone_set = set(cone)
         dag = build_dag(project)
         entries = [
@@ -202,6 +222,7 @@ def _replay_cone(
 
     if verdicts is None:
         verdicts = scan(project)
+    cone = _live_cone(cone, roots, verdicts)  # a husk dragged into a stale head's cone must not replay into junk (#154)
     remap: dict[str, str] = {}
     entries: list[RecalcEntry] = []
     status = "ok"

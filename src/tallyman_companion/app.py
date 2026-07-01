@@ -1671,7 +1671,9 @@ def create_app(
         Read-only (no checkpoint). Drives the per-entry staleness badge: ``stale``
         lists directly-stale hashes (their own input moved), ``transitively_stale``
         the clean descendants a recalc would carry, ``entries`` the full verdict
-        map. The SPA fires this on project load / switch and after a recalc.
+        map. Only current alias heads are ``stale`` (#154): a superseded historical
+        version reports ``live=False`` and is never listed — recomputing it re-points
+        no alias. The SPA fires this on project load / switch and after a recalc.
         """
         project = _validate_project(project)
         from tallyman_core.config import auto_recalc_enabled  # noqa: PLC0415

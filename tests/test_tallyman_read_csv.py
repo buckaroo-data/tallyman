@@ -310,3 +310,70 @@ expr = tallyman_read_csv({str(p)!r}, schema=schema, separator=";")
     assert {"id", "name", "original_row_order"} <= fields, (
         f"separator=';' not forwarded — columns did not split: {fields}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Name collision: the CSV already carries an 'original_row_order' column.
+# tallyman would add one via with_row_index, which raises a polars DuplicateError
+# (not caught by the infer ladder). Instead: reuse the column when it IS the
+# canonical 0..N-1 file sequence, and raise a clear, actionable error when the
+# name is a coincidence carrying non-canonical data.
+# --------------------------------------------------------------------------- #
+def test_existing_row_order_column_reused(project, monkeypatch):
+    """A CSV already carrying a valid 0..N-1 'original_row_order' column ingests
+    by reusing that column, not by crashing on the row-index name collision."""
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.result_cache import baked_snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "hasorder.csv"
+    # Rows deliberately NOT sorted by name; original_row_order = true 0..N-1 order.
+    p.write_text("original_row_order,name\n0,charlie\n1,alice\n2,bob\n")
+    code = f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(p)!r})
+"""
+    res = catalog_create("hasorder", code)
+    assert "error" not in res, res
+    h = _hash_of(project)
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    table = pq.read_table(str(snap)).sort_by("original_row_order")
+    assert table.column("original_row_order").to_pylist() == [0, 1, 2]
+    assert table.column("name").to_pylist() == ["charlie", "alice", "bob"]
+
+
+def test_existing_row_order_column_nonsequential_raises(project, monkeypatch):
+    """An 'original_row_order' column that is NOT the contiguous 0..N-1 sequence
+    (here 1..N) is a coincidental name clash — ingest must raise rather than
+    silently trust a non-canonical order."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "badorder.csv"
+    p.write_text("original_row_order,name\n1,alice\n2,bob\n3,charlie\n")
+    code = f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(p)!r})
+"""
+    res = catalog_create("badorder", code)
+    assert "error" in res
+    err = res["error"]
+    assert "original_row_order" in err
+    assert "reserved" in err.lower() or "0.." in err or "contiguous" in err.lower()
+
+
+def test_existing_row_order_column_noninteger_raises(project, monkeypatch):
+    """An 'original_row_order' column whose values aren't integers cannot be the
+    canonical row index — ingest must raise with the reserved-name message."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "strorder.csv"
+    p.write_text("original_row_order,name\na,alice\nb,bob\n")
+    code = f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(p)!r})
+"""
+    res = catalog_create("strorder", code)
+    assert "error" in res
+    err = res["error"]
+    assert "original_row_order" in err
+    assert "reserved" in err.lower() or "integer" in err.lower() or "0.." in err

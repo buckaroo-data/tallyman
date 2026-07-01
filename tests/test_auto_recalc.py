@@ -21,8 +21,9 @@ from tallyman_core.catalog_state import current_step, reset_to
 from tallyman_core.config import auto_recalc_enabled, set_auto_recalc
 from tallyman_core.errors import error_for_hash
 from tallyman_core.paths import entry_dir
-from tallyman_mcp.server import catalog_create, catalog_revise
+from tallyman_mcp.server import catalog_create, catalog_recalc, catalog_revise
 from tallyman_xorq.build import list_entries
+from tallyman_xorq.recalc import followers_of
 from tallyman_xorq.staleness import scan
 
 # ---------------------------------------------------------------------------
@@ -473,3 +474,108 @@ def test_auto_recalc_scans_staleness_once(project, orders_parquet, monkeypatch):
     monkeypatch.setattr(recalc_mod, "scan", counting_scan)
     catalog_revise("a", _src_code_v2(project))
     assert calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 10. head-reachability (#154): a SUPERSEDED historical version — a husk that no
+#     alias still heads — is dead history. Its immutable pin to a since-advanced
+#     alias makes it look stale forever, but recomputing it re-points nothing and,
+#     for a recipe shape no current head uses, manufactures a junk entry (the
+#     f2dd/cb24 regression). Staleness is gated on being a current alias head, so
+#     a husk is never a recompute root (followers_of / scan-driven catalog_recalc)
+#     and never a false UNEXPLAINED orphan.
+# ---------------------------------------------------------------------------
+
+
+def _tracked_mutate(parent: str, col: str, mult: int) -> str:  # tracked follower, distinguishing column+graph
+    return (
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({parent!r})\n"
+        f"expr = t.mutate({col}=t.price * {mult})\n"
+    )
+
+
+def _make_divergent_husk(project) -> tuple[str, str, str]:
+    """leaf@v1; alias ``u`` built on one recipe shape (husk_tag) then REBASED onto a
+    different shape (live_tag). The original ``u`` version is now a superseded husk
+    whose recipe shape no current head uses — replaying it against an advanced leaf
+    yields a novel hash (the divergent-recipe junk). Returns (leaf_v1, husk, live_head)."""
+    leaf1 = _hash(catalog_create("leaf", _src_code(project)))
+    husk = _hash(catalog_create("u", _tracked_mutate("leaf", "husk_tag", 3)))
+    live = catalog_revise("u", _tracked_mutate("leaf", "live_tag", 5))["hash"]
+    assert live != husk and get_alias(project, "u") == live  # u rebased; husk orphaned
+    return leaf1, husk, live
+
+
+def test_revising_leaf_does_not_replay_a_superseded_husk(project, orders_parquet, monkeypatch):
+    # THE f2dd/cb24 REGRESSION. Revising a leaf the husk pins must recompute only
+    # u's live head, not replay the divergent husk into a brand-new junk entry.
+    _clean_env(monkeypatch)
+    _leaf1, husk, live = _make_divergent_husk(project)
+
+    before = {e["content_hash"] for e in list_entries(project)}
+    out = catalog_revise("leaf", _src_code_v2(project))  # auto-recalc cascades from the head advance
+    leaf2 = out["hash"]
+    new_head = get_alias(project, "u")
+
+    assert new_head != live  # u's live head recomputed against the advanced leaf
+    # exactly two new entries — the leaf edit and u's live-head recompute — no junk husk replay
+    new = {e["content_hash"] for e in list_entries(project)} - before
+    assert new == {leaf2, new_head}
+    assert out["recalc"]["remap"] == {live: new_head}  # the husk is not a remap root
+    assert husk not in out["recalc"]["remap"]
+
+
+def test_followers_of_excludes_superseded_husk(project, orders_parquet, monkeypatch):
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)  # advance leaf WITHOUT the cascade, to inspect the raw roots
+    _leaf1, husk, live = _make_divergent_husk(project)
+    catalog_revise("leaf", _src_code_v2(project))  # leaf head advances; nothing recomputed
+
+    follows = set(followers_of(project, "leaf"))
+    assert live in follows  # the live head is a genuine recompute root
+    assert husk not in follows  # the dead husk is not
+
+
+def test_scan_excludes_husk_from_stale_but_keeps_it_in_the_dict(project, orders_parquet, monkeypatch):
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)
+    _leaf1, husk, live = _make_divergent_husk(project)
+    catalog_revise("leaf", _src_code_v2(project))  # leaf advances; no cascade
+
+    v = scan(project)
+    assert v[live].stale is True  # a current head whose input moved IS actionably stale
+    assert v[husk].stale is False  # the superseded husk is not
+    assert husk in v  # ...but still present in the dict (the replay loop indexes every cone member)
+
+
+def test_superseded_husk_is_not_an_unexplained_orphan(project, orders_parquet, monkeypatch):
+    # The perpetual-false-alarm half: a husk must not fill orphan_stale with
+    # "file a bug", while a genuinely-stale live head with no error still does.
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)
+    _second_source(project, "widgets.parquet", seed=1)
+    _leaf1, husk, live = _make_divergent_husk(project)
+    catalog_revise("leaf", _src_code_v2(project))  # leaf advances → husk + live both stale, none recomputed
+    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    set_auto_recalc(project, True)
+
+    out = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
+    orphans = {o["hash"]: o for o in out["recalc"]["orphan_stale"]}
+    assert live in orphans and "UNEXPLAINED" in orphans[live]["explanation"]  # real stale head still flagged
+    assert husk not in orphans  # the husk is no longer a false UNEXPLAINED
+
+
+def test_scan_driven_recalc_does_not_replay_husk(project, orders_parquet, monkeypatch):
+    # The SECOND junk-site: a no-arg catalog_recalc defaults its roots to every
+    # directly-stale entry (server.py), bypassing followers_of. The head-gate must
+    # cover it too, or the husk churns junk here instead of on the revise path.
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)
+    _leaf1, husk, live = _make_divergent_husk(project)
+    catalog_revise("leaf", _src_code_v2(project))  # leaf advances; no cascade
+
+    before = {e["content_hash"] for e in list_entries(project)}
+    catalog_recalc(dry_run=False)  # roots default to the scan-driven directly-stale set
+    new = {e["content_hash"] for e in list_entries(project)} - before
+    assert new == {get_alias(project, "u")}  # only u's live-head recompute; no husk junk

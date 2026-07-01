@@ -353,6 +353,7 @@ function CodeWithLinks({
 
 function BuckarooDataPane({ project, hash, totalRows }: { project: string; hash: string; totalRows: number }) {
   const [result, setResult] = useState<SessionResult | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
@@ -372,10 +373,19 @@ function BuckarooDataPane({ project, hash, totalRows }: { project: string; hash:
     };
   }, [project, hash, attempt]);
 
+  // Count up while the session loads so a slow materialise reads as progress,
+  // not a hang. performance.now keeps it monotonic across wall-clock changes.
+  useEffect(() => {
+    if (result !== null) return;
+    const start = performance.now();
+    const id = window.setInterval(() => setElapsed((performance.now() - start) / 1000), 100);
+    return () => window.clearInterval(id);
+  }, [result, attempt]);
+
   if (result === null) {
     return (
       <div className="buckaroo-loading">
-        <span className="spinner" /> loading data…
+        <span className="spinner" /> loading data… {elapsed.toFixed(1)}s
       </div>
     );
   }

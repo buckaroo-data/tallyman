@@ -23,6 +23,7 @@ from tallyman_core.errors import error_for_hash
 from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_recalc, catalog_revise
 from tallyman_xorq.build import list_entries
+from tallyman_xorq.dependents import descendant_cone
 from tallyman_xorq.recalc import followers_of
 from tallyman_xorq.staleness import scan
 
@@ -579,3 +580,28 @@ def test_scan_driven_recalc_does_not_replay_husk(project, orders_parquet, monkey
     catalog_recalc(dry_run=False)  # roots default to the scan-driven directly-stale set
     new = {e["content_hash"] for e in list_entries(project)} - before
     assert new == {get_alias(project, "u")}  # only u's live-head recompute; no husk junk
+
+
+def test_scan_driven_recalc_does_not_replay_husk_under_source_drift(project, orders_parquet, monkeypatch):
+    # The SOURCE-DRIFT sibling of the test above. Instead of REVISING the leaf
+    # (which advances its head, so the leaf drops out of the root set), drift the
+    # leaf's SOURCE FILE on disk. The leaf HEAD stays a directly-stale root, so
+    # descendant_cone([leaf]) re-expands through the husk's follow=True parent edge
+    # and drags the husk back into the cone. The head-gate lives on the ROOT SET,
+    # not on cone membership, so _replay_cone rebuilds the husk anyway — the
+    # f2dd/cb24 junk-replay regression, on the source-drift path.
+    _clean_env(monkeypatch)
+    set_auto_recalc(project, False)
+    leaf1, husk, _live = _make_divergent_husk(project)
+    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=1)  # drift leaf's source in place
+
+    v = scan(project)
+    assert v[leaf1].stale is True  # leaf head directly stale on the source axis → a recalc root
+    assert v[husk].stale is False and v[husk].live is False  # husk gated out of the root set...
+    assert husk in descendant_cone(project, [leaf1])  # ...but still dragged into the leaf's cone
+
+    before = {e["content_hash"] for e in list_entries(project)}
+    catalog_recalc(dry_run=False)  # roots default to the scan-driven directly-stale set = [leaf]
+    new = {e["content_hash"] for e in list_entries(project)} - before
+    # exactly two new entries — the leaf source-recompute and u's live-head recompute — no junk husk replay
+    assert new == {get_alias(project, "leaf"), get_alias(project, "u")}

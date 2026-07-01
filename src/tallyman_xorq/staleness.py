@@ -145,6 +145,6 @@ def scan(project: str) -> dict[str, StaleVerdict]:
     if directly_stale:
         for content_hash in descendant_cone(project, directly_stale):
             verdict = verdicts.get(content_hash)
-            if verdict is not None and not verdict.stale:
+            if verdict is not None and verdict.live and not verdict.stale:  # a husk is dead history, not carried (#154)
                 verdict.transitively_stale = True
     return verdicts

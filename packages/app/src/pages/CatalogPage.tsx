@@ -353,6 +353,7 @@ function CodeWithLinks({
 
 function BuckarooDataPane({ project, hash, totalRows }: { project: string; hash: string; totalRows: number }) {
   const [result, setResult] = useState<SessionResult | null>(null);
+  const [elapsed, setElapsed] = useState(0);
   const [attempt, setAttempt] = useState(0);
 
   useEffect(() => {
@@ -372,10 +373,19 @@ function BuckarooDataPane({ project, hash, totalRows }: { project: string; hash:
     };
   }, [project, hash, attempt]);
 
+  // Count up while the session loads so a slow materialise reads as progress,
+  // not a hang. performance.now keeps it monotonic across wall-clock changes.
+  useEffect(() => {
+    if (result !== null) return;
+    const start = performance.now();
+    const id = window.setInterval(() => setElapsed((performance.now() - start) / 1000), 100);
+    return () => window.clearInterval(id);
+  }, [result, attempt]);
+
   if (result === null) {
     return (
       <div className="buckaroo-loading">
-        <span className="spinner" /> loading data…
+        <span className="spinner" /> loading data… {elapsed.toFixed(1)}s
       </div>
     );
   }
@@ -457,6 +467,37 @@ function EntryCacheView({ project, hash }: { project: string; hash: string }) {
 
   return (
     <div className="cache-meta">
+      {(data.parents.length > 0 || data.children.length > 0) && (
+        <div className="cache-lineage">
+          {data.parents.length > 0 && (
+            <div>
+              <h4>built from</h4>
+              <ul className="lineage-list">
+                {data.parents.map((p) => (
+                  <li key={p.hash}>
+                    <Link to={`/${project}/catalog/${p.hash}`}>{p.alias ?? p.ref ?? p.hash.slice(0, 12)}</Link>
+                    {p.alias && p.ref !== p.alias && <span className="meta"> (as {p.ref})</span>}
+                    <span className="meta"> · {p.follow ? "follows alias" : "pinned"}</span>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {data.children.length > 0 && (
+            <div>
+              <h4>used by</h4>
+              <ul className="lineage-list">
+                {data.children.map((ch) => (
+                  <li key={ch.hash}>
+                    <Link to={`/${project}/catalog/${ch.hash}`}>{ch.alias ?? ch.hash.slice(0, 12)}</Link>
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+
       <div className="cache-summary">
         <strong>{data.total_formatted} on disk for this expression</strong>
         <span className="meta">
@@ -548,36 +589,6 @@ function EntryCacheView({ project, hash }: { project: string; hash: string }) {
         </div>
       )}
 
-      {(data.parents.length > 0 || data.children.length > 0) && (
-        <div className="cache-lineage">
-          {data.parents.length > 0 && (
-            <div>
-              <h4>built from</h4>
-              <ul className="lineage-list">
-                {data.parents.map((p) => (
-                  <li key={p.hash}>
-                    <Link to={`/${project}/catalog/${p.hash}`}>{p.alias ?? p.ref ?? p.hash.slice(0, 12)}</Link>
-                    {p.alias && p.ref !== p.alias && <span className="meta"> (as {p.ref})</span>}
-                    <span className="meta"> · {p.follow ? "follows alias" : "pinned"}</span>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-          {data.children.length > 0 && (
-            <div>
-              <h4>used by</h4>
-              <ul className="lineage-list">
-                {data.children.map((ch) => (
-                  <li key={ch.hash}>
-                    <Link to={`/${project}/catalog/${ch.hash}`}>{ch.alias ?? ch.hash.slice(0, 12)}</Link>
-                  </li>
-                ))}
-              </ul>
-            </div>
-          )}
-        </div>
-      )}
     </div>
   );
 }

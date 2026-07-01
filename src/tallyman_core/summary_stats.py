@@ -15,8 +15,8 @@ log line nobody reads.
 Soft-delete by default: ``remove_stat`` moves ``stats/<name>.py`` to
 ``stats/_disabled/<name>.py`` (the ``_`` prefix on the subdirectory keeps
 buckaroo from scanning it). Hard-delete is a manual ``rm`` under the
-project directory — matches the catalog-is-curated principle from
-``plan.md``: deletions are deliberate.
+project directory — matches the catalog-is-curated principle: deletions
+are deliberate.
 """
 
 from __future__ import annotations

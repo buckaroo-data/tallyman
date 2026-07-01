@@ -10,8 +10,8 @@ Install these first:
 
 - **[uv](https://docs.astral.sh/uv/)** — manages the Python environment. uv
   fetches Python 3.13 itself, so you don't need a system Python.
-- **Node 18+ and [pnpm](https://pnpm.io/)** — only to build the companion's
-  dataframe embed (a Vite/React bundle). The build artifact is not committed,
+- **Node 18+ and [pnpm](https://pnpm.io/)** — to build the React companion UI
+  (a Vite SPA the FastAPI server serves). The build artifact is not committed,
   so this is a one-time per-checkout step.
 - **git** and **Claude Code**.
 
@@ -34,19 +34,20 @@ This creates `.venv/` in the repo and installs everything from `uv.lock`. You
 do **not** activate the venv — every command below is prefixed with `uv run`,
 which resolves the project's venv from the current directory automatically.
 
-## 3. Build the companion embed (one-time)
+## 3. Build the companion UI (one-time)
 
-The companion renders dataframes via a bundle that is built, not committed:
+The companion serves a React SPA that is built, not committed:
 
 ```sh
-cd packages/embed && pnpm install && pnpm build
+cd packages/app && pnpm install && pnpm build
 cd ../..
 ```
 
-This writes `src/tallyman_companion/static/buckaroo-embed.{js,css}`. If you're
-actively editing the embed, use `pnpm dev` (runs `vite build --watch`) instead.
+This writes `packages/app/dist/`, which the FastAPI server mounts as a
+catch-all. Without it the server returns a 503 with a build reminder. If you're
+actively editing the UI, use `pnpm dev` (Vite dev server) instead.
 
-> Keep `buckaroo-js-core` in `packages/embed/package.json` in sync with the
+> Keep `buckaroo-js-core` in `packages/app/package.json` in sync with the
 > `buckaroo` pin in `pyproject.toml`, and rebuild whenever either side moves.
 
 ## 4. Initialize a project
@@ -185,8 +186,8 @@ The active project is resolved from `TALLYMAN_PROJECT` first, then the
 
 - **`claude mcp list` shows "Pending approval"** — restart `claude` from the
   repo directory and approve the server.
-- **Companion shows no dataframes / embed 404s** — you skipped step 3. Run the
-  `pnpm build` in `packages/embed`.
+- **Companion returns 503 / no UI** — you skipped step 3. Run the `pnpm build`
+  in `packages/app`.
 - **`uv run tallyman` fails to resolve the command** — make sure you're in the
   checkout directory (or a subdirectory). `uv run` picks the venv from the
   nearest `pyproject.toml`.

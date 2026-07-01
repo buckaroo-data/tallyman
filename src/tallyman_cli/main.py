@@ -313,7 +313,7 @@ def pack_project(project_name: str | None, project: str | None, output: str | No
 
     The output bundle can be untarred anywhere and served read-only via
     `tallyman serve <extracted_dir>`. Portability is provided by the catalog
-    entries' `${TALLYMAN_PROJECT_ROOT}` placeholder rewriting (see plan.md).
+    entries' `${TALLYMAN_PROJECT_ROOT}` placeholder rewriting (see docs/architecture.md).
     """
     import datetime
     import tarfile

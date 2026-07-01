@@ -1020,6 +1020,36 @@ def test_cas_cold_read_after_inplace_edit_serves_built_bytes(project, monkeypatc
     assert sorted(df["x"].tolist()) == [0, 1, 2]
 
 
+def test_cas_cold_read_after_source_deleted_serves_built_bytes(project, monkeypatch):
+    """#115 / #148-review: a cold read serves the frozen bytes even when the live
+    source has been DELETED (or moved), not just edited in place.
+
+    recon_cas_path serves the frozen data/.cas/<digest> clone without touching the
+    live file, but read_project_file called project_path first, whose is_file() guard
+    raised ProjectDataNotFound before the reconstruction block could run — so a
+    deleted source defeated pinned reconstruction entirely.
+    """
+    from tallyman_core import data_dir
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    assert si.mode() == "cas"
+
+    src = data_dir(project) / "src.parquet"
+    _write_ints(src, [0, 1, 2])
+    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
+
+    src.unlink()  # source gone entirely — the frozen .cas clone is the only copy left
+    cached_result_expr.cache_clear()  # force a genuinely COLD read (re-import the recipe)
+
+    df = cached_result_expr(project, h).execute()
+    # Only the frozen clone holds exactly {0,1,2}; assert on values, not just the count.
+    assert sorted(df["x"].tolist()) == [0, 1, 2]
+
+
 def test_cas_expensive_self_heal_after_edit_serves_built_bytes(project, monkeypatch, caplog):
     """#115: an expensive entry self-healing an evicted snapshot recomputes from the
     FROZEN source, not the edited live file.

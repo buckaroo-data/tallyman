@@ -344,6 +344,34 @@ expr = tallyman_read_csv({str(p)!r})
     assert table.column("name").to_pylist() == ["charlie", "alice", "bob"]
 
 
+def test_existing_row_order_column_with_explicit_schema_accepted(project, monkeypatch):
+    """A CSV carrying a valid 0..N-1 'original_row_order' column plus an explicit
+    schema for its DATA columns must ingest. The reserved column is tallyman's, not
+    the caller's to spec, so the totality check must not demand it be named (pre-fix
+    it raised 'schema is not total — it leaves column(s) [original_row_order]')."""
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.result_cache import baked_snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "orderschema.csv"
+    # original_row_order present; rows deliberately NOT sorted by name.
+    p.write_text("original_row_order,id,name\n0,1,charlie\n1,2,alice\n2,3,bob\n")
+    code = f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(p)!r}, schema={{"id": "int64", "name": "string"}})
+"""
+    res = catalog_create("orderschema", code)
+    assert "error" not in res, res
+    h = _hash_of(project)
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    table = pq.read_table(str(snap)).sort_by("original_row_order")
+    assert table.column("original_row_order").to_pylist() == [0, 1, 2]
+    assert table.column("id").to_pylist() == [1, 2, 3]
+    assert table.column("name").to_pylist() == ["charlie", "alice", "bob"]
+
+
 def test_existing_row_order_column_nonsequential_raises(project, monkeypatch):
     """An 'original_row_order' column that is NOT the contiguous 0..N-1 sequence
     (here 1..N) is a coincidental name clash — ingest must raise rather than

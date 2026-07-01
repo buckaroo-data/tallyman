@@ -213,3 +213,23 @@ expr = tallyman_read_csv({str(late_poison_csv)!r}, schema=schema)
     assert "suggested schema" in err.lower()
     assert "'v'" in err or '"v"' in err  # names the failing column
     assert "string" in err  # suggests string for the unparseable column
+
+
+# --------------------------------------------------------------------------- #
+# #148-review — reserved scan kwargs must not collide with the internal ones
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("bad_kwarg", ["infer_schema_length", "schema_overrides"])
+def test_reserved_scan_kwarg_raises_clear_error(project, monkeypatch, bad_kwarg):
+    """``infer_schema_length`` and ``schema_overrides`` are managed internally — the
+    former by the escalation ladder, the latter by the ``schema=`` parameter — so
+    forwarding one as a ``**kwargs`` reader option must raise a clear ValueError, not
+    the raw polars ``TypeError: got multiple values for keyword argument`` (or, for
+    ``schema_overrides`` with no schema, silently bypass the schema system)."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.io import tallyman_read_csv
+
+    p = data_dir(project) / "kw.csv"
+    p.write_text("a,b\n1,x\n2,y\n")
+    kwargs = {bad_kwarg: 1000 if bad_kwarg == "infer_schema_length" else {"a": "int64"}}
+    with pytest.raises(ValueError, match="managed internally"):
+        tallyman_read_csv(str(p), **kwargs)

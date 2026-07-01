@@ -134,6 +134,11 @@ def test_alias_advance_cascades_to_the_follower(project, orders_parquet, monkeyp
     # follower b *directly* stale on the alias axis; recalc re-resolves b to the
     # advanced head. b's source is unchanged, so this isolates the alias cascade.
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    # Opt out of auto-recalc-on-revise so the revise advances a WITHOUT recomputing
+    # b: otherwise the cascade re-points "b" to a fresh head and b1 becomes a
+    # superseded husk (never actionably stale under #154), not the *live* directly-
+    # stale follower this test means to observe and then recalc explicitly.
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
     a1 = _hash(catalog_create("a", _base_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
 

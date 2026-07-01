@@ -52,10 +52,11 @@ class StaleReason:
 @dataclass
 class StaleVerdict:
     content_hash: str
-    stale: bool  # directly stale: this entry's own recorded inputs moved
+    stale: bool  # actionably stale: a CURRENT alias head whose own recorded inputs moved
     reasons: list[StaleReason] = field(default_factory=list)
     unknown_axes: list[str] = field(default_factory=list)  # axes that can't be evaluated
     transitively_stale: bool = False  # set by scan(): a directly-stale ancestor exists
+    live: bool = True  # #154: content_hash is a current alias head (set by scan)
 
 
 @contextmanager
@@ -115,16 +116,31 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
 
 
 def scan(project: str) -> dict[str, StaleVerdict]:
-    """Staleness for every live entry, tagging direct vs transitive staleness.
+    """Actionable staleness for every live entry, tagging direct vs transitive.
 
-    A **directly** stale entry has its own recorded input moved. A
-    **transitively** stale entry is a (not directly stale) descendant of one in
-    the dependency cone. The recalc surfaces use this to flag both while
-    distinguishing the entry the user must act on from the ones a cascade carries.
+    An entry is **directly** stale only when it is a *current alias head* whose own
+    recorded input moved (#154). A superseded historical version pins alias heads
+    that have since advanced, so its inputs read as moved forever — but it heads no
+    alias, so recomputing it re-points nothing (and, for a recipe shape no current
+    head uses, manufactures a junk entry), and it is not an invariant break to flag.
+    Such a non-head is marked ``live=False`` and forced ``stale=False`` here (its
+    ``reasons`` are kept for forensics). A **transitively** stale entry is a (not
+    directly stale) descendant of a directly-stale head in the dependency cone.
+
+    ``entry_staleness`` stays the raw per-entry primitive — did *this* entry's inputs
+    move, regardless of headship; this function layers the head-reachability gate
+    that makes ``stale`` mean *actionable*. The verdict dict still keys **every**
+    entry (heads and husks alike), because the recalc replay indexes cone members
+    that are not themselves heads (a hash-pinned child).
     """
+    heads = set(aliases.load_aliases(project).values())  # current alias heads, read once
     verdicts = {
         entry["content_hash"]: entry_staleness(project, entry["content_hash"]) for entry in list_entries(project)
     }
+    for content_hash, verdict in verdicts.items():
+        verdict.live = content_hash in heads
+        if not verdict.live:
+            verdict.stale = False  # a non-head is never actionably stale (#154)
     directly_stale = [h for h, v in verdicts.items() if v.stale]
     if directly_stale:
         for content_hash in descendant_cone(project, directly_stale):

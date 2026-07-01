@@ -495,6 +495,36 @@ def test_empty_roots_list_recomputes_nothing(project, orders_parquet, monkeypatc
     assert scan(project)[a1].stale is True
 
 
+def test_explicit_husk_root_is_dropped_from_the_cone(project, orders_parquet, monkeypatch):
+    """#154 head-gated the scan-driven root set and cone membership so a
+    superseded old version (a husk, ``live=False``) is never replayed. The same
+    gate must hold for an EXPLICITLY-passed husk root — mcp-server.md: "Roots
+    naming no live entry are silently dropped." Replaying a source-drifted husk
+    mints a junk sibling entry of the live head (the #154 junk-replay shape)."""
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
+    a1 = _hash(catalog_create("a", _base_code(project)))
+    a2 = _hash(catalog_revise("a", _base_code_v2(project)))
+    assert a2 != a1  # a1 is now a superseded husk
+    assert scan(project)[a1].live is False
+
+    _edit_source(project)  # drift the raw source both versions read
+
+    step_before = current_step(project)
+    entries_before = {e["content_hash"] for e in list_entries(project)}
+    report = recalc(project, [a1], dry_run=False)
+
+    assert report.status == "ok"
+    assert report.remap == {}, (
+        "an explicit husk root was replayed instead of dropped — under source "
+        "drift this mints a junk sibling of the live head"
+    )
+    assert report.checkpoint_step is None
+    assert current_step(project) == step_before
+    assert get_alias(project, "a") == a2
+    assert {e["content_hash"] for e in list_entries(project)} == entries_before  # no junk sibling
+
+
 # ---------------------------------------------------------------------------
 # alias bookkeeping through the walk: multi-alias heads, scratch entries, pins
 # ---------------------------------------------------------------------------
@@ -520,6 +550,67 @@ def test_rebuilt_head_with_two_aliases_advances_both(project, orders_parquet, mo
     assert get_alias(project, "bb") == h2
     assert history_for(project, "b") == [h1, h2]
     assert history_for(project, "bb") == [h1, h2]
+
+
+def test_scratch_follower_rebuilds_with_remap_but_no_alias_revision(project, orders_parquet, monkeypatch):
+    """docs/reactive-recalc.md: "A rebuilt entry that has no alias on its head —
+    an unnamed scratch entry ... — produces a new hash and a ``remap`` entry but
+    ZERO alias revisions." So a ``catalog_run`` scratch follower must scan stale
+    and rebuild like any follower, minus the alias bookkeeping."""
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
+    catalog_create("a", _base_code(project))
+    s1 = _hash(catalog_run(_child_code("a")))  # unnamed scratch follower
+    assert alias_for_hash(project, s1) is None
+
+    catalog_revise("a", _base_code_v2(project))
+    verdict = scan(project)[s1]
+    assert verdict.stale is True, (
+        "a scratch follower must be actionably stale when its followed alias advances "
+        f"(got stale={verdict.stale}, live={verdict.live}: the head-gate also excludes "
+        "never-aliased scratch entries, contradicting the documented scratch-rebuild "
+        "semantics of reactive-recalc.md)"
+    )
+
+    report = recalc(project, [s1], dry_run=False)
+
+    assert report.status == "ok"
+    s2 = report.remap.get(s1)
+    assert s2 is not None and s2 != s1
+    assert alias_for_hash(project, s2) is None  # rebuilt, but zero alias revisions
+    parents = next(e for e in list_entries(project) if e["content_hash"] == s2)["parents"]
+    assert parents[0]["hash"] == get_alias(project, "a")
+
+
+def test_alias_pin_is_not_silently_advanced_by_a_replay(project, orders_parquet, monkeypatch):
+    """docs/reactive-recalc.md promises a pinned parent (by alias OR hash) means
+    the child "stays on that exact revision" and is "never disturbed by recalc".
+    The hard case is a child with one tracked parent and one alias-pinned parent:
+    when the TRACKED parent advances and forces a replay, the recipe's
+    ``pinned_expr_from_alias("p")`` re-runs — it must keep resolving to the
+    revision recorded at build, not silently absorb p's new head."""
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
+    catalog_create("a", _base_code(project))
+    p1 = _hash(catalog_create("p", _filtered_code(project, 100)))
+    child1 = _hash(catalog_create("child", _union_tracked_pinned_code("a", "p")))
+
+    # Advance the PINNED alias first — the pin means the child must not care.
+    catalog_revise("p", _filtered_code(project, 150))
+    assert get_alias(project, "p") != p1
+    assert entry_staleness(project, child1).stale is False
+
+    # Now advance the TRACKED parent, forcing the child to replay. The new
+    # recipe keeps the (region, price) schema so the union still plans.
+    catalog_revise("a", _filtered_code(project, 50))
+    report = recalc(project, [child1], dry_run=False)
+
+    assert report.status == "ok"
+    child2 = report.remap[child1]
+    pinned_parents = [pr for pr in parents_of(project, child2) if pr.follow is False]
+    assert [pr.hash for pr in pinned_parents] == [p1], (
+        "the alias pin was silently advanced to p's new head by the replay"
+    )
 
 
 def test_replay_with_deleted_parent_alias_fails_cleanly(project, orders_parquet, monkeypatch):

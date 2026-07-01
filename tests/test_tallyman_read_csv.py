@@ -405,3 +405,113 @@ expr = tallyman_read_csv({str(p)!r})
     err = res["error"]
     assert "original_row_order" in err
     assert "reserved" in err.lower() or "integer" in err.lower() or "0.." in err
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        (("original_row_order", "int64"), ("&rest", "infer")),  # positional rename target
+        (("a", "int64"), ("original_row_order", "string")),  # positional, second column
+    ],
+)
+def test_schema_output_name_original_row_order_raises(project, monkeypatch, schema):
+    """A schema that maps a DATA column onto the reserved 'original_row_order' output
+    name collides with tallyman's auto-added row index. Pre-fix this leaked a raw
+    polars DuplicateError ('column original_row_order is duplicate'); ingest must
+    instead reject the reserved output name with a clear ValueError."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.io import tallyman_read_csv
+
+    p = data_dir(project) / "renameoro.csv"
+    p.write_text("a,b\nx,10\ny,20\n")
+    with pytest.raises(ValueError, match="reserved"):
+        tallyman_read_csv(str(p), schema=schema)
+
+
+# --------------------------------------------------------------------------- #
+# Reserved-column exclusion, threaded consistently (review follow-ups).
+#
+# The totality check excludes tallyman's reserved 'original_row_order' column so
+# a complete DATA-column schema is not spuriously "not total". Three surfaces
+# read the header and must apply that same exclusion consistently, or the
+# recovery / diagnostic / positional-binding contracts break in exactly the path
+# the exclusion newly enables:
+#   1. the #143 suggested-schema recovery hint must stay paste-ready,
+#   2. schema-error diagnostics must not hide the reserved column, and
+#   3. positional binding must not silently rebind onto the wrong data column.
+# --------------------------------------------------------------------------- #
+def test_suggested_schema_recovery_is_pasteable_with_reserved_column(project, monkeypatch):
+    """#143 recovery contract, reserved-column path: when an explicit schema fails
+    to parse a CSV that carries a canonical 'original_row_order' column, the
+    suggested schema in the error must be paste-ready. The whole-file suggestion
+    must NOT emit a cell for the reserved column (which the caller cannot spec) —
+    pre-fix it did, so pasting the suggestion back raised 'positional schema has 3
+    columns but the CSV header has 2'."""
+    import ast
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.io import tallyman_read_csv
+
+    p = data_dir(project) / "suggest_oro.csv"
+    # Canonical 0..N-1 original_row_order (trailing, as tallyman exports it); the
+    # amount column holds a float that an int64 pin cannot parse, so the
+    # explicit-mode suggestion path fires.
+    p.write_text("id,amount,original_row_order\n1,12.5,0\n2,3.0,1\n")
+    with pytest.raises(ValueError) as exc:
+        tallyman_read_csv(str(p), schema=(("id", "int64"), ("amount", "int64")))
+    msg = str(exc.value)
+    assert "Suggested schema" in msg, msg
+    assert "original_row_order" not in msg, f"suggestion leaked the reserved column: {msg}"
+
+    # The suggestion must paste back and parse (pre-fix it raised on the column count).
+    suggested = ast.literal_eval(msg.rsplit("schema=", 1)[-1].strip())
+    expr = tallyman_read_csv(str(p), schema=suggested)
+    out = {k: str(v) for k, v in expr.schema().items()}
+    assert out.get("amount") == "float64", out
+    assert "original_row_order" in out  # the reserved column is still reused
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        (("a", "int64"), ("b", "int64"), ("c", "int64")),  # over-long positional spec
+        {"zzz": "int64", "&rest": "infer"},  # by-name miss
+    ],
+)
+def test_schema_error_diagnostic_names_reserved_column(project, monkeypatch, schema):
+    """A schema error against a CSV that carries 'original_row_order' must not hide
+    that column. Pre-fix the diagnostic printed the reserved-stripped header, so a
+    3-column file (a,b,original_row_order) was reported as 'has 2 [a, b]' — an
+    off-by-one that the user, staring at a 3-column file, cannot reconcile. The
+    reserved column must appear in the message."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.io import tallyman_read_csv
+
+    p = data_dir(project) / "diag_oro.csv"
+    p.write_text("a,b,original_row_order\n1,2,0\n3,4,1\n")
+    with pytest.raises(ValueError) as exc:
+        tallyman_read_csv(str(p), schema=schema)
+    assert "original_row_order" in str(exc.value), (
+        f"diagnostic hides the reserved column: {exc.value}"
+    )
+
+
+def test_positional_schema_rejects_nontrailing_reserved_column(project, monkeypatch):
+    """Positional cells bind by physical column position. A valid canonical
+    'original_row_order' column that is NOT the last column shifts that mapping —
+    excluding it from the middle silently rebinds later cells onto the wrong data
+    column (renaming/dropping a column with no error). Ingest must reject a
+    positional schema in this layout rather than silently corrupt the output."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.io import tallyman_read_csv
+
+    p = data_dir(project) / "oro_middle.csv"
+    # original_row_order is canonical 0..N-1 (so _validate_existing_row_order
+    # passes) but sits in the MIDDLE, not trailing.
+    p.write_text("sku,original_row_order,qty\nA,0,10\nB,1,20\n")
+    with pytest.raises(ValueError) as exc:
+        tallyman_read_csv(str(p), schema=(("sku", "string"), ("row", "int64")))
+    msg = str(exc.value).lower()
+    assert "original_row_order" in msg and ("position" in msg or "last" in msg or "by-name" in msg), (
+        f"expected a positional/last-column guard message; got: {exc.value}"
+    )

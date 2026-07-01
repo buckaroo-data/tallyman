@@ -18,8 +18,13 @@ class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
-def project_path(rel_path: str, project: str | None = None) -> Path:
-    """Resolve `rel_path` against the project's data dir. Raises if absent."""
+def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
+    """Resolve `rel_path` against the project's data dir. Raises if absent.
+
+    Pass ``must_exist=False`` for digest-pinned reconstruction: it serves the frozen
+    ``.cas`` clone (``recon_cas_path``) and must not require the live source to still
+    be present. The traversal guard still applies regardless.
+    """
     proj = resolve_project(project)
     base = data_dir(proj)
     candidate = (base / rel_path).resolve()
@@ -28,7 +33,7 @@ def project_path(rel_path: str, project: str | None = None) -> Path:
         candidate.relative_to(base.resolve())
     except ValueError as exc:
         raise ProjectDataNotFound(f"{rel_path!r} resolves outside {base} (got {candidate})") from exc
-    if not candidate.is_file():
+    if must_exist and not candidate.is_file():
         raise ProjectDataNotFound(f"{candidate} not found")
     return candidate
 
@@ -52,7 +57,6 @@ def read_project_file(rel_path: str, project: str | None = None):
     from tallyman_xorq import source_identity as si
 
     proj = resolve_project(project)
-    path = project_path(rel_path, proj)
     if si.mode() == "cas":
         recorded = _reconstructing_source_digest(proj, rel_path)
         if recorded is not None:
@@ -64,8 +68,14 @@ def read_project_file(rel_path: str, project: str | None = None):
             # source collector is independent of tracked_expr_from_alias's _RECONSTRUCTING-gated
             # parent capture, so both fire) so a child build reconstructing this entry
             # records the frozen digest and gc_cas keeps the clone alive.
+            #
+            # must_exist=False: recon_cas_path serves the frozen clone without the live
+            # source, so a moved/deleted source must not defeat the pinned read. This
+            # block MUST run before the existence-requiring project_path below.
+            recon_path = project_path(rel_path, proj, must_exist=False)
             si.note_source(rel_path, recorded)
-            return deferred_read_parquet(str(si.recon_cas_path(proj, path, recorded)))
+            return deferred_read_parquet(str(si.recon_cas_path(proj, recon_path, recorded)))
+    path = project_path(rel_path, proj)
     if si.mode() != "off":
         digest = si.digest_for(proj, path)
         si.note_source(rel_path, digest)
@@ -155,6 +165,13 @@ _INFER = "infer"  # dtype token: keep a column's name/position but infer its typ
 _REST = "&rest"  # wildcard closure: the remaining tail columns (ADR D3)
 _BEGIN = "&begin"  # wildcard closure: the leading head columns (specced, not yet implemented)
 
+# scan_csv options tallyman_read_csv owns and must not accept as pass-through
+# **kwargs: every internal scan_csv call hardcodes infer_schema_length (the
+# escalation ladder) and schema_overrides (derived from schema=), so forwarding
+# either collides ("multiple values for keyword argument") or silently bypasses
+# the schema system. Rejected up front with a message steering to schema=.
+_RESERVED_SCAN_KWARGS = ("infer_schema_length", "schema_overrides")
+
 
 def _spec_sig(spec) -> str:
     """A stable string for the cache key, covering every schema-spec shape.
@@ -189,8 +206,16 @@ def _spec_pairs(spec):
     return list(spec.items())
 
 
-def _normalize_schema(spec, header: list[str]) -> dict:
+def _normalize_schema(spec, header: list[str], *, reserved: tuple[str, ...] = ()) -> dict:
     """Resolve a schema spec against the CSV *header* into a polars parse plan.
+
+    *header* is the CSV's full header. *reserved* names tallyman-managed columns
+    (currently ``original_row_order``) that the caller must not spec: they are
+    excluded from the columns the spec has to cover, but kept in the diagnostics
+    so an error message matches the file the user is looking at rather than a
+    silently reserved-stripped subset. Threading ``reserved`` in — rather than
+    pre-stripping the header at the call site — keeps the totality check, the
+    diagnostics, and positional binding all reading one consistent header.
 
     Returns ``{overrides, rename, out_names, all_pinned}``:
       - ``overrides``  — ``{header_name: polars_dtype}`` for pinned columns, keyed by the
@@ -199,9 +224,21 @@ def _normalize_schema(spec, header: list[str]) -> dict:
       - ``out_names``  — output column names in column order (the final ``select``).
       - ``all_pinned`` — True if no column is inferred (then ``infer_schema_length=0``).
 
-    Raises the actionable ValueError on a by-name miss, a non-total spec, or an
-    over-long positional spec — these are the #143 error-contract surfaces.
+    Raises the actionable ValueError on a by-name miss, a non-total spec, an
+    over-long positional spec, a by-name spec that names a reserved column, or a
+    positional spec whose reserved column is not the trailing column — these are
+    the #143 error-contract surfaces.
     """
+    reserved = tuple(r for r in reserved if r in header)
+    speccable = [h for h in header if h not in reserved]
+    reserved_hint = ""
+    if reserved:
+        names = ", ".join(repr(r) for r in reserved)
+        reserved_hint = (
+            f" (the file also has tallyman's reserved column {names}, which tallyman "
+            "manages automatically — leave it out of the schema.)"
+        )
+
     overrides: dict = {}
     rename: dict = {}
     inferred = False
@@ -219,20 +256,31 @@ def _normalize_schema(spec, header: list[str]) -> dict:
             cells = cells[:-1]
         if any(n in (_REST, _BEGIN) for n, _ in cells):
             raise ValueError("tallyman_read_csv: '&rest' must be the last cell and '&begin' the first.")
-        if len(cells) > len(header):
+        # Positional cells bind by physical column position. Excluding a reserved column
+        # that is not the trailing column would silently shift every later cell onto the
+        # wrong data column, so require the reserved column(s) to be a trailing suffix
+        # (header[:len(speccable)] == speccable); otherwise steer to a by-name schema.
+        if reserved and header[: len(speccable)] != speccable:
+            raise ValueError(
+                f"tallyman_read_csv: a positional schema cannot bind {list(header)} — its reserved "
+                f"column {list(reserved)} is not the last column, and positional cells bind by physical "
+                "column position, so excluding it would silently rebind later cells onto the wrong data "
+                "column. Use a by-name schema (a dict or ibis schema keyed on the header names) instead."
+            )
+        if len(cells) > len(speccable):
             raise ValueError(
                 f"tallyman_read_csv: positional schema has {len(cells)} columns but the CSV header has "
-                f"{len(header)} {list(header)}."
+                f"{len(speccable)} {list(speccable)}.{reserved_hint}"
             )
-        if rest_dtype is None and len(cells) != len(header):
-            uncovered = list(header[len(cells):])
+        if rest_dtype is None and len(cells) != len(speccable):
+            uncovered = list(speccable[len(cells):])
             raise ValueError(
                 f"tallyman_read_csv: schema is not total — it leaves column(s) {uncovered} unspecified. "
                 'Name every column, or close the spec with ("&rest", "infer").'
             )
         out_names = []
         for i, (out_name, dt) in enumerate(cells):
-            orig = header[i]
+            orig = speccable[i]
             out_names.append(out_name)
             if out_name != orig:
                 rename[orig] = out_name
@@ -241,7 +289,7 @@ def _normalize_schema(spec, header: list[str]) -> dict:
                 inferred = True
             else:
                 overrides[orig] = pl_dt
-        for orig in header[len(cells):]:  # the &rest tail keeps its header name
+        for orig in speccable[len(cells):]:  # the &rest tail keeps its header name
             out_names.append(orig)
             pl_dt = _resolve_spec_dtype(rest_dtype)
             if pl_dt is None:
@@ -260,14 +308,20 @@ def _normalize_schema(spec, header: list[str]) -> dict:
             rest_dtype = dt
             continue
         named[str(name)] = dt
-    missing = [n for n in named if n not in header]
+    named_reserved = [n for n in named if n in reserved]
+    if named_reserved:
+        raise ValueError(
+            f"tallyman_read_csv: schema names tallyman's reserved column {sorted(named_reserved)}, which "
+            "tallyman manages automatically — remove it from the schema (it is added and ordered for you)."
+        )
+    missing = [n for n in named if n not in speccable]
     if missing:
         raise ValueError(
-            f"tallyman_read_csv: schema column(s) {sorted(missing)} are not in the CSV header {list(header)}. "
+            f"tallyman_read_csv: schema column(s) {sorted(missing)} are not in the CSV header {list(speccable)}. "
             "Bind by name only when the names match the header; to rename by position pass a tuple-of-tuples "
-            'schema, e.g. schema=(("Date", "date"), ("&rest", "infer")).'
+            'schema, e.g. schema=(("Date", "date"), ("&rest", "infer")).' + reserved_hint
         )
-    uncovered = [h for h in header if h not in named]
+    uncovered = [h for h in speccable if h not in named]
     if rest_dtype is None and uncovered:
         raise ValueError(
             f"tallyman_read_csv: schema is not total — it leaves column(s) {uncovered} unspecified. "
@@ -285,7 +339,7 @@ def _normalize_schema(spec, header: list[str]) -> dict:
             inferred = True
         else:
             overrides[name] = pl_dt
-    return {"overrides": overrides, "rename": {}, "out_names": list(header), "all_pinned": not inferred}
+    return {"overrides": overrides, "rename": {}, "out_names": list(speccable), "all_pinned": not inferred}
 
 
 _ESCALATED_INFER = 10_000  # the middle rung of the #143 infer ladder; whole-file (None) is the terminal
@@ -317,12 +371,18 @@ def _polars_to_ibis(dt) -> str:
     return "string"  # safe fallback — an unmapped column still reads as string
 
 
-def _suggest_schema_dsl(src: Path, scan_kwargs: dict) -> str:
-    """Whole-file-infer *src* and render it as the paste-ready tuple-of-tuples DSL."""
+def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] = ()) -> str:
+    """Whole-file-infer *src* and render it as the paste-ready tuple-of-tuples DSL.
+
+    *reserved* columns (tallyman-managed, e.g. ``original_row_order``) are dropped:
+    they must not appear in the suggestion because the caller cannot spec them —
+    a suggestion carrying one is un-pasteable (the totality check excludes the
+    reserved column, so pasting it back over-counts the columns and raises).
+    """
     import polars as pl
 
     inferred = pl.scan_csv(str(src), infer_schema_length=None, **scan_kwargs).collect_schema()
-    pairs = tuple((name, _polars_to_ibis(dt)) for name, dt in inferred.items())
+    pairs = tuple((name, _polars_to_ibis(dt)) for name, dt in inferred.items() if name not in reserved)
     return repr(pairs)
 
 
@@ -380,13 +440,28 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     # check; infer_schema_length=0 reads just the header line, no type sampling.
     header = list(pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs).collect_schema().names())
     has_row_order = "original_row_order" in header
+    # original_row_order is tallyman's reserved index — _ordered re-appends it, and
+    # _validate_existing_row_order (below) vets a pre-existing one. It is not the caller's
+    # to spec, so it is threaded as `reserved` through every header reader (the schema
+    # plan, the diagnostics, and the suggested-schema hint) rather than stripped ad hoc.
+    reserved = ("original_row_order",) if has_row_order else ()
     if has_row_order:
         _validate_existing_row_order(src, scan_kwargs)  # reuse it, or raise — never with_row_index over it
 
     plan = None
     explicit_only = False
     if schema is not None:
-        plan = _normalize_schema(schema, header)
+        plan = _normalize_schema(schema, header, reserved=reserved)
+        # A spec may not PRODUCE the reserved name either: renaming a data column onto
+        # 'original_row_order' collides with the index _ordered re-appends (a raw polars
+        # DuplicateError at sink). Reject the reserved output name up front with the same
+        # guidance as the pre-existing-column clash.
+        if "original_row_order" in plan["out_names"]:
+            raise ValueError(
+                "tallyman_read_csv: 'original_row_order' is reserved for tallyman's canonical "
+                "row index and cannot be a schema output column name. Rename that column to "
+                "something other than 'original_row_order' in the schema."
+            )
         explicit_only = plan["all_pinned"]
 
     def _ordered(infer_len):
@@ -417,7 +492,7 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
             last_exc = exc
     raise ValueError(
         f"tallyman_read_csv: the schema does not parse {src.name}: {last_exc}. "
-        f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs)}"
+        f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs, reserved)}"
     )
 
 
@@ -533,10 +608,21 @@ def tallyman_read_csv(path: str, schema=None, **kwargs):
         **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
             ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
             ``has_header``, ``encoding``. They participate in the intermediate's
-            cache key, so changing one re-ingests.
+            cache key, so changing one re-ingests. ``infer_schema_length`` and
+            ``schema_overrides`` are managed internally (see ``_RESERVED_SCAN_KWARGS``)
+            and rejected — they would collide with the values every internal
+            ``scan_csv`` call already sets.
     """
     import xorq.api as xo
 
+    reserved = [k for k in _RESERVED_SCAN_KWARGS if k in kwargs]
+    if reserved:
+        raise ValueError(
+            f"tallyman_read_csv: {reserved} is managed internally, not a pass-through "
+            "polars.scan_csv reader option. Type inference escalates automatically "
+            "(100 -> 10k -> whole-file); to pin column types pass schema= (an ibis schema, "
+            "plain dict, or tuple-of-tuples), never schema_overrides."
+        )
     parquet_path = _ordered_csv_parquet(path, schema, kwargs)
     return xo.deferred_read_parquet(str(parquet_path)).order_by("original_row_order")
 

@@ -19,8 +19,13 @@ class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
-def project_path(rel_path: str, project: str | None = None) -> Path:
-    """Resolve `rel_path` against the project's data dir. Raises if absent."""
+def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
+    """Resolve `rel_path` against the project's data dir. Raises if absent.
+
+    Pass ``must_exist=False`` for digest-pinned reconstruction: it serves the frozen
+    ``.cas`` clone (``recon_cas_path``) and must not require the live source to still
+    be present. The traversal guard still applies regardless.
+    """
     proj = resolve_project(project)
     base = data_dir(proj)
     candidate = (base / rel_path).resolve()
@@ -29,7 +34,7 @@ def project_path(rel_path: str, project: str | None = None) -> Path:
         candidate.relative_to(base.resolve())
     except ValueError as exc:
         raise ProjectDataNotFound(f"{rel_path!r} resolves outside {base} (got {candidate})") from exc
-    if not candidate.is_file():
+    if must_exist and not candidate.is_file():
         raise ProjectDataNotFound(f"{candidate} not found")
     return candidate
 
@@ -53,7 +58,6 @@ def read_project_file(rel_path: str, project: str | None = None):
     from tallyman_xorq import source_identity as si
 
     proj = resolve_project(project)
-    path = project_path(rel_path, proj)
     if si.mode() == "cas":
         recorded = _reconstructing_source_digest(proj, rel_path)
         if recorded is not None:
@@ -65,8 +69,14 @@ def read_project_file(rel_path: str, project: str | None = None):
             # source collector is independent of tracked_expr_from_alias's _RECONSTRUCTING-gated
             # parent capture, so both fire) so a child build reconstructing this entry
             # records the frozen digest and gc_cas keeps the clone alive.
+            #
+            # must_exist=False: recon_cas_path serves the frozen clone without the live
+            # source, so a moved/deleted source must not defeat the pinned read. This
+            # block MUST run before the existence-requiring project_path below.
+            recon_path = project_path(rel_path, proj, must_exist=False)
             si.note_source(rel_path, recorded)
-            return deferred_read_parquet(str(si.recon_cas_path(proj, path, recorded)))
+            return deferred_read_parquet(str(si.recon_cas_path(proj, recon_path, recorded)))
+    path = project_path(rel_path, proj)
     if si.mode() != "off":
         digest = si.digest_for(proj, path)
         si.note_source(rel_path, digest)
@@ -155,6 +165,13 @@ _DEFAULT_INFER = 100
 _INFER = "infer"  # dtype token: keep a column's name/position but infer its type
 _REST = "&rest"  # wildcard closure: the remaining tail columns (ADR D3)
 _BEGIN = "&begin"  # wildcard closure: the leading head columns (specced, not yet implemented)
+
+# scan_csv options tallyman_read_csv owns and must not accept as pass-through
+# **kwargs: every internal scan_csv call hardcodes infer_schema_length (the
+# escalation ladder) and schema_overrides (derived from schema=), so forwarding
+# either collides ("multiple values for keyword argument") or silently bypasses
+# the schema system. Rejected up front with a message steering to schema=.
+_RESERVED_SCAN_KWARGS = ("infer_schema_length", "schema_overrides")
 
 
 def _spec_sig(spec) -> str:
@@ -387,7 +404,12 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     plan = None
     explicit_only = False
     if schema is not None:
-        plan = _normalize_schema(schema, header)
+        # original_row_order is tallyman's reserved index — _ordered re-appends it, and
+        # _validate_existing_row_order already vetted a pre-existing one. It is not the
+        # caller's to spec, so exclude it from the header the spec must totally cover;
+        # otherwise a complete data-column schema is spuriously rejected as "not total".
+        spec_header = [h for h in header if h != "original_row_order"]
+        plan = _normalize_schema(schema, spec_header)
         explicit_only = plan["all_pinned"]
 
     def _ordered(infer_len):
@@ -534,10 +556,21 @@ def tallyman_read_csv(path: str, schema=None, **kwargs):
         **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
             ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
             ``has_header``, ``encoding``. They participate in the intermediate's
-            cache key, so changing one re-ingests.
+            cache key, so changing one re-ingests. ``infer_schema_length`` and
+            ``schema_overrides`` are managed internally (see ``_RESERVED_SCAN_KWARGS``)
+            and rejected — they would collide with the values every internal
+            ``scan_csv`` call already sets.
     """
     import xorq.api as xo
 
+    reserved = [k for k in _RESERVED_SCAN_KWARGS if k in kwargs]
+    if reserved:
+        raise ValueError(
+            f"tallyman_read_csv: {reserved} is managed internally, not a pass-through "
+            "polars.scan_csv reader option. Type inference escalates automatically "
+            "(100 -> 10k -> whole-file); to pin column types pass schema= (an ibis schema, "
+            "plain dict, or tuple-of-tuples), never schema_overrides."
+        )
     parquet_path = _ordered_csv_parquet(path, schema, kwargs)
     return xo.deferred_read_parquet(str(parquet_path)).order_by("original_row_order")
 

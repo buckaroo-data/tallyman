@@ -233,3 +233,19 @@ def test_reserved_scan_kwarg_raises_clear_error(project, monkeypatch, bad_kwarg)
     kwargs = {bad_kwarg: 1000 if bad_kwarg == "infer_schema_length" else {"a": "int64"}}
     with pytest.raises(ValueError, match="managed internally"):
         tallyman_read_csv(str(p), **kwargs)
+
+
+def test_ordinary_reader_kwarg_still_forwarded(project, monkeypatch):
+    """The guard must reject only the two reserved keys — a genuine reader option
+    such as ``separator`` still reaches polars.scan_csv and parses correctly."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    p = data_dir(project) / "semi.csv"
+    p.write_text("a;b\n1;x\n2;y\n")
+    code = f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(p)!r}, separator=";")
+"""
+    res = catalog_create("semicsv", code)
+    assert "error" not in res, res
+    types = _types_of(res)
+    assert "a" in types and "b" in types  # split into two columns, not one "a;b"

@@ -617,7 +617,7 @@ class BuckarooManager:
                     _row_count = read_manifest(_mpath.parent).row_count or 0
                 except Exception:
                     pass
-            _load_timeout = 3.0 + _row_count / 1_000_000
+            _load_timeout = 10.0 + _row_count / 1_000_000
             _t_post = time.perf_counter()
             try:
                 resp = self._client.post(

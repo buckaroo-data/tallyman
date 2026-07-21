@@ -1,5 +1,5 @@
-# tallyman notebooks
-
+# tallyman notebooks - Paddy feedstock
+(the LLM should never edit this section)
 Tallyman is my take on an AI native notebook system.  Jupyter notebooks have been the go to tool for data science for over a decade for many reasons.
 
 1. They combine the code and results of data analysis into one UI.  This is iporant because data science programming is different in nature than typical software engineering.
@@ -19,4 +19,16 @@ I would say that jupyter notebooks are the most used example of literate program
 Back to updating named expressions.  The named expression thing is really important.  In a regular notebook, it would be equivalent to `customers_df`, and hopefully you'd update it appropriately and dependent variables/cells as you update your notebooks.  Marimo puts more rigor around this Cell-DAG approach, but Marimo is putting structure around unstructured python code,  marimo doesn't cache intermediate results.  Everytime you reload a notebook, marimo goes and re-executes everything.  Furthermore marimo, can't diff between versions.
 
 I got side tracked there talking about the dependency graph.  We also have versioned history of each named expresion, and it's prompt.  All of that is built into tallyman, and it's fast.
+
+There is a notebook view that lets you organize named expressions into a coherent order and edit the prompt/markdown for each alias.  I think of this as kind of an outline view of what will be a presentation notebook.  ... Then because we don't want to reinvent an entire ecosystem, if you want to export, you can export this order to either a marimo notebook or jupyter (coming) and leverage their rich presentation ecosystem.
+
+
+An important note about why tallyman is built how it is.  LLMs are good at writing code, I think they are less good at udnerstanding existing jupyter kernel state.  The dominant form of interacting with LLMs is a chat interface that produces side effects or artifacts like cluade code.  I could have put a chat box in  each notebook cell and gotten claude to write that code secgtion, but that misses gthe whole system.  Tallyman is built to let LLMs do what they are good at, and provide the best parts of the notebook expreince for data analyssi
+
+# Bullet point list of features
+(Claude please fill in the features I have written about into an organized list, + features that I ahven't mentioned)
+
+# Introduction to Tallyman
+Calude, please help me with a narrative structure taht introduces users quickly to what tallyman is building.  Ground it in what they are familiar with, but quickly get to why tallyman is better)
+
 

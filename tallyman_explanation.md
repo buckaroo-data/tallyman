@@ -209,6 +209,58 @@ That's a thing you cannot do in Jupyter or Marimo, because neither one keeps
 what the previous version produced. Once you rerun a cell, the old answer is
 gone.
 
+## Why the diff can exist at all
+
+The deeper reason is that a general-purpose notebook wouldn't know what to do
+with a diff even if it kept the history. A Jupyter cell can produce anything: a
+dataframe, a fitted model, a matplotlib figure, a dict, a string, a file handle,
+`None`. What does it mean to diff two of those? You could special-case
+dataframes and diff those, but you'd be guessing at which variables mattered,
+which pairs were meant to be compared, and what "changed" means for a column of
+floats. You'd be grasping at straws, and the feature would be unreliable
+enough that nobody would trust it.
+
+Tallyman can only hold one kind of thing. Every entry is a xorq expression that
+evaluates to a table, so the system knows the shape of every object it stores.
+Diff isn't a heuristic bolted on top of arbitrary Python; it's a well-defined
+operation on two tables with known schemas, and it can be specific: which
+columns appeared, which types changed, how each column's distribution moved,
+which rows differ when joined on a key.
+
+That constraint is the whole trade, and it's a better deal than it sounds. In
+practice, what are you actually doing in a notebook? Loading a file, reshaping
+it, joining it, aggregating it, and looking at the result. There is real
+non-tabular work — training a model, building a simulation, plotting something
+exotic — but it sits at the edges of a session that is overwhelmingly tabular.
+
+Jupyter charges the full generality of Python for those edges, and it charges
+it to everyone in the room. A human handles it easily: you know which variable
+matters, you remember that cell 8 is now stale, you can tell a dataframe from a
+fitted model at a glance. Tool builders don't get off so lightly — there's no
+type you can count on and no structure to hang a feature from, which is why
+tabular tooling for notebooks is so hard to build.
+
+And an agent working in that environment inherits every bit of the generality.
+It has to decide what kind of object it's holding, what the kernel state is,
+and which of forty cells its change affects — on top of the actual analytical
+question you asked.
+
+Tallyman asks the agent for one thing: write an expression. That's the entire
+job. Whether the result should be cached, what else in the catalog is now
+stale, what has to recompute and in what order, how the version history is
+recorded, how the result gets displayed — none of that is the model's problem.
+It's deterministic machinery that runs the same way every time, and it's the
+part of the system you want to be boring and correct rather than inferred.
+
+That's the argument for structure. You get better results from an LLM by
+narrowing what you ask it to do *before* you point it at the problem, not by
+prompting harder afterward. Give up the edges and every object in the system
+has a known shape: diff, caching, a dependency graph nobody has to infer, a
+grid that pages through millions of rows, versioned history of every step. None
+of those are individually hard once there's only one kind of thing in the
+system — and none of them depend on the model getting anything right beyond the
+expression itself.
+
 ## You shape the review to your data
 
 > Add a summary stat for the percent of nulls in each column.

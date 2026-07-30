@@ -46,7 +46,8 @@ from tallyman_core.entry_config import carry_forward_entry_config
 from tallyman_core.errors import errors_by_hash, record_error
 from tallyman_core.paths import entry_dir, entry_manifest_path, project_dir
 from tallyman_xorq.build import BuildError, build_and_persist
-from tallyman_xorq.dependents import DependencyCycleError, build_dag, descendant_cone
+from tallyman_xorq.dependents import DependencyCycleError, build_dag, descendant_cone, parents_of
+from tallyman_xorq.io import pin_freeze
 from tallyman_xorq.portable import PLACEHOLDER
 from tallyman_xorq.staleness import StaleReason, StaleVerdict, scan
 
@@ -102,6 +103,18 @@ def _recipe_code(project: str, content_hash: str) -> str:
     return code.replace(PLACEHOLDER, str(project_dir(project)))
 
 
+def _pinned_alias_freeze(project: str, content_hash: str) -> dict[str, str]:
+    """``{alias_name: recorded_hash}`` for this entry's alias-pinned parents (#160).
+
+    A ``follow=False`` parent whose ``ref`` is an alias *name* (not the pinned hash
+    itself) was resolved to ``ref``'s head at build; on replay the recipe re-runs
+    ``pinned_expr_from_alias(ref)`` and would re-resolve the name to the alias's *new*
+    head, silently advancing the pin. Freezing ``ref -> hash`` keeps the pin on its
+    recorded revision. A hash pin (``ref == hash``) stores the hash literally in the
+    recipe and is already replay-durable, so it needs no freeze entry."""
+    return {p.ref: p.hash for p in parents_of(project, content_hash) if not p.follow and p.ref != p.hash}
+
+
 def _aliases_heading(project: str, content_hash: str) -> list[str]:
     """Every alias whose *current* head is ``content_hash`` (usually one, never
     more for a freshly-built entry; a doubly-aliased head returns both)."""
@@ -118,23 +131,25 @@ def _preview_action(content_hash: str, verdict, cone: set[str], dag: dict) -> st
     return "unchanged"  # pinned to an out-of-cone parent, or a non-stale root
 
 
-def _live_cone(cone: list[str], roots: list[str], verdicts: dict[str, StaleVerdict]) -> list[str]:
-    """The cone with dragged-in husks removed (#154). ``descendant_cone`` re-expands
-    from a stale head through *every* recorded parent edge, so a superseded husk that
-    follows that head (via a since-advanced alias) is pulled back in even though the
-    head-gate dropped it from the root set. Replaying such a husk re-resolves its
-    followed alias to the advanced head and manufactures a junk entry that heads no
-    alias and re-points nothing — the f2dd/cb24 regression. Drop every non-head cone
-    member; an explicitly-named root is exempt (a user-supplied root is a deliberate
-    request, not scan-driven drag-in — the revise/recalc defaults never pass one).
+def _live_cone(cone: list[str], verdicts: dict[str, StaleVerdict]) -> list[str]:
+    """The cone with husks removed (#154). ``descendant_cone`` re-expands from a stale
+    head through *every* recorded parent edge, so a superseded husk that follows that
+    head (via a since-advanced alias) is pulled back in. Replaying such a husk
+    re-resolves its followed alias to the advanced head and manufactures a junk entry
+    that heads no alias and re-points nothing — the f2dd/cb24 regression.
+
+    Drop every husk (``live=False``), whether it was dragged in by the cone expansion
+    OR named explicitly as a root: mcp-server.md promises "roots naming no live entry
+    are silently dropped", and the scan's own ``live=False`` verdict for the husk is
+    the authority on that. An explicit husk root replayed under source drift mints the
+    same junk sibling as the scan-driven path, so the gate must cover both.
 
     Safe because a *live* entry can depend on a husk only through a ``follow=False``
     hash pin (nothing can follow a headless husk by name), and a hash pin replays to
     the same parent whether or not the husk itself was rebuilt — so nothing downstream
     is stranded by skipping it. Order is preserved, so the topological walk stays valid.
     """
-    roots_set = set(roots)
-    return [h for h in cone if h in roots_set or verdicts[h].live]
+    return [h for h in cone if verdicts[h].live]
 
 
 def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcReport:
@@ -165,7 +180,7 @@ def recalc(project: str, roots: list[str], *, dry_run: bool = False) -> RecalcRe
         # the project), then index into it for the cone. Keeps the staleness
         # semantics in one tested place rather than re-deriving them here.
         verdicts = scan(project)
-        cone = _live_cone(cone, roots, verdicts)  # drop dragged-in husks so preview matches the real walk (#154)
+        cone = _live_cone(cone, verdicts)  # drop husks so preview matches the real walk (#154)
         cone_set = set(cone)
         dag = build_dag(project)
         entries = [
@@ -222,7 +237,7 @@ def _replay_cone(
 
     if verdicts is None:
         verdicts = scan(project)
-    cone = _live_cone(cone, roots, verdicts)  # a husk dragged into a stale head's cone must not replay into junk (#154)
+    cone = _live_cone(cone, verdicts)  # a husk (dragged-in or explicitly named) must not replay into junk (#154)
     remap: dict[str, str] = {}
     entries: list[RecalcEntry] = []
     status = "ok"
@@ -246,8 +261,13 @@ def _replay_cone(
         # Resolve the heading alias(es) BEFORE re-pointing anything for this entry,
         # so a yet-to-be-processed downstream alias is read at its pre-recalc head.
         heading = _aliases_heading(project, old_hash)
+        # Freeze alias-pinned parents to the revision they resolved to at build, so a
+        # replay forced by a *tracked* parent advancing does not silently re-resolve
+        # `pinned_expr_from_alias("p")` to p's new head (#160).
+        freeze = _pinned_alias_freeze(project, old_hash)
         try:
-            result = build_and_persist(project, _recipe_code(project, old_hash))
+            with pin_freeze(freeze):
+                result = build_and_persist(project, _recipe_code(project, old_hash))
         except BuildError as exc:
             # Persist the failure (outside the catalog repo, so it survives
             # reset_to) keyed by the failed hash — the orphan-stale tie-back.

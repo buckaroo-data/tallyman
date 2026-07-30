@@ -32,3 +32,18 @@ def test_read_project_file_returns_xorq_expr(orders_parquet: Path, project: str,
     schema = expr.schema()
     assert "region" in schema.names
     assert "price" in schema.names
+
+
+def test_tracked_expr_from_alias_rejects_a_hash(orders_parquet: Path, project: str, monkeypatch):
+    """docs/reactive-recalc.md: ``tracked_expr_from_alias`` accepts an alias only
+    — "pass it a hash and it raises, because a hash has no head to follow". The
+    hash form must not silently degrade into an untracked/pinned read."""
+    from tallyman_xorq import build_and_persist
+    from tallyman_xorq.io import tracked_expr_from_alias
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = 'from tallyman_xorq.io import read_project_file\nexpr = read_project_file("orders.parquet")\n'
+    content_hash = build_and_persist(project, code).content_hash
+
+    with pytest.raises(Exception):
+        tracked_expr_from_alias(content_hash, project=project)

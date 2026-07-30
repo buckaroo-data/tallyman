@@ -16,7 +16,7 @@ import logging
 
 from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_core import data_dir
-from tallyman_core.aliases import get_alias
+from tallyman_core.aliases import get_alias, history_for
 from tallyman_core.catalog_state import current_step, reset_to
 from tallyman_core.config import auto_recalc_enabled, set_auto_recalc
 from tallyman_core.errors import error_for_hash
@@ -605,3 +605,30 @@ def test_scan_driven_recalc_does_not_replay_husk_under_source_drift(project, ord
     new = {e["content_hash"] for e in list_entries(project)} - before
     # exactly two new entries — the leaf source-recompute and u's live-head recompute — no junk husk replay
     assert new == {get_alias(project, "leaf"), get_alias(project, "u")}
+
+
+# ---------------------------------------------------------------------------
+# 9. a byte-identical revise is a no-op head advance: no new revision, no cascade
+# ---------------------------------------------------------------------------
+
+
+def test_revise_identical_code_keeps_version_and_cascades_nothing(project, orders_parquet, monkeypatch):
+    """docs/reactive-recalc.md: "a new alias revision is created exactly when an
+    alias head advances to a hash it was not already pointing at" and
+    "set_alias dedupes a consecutive duplicate hash regardless". Re-submitting
+    the identical recipe rebuilds to the same content hash, so the alias history
+    must not grow, followers must not go stale, and the cascade must be empty."""
+    _clean_env(monkeypatch)
+    a1 = _hash(catalog_create("a", _src_code(project)))
+    b1 = _hash(catalog_create("b", _child_code("a")))
+
+    out = catalog_revise("a", _src_code(project))  # byte-identical recipe
+
+    assert "error" not in out, out
+    assert out["hash"] == a1  # build idempotency: same structure, same hash
+    assert get_alias(project, "a") == a1
+    assert history_for(project, "a") == [a1]  # deduped — still version 1
+    assert out.get("version") == 1
+    assert get_alias(project, "b") == b1  # nothing went stale, nothing cascaded
+    assert (out.get("recalc") or {}).get("remap") in (None, {})
+    assert scan(project)[b1].stale is False

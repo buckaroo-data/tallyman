@@ -118,29 +118,39 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
 def scan(project: str) -> dict[str, StaleVerdict]:
     """Actionable staleness for every live entry, tagging direct vs transitive.
 
-    An entry is **directly** stale only when it is a *current alias head* whose own
-    recorded input moved (#154). A superseded historical version pins alias heads
-    that have since advanced, so its inputs read as moved forever — but it heads no
-    alias, so recomputing it re-points nothing (and, for a recipe shape no current
-    head uses, manufactures a junk entry), and it is not an invariant break to flag.
-    Such a non-head is marked ``live=False`` and forced ``stale=False`` here (its
-    ``reasons`` are kept for forensics). A **transitively** stale entry is a (not
-    directly stale) descendant of a directly-stale head in the dependency cone.
+    An entry is **live** unless it is a *superseded husk* — a version that appears
+    in some alias's history but is no longer that alias's head (#154). A husk pins
+    alias heads that have since advanced, so its inputs read as moved forever, yet
+    recomputing it re-points nothing (and, for a recipe shape no current head uses,
+    manufactures a junk entry). Such a husk is marked ``live=False`` and forced
+    ``stale=False`` here (its ``reasons`` are kept for forensics).
+
+    A never-aliased *scratch* entry (a ``catalog_run`` follower that appears in no
+    alias history) is **not** a husk: nothing has superseded it, so it stays live
+    and goes actionably stale when a parent it follows advances — it rebuilds like
+    any follower, minus the alias bookkeeping (reactive-recalc.md's scratch-rebuild
+    semantics). The gate is "superseded", not "is a head".
+
+    A **transitively** stale entry is a (not directly stale) descendant of a
+    directly-stale head in the dependency cone.
 
     ``entry_staleness`` stays the raw per-entry primitive — did *this* entry's inputs
-    move, regardless of headship; this function layers the head-reachability gate
-    that makes ``stale`` mean *actionable*. The verdict dict still keys **every**
-    entry (heads and husks alike), because the recalc replay indexes cone members
-    that are not themselves heads (a hash-pinned child).
+    move, regardless of headship; this function layers the husk gate that makes
+    ``stale`` mean *actionable*. The verdict dict still keys **every** entry (live
+    entries and husks alike), because the recalc replay indexes cone members that
+    are not themselves heads (a hash-pinned child).
     """
     heads = set(aliases.load_aliases(project).values())  # current alias heads, read once
+    # A husk is a hash that appears in some alias history but is no longer a head;
+    # a never-aliased scratch entry appears in no history, so it is not a husk.
+    superseded = {h for hist in aliases.load_history(project).values() for h in hist} - heads
     verdicts = {
         entry["content_hash"]: entry_staleness(project, entry["content_hash"]) for entry in list_entries(project)
     }
     for content_hash, verdict in verdicts.items():
-        verdict.live = content_hash in heads
+        verdict.live = content_hash not in superseded
         if not verdict.live:
-            verdict.stale = False  # a non-head is never actionably stale (#154)
+            verdict.stale = False  # a superseded husk is never actionably stale (#154)
     directly_stale = [h for h, v in verdicts.items() if v.stale]
     if directly_stale:
         for content_hash in descendant_cone(project, directly_stale):

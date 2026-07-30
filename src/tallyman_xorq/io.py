@@ -9,6 +9,8 @@ across machines (and packable via `tallyman pack`; see docs/architecture.md).
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 from pathlib import Path
 
 from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
@@ -16,6 +18,30 @@ from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
 
 class ProjectDataNotFound(FileNotFoundError):
     pass
+
+
+# A replay-time freeze for alias-pinned parents (#160). ``pinned_expr_from_alias("p")``
+# stores the alias *name* in the recipe, so a naive replay re-resolves the name to p's
+# CURRENT head and the pin silently advances — the docs promise a pin "stays on that
+# exact revision" and is "never disturbed by recalc". During a recalc replay the walk
+# knows the revision the pin resolved to at build (``manifest.parents[i].hash``) and
+# sets this map ``{alias_name: frozen_hash}`` so ``pinned_expr_from_alias`` re-resolves
+# to the recorded revision instead of the live head. A pin by *hash* stores the hash
+# literally and never consults this map — it is already replay-durable.
+_PIN_FREEZE: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar("tallyman_pin_freeze", default=None)
+
+
+@contextlib.contextmanager
+def pin_freeze(mapping: dict[str, str]):
+    """Freeze alias-pinned parents to their recorded revisions for the duration of a
+    recalc replay (#160). ``mapping`` is ``{alias_name: content_hash}``; while it is
+    active, ``pinned_expr_from_alias(name)`` resolves ``name`` to ``content_hash``
+    rather than the alias's current head."""
+    token = _PIN_FREEZE.set(mapping)
+    try:
+        yield
+    finally:
+        _PIN_FREEZE.reset(token)
 
 
 def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
@@ -99,10 +125,19 @@ _CSV_PARQUET_WRITE = {
 # Covers the types the MCP documents for tallyman_read_csv; an unmapped type
 # raises rather than silently inferring, so a schema mistake fails loudly.
 _IBIS_TO_POLARS = {
-    "int8": "Int8", "int16": "Int16", "int32": "Int32", "int64": "Int64",
-    "uint8": "UInt8", "uint16": "UInt16", "uint32": "UInt32", "uint64": "UInt64",
-    "float32": "Float32", "float64": "Float64",
-    "string": "String", "bool": "Boolean", "boolean": "Boolean",
+    "int8": "Int8",
+    "int16": "Int16",
+    "int32": "Int32",
+    "int64": "Int64",
+    "uint8": "UInt8",
+    "uint16": "UInt16",
+    "uint32": "UInt32",
+    "uint64": "UInt64",
+    "float32": "Float32",
+    "float64": "Float64",
+    "string": "String",
+    "bool": "Boolean",
+    "boolean": "Boolean",
     "date": "Date",
 }
 
@@ -273,7 +308,7 @@ def _normalize_schema(spec, header: list[str], *, reserved: tuple[str, ...] = ()
                 f"{len(speccable)} {list(speccable)}.{reserved_hint}"
             )
         if rest_dtype is None and len(cells) != len(speccable):
-            uncovered = list(speccable[len(cells):])
+            uncovered = list(speccable[len(cells) :])
             raise ValueError(
                 f"tallyman_read_csv: schema is not total — it leaves column(s) {uncovered} unspecified. "
                 'Name every column, or close the spec with ("&rest", "infer").'
@@ -289,7 +324,7 @@ def _normalize_schema(spec, header: list[str], *, reserved: tuple[str, ...] = ()
                 inferred = True
             else:
                 overrides[orig] = pl_dt
-        for orig in speccable[len(cells):]:  # the &rest tail keeps its header name
+        for orig in speccable[len(cells) :]:  # the &rest tail keeps its header name
             out_names.append(orig)
             pl_dt = _resolve_spec_dtype(rest_dtype)
             if pl_dt is None:
@@ -717,7 +752,16 @@ def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
 
     proj = resolve_project(project)
     is_hash = entry_dir(proj, alias_or_hash).exists()
-    content_hash = alias_or_hash if is_hash else get_alias(proj, alias_or_hash)
+    if is_hash:
+        content_hash = alias_or_hash  # a literal hash pin is already replay-durable
+    else:
+        # An alias-name pin: during a recalc replay, resolve to the revision recorded
+        # at build (the freeze map) so the pin is not silently advanced by the replay
+        # (#160); otherwise resolve the alias's current head as usual.
+        frozen = _PIN_FREEZE.get()
+        content_hash = frozen.get(alias_or_hash) if frozen else None
+        if content_hash is None:
+            content_hash = get_alias(proj, alias_or_hash)
     if content_hash is None or not entry_dir(proj, content_hash).exists():
         raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
     content_hash = _resolve_noncyclic_hash(proj, alias_or_hash, content_hash)

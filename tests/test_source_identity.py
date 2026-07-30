@@ -94,3 +94,52 @@ def test_cas_clone_is_a_snapshot_not_a_hardlink(project):
 
     assert pd.read_parquet(clone).shape[0] == 3
     assert clone.stat().st_ino != src.stat().st_ino  # distinct inode — not a hardlink
+
+
+def _agg_code(project: str, rel: str) -> str:  # expensive (Aggregate) — would bake under cas
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file({rel!r}, project={project!r})
+expr = t.group_by("region").aggregate(total=t.price.sum())
+"""
+
+
+def test_salt_rebuild_over_edited_source_forks_hash(project, monkeypatch):
+    """docs/caching.md: ``salt`` folds source digests into the entry hash (like
+    cas, an in-place edit forks the hash on rebuild) even though it leaves
+    xorq's own keys path-only."""
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "salt")
+    monkeypatch.setenv("TALLYMAN_SOURCE_REHASH", "1")  # never serve a stale digest
+    assert si.mode() == "salt"
+
+    src = data_dir(project) / "src.parquet"
+    _write_parquet(src, 3)
+    code = _read_code(project, "src.parquet")
+    h1 = build_and_persist(project, code).content_hash
+
+    _write_parquet(src, 5)  # user edits the source in place
+    h2 = build_and_persist(project, code).content_hash
+
+    assert h1 != h2, "salt: an in-place source edit must fork the content hash on rebuild"
+
+
+def test_salt_mode_bakes_no_snapshot_and_reads_still_work(project, monkeypatch):
+    """docs/caching.md: under ``salt``, ``rewrite_for_build`` bakes no cache at
+    all — a baked snapshot's path-only key would collide across entries with
+    identical paths but different content — so an expensive entry has no baked
+    snapshot and every read recomputes (and must still return rows)."""
+    from tallyman_cli.fixtures import write_shoe_orders
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "salt")
+    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=60, seed=0)
+
+    res = build_and_persist(project, _agg_code(project, "orders.parquet"))
+
+    result_cache = compute_cache_dir(project) / "result_cache"
+    baked = list(result_cache.rglob("*.parquet")) if result_cache.exists() else []
+    assert baked == [], "salt must not bake a result snapshot (path-only keys would collide)"
+
+    df = cached_result_expr(project, res.content_hash).execute()
+    assert len(df) > 0  # the read recomputes live instead

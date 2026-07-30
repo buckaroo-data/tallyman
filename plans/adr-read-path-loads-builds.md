@@ -155,18 +155,48 @@ wrong-file read.
   `docs/caching.md` / `expression-lifecycle.md` / `architecture.md` get
   corrected when the fix lands, as planned.
 
-## Open (deliberately not decided here)
+## Post-acceptance decisions (grilling round 3, 2026-07-30)
 
-1. **Cheap-entry digests** — record an output digest for cheap entries, or
-   rely on the by-construction argument (frozen graph over CAS clones)?
-2. **Audit issue filing** — which of W3 (CSV identity), W4 (PK lineage),
-   B3 (klass scan path), B1 (cross-project session map) get GitHub issues
-   now, and which fold into others.
-3. **Buckaroo upstream** — filing the three buckaroo-repo issues (stats
-   cache key, `dataframe_id` never passed, `/reload_expr` config loss) and
-   whether the tallyman fix PR carries the interim mitigation (wipe an
-   entry's stat cache and evict its session when a heal fails verification).
-4. **Second red-test commit** — extend PR #167's failing suite (hard error
-   on missing build, cold chained read heals without pre-heal, D5
-   provocation tests) before the fix commit, or add them as regression
-   guards after.
+The four items originally left open here were resolved in the final round:
+
+### D9. No cheap-entry digests
+
+Cheap entries record no `result_digest`. With reads loading builds, a cheap
+entry's bytes are the deterministic pushdown of a frozen graph over
+content-pinned clones — no snapshot to drift, no second manufacture point —
+so a digest would cost a canonical materialization at build and at every
+verify to audit a hole that no longer exists. Resolves the contract's open
+question 4.
+
+### D10. An unfaithful heal wipes the entry's Buckaroo state
+
+When a heal fails verification, the fix PR wipes that entry's
+`.buckaroo_stat_cache` and evicts its Buckaroo session, so stale stats never
+render beside fresh rows while buckaroo#955/#956 await a wheel bump.
+Faithful heals need no wipe: enforced verification makes them
+byte-identical, which is exactly the assumption Buckaroo's caches key on.
+
+### D11. Second red-test commit before the fix
+
+PR #167's failing suite is extended with the newly-decided behaviors before
+the fix commit: hard error on a missing build (D6), a cold load of a
+chained child's build healing the parent snapshot with no pre-heal (D4),
+and the D10 wipe. The #171 provocation probes ride in a separate commit —
+they may pass on `main` (whether the reorder fires at test scale is the
+empirical question they exist to answer), so per the failing-tests
+discipline they don't belong in the red commit. Tests that cannot fail
+first (the D8 snapshot-key assert needs the new manifest field) ride with
+the fix commit.
+
+### D12. Unfaithful entries are pinned and badged
+
+An entry whose heal fails verification has bytes that are not regenerable:
+it is marked non-evictable (its snapshot is retained, not treated as
+reclaimable cache) and surfaced with a UI badge via the D7 error record —
+the #83 position. Full bullpen/eviction wiring is deferred; the marking and
+badge land with the fix. Resolves the contract's open question 7.
+
+Two defaults adopted without ceremony: `diff_stat_cache/` joins
+`_invalidate_reset_caches` and the reset prune (size caps deferred),
+resolving the contract's open question 8; and #166 (`pinned_expr_from_alias`
+version references) lands as its own PR after the fix.

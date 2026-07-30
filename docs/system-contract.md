@@ -638,10 +638,9 @@ calling it finished:
 3. **Child hashes change.** *Resolved (ADR D1/D4):* accepted — the read-path
    fix, chaining inline, and digest re-scope land in one PR followed by one
    corpus rebuild.
-4. **Cheap entries have no digest.** Their faithfulness rests entirely on
-   construction (frozen graph over CAS clones). Is that argument airtight
-   enough to leave them unaudited, or should cheap entries record a digest at
-   build too (cost: one hashing pass they currently skip)?
+4. **Cheap entries have no digest.** *Resolved (ADR D9):* they stay
+   digest-free — with reads loading builds, their bytes are deterministic by
+   construction, so the audit would have nothing to catch.
 5. **Fallback scope.** *Resolved (ADR D6):* there is no fallback. A missing
    or unloadable build is a hard error; recipe re-execution survives only in
    minting and the structural-nondeterminism diagnostic.
@@ -650,10 +649,8 @@ calling it finished:
    these shouldn't occur — but memtables serialized by xorq
    (`memtables/*.parquet` in a build) load back as real tables. Confirm no
    tallyman entry can produce one, or define the composition story if it can.
-7. **Eviction policy for unfaithful entries.** When a heal fails verification
-   (execution nondeterminism), the entry's bytes are not regenerable. The
-   #83 position — pin to snapshot, mark non-evictable, steer the author —
-   needs wiring into the eviction/bullpen story.
-8. **`diff_stat_cache` ownership.** Pair-keyed is honest once diff inputs are
-   lineage-faithful (I1), but the cache still needs an owner: size cap,
-   eviction, and a wipe on this fix's landing.
+7. **Eviction policy for unfaithful entries.** *Resolved (ADR D12):* pin
+   non-evictable, badge via the error record; full bullpen wiring deferred.
+8. **`diff_stat_cache` ownership.** *Resolved (ADR post-acceptance):* wiped
+   at the fix's landing and wired into reset invalidation; size caps
+   deferred.

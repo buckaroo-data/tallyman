@@ -21,13 +21,25 @@ the caches are in (I2).
 
 from __future__ import annotations
 
+import json
 import shutil
+
+import pytest
+from xorq.ibis_yaml.compiler import load_expr
 
 from tallyman_companion.diff import build_diff_expr
 from tallyman_core.aliases import get_alias
 from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import compute_cache_dir, entry_dir
+from tallyman_core.paths import (
+    compute_cache_dir,
+    entry_build_dir,
+    entry_dir,
+    entry_expanded_build_dir,
+    entry_stat_cache_dir,
+    project_dir,
+)
 from tallyman_mcp.server import catalog_create, catalog_revise
+from tallyman_xorq.portable import ensure_expanded_build
 from tallyman_xorq.result_cache import (
     baked_snapshot_path,
     cached_result_expr,
@@ -159,3 +171,88 @@ def test_cold_cache_read_reproduces_build_bytes(project, orders_parquet, monkeyp
     cached_result_expr.cache_clear()
     cached_result_expr(project, b1)  # cold read — forces the self-heal
     assert verify_result_faithful(project, b1) is True
+
+
+# ---------------------------------------------------------------------------
+# second wave — behaviors decided in plans/adr-read-path-loads-builds.md
+# (D4, D6, D10); also expected to fail on current main
+# ---------------------------------------------------------------------------
+
+
+def _worthy_parent_code(project: str) -> str:  # Aggregate at the parent → worthy parent
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(n=t.count(), total=t.price.sum())
+"""
+
+
+def test_missing_build_is_hard_error(project, orders_parquet, monkeypatch):
+    """ADR D6: an entry whose xorq_build/ is gone must raise, not reconstruct.
+
+    On main the read path never touches the build — it re-imports expr.py —
+    so deleting xorq_build/ goes unnoticed and the read silently succeeds.
+    The error must name the entry so the remedy (rebuild) is actionable.
+    """
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    h = catalog_create("plain", _parent_v1_code(project))["hash"]
+    shutil.rmtree(entry_build_dir(project, h))
+    cached_result_expr.cache_clear()
+    with pytest.raises(Exception, match=h[:12]):
+        cached_result_expr(project, h)
+
+
+def test_chained_child_build_heals_parent_without_preheal(project, orders_parquet, monkeypatch):
+    """ADR D4: a child's build is self-contained — a cold load heals ancestors.
+
+    Simulates exactly what Buckaroo does (expand the child's build, load it,
+    execute) with every snapshot evicted and NO pre-heal call. On main the
+    child's build holds a bare read of the worthy parent's snapshot — a file
+    reference with no regeneration knowledge — so the cold load reads a
+    missing file. Under the contract the parent's cache node travels in the
+    child's build and heals through ordinary cache mechanics.
+    """
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    catalog_create("trips", _worthy_parent_code(project))
+    child_code = """
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("trips")
+expr = t.mutate(doubled=t.total * 2)
+"""
+    child = catalog_create("by_region", child_code)["hash"]
+    recorded = read_manifest(entry_dir(project, child)).row_count
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+    expanded = ensure_expanded_build(
+        entry_build_dir(project, child),
+        project_dir(project),
+        entry_expanded_build_dir(project, child),
+    )
+    loaded = load_expr(expanded, cache_dir=compute_cache_dir(project))
+    assert int(loaded.count().execute()) == recorded
+
+
+def test_unfaithful_heal_wipes_stat_cache(project, orders_parquet, monkeypatch):
+    """ADR D10: a heal that fails verification wipes the entry's stat cache.
+
+    Buckaroo's summary-stats cache is keyed on expression structure and paths
+    (buckaroo#955), so bytes that change under a stable path leave stale stats
+    rendering beside fresh rows. A verified-faithful heal is byte-identical
+    and needs no wipe; an UNFAITHFUL one must clear the entry's
+    .buckaroo_stat_cache. The recorded digest is tampered here so the heal is
+    unfaithful by construction. On main the mismatch only logs a warning.
+    """
+    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+    h = catalog_create("by_region", _worthy_parent_code(project))["hash"]
+    mpath = entry_dir(project, h) / "manifest.json"
+    doc = json.loads(mpath.read_text())
+    doc["result_digest"] = "0" * 64
+    mpath.write_text(json.dumps(doc))
+    stat_dir = entry_stat_cache_dir(project, h) / "parquet"
+    stat_dir.mkdir(parents=True, exist_ok=True)
+    sentinel = stat_dir / "stale-stats.parquet"
+    sentinel.write_text("stale")
+    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
+    cached_result_expr.cache_clear()
+    cached_result_expr(project, h)  # heal fires; digest cannot match the tamper
+    assert not sentinel.exists()

@@ -54,7 +54,7 @@ nothing. Fill `(A, H)` while B is active, switch back to A: every read of
 `(A, H)` serves B-flavored results for the process lifetime (the recompute
 branch has no exists-check to trip a heal).
 
-### W3. `tallyman_read_csv` sits entirely outside source identity [verified]
+### W3. `tallyman_read_csv` sits entirely outside source identity [verified] — filed #168
 
 - Intermediate keyed `md5(abs_path | schema | scan_kwargs)` — content-blind by
   documented intent (`io.py:515-527`); refreshed by an mtime sidecar via
@@ -79,7 +79,7 @@ in `TALLYMAN_HOME/csv_ordered/` (project-independent by design,
 `io.py:499-512`), so the same recipe over the same CSV in two projects builds
 the **identical content hash** — which arms B1 below.
 
-### W4. Primary-key inheritance resolves lineage by alphabetical accident
+### W4. Primary-key inheritance resolves lineage by alphabetical accident — filed #169
 
 `_parent_hash` calls `previous_version(project, hash)` with no alias hint
 (`primary_key.py:61-69`); `version_of_hash`'s fallback scans aliases in dict
@@ -128,13 +128,13 @@ condition that arms W1 goes unreported.
 
 ## Tallyman — secondary findings
 
-- **B1. Buckaroo session map is cross-project on a false premise.**
+- **B1 (filed #172). Buckaroo session map is cross-project on a false premise.**
   `_sessions` keys by content hash only, justified "bytes identical by
   construction" (`buckaroo_lifecycle.py:528-531`) — W3 breaks the premise via
   `csv_ordered`. When two projects share H: B's grid uses A's session, A's
   stat-cache dir, A's telemetry; `reload_project_sessions(B)` filters on the
   *recorded* project and skips H, so B's klass changes never reload B's grid.
-- **B3. Buckaroo never finds project klasses [verified].** Tallyman passes
+- **B3 (filed #170). Buckaroo never finds project klasses [verified].** Tallyman passes
   `project_root = artifacts_dir(project)` (`buckaroo_lifecycle.py:598`);
   Buckaroo scans `<project_root>/stats/*.py` and returns silently on a missing
   dir (`xorq_loading.py:154-155` in the wheel); tallyman writes stats to
@@ -171,7 +171,8 @@ condition that arms W1 goes unreported.
 Yes — the worst instance is #163 verbatim, and it sits directly under
 tallyman's grid.
 
-1. **Summary-stats snapshot cache is path-keyed over mutable bytes.**
+1. **Summary-stats snapshot cache is path-keyed over mutable bytes**
+   (filed buckaroo#955)**.**
    Buckaroo caches per-column stats in a xorq `ParquetSnapshotCache`
    (`xorq_loading.py:43-45`) whose key is the stat query's *expression token*
    — structure + leaf path strings, no content, no mtime; xorq documents the
@@ -186,7 +187,8 @@ tallyman's grid.
    Under the tallyman contract this is masked while I1 holds upstream (bytes
    never change under a hash) but is armed the moment any heal drifts:
    tallyman's failure containment ends at the `/load_expr` boundary.
-2. **The JS row cache's data-identity signal is never armed.** Client row
+2. **The JS row cache's data-identity signal is never armed**
+   (filed buckaroo#956)**.** Client row
    caches partition on `outside_df_params`, whose one data-identity field,
    `dataframe_id`, is passed by no caller in server mode
    (`BuckarooView.tsx:287-299`). On `/reload_expr` (which tallyman issues on
@@ -194,7 +196,7 @@ tallyman's grid.
    rebroadcasts, the recomputed params are byte-identical, no purge fires,
    and `SmartRowCache` serves the previous expression's rows from memory
    under new stats. One prop (a server load-generation counter) closes it.
-3. **`/reload_expr` silently drops config.** The rebuilt dataflow loses
+3. **`/reload_expr` silently drops config** (filed buckaroo#957)**.** The rebuilt dataflow loses
    `cache_storage_path`, `column_config_overrides`, `extra_grid_config`
    (`handlers.py:807-808`) — after any reload, stat caching is off and the
    caller's column config is gone. Tallyman reloads on every stat/klass

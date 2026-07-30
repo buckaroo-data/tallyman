@@ -434,9 +434,11 @@ missing when the child executes, the parent's cache node re-runs its frozen
 subgraph and rewrites the file, the same as any cache miss; nothing outside
 the execution has to arrange for the file to exist.[^preheal]
 
-The recipe-reconstruction machinery survives only as a fallback (for an entry
-whose build is missing or unloadable) and as a diagnostic — never as a path
-for serving results while a build exists.[^recon]
+The recipe-reconstruction machinery survives only as a diagnostic. An entry
+whose build is missing or unloadable is a **hard error** naming the entry and
+the remedy (rebuild) — there is no automatic recipe fallback, because a
+warning on a background read is exactly how #163-class behavior stays
+invisible (decided in `plans/adr-read-path-loads-builds.md`, D6).[^recon]
 
 ## Composition: diff and beyond
 
@@ -623,27 +625,26 @@ contract's rules apply to those axes too; the audit is the worklist.
 For the grilling session; none block understanding the design, all block
 calling it finished:
 
-1. **Canonical ordering for parquet-sourced bakes.** CSV ingest injects
-   `original_row_order`; parquet sources have no such column. Sort every bake
-   over all columns (cost?), inject an order column at read time, or scope
-   the digest's order-insensitivity claim to CSV-sourced entries?
+1. **Canonical ordering for parquet-sourced bakes.** *Resolved (ADR D5):*
+   the order-insensitivity claim is scoped to CSV-sourced entries; parquet
+   digests are documented order-sensitive with advisory drift warnings, a
+   tracked issue, and provocation tests. Sort-all-columns and multiset
+   digests remain the fallback options if the advisory fires in practice.
 2. **Nested cache-node rebase.** With parent cache nodes kept inline, builds
    now contain nested cache nodes, and xorq's shallow load-time cache-dir
    rewrite misses the inner ones. Proposal: a tallyman-side deep rewrite over
    xorq's deep-walking primitives. Verify no path still relies on xorq's
    shallow one.
-3. **Child hashes change.** Keeping the parent's cache node in the child's
-   graph (rather than a stripped snapshot read) changes child content hashes
-   → corpus rebuild. Accepted per project policy; confirm nothing else keys
-   off the old chaining shape.
+3. **Child hashes change.** *Resolved (ADR D1/D4):* accepted — the read-path
+   fix, chaining inline, and digest re-scope land in one PR followed by one
+   corpus rebuild.
 4. **Cheap entries have no digest.** Their faithfulness rests entirely on
    construction (frozen graph over CAS clones). Is that argument airtight
    enough to leave them unaudited, or should cheap entries record a digest at
    build too (cost: one hashing pass they currently skip)?
-5. **Fallback scope.** When exactly may the recipe-reconstruction fallback
-   fire (build dir missing? unloadable after an xorq upgrade?), and does it
-   warn loudly enough that it never silently becomes a load-bearing path
-   again?
+5. **Fallback scope.** *Resolved (ADR D6):* there is no fallback. A missing
+   or unloadable build is a hard error; recipe re-execution survives only in
+   minting and the structural-nondeterminism diagnostic.
 6. **`replace_sources` edge.** It refuses raw `DatabaseTable` leaves (data
    living inside a backend). Tallyman's build rejects in-memory reads, so
    these shouldn't occur — but memtables serialized by xorq

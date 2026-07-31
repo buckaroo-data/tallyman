@@ -2,8 +2,8 @@
 
 - **Status:** Accepted (2026-07-30) — decided in the grilling session over
   `docs/system-contract.md`. Supersedes the read-path behavior introduced by
-  #74/#75 (recipe re-import on read). Four follow-up questions remain open,
-  listed at the end.
+  #74/#75 (recipe re-import on read). All follow-up questions resolved
+  (D9–D12, and the D5 amendment); implemented on PR #167.
 - **Context ticket:** buckaroo-data/tallyman#163 (read path reconstructs from
   `expr.py`; a content hash does not name a fixed result). Normative design:
   `docs/system-contract.md`. Bug-class survey:
@@ -21,9 +21,10 @@
   (the digest whose ordering claim D5 re-scopes).
 - **Evidence:** #163's verification on the `taxi2` corpus (frozen builds
   execute to distinct correct results; composition after rebinding works;
-  warm and cold runs byte-identical), and
-  `tests/test_lineage_faithful_reads.py` — five invariant tests red on CI
-  (PR #167) against `main`.
+  warm and cold runs byte-identical);
+  `tests/test_lineage_faithful_reads.py` — eight invariant tests red on CI
+  (PR #167) against `main`; and the #171 probe (3 distinct digests over 3
+  heals at 250k rows) that forced the D5 amendment.
 
 ## Problem
 
@@ -39,11 +40,11 @@ restoring them.
 
 ### D1. One PR, one rebuild
 
-The read-path fix, the chaining change (D4), and the digest re-scope (D5)
-land together on PR #167, flipping the five red tests green in a single
-change, followed by one corpus rebuild (chaining changes child content
-hashes). *Rejected:* staged landing (read-path first, hash-changing PRs
-after) — smaller diffs and easier bisection, but two rebuild events and an
+The read-path fix, the chaining change (D4), and the canonical-sort bake (D5)
+land together on PR #167, flipping the eight red tests green in a single
+change, followed by one corpus rebuild (chaining and the sort both change
+content hashes). *Rejected:* staged landing (read-path first, hash-changing
+PRs after) — smaller diffs and easier bisection, but two rebuild events and an
 interim state where builds are read but not yet self-contained.
 
 ### D2. Keep the facade; replace the internals
@@ -85,20 +86,35 @@ rebuilds. *Rejected:* keep stripping — no nesting and no rebuild, but builds
 stay non-self-contained and the pre-heal choreography stays load-bearing
 forever.
 
-### D5. Digest order-insensitivity is scoped to CSV-sourced entries
+### D5. The bake is canonically ordered: sort-by-all-columns (amended)
 
-`result_digest` keeps its file-hash definition. CSV-sourced entries keep the
-canonical `original_row_order` sort (the existing ADR). For parquet-sourced
-worthy entries the order-insensitivity claim is **withdrawn**, not fixed:
-their digests are documented as order-sensitive, heal-drift warnings on them
-are advisory, and #171 plus provocation tests (attempt to trigger DataFusion
-parallel-scan reordering; demonstrate either stability or the advisory
-firing) capture the residual. *Rejected for now:* sort-by-all-columns
-before the bake (deterministic bytes everywhere, but a sort on every
-bake/heal and pinned-null-ordering complexity) and a multiset digest (order
-insensitivity by definition, but verify must read every row and the digest
-stops being a hash of the artifact). Either remains available if the
-advisory fires in practice.
+**Amended 2026-07-30, same day, on probe evidence.** As originally decided,
+the order-insensitivity claim for parquet-sourced worthy entries was
+withdrawn rather than fixed: digests documented as order-sensitive, heal-drift
+warnings advisory, #171 + provocation tests capturing the residual — with
+sort-by-all-columns and a multiset digest noted as the escape hatches "if the
+advisory fires in practice."
+
+It fires on every heal. The #171 probe (250k rows, above DataFusion's 1 MiB
+`repartition_file_min_size`) produced three distinct digests over three heals,
+none matching the build. At that rate the advisory posture is untenable: D10
+would wipe stat caches on every heal and D12 would pin and badge every large
+parquet-sourced entry, drowning the signal both exist to carry.
+
+So the escape clause is exercised: `rewrite_for_build` imposes a canonical
+total order under the result-cache node before every bake. Key priority: the
+author's own top-level `order_by` keys stay primary (served row order is part
+of what they asked for), then `original_row_order` (the canonical CSV file
+order), then the remaining sortable columns in schema order; nested/geospatial
+columns are skipped as keys (rows still tied after all sortable columns are
+byte-identical, so residual ties can't change the file's bytes). The sort node
+lands in the build, so the build's bake and every later heal execute the same
+ordered plan — the probe test now pins byte-equality across heals instead of
+probing for drift. `result_digest` keeps its file-hash definition and is sound
+for every worthy entry, CSV- and parquet-sourced alike. *Rejected:* the
+multiset digest (order insensitivity by definition, but verify must read every
+row and the digest stops being a hash of the artifact). Cost accepted: a sort
+on every bake/heal — D4 already forces the corpus rebuild this rides on.
 
 ### D6. A missing or unloadable build is a hard error
 
@@ -141,12 +157,12 @@ wrong-file read.
   project policy there is no migration path. `diff_stat_cache/` is wiped and
   Buckaroo bounced at the same time (its current contents were computed over
   #163's self-join diffs).
-- **Buckaroo's caches become sound again for CSV-sourced entries:** with
-  verify enforced, a faithful heal is byte-identical, so expression-keyed
-  stat caches over stable paths are honest. For parquet-sourced entries a
-  heal may legitimately reorder rows (D5): aggregate summary stats are
-  order-insensitive and stay correct, but an open session's row cache can
-  show the new order — accepted until the D5 issue is resolved.
+- **Buckaroo's caches become sound again:** with the canonical sort (D5,
+  amended) and verify enforced, a faithful heal is byte-identical for every
+  worthy entry — CSV- and parquet-sourced alike — so expression-keyed stat
+  caches over stable paths are honest. The unfaithful residual (a genuinely
+  nondeterministic recompute: an impure UDF, source drift under `off`) is the
+  D10/D12 path, not a routine occurrence.
 - **The audit's W5 (MCP-process invalidation) largely dissolves:** cached
   values become pure functions of immutable builds, so cross-process
   staleness reduces to the existence checks the read already performs.

@@ -45,6 +45,86 @@ def _should_cache_read(method_name: str) -> bool:
     return method_name not in _EXEMPT_READS
 
 
+def _sortable(dtype) -> bool:
+    """Whether a column can serve as a canonical-order sort key.
+
+    Nested / geospatial types can't be sort keys in datafusion; leaving them out
+    of the tie-breakers is safe — any remaining ties are between rows identical
+    on every sortable column, and identical prefixes write identical bytes.
+    """
+    for pred in ("is_array", "is_map", "is_struct", "is_json", "is_geospatial"):
+        if getattr(dtype, pred, None) and getattr(dtype, pred)():
+            return False
+    return True
+
+
+def _constant_names(rel) -> set[str]:
+    """Columns the relation defines as scalars (projected literals/constants).
+
+    A constant column adds no ordering information — every row ties on it — and
+    ibis dereferences a sort key straight through to the defining value, so
+    ``ORDER BY <literal>`` reaches datafusion's planner, which rejects a bare
+    literal there ("invalid digit found in string": it reads a numeric literal
+    as a column ordinal). Skipping them is both necessary and free.
+    """
+    values = getattr(rel, "values", None)
+    if not values:
+        return set()
+    out = set()
+    for name, v in values.items():
+        shape = getattr(v, "shape", None)
+        if shape is not None and shape.is_scalar():
+            out.add(name)
+    return out
+
+
+def _tie_break_order(names, keyed: set[str], schema, rel) -> list[str]:
+    """Sortable, non-constant columns not already keyed, ``original_row_order`` first.
+
+    ``original_row_order`` is tallyman's canonical total order for CSV-sourced
+    entries (``tallyman_read_csv``); leading with it keeps a baked CSV result in
+    file order rather than lexicographic-by-first-column order.
+    """
+    skip = keyed | _constant_names(rel)
+    remaining = [n for n in names if n not in skip and _sortable(schema[n])]
+    remaining.sort(key=lambda n: n != "original_row_order")  # stable: row order first, schema order after
+    return remaining
+
+
+def _canonical_sorted(expr):
+    """Impose a deterministic total order before the result-cache bake.
+
+    ADR D5 (amended, plans/adr-read-path-loads-builds.md): datafusion's parallel
+    scan/aggregation reorders rows run-to-run above its 1 MiB repartition
+    threshold, so an unsorted bake produces different bytes on every heal and
+    ``result_digest`` stops naming the entry's result. Sorting by every column
+    makes the bytes deterministic: rows still tied after all sortable columns are
+    byte-identical, so any permutation among them writes the same file.
+
+    Key priority: the author's own top-level ``order_by`` keys stay primary (the
+    served row order is part of what they asked for), then ``original_row_order``
+    (the canonical CSV file order), then the remaining sortable columns in schema
+    order. An author sort is extended in place rather than wrapped, so the graph
+    carries one Sort node.
+    """
+    import xorq.vendor.ibis.expr.operations as ops
+
+    node = expr.op()
+    if isinstance(node, ops.Sort):
+        parent = node.parent
+        keyed = {k.expr.name for k in node.keys if isinstance(k.expr, ops.Field)}
+        remaining = _tie_break_order(parent.schema.names, keyed, parent.schema, parent)
+        if not remaining:
+            return expr
+        extra = tuple(ops.SortKey(ops.Field(parent, n)) for n in remaining)
+        return ops.Sort(parent, tuple(node.keys) + extra).to_expr()
+    schema = expr.schema()
+    names = _tie_break_order(schema.names, set(), schema, node)
+    if not names:
+        return expr  # nothing sortable — the digest stays best-effort for this entry
+    return expr.order_by(names)
+
+
 _IN_MEMORY_MSG = (
     "expression reads in-memory data (read_in_memory / ibis.memtable). This "
     "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
@@ -153,11 +233,13 @@ def rewrite_for_build(expr, project: str):
 
         expr = replace_nodes(replacer, expr).to_expr()
 
-    # 3. Bake the result cache for an expensive expression. A distinct
-    # relative_path keeps baked results inspectable apart from source parses
-    # under the same compute-cache root.
+    # 3. Bake the result cache for an expensive expression, canonically ordered
+    # first so the snapshot's bytes — and therefore result_digest — are
+    # deterministic across the build and every later heal (ADR D5, amended).
+    # A distinct relative_path keeps baked results inspectable apart from
+    # source parses under the same compute-cache root.
     if _is_worthy_expr(expr):
         result_cache = ParquetSnapshotCache.from_kwargs(source=connect(), base_path=base, relative_path="result_cache")
-        expr = expr.cache(cache=result_cache)
+        expr = _canonical_sorted(expr).cache(cache=result_cache)
 
     return expr

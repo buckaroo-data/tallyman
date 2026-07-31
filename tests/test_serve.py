@@ -105,7 +105,7 @@ def test_notify_recalc_reloads_sessions_and_invalidates_caches(project: str, mon
     import tallyman_companion.app as appmod
 
     invalidated: list[bool] = []
-    monkeypatch.setattr(appmod, "_invalidate_reset_caches", lambda: invalidated.append(True))
+    monkeypatch.setattr(appmod, "_invalidate_reset_caches", lambda project=None: invalidated.append(True))
     stub = _TrackingBuckaroo()
     app = create_app(project, buckaroo=stub)
     c = TestClient(app)

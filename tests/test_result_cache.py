@@ -925,7 +925,10 @@ def test_cross_process_heal_reads_landed_snapshot_else_reraises(project, orders_
     def _stub_plan(on_execute):
         # Stand in for the lru-memoised plan so the heal hits our controlled execute()
         # against the REAL evicted path — the only thing the except arm reads.
-        monkeypatch.setattr(rc, "_resolve_result_plan", lambda _proj, _h: ("baked", _FakeBaked(on_execute), p))
+        fake = _FakeBaked(on_execute)
+        monkeypatch.setattr(
+            rc, "_resolve_result_plan", lambda _proj, _h: rc._ResultPlan("baked", fake, fake, p)
+        )
 
     # Landed: the peer's rename completed (snapshot back on disk) but our execute still
     # raised on the vanished shared tmp — swallow it and read the materialised file.
@@ -1425,15 +1428,20 @@ def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, o
     assert recipe_is_structurally_nondeterministic(project, h) is False
 
 
-def test_self_heal_warning_labels_structural_for_baked_literal(project, orders_parquet, monkeypatch, caplog):
-    # #88 part 2, end to end: an entry that bakes a random literal reconstructs to a
-    # graph whose snapshot key differs from the build-time one, so its very first cold
-    # read self-heals to bytes that differ from the recorded digest. The faithfulness
-    # warning must fire AND attribute the drift to the structural axis (#88), not
-    # execution — the literal genuinely moves the graph hash between imports.
+def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_parquet, monkeypatch, caplog):
+    # Inversion of the pre-#163 behavior this test used to pin. On main, reading
+    # an entry whose recipe bakes a random literal re-imported expr.py, re-rolled
+    # the literal, derived a *different* snapshot key, and self-healed to bytes
+    # that weren't the recorded ones — so the read had to fire an UNFAITHFUL
+    # warning with the structural (#88) attribution. Under the contract the read
+    # loads the frozen build, where the literal is fixed forever: the original
+    # snapshot resolves, nothing heals, no warning fires, and the entry is
+    # byte-faithful (I1) despite the structurally nondeterministic recipe. The
+    # nondeterminism now surfaces only where it belongs — re-minting — and the
+    # detector test above still covers the diagnostic.
     import logging
 
-    from tallyman_xorq.result_cache import cached_result_expr
+    from tallyman_xorq.result_cache import cached_result_expr, verify_result_faithful
 
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -1443,10 +1451,11 @@ def test_self_heal_warning_labels_structural_for_baked_literal(project, orders_p
 
     caplog.clear()
     with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
-        df = cached_result_expr(project, h).execute()  # reconstructs a new graph → self-heals
+        df = cached_result_expr(project, h).execute()
     assert len(df) > 0
+    assert verify_result_faithful(project, h) is True
     msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
-    assert any("UNFAITHFUL" in m and h in m and "structural (#88)" in m for m in msgs), msgs
+    assert not any("UNFAITHFUL" in m for m in msgs), msgs
 
 
 # ---------------------------------------------------------------------------

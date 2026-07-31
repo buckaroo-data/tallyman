@@ -6,6 +6,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import time
 from dataclasses import asdict
 from pathlib import Path
@@ -440,7 +441,7 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
     return build_path, overrides
 
 
-def _invalidate_reset_caches() -> None:
+def _invalidate_reset_caches(project: str | None = None) -> None:
     """Drop the companion's process-global result/compare caches after a reset.
 
     A reset prunes baked snapshots (``catalog_state.reset_to`` →
@@ -452,6 +453,11 @@ def _invalidate_reset_caches() -> None:
     but we clear it for parity. Blunt global clear is correct and cheap: entries
     are content-addressed, so the next call rebuilds an identical expression.
 
+    When *project* is given, the per-pair Buckaroo diff stat cache
+    (``diff_stat_cache/``) is wiped too: its stats were computed over diff joins
+    whose inputs the reset/recalc just moved, and Buckaroo repopulates it on the
+    next compare view (ADR follow-up to D10; size caps deferred).
+
     Called from BOTH reset paths — the in-server ``/api/reset`` and the
     cross-process CLI ``reset-to`` that arrives as a ``project_reset`` on
     ``/internal/notify`` — so the two can't drift. (The in-server path having the
@@ -459,6 +465,10 @@ def _invalidate_reset_caches() -> None:
     """
     _build_compare_expr.cache_clear()
     cached_result_expr.cache_clear()
+    if project is not None:
+        from tallyman_core.paths import diff_stat_cache_root  # noqa: PLC0415
+
+        shutil.rmtree(diff_stat_cache_root(project), ignore_errors=True)
 
 
 def _recalc_sse_event(remap: dict, step: int | None) -> dict:
@@ -661,6 +671,38 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
+    # ADR D7/D10: when a self-heal fails verification (result_cache writes the
+    # durable errors.jsonl record and wipes the entry's stat cache itself), the
+    # companion additionally evicts the entry's Buckaroo session — an open
+    # session's row cache would show the pre-heal rows beside fresh stats — and
+    # pushes the SSE event the UI badges from. Registered on startup (the hook
+    # needs the running loop to publish from the sync heal path) and removed on
+    # shutdown so test-created apps don't pile up dead hooks.
+    @app.on_event("startup")
+    async def _register_unfaithful_heal_hook():
+        from tallyman_xorq.result_cache import UNFAITHFUL_HEAL_HOOKS  # noqa: PLC0415
+
+        loop = asyncio.get_running_loop()
+
+        def _on_unfaithful_heal(project: str, content_hash: str) -> None:
+            if buckaroo:
+                buckaroo.evict_session(content_hash)
+            asyncio.run_coroutine_threadsafe(
+                publish({"kind": "unfaithful_heal", "hash": content_hash, "project": project}),
+                loop,
+            )
+
+        UNFAITHFUL_HEAL_HOOKS.append(_on_unfaithful_heal)
+        app.state.unfaithful_heal_hook = _on_unfaithful_heal
+
+    @app.on_event("shutdown")
+    async def _unregister_unfaithful_heal_hook():
+        from tallyman_xorq.result_cache import UNFAITHFUL_HEAL_HOOKS  # noqa: PLC0415
+
+        hook = getattr(app.state, "unfaithful_heal_hook", None)
+        if hook is not None and hook in UNFAITHFUL_HEAL_HOOKS:
+            UNFAITHFUL_HEAL_HOOKS.remove(hook)
+
     async def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> dict | None:
         """Cascade-recompute *name*'s stale followers after an in-browser head
         advance (PUT /api/code, promote_diff), in the SAME revision the checkpoint
@@ -679,7 +721,7 @@ def create_app(
             return None
         report = await run_in_threadpool(auto_recalc, project, name, tool=tool)
         if report.get("remap"):
-            _invalidate_reset_caches()
+            _invalidate_reset_caches(project)
             if buckaroo:
                 buckaroo.reload_project_sessions(project)
             # checkpoint_step is None on the auto path: the checkpoint middleware
@@ -1658,7 +1700,7 @@ def create_app(
         # reset_to ran in-process and cleared the result-plan memo; the
         # compare-expr LRU is a companion-layer cache it can't reach, so invalidate
         # the companion caches here (#80). Shared with the cross-process notify path.
-        _invalidate_reset_caches()
+        _invalidate_reset_caches(project)
         reloaded = buckaroo.reload_project_sessions(project) if buckaroo else 0
         step = current_step(project)
         await publish({"kind": "project_reset", "step": step})
@@ -1723,7 +1765,7 @@ def create_app(
             return {"status": "ok", "roots": [], "cone": [], "entries": [], "dry_run": dry_run, "remap": {}}
         report = await run_in_threadpool(recalc, project, roots, dry_run=dry_run)
         if not dry_run and report.remap:
-            _invalidate_reset_caches()
+            _invalidate_reset_caches(project)
             if buckaroo:
                 buckaroo.reload_project_sessions(project)
             await publish(_recalc_sse_event(report.remap, report.checkpoint_step))
@@ -1763,7 +1805,7 @@ def create_app(
                 # doesn't leave the viewer serving stale state (#80's communication
                 # gap). Not gated on `buckaroo`: the LRUs are process memory
                 # independent of the buckaroo subprocess.
-                _invalidate_reset_caches()
+                _invalidate_reset_caches(project_name)
             if buckaroo:
                 reloaded = buckaroo.reload_project_sessions(project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)

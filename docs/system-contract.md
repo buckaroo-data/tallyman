@@ -578,7 +578,7 @@ wrong even if every test passes.
 
 # Deviations on main today
 
-As of `main` @ d7e0867 — the gap this proposal closes (all tracked in #163):
+As of `main` @ d7e0867 — the gap PR #167 closes (all tracked in #163):
 
 - No in-process consumer loads the build; the only `load_expr` call in the
   codebase is at build time (`build.py:496`). Every in-process read
@@ -625,16 +625,20 @@ contract's rules apply to those axes too; the audit is the worklist.
 For the grilling session; none block understanding the design, all block
 calling it finished:
 
-1. **Canonical ordering for parquet-sourced bakes.** *Resolved (ADR D5):*
-   the order-insensitivity claim is scoped to CSV-sourced entries; parquet
-   digests are documented order-sensitive with advisory drift warnings, a
-   tracked issue, and provocation tests. Sort-all-columns and multiset
-   digests remain the fallback options if the advisory fires in practice.
-2. **Nested cache-node rebase.** With parent cache nodes kept inline, builds
-   now contain nested cache nodes, and xorq's shallow load-time cache-dir
-   rewrite misses the inner ones. Proposal: a tallyman-side deep rewrite over
-   xorq's deep-walking primitives. Verify no path still relies on xorq's
-   shallow one.
+1. **Canonical ordering for parquet-sourced bakes.** *Resolved (ADR D5,
+   amended):* originally scoped to CSV with advisory warnings, but the #171
+   probe showed the drift fires on every heal at scale (3 heals, 3 distinct
+   digests), so the escape clause was exercised: the worthiness rewrite
+   imposes a sort-by-all-columns total order under the result-cache node
+   (author's `order_by` keys first, then `original_row_order`, then the rest),
+   making every worthy bake byte-deterministic. The probe is now a regression
+   test pinning byte-equality across heals.
+2. **Nested cache-node rebase.** *Resolved (implemented):*
+   `portable.rewrite_cache_dirs` runs the storage rewrite through xorq's
+   `replace_nodes` (which descends `CachedNode.parent`), and the canonical
+   read applies it after every `load_expr`. xorq's shallow rewrite still runs
+   first via `load_expr(cache_dir=…)`; the deep pass is idempotent over what
+   it already fixed.
 3. **Child hashes change.** *Resolved (ADR D1/D4):* accepted — the read-path
    fix, chaining inline, and digest re-scope land in one PR followed by one
    corpus rebuild.
@@ -644,11 +648,13 @@ calling it finished:
 5. **Fallback scope.** *Resolved (ADR D6):* there is no fallback. A missing
    or unloadable build is a hard error; recipe re-execution survives only in
    minting and the structural-nondeterminism diagnostic.
-6. **`replace_sources` edge.** It refuses raw `DatabaseTable` leaves (data
-   living inside a backend). Tallyman's build rejects in-memory reads, so
-   these shouldn't occur — but memtables serialized by xorq
-   (`memtables/*.parquet` in a build) load back as real tables. Confirm no
-   tallyman entry can produce one, or define the composition story if it can.
+6. **`replace_sources` edge.** *Resolved (implemented):* the build already
+   rejects in-memory reads (`InMemoryReadError`), so no tallyman entry can
+   serialize a memtable, and the rebind keeps `replace_sources`'s default
+   refusal of raw `DatabaseTable` leaves — if one ever appears, the read fails
+   loudly naming the table rather than silently copying data between
+   backends. The one-content-profile guard (ADR D3) sits beside it: more than
+   one distinct backend profile in a build also fails loudly.
 7. **Eviction policy for unfaithful entries.** *Resolved (ADR D12):* pin
    non-evictable, badge via the error record; full bullpen wiring deferred.
 8. **`diff_stat_cache` ownership.** *Resolved (ADR post-acceptance):* wiped

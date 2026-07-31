@@ -436,6 +436,23 @@ class BuckarooManager:
             self._persist_sessions()
         return reloaded
 
+    def evict_session(self, content_hash: str) -> bool:
+        """Drop the cached session for one entry so its next view reloads fresh.
+
+        Used after an unfaithful self-heal (ADR D10): the entry's snapshot bytes
+        changed under a stable path, so an open session's row cache would show
+        the old rows beside freshly computed stats. Returns whether a session
+        was actually evicted. The Buckaroo-side session object is left to its
+        own idle reaping — only the hash→session mapping is dropped here, which
+        is what makes the next ``load_session`` create a new one.
+        """
+        with self._session_lock:
+            removed = self._sessions.pop(content_hash, None) is not None
+        if removed:
+            self._persist_sessions()
+            log.info("evicted buckaroo session for %s (unfaithful heal)", content_hash)
+        return removed
+
     def _clear_stat_cache(self, project: str, content_hash: str) -> None:
         """Delete cached stat parquet files for one entry.
 
@@ -550,22 +567,12 @@ class BuckarooManager:
                 "session_id": None,
                 "detail": "This entry has no xorq build to load.",
             }
-        # Materialise the entry's baked snapshot before buckaroo replays the
-        # build via /load_expr. A tracked_expr_from_alias chain off an expensive parent
-        # embeds a *bare* read of the parent's snapshot (#75 strips the parent
-        # CachedNode to keep the composed expression on one backend), so on a
-        # cold compute cache — a fresh clone, or an entry the startup warmup
-        # didn't reach — the replay reads zero rows and the grid renders empty.
-        # cached_result_expr repopulates it (idempotent; lru-cached, so a warmed
-        # entry is ~free), the same heal the paginated read (api_data) relies on.
-        # Done before the lock: a cold entry's recompute mustn't block other
-        # sessions, and a warm one is a cheap cache hit.
-        try:
-            from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
-
-            cached_result_expr(project, content_hash)
-        except Exception:
-            log.debug("snapshot self-heal before /load_expr failed for %s", content_hash, exc_info=True)
+        # No pre-heal here (ADR D4): entry builds are self-contained — a chained
+        # child's build carries its ancestors' cache nodes — so Buckaroo's replay
+        # of the build regenerates any evicted snapshot through ordinary cache
+        # mechanics on first query. The discarded-result cached_result_expr call
+        # that used to force ancestor snapshots onto disk before the replay is
+        # retired with the #75 stripping that made it necessary.
         with self._session_lock:
             cached = self._sessions.get(content_hash)
             if cached:

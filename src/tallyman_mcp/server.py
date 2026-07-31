@@ -1022,7 +1022,7 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
 
 @mcp.tool()
 @_tag_project
-def catalog_scan_staleness() -> dict:
+def catalog_scan_staleness(verify_results: bool = False) -> dict:
     """Scan every catalog entry for staleness against its recorded inputs.
 
     Read-only. An entry is *stale* when an input it was built against moved:
@@ -1034,12 +1034,20 @@ def catalog_scan_staleness() -> dict:
     and is never listed, since recomputing it re-points no alias. Use
     ``catalog_recalc`` to act.
 
+    ``verify_results=True`` additionally sweeps result faithfulness: every entry
+    with a recorded ``result_digest`` has its baked snapshot re-hashed and
+    compared. Adds a ``verify`` key — ``{results: {hash: bool|null}, unfaithful:
+    [hashes], errors: {hash: message}}`` — where ``false`` means the snapshot's
+    bytes are not what the build recorded (a nondeterministic recompute healed it
+    to different bytes). Hashes every snapshot file, so opt-in.
+
     Returns:
         stale: hashes that are directly stale (the natural recalc roots).
         transitively_stale: clean descendants carried by a stale ancestor.
         entries: ``{hash: verdict}`` for every live entry, where a verdict is
             ``{stale, live, reasons:[{axis, ref, was, now}], unknown_axes,
             transitively_stale}``.
+        verify: only when ``verify_results=True`` (see above).
     """
     project = _resolve_active_project()
     verdicts = staleness.scan(project)
@@ -1049,12 +1057,15 @@ def catalog_scan_staleness() -> dict:
     # owns its own staleness and a directly-stale follower is expected there, not
     # a bug to flag. Same classifier auto-recalc uses, so the verdict is identical.
     orphan_stale = classify_orphans(project, verdicts) if auto_recalc_enabled(project) else []
-    return {
+    out = {
         "stale": sorted(h for h, v in verdicts.items() if v.stale),
         "transitively_stale": sorted(h for h, v in verdicts.items() if v.transitively_stale),
         "entries": {h: asdict(v) for h, v in verdicts.items()},
         "orphan_stale": orphan_stale,
     }
+    if verify_results:
+        out["verify"] = staleness.verify_sweep(project)
+    return out
 
 
 @mcp.tool()

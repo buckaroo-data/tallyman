@@ -10,6 +10,7 @@ from tallyman_core.aliases import (  # noqa: I001 (keep notebook import first)
     remove_alias,
     rename_alias,
     set_alias,
+    validate_alias_name,
     version_of_hash,
 )
 from tallyman_core.charts import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
@@ -150,6 +151,7 @@ __all__ = [
     "set_alias",
     "set_chart",
     "stats_dir",
+    "validate_alias_name",
     "validate_project_name",
     "version_of_hash",
     "write_manifest",

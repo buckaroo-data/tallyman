@@ -44,6 +44,7 @@ from tallyman_core import (
     run_post_processing,
     set_alias,
     set_chart,
+    validate_alias_name,
     write_display_klass,
     write_post_processing,
     write_stat,
@@ -296,10 +297,12 @@ def catalog_run(code: str, prompt: str = "") -> dict:
       - `tallyman_read_csv("/abs/path/to/file.csv", schema=...)` reads a CSV and
         injects ``original_row_order`` so the snapshot is byte-stable across builds.
         Use this for ALL CSV ingests instead of ``xo.deferred_read_csv``.
-      - `pinned_expr_from_alias("name_or_hash")` reads a catalog entry by alias or
-        content hash and records a pinned (follow=False) parent edge. Use when you
-        want to stay on a specific version — recalc will find the entry but won't
-        advance it when the parent alias moves.
+      - `pinned_expr_from_alias(<hash or "name-vN">)` reads a catalog entry by
+        content hash or explicit version reference (e.g. "shoe_sales-v2") and
+        records a pinned (follow=False) parent edge. Use when you want to stay on
+        a specific version — recalc will find the entry but won't advance it when
+        the parent alias moves. A bare alias is rejected (#166): a pin must name
+        the same entry forever, so say which version you mean.
       - When in doubt, call `catalog_list` first. A name that looks like a file
         is often actually an alias — `read_project_file` on an alias raises
         `ProjectDataNotFound`.
@@ -613,6 +616,10 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
     project = _resolve_active_project()
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
+    try:
+        validate_alias_name(name)  # before the build — an unaliasable entry shouldn't be built
+    except ValueError as exc:
+        return {"error": str(exc)}
     out = _run_and_record(project, code, prompt, tool="catalog_create")
     if "error" in out:
         return out
@@ -738,6 +745,8 @@ def catalog_rename(old_name: str, new_name: str) -> dict:
         return {"error": f"alias {old_name!r} does not exist"}
     except AliasExists:
         return {"error": f"alias {new_name!r} already exists"}
+    except ValueError as exc:  # version-shaped name (#166)
+        return {"error": str(exc)}
     notebook.rename_alias_in_cells(project, old_name, new_name)
     _notify("alias_renamed", old=old_name, new=new_name, content_hash=info["hash"])
     _notify("notebook_changed")

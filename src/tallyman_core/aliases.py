@@ -21,6 +21,7 @@ remain in the catalog as forensic artifacts.
 from __future__ import annotations
 
 import json
+import re
 
 from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import catalog_dir, ensure_project
@@ -32,6 +33,47 @@ class AliasExists(ValueError):
 
 class AliasNotFound(KeyError):
     pass
+
+
+# "<alias>-v<N>" — the version-reference syntax pinned_expr_from_alias accepts
+# (#166), matching the V1…Vn vocabulary the UI and catalog_diff use. Alias
+# names matching it are rejected at creation/rename so a name can never
+# collide with version syntax.
+VERSION_REF_RE = re.compile(r"^(?P<name>.+)-v(?P<n>[1-9]\d*)$")
+
+
+def validate_alias_name(name: str) -> None:
+    """Raise ValueError if *name* is not a legal alias name.
+
+    Currently one rule: a name matching the version-reference syntax would
+    make ``pinned_expr_from_alias("<name>")`` ambiguous forever. The steer for
+    the common intent — a parallel take on an existing concept — is the
+    ``-o<N>`` (option) convention: distinct aliases, each with its own V1…Vn
+    history, no collision with version syntax.
+    """
+    m = VERSION_REF_RE.match(name)
+    if m:
+        raise ValueError(
+            f"alias {name!r} matches the version-reference syntax '<alias>-v<N>' "
+            f"(reserved for pinned_expr_from_alias, #166). If this is a parallel "
+            f"take on {m['name']!r}, name it {m['name'] + '-o' + m['n']!r} "
+            f"(option {m['n']}) instead."
+        )
+
+
+def resolve_version_ref(project: str, ref: str) -> str | None:
+    """Resolve ``"<alias>-v<N>"`` (1-based) against the alias history, or None.
+
+    None when *ref* is not version-shaped or names an unknown alias; an
+    out-of-range N also returns None (the caller distinguishes it via
+    ``history_for`` for a better error message).
+    """
+    m = VERSION_REF_RE.match(ref)
+    if not m:
+        return None
+    hist = history_for(project, m["name"])
+    n = int(m["n"])
+    return hist[n - 1] if 1 <= n <= len(hist) else None
 
 
 def _aliases_file(project: str):
@@ -147,6 +189,7 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
       False — error if alias DOES exist (`catalog_create`/`catalog_alias` semantics).
     """
     ensure_project(project)
+    validate_alias_name(name)
     aliases, history = _read(project)
     exists = name in aliases
     if expect_exists is True and not exists:
@@ -170,6 +213,7 @@ def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool
 
 
 def rename_alias(project: str, old_name: str, new_name: str) -> dict:
+    validate_alias_name(new_name)
     aliases, history = _read(project)
     if old_name not in aliases:
         raise AliasNotFound(old_name)

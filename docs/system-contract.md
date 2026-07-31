@@ -1,17 +1,11 @@
 # Tallyman: primitives and the system contract
 
-- **Status:** Proposed design (2026-07-30), written in response to #163. This
-  doc describes the system **as it will be** once the #163 fix lands. It is the
-  pre-grilling proposal: read it as a claim about how things should work, not a
-  description of `main`. The places where `main` currently disagrees are
-  collected in [Deviations on main today](#deviations-on-main-today), and the
-  genuinely unsettled points in [Open questions](#open-questions).
+- **Status:** Normative, implemented (PR #167, 2026-07-31). Describes the
+  system as built; where code or the descriptive docs disagree with it, the
+  disagreement is a bug. Design decisions and pre-fix history:
+  `plans/adr-read-path-loads-builds.md`.
 - **Audience:** no prior xorq knowledge assumed. The xorq section below covers
   exactly as much of xorq as the rest of the doc needs, and no more.
-- **Relation to other docs:** `architecture.md`, `caching.md`, and
-  `expression-lifecycle.md` describe the as-built system and will be corrected
-  when the fix lands. Until then, where they contradict this doc, the
-  contradiction is the bug.
 
 ## What tallyman is, in three sentences
 
@@ -74,8 +68,8 @@ refuses those unless passed an explicit transfer flag. Tallyman never passes
 it: the build forbids the authoring patterns that create such nodes
 (in-memory reads are a build error), so every leaf is a file read and the
 refusal is a loud assertion that the build gate failed, never a live copy
-path. (Whether xorq's build bundling can smuggle such a node in is
-[open question 6](#open-questions).)
+path. Beside it, rebinding fails loudly if a build ever spans more than one
+distinct backend content profile (ADR D3).
 
 ## 3. Builds: freezing an expression to disk
 
@@ -295,7 +289,7 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 | `parents` | `[{hash, ref, follow}]` — each alias reference, **resolved to the exact hash it meant at build time** |
 | `sources` | `{rel_path: digest}` — each source, pinned to the bytes read |
 | `result_digest` | SHA-256 of the baked result snapshot (worthy entries) — the output identity |
-| `snapshot_key` | the baked snapshot's cache key, recorded at build (new; see write path) |
+| `snapshot_key` | the baked snapshot's cache key, recorded at build (see write path) |
 | `cache_worthy`, `cache_worthy_why`, `cache_bytes` | the worthiness verdict and its evidence |
 | `row_count`, `execute_seconds`, `compile_seconds`, timings | build measurements |
 
@@ -348,8 +342,10 @@ of the build, in any process, reads through the same snapshot key.
 ## Result digest
 
 For worthy entries, the build records `result_digest`: the SHA-256 of the
-baked snapshot file, taken over a canonically-ordered materialization (so an
-engine's parallel-scan row reshuffling cannot move it — see write path). It is
+baked snapshot file, taken over a canonically-ordered materialization so an
+engine's parallel-scan row reshuffling cannot move it — the worthiness
+rewrite sorts by the author's own `order_by` keys, then `original_row_order`,
+then the remaining sortable columns (ADR D5). It is
 the **output** identity axis, and it has exactly one job: witnessing that a
 later rematerialization reproduced the original bytes. It is never a
 staleness input (an entry whose recompute differs is *nondeterministic*, not
@@ -415,14 +411,13 @@ read(project, content_hash, cache_dir=<project compute cache>):
   the warm read. That property is the standing regression test for every
   read-path change.
 
-`cached_result_expr(project, hash)` remains as the function every in-process
-consumer calls, but it is demoted to an optimization: it performs the
-canonical read once per `(project, content_hash)` and keeps the loaded
+`cached_result_expr(project, hash)` is the function every in-process consumer
+calls, and it is an optimization over the canonical read, nothing more: it
+performs the read once per `(project, content_hash)` and keeps the loaded
 expression in a bounded in-process LRU, so repeated reads (every pagination
 request, both sides of a diff) skip the load. Removing it must change latency
-and nothing else. That is what finally makes its key honest: the cached value
-is a pure function of the frozen build the key names, where today the same
-key stores a value that depends on live alias state. The per-call
+and nothing else. That is what makes its key honest: the cached value is a
+pure function of the frozen build the key names. The per-call
 snapshot-existence check and the single-flighted heal stay outside the LRU,
 because file existence is the one input that remains mutable (eviction).
 
@@ -500,9 +495,11 @@ entry's frozen build reproduces its recorded `result_digest`.* It runs in
 production, not only in tests:
 
 - on every self-heal (a healed snapshot is checked before it is served);
-- on demand, corpus-wide, via the staleness-scan surface.
+- on demand, corpus-wide, via `catalog_scan_staleness(verify_results=True)`.
 
-A failure is surfaced loudly (event log / UI, not a perf logger), and its
+A failure is surfaced loudly — a durable `unfaithful_heal` record in
+`errors.jsonl` (the UI badge and ADR D12's non-evictable marking), a stat
+cache wipe, session eviction, an SSE event — never only a log line. Its
 attribution has three classes with three different fixes:
 
 | class | detector | meaning | response |
@@ -514,33 +511,32 @@ attribution has three classes with three different fixes:
 The third row is the point of the whole design: with reads going through the
 build, lineage drift has no mechanism left.
 
-[^preheal]: This replaces a two-layer workaround on `main`. There, chaining
-    strips the parent's cache node down to a bare file read of its snapshot
-    (the #75 single-backend fix), so the child's build points at a parquet
-    without knowing the file is regenerable — evict the snapshot and the
-    child reads nothing. To compensate, the companion calls
+[^preheal]: This replaced a two-layer workaround. Before the #163 fix,
+    chaining stripped the parent's cache node down to a bare file read of its
+    snapshot (the #75 single-backend fix), so the child's build pointed at a
+    parquet without knowing the file was regenerable — evict the snapshot and
+    the child read nothing. To compensate, the companion called
     `cached_result_expr` on an entry just before handing its build to
-    Buckaroo and discards the result: the call exists only for its side
-    effect, which is that reconstructing the entry walks its recipe chain and
-    forces any missing ancestor snapshots onto disk in time for Buckaroo's
-    replay. Under this design the stripping and the pre-heal call are both
-    deleted.
+    Buckaroo and discarded the result: the call existed only for its side
+    effect, forcing any missing ancestor snapshots onto disk in time for
+    Buckaroo's replay. The stripping and the pre-heal call were both deleted
+    with the fix.
 
-[^recon]: The subsystem being demoted: `_recipe_expr` re-imports an entry's
+[^recon]: The subsystem the fix demoted: `_recipe_expr` re-imports an entry's
     `expr.py` to recover its expression, patching over the recipe's
     name-binding with context variables for the duration of the import.
     `_RECON_SOURCES` carries the entry's recorded `{path: digest}` map so
-    that `read_project_file`, when called inside a reconstruction, resolves
+    that `read_project_file`, when called inside such a re-import, resolves
     each source to its frozen `.cas/<digest>` clone instead of re-digesting
-    the live file (#115). #162 proposed a `_RECON_PARENTS` sibling to pin
-    parent aliases to their recorded hashes the same way, and
-    `_resolve_noncyclic_hash` walks a self-referencing alias back to its
-    previous version to break read-time cycles (#74). Each hook re-derives at
-    read time a binding the frozen build already contains, which is why the
-    fix retires them rather than adding a fourth. The diagnostic use stays:
-    `recipe_is_structurally_nondeterministic` re-derives the hash from the
-    recipe on purpose, because re-running the recipe is exactly how you
-    detect that a recipe fails to reproduce its own graph.
+    the live file (#115), and `_resolve_noncyclic_hash` walks a
+    self-referencing alias back to its previous version to break re-import
+    cycles (#74). Each hook re-derives a binding the frozen build already
+    contains, which is why the fix retired their read-time role (and #162's
+    proposed `_RECON_PARENTS` sibling was never built) rather than adding a
+    fourth. The diagnostic use stays, and is the only reason the machinery
+    still exists: `recipe_is_structurally_nondeterministic` re-derives the
+    hash from the recipe on purpose, because re-running the recipe is exactly
+    how you detect that a recipe fails to reproduce its own graph.
 
 ---
 
@@ -576,87 +572,12 @@ wrong even if every test passes.
 
 ---
 
-# Deviations on main today
+# History
 
-As of `main` @ d7e0867 — the gap PR #167 closes (all tracked in #163):
-
-- No in-process consumer loads the build; the only `load_expr` call in the
-  codebase is at build time (`build.py:496`). Every in-process read
-  (`cached_result_expr` and its ~14 consumers: diff, `/api/data`,
-  post-processing, primary-key inference, promote-diff, warmup) re-imports
-  `expr.py`; only Buckaroo's out-of-process grid reads the build. I3 broken.
-- `tracked_expr_from_alias` resolves live heads inside reconstruction
-  (`io.py:686`), so historical entries materialize against today's parents;
-  the `(project, content_hash)` LRU asserts an immutability its value lacks.
-  I1/I4 broken.
-- The self-heal manufactures: a wrong snapshot key heals by executing the
-  live-head expression and serving the result under the historical hash
-  (`result_cache.py:557`). I2 broken.
-- No cold seam: `cached_result_expr` bakes an absolute snapshot path and
-  accepts no cache-dir override, so I2's regression test cannot be written.
-- `verify_result_faithful` has no caller in `src/`, and locates the snapshot
-  through today's alias state. I4 (verification) unmet.
-- The manifest records no snapshot key; build and read derive the snapshot
-  path independently through different routes, which is how they came to
-  disagree silently.
-- The canonical-ordering claim behind `result_digest` is implemented only for
-  CSV ingest (`original_row_order` via `tallyman_read_csv`); `build.py`'s
-  comments claim a sort-before-bake that does not exist, so parquet-sourced
-  worthy entries can show digest drift from engine scan order alone — false
-  positives in the one audit signal I1 leans on.
-- Worthy parents are chained by *stripping* their cache node to a bare
-  snapshot read (#75 workaround), which is why `ensure_session` pre-heals
-  parents before Buckaroo loads; under this proposal the cache node stays in
-  the child's graph and the pre-heal retires.
-- `diff_stat_cache/` has no invalidation path in `src/`; its current contents
-  were computed over #163's self-join diffs. Wipe it when the fix lands.
-
-Existing catalogs are affected but rebuildable; per project policy there is no
-migration path — rebuild the corpus.
-
-Beyond #163's axis, a full audit of the same bug class (mutable state behind
-immutable keys — the project binding, CSV ingest identity, primary-key
-lineage, and Buckaroo's own caches) is in
-[`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md). The
-contract's rules apply to those axes too; the audit is the worklist.
-
-# Open questions
-
-For the grilling session; none block understanding the design, all block
-calling it finished:
-
-1. **Canonical ordering for parquet-sourced bakes.** *Resolved (ADR D5,
-   amended):* originally scoped to CSV with advisory warnings, but the #171
-   probe showed the drift fires on every heal at scale (3 heals, 3 distinct
-   digests), so the escape clause was exercised: the worthiness rewrite
-   imposes a sort-by-all-columns total order under the result-cache node
-   (author's `order_by` keys first, then `original_row_order`, then the rest),
-   making every worthy bake byte-deterministic. The probe is now a regression
-   test pinning byte-equality across heals.
-2. **Nested cache-node rebase.** *Resolved (implemented):*
-   `portable.rewrite_cache_dirs` runs the storage rewrite through xorq's
-   `replace_nodes` (which descends `CachedNode.parent`), and the canonical
-   read applies it after every `load_expr`. xorq's shallow rewrite still runs
-   first via `load_expr(cache_dir=…)`; the deep pass is idempotent over what
-   it already fixed.
-3. **Child hashes change.** *Resolved (ADR D1/D4):* accepted — the read-path
-   fix, chaining inline, and digest re-scope land in one PR followed by one
-   corpus rebuild.
-4. **Cheap entries have no digest.** *Resolved (ADR D9):* they stay
-   digest-free — with reads loading builds, their bytes are deterministic by
-   construction, so the audit would have nothing to catch.
-5. **Fallback scope.** *Resolved (ADR D6):* there is no fallback. A missing
-   or unloadable build is a hard error; recipe re-execution survives only in
-   minting and the structural-nondeterminism diagnostic.
-6. **`replace_sources` edge.** *Resolved (implemented):* the build already
-   rejects in-memory reads (`InMemoryReadError`), so no tallyman entry can
-   serialize a memtable, and the rebind keeps `replace_sources`'s default
-   refusal of raw `DatabaseTable` leaves — if one ever appears, the read fails
-   loudly naming the table rather than silently copying data between
-   backends. The one-content-profile guard (ADR D3) sits beside it: more than
-   one distinct backend profile in a build also fails loudly.
-7. **Eviction policy for unfaithful entries.** *Resolved (ADR D12):* pin
-   non-evictable, badge via the error record; full bullpen wiring deferred.
-8. **`diff_stat_cache` ownership.** *Resolved (ADR post-acceptance):* wiped
-   at the fix's landing and wired into reset invalidation; size caps
-   deferred.
+This contract began as the proposed design for the #163 fix; the pre-fix
+deviations and the decisions that settled the design (D1–D12) are in
+[`plans/adr-read-path-loads-builds.md`](../plans/adr-read-path-loads-builds.md).
+The wider audit of the same bug class is
+[`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
+(#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes
+too.

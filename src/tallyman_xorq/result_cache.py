@@ -1,20 +1,29 @@
 """xorq-backed result cache for catalog entries, gated by a structural rubric.
 
-The entry's *expression* (its portable ``xorq_build``) is the source of truth.
-Whether we keep a materialised copy of its result depends on how expensive the
+The entry's frozen build (``xorq_build/``) is the source of truth, and **every
+read loads it** — ``ensure_expanded_build`` → ``load_expr(cache_dir=…)`` → the
+deep cache-dir rewrite (``portable.rewrite_cache_dirs``). This is the canonical
+read of ``docs/system-contract.md`` (#163): a content hash names the fixed
+result its build freezes, so reads never re-import ``expr.py`` — recipe
+re-execution happens only at minting (build / revise / recalc) and in the
+structural-nondeterminism diagnostic below. A missing or unloadable build is a
+hard error (ADR D6), never a fallback.
+
+Whether we keep a materialised copy of the result depends on how expensive the
 computation is — caching only pays off when recompute costs far more than
 reading a cached parquet:
 
   * Expensive entries — the expression contains an Aggregate / Join / Sort /
     window / UDF — are materialised in xorq's ``ParquetSnapshotCache``.  Reads
-    hit the cache; a deleted cache file self-heals by recomputing from the
-    build.
+    hit the cache; a deleted cache file self-heals by re-executing the frozen
+    build, and the healed bytes are verified against the recorded
+    ``result_digest`` before they are served (ADR D7/D10).
   * Cheap entries — a source read plus projections / renames / row-wise scalar
     math (the citibike column-reorder/derive case) — materialise nothing (#73).
     Recompute ≈ re-reading a columnar source (pushdown), so a stored copy would
     burn work and storage for ~no savings; a non-parquet source's parse is
     already cached (see ``tallyman_xorq.source_cache``).  Reads of a cheap entry
-    recompute the expression directly — no per-entry ``result.parquet`` is ever
+    execute the loaded build directly — no per-entry ``result.parquet`` is ever
     written, on demand or otherwise. Every consumer (the viewer, paginated
     reads, diffs, post-processing) reads ``cached_result_expr``.
 
@@ -39,6 +48,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
@@ -251,25 +261,139 @@ def _cached_node_path(baked) -> Path | None:
     return Path(node.cache.storage.get_path(node.cache.calc_key(node.parent)))
 
 
+def load_entry_expr(project: str, content_hash: str):
+    """Load the entry's frozen build as a live expression — the canonical read (#163).
+
+    ``ensure_expanded_build`` → ``load_expr(expanded, cache_dir=compute_cache)``
+    → ``rewrite_cache_dirs`` (the deep rewrite xorq's shallow load-time one
+    misses for nested cache nodes, ADR D4). The build binds by value — parents
+    inlined, sources as content-pinned paths — so the returned expression is the
+    entry's fixed computation regardless of where alias heads sit today.
+
+    A missing or unloadable build raises ``BuildError`` naming the entry and the
+    remedy (ADR D6). There is no recipe fallback: ``expr.py`` binds by name and
+    re-executing it is how #163's lineage drift happened.
+    """
+    from xorq.ibis_yaml.compiler import load_expr
+
+    from tallyman_core.paths import (
+        compute_cache_dir,
+        entry_build_dir,
+        entry_expanded_build_dir,
+        project_dir,
+    )
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.portable import ensure_expanded_build, rewrite_cache_dirs
+
+    build_dir = entry_build_dir(project, content_hash)
+    if not (build_dir / "expr.yaml").is_file():
+        raise BuildError(
+            f"entry {content_hash} in {project!r} has no loadable xorq_build/ "
+            f"(expected {build_dir / 'expr.yaml'}). The frozen build is the read "
+            "path's only source of truth — rebuild the entry (catalog_revise / "
+            "catalog_recalc) to restore it; reads never fall back to expr.py."
+        )
+    cache_dir = compute_cache_dir(project)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        expanded = ensure_expanded_build(
+            build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash)
+        )
+        loaded = load_expr(expanded, cache_dir=cache_dir)
+        return rewrite_cache_dirs(loaded, cache_dir)
+    except Exception as exc:
+        raise BuildError(
+            f"entry {content_hash} in {project!r}: loading its frozen build failed "
+            f"({type(exc).__name__}: {exc}) — rebuild the entry (catalog_revise / catalog_recalc)"
+        ) from exc
+
+
+def _profile_content_token(backend) -> str:
+    """A backend profile's content identity: its tokenized dict minus ``idx``.
+
+    ``Profile.idx`` is a process-local counter (creation-order noise), so two
+    backends are the same *kind* of connection exactly when their idx-stripped
+    profiles tokenize identically — the equality ``Profile.__eq__`` itself uses.
+    """
+    import toolz
+    from xorq.common.utils.dasher import tokenize
+
+    return tokenize(toolz.dissoc(backend._profile.as_dict(), "idx"))
+
+
+def _rebind_to_default_backend(expr):
+    """Collapse every backend in a loaded build onto the process default backend.
+
+    ``load_expr`` mints fresh backend objects per profile, so two loaded builds —
+    or a loaded build and a recipe's ``read_project_file`` — span distinct
+    backend objects and composition raises "Multiple backends found". The
+    contract allows the collapse because every profile in a tallyman build is
+    content-identical no-arg ``xorq_datafusion``; that assumption is enforced
+    here (ADR D3): more than one distinct content profile fails loudly rather
+    than misbinding a node onto the wrong kind of connection. A raw
+    ``DatabaseTable`` (bundled data that would need a copy) also fails loudly —
+    ``replace_sources`` raises unless told to transfer, and tallyman builds must
+    never contain one (in-memory reads are rejected at build).
+    """
+    from xorq.common.utils.graph_utils import find_all_sources, replace_sources
+    from xorq.config import default_backend
+
+    target = default_backend()
+    others = [s for s in find_all_sources(expr) if s is not target]
+    if not others:
+        return expr
+    tokens = {_profile_content_token(s) for s in (*others, target)}
+    if len(tokens) > 1:
+        from tallyman_xorq.build import BuildError
+
+        raise BuildError(
+            f"loaded build spans {len(tokens)} distinct backend content profiles; "
+            "rebinding onto the default backend would misbind — every profile in a "
+            "tallyman build must be content-identical no-arg xorq_datafusion (ADR D3)"
+        )
+    return replace_sources({id(s): target for s in others}, expr)
+
+
+def _assert_recorded_snapshot_key(project: str, content_hash: str, path: Path) -> None:
+    """ADR D8 tripwire: the read's snapshot derivation must match the build's.
+
+    The build records the baked snapshot's filename (``manifest.snapshot_key``);
+    the canonical read asserts its own derivation lands on the same file. With
+    both sides sharing one derivation route the original disagreement mechanism
+    is gone — a mismatch means an xorq tokenization change or a rewrite drift,
+    and reading on would serve the wrong file silently. Manifests without the
+    field (mid-rebuild corpus) are skipped.
+    """
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        recorded = read_manifest(entry_dir(project, content_hash)).snapshot_key
+    except (OSError, ValueError):
+        return
+    if recorded is None or path.name == recorded:
+        return
+    from tallyman_xorq.build import BuildError
+
+    raise BuildError(
+        f"entry {content_hash} in {project!r}: the read derives snapshot key "
+        f"{path.name!r} but the build recorded {recorded!r} — the two derivations "
+        "have diverged (an xorq upgrade or a rewrite drift); rebuild the entry "
+        "rather than read the wrong snapshot"
+    )
+
+
 def baked_snapshot_path(project: str, content_hash: str) -> Path | None:
     """Path of the entry's baked result-cache snapshot, or None if it bakes none.
 
-    Mirrors ``cached_result_expr``'s derivation — re-import the recipe, rewrite
-    it for build, read the top-level ``CachedNode``'s storage path — so it names
-    the very file a cold read returns. None for a cheap entry (bakes nothing), a
-    worthiness disagreement, or salt mode (bakes no cache — see
-    ``rewrite_for_build``). The build uses it to size the snapshot (#87, the
-    value-per-byte denominator); other callers use it to find the snapshot
-    without reconstructing the read expression.
+    Derived from the entry's *loaded build* — the same derivation
+    ``cached_result_expr`` serves and the build recorded — so it names the very
+    file a cold read returns. None for a cheap entry (bakes nothing), a
+    worthiness disagreement, or a build written under salt mode (no cache node —
+    see ``rewrite_for_build``). Raises like ``load_entry_expr`` when the build is
+    missing (ADR D6).
     """
-    from tallyman_xorq import source_identity as si
-
-    if si.mode() == "salt" or not cache_worthy(project, content_hash):
-        return None
-
-    from tallyman_xorq.source_cache import rewrite_for_build
-
-    return _cached_node_path(rewrite_for_build(_recipe_expr(project, content_hash), project))
+    return _resolve_result_plan(project, content_hash).path
 
 
 def snapshot_file_digest(path: Path) -> str:
@@ -317,18 +441,19 @@ def _recorded_result_digest(project: str, content_hash: str) -> str | None:
 
 
 def verify_result_faithful(project: str, content_hash: str) -> bool | None:
-    """Whether the entry's baked snapshot matches its build-time digest.
+    """Whether executing this entry's frozen build reproduces its recorded digest.
 
-    Only meaningful for worthy (snapshot-baking) entries: returns True when the
-    snapshot file's SHA-256 matches the recorded ``result_digest``, False on
-    drift, and None when no digest was recorded (cheap entry, or built before
-    the canonical-order ADR — ``adr-result-digest-canonical-ordering.md``).
-    Cheap entries record no digest, so this always returns None for them.
+    Re-anchored by ADR D7: the snapshot is located through the entry's *own
+    loaded build* — never today's alias state — so the verdict is about this
+    entry's bytes, not a sibling's. Returns True when the snapshot file's
+    SHA-256 matches the recorded ``result_digest``, False on drift, and None
+    when there is nothing to check (no recorded digest — a cheap entry — or no
+    snapshot on disk yet; a cold entry heals on its next read, which verifies).
     """
     recorded = _recorded_result_digest(project, content_hash)
     if not recorded:
         return None
-    snap = baked_snapshot_path(project, content_hash)
+    snap = _resolve_result_plan(project, content_hash).path
     if snap is None or not snap.exists():
         return None
     return snapshot_file_digest(snap) == recorded
@@ -398,20 +523,34 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
     return a is not None and b is not None and a != b
 
 
-def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -> None:
-    """Compare a just-repopulated snapshot to the build-time digest, warn on drift.
+# Called (project, content_hash) after an UNFAITHFUL self-heal, best-effort.
+# The companion registers a hook that evicts the entry's Buckaroo session and
+# pushes the SSE badge event (ADR D7/D10); processes without an SSE bus (the
+# MCP server) still get the durable errors.jsonl record written below.
+UNFAITHFUL_HEAL_HOOKS: list = []
+
+
+def _verify_self_heal(project: str, content_hash: str, path: Path) -> None:
+    """Verify a just-repopulated snapshot against the build-time digest (ADR D7).
 
     Eviction's load-bearing assumption is that an evicted snapshot recomputes to
-    what was evicted (the result-cache + source-identity ADRs both call this out).
-    For an execution-nondeterministic entry that is false: the snapshot self-heals
-    to *different* bytes, silently. This fires the soundness signal — a
-    ``tallyman.perf`` warning — without ever breaking the read (best-effort),
-    attributing the drift as structural (#88: the recipe's graph hash itself moves)
-    vs execution (#83: a fixed graph that runs differently).
+    what was evicted. A faithful heal is byte-identical (the canonical sort makes
+    the bake deterministic); a mismatch means this entry's recompute is genuinely
+    nondeterministic and the heal just manufactured different bytes under the
+    entry's recorded hash. The read is still served — the bytes are the honest
+    output of the frozen build — but never silently:
 
-    The digest is now the SHA-256 of the snapshot file bytes (ADR
-    ``adr-result-digest-canonical-ordering.md``), so we hash the newly-landed
-    file directly — no extra expression execution.
+      * a ``tallyman.perf`` UNFAITHFUL warning, attributing the drift as
+        structural (#88: the recipe's graph hash itself moves) vs execution
+        (#83: a fixed graph that runs differently);
+      * a durable ``errors.jsonl`` record (``code="unfaithful_heal"``) — the UI
+        badge's source, and the ADR D12 pin marking (the entry's bytes are not
+        regenerable, so eviction machinery must treat its snapshot as retained,
+        not reclaimable);
+      * the entry's ``.buckaroo_stat_cache`` is wiped (ADR D10): Buckaroo's
+        summary stats key on expression structure and stable paths
+        (buckaroo#955), so stale stats would render beside the fresh rows;
+      * registered hooks fire (companion: session eviction + SSE).
     """
     recorded = _recorded_result_digest(project, content_hash)
     if not recorded:
@@ -420,31 +559,73 @@ def _warn_if_self_heal_unfaithful(project: str, content_hash: str, path: Path) -
         actual = snapshot_file_digest(path)
     except Exception:
         return
-    if actual != recorded:
-        kind = (
-            "structural (#88) — the recipe bakes a nondeterministic literal that re-derives a different graph hash"
-            if recipe_is_structurally_nondeterministic(project, content_hash)
-            else "execution (#83) — a fixed graph that runs differently each execute, or source drift under off"
+    if actual == recorded:
+        return
+    kind = (
+        "structural (#88) — the recipe bakes a nondeterministic literal that re-derives a different graph hash"
+        if recipe_is_structurally_nondeterministic(project, content_hash)
+        else "execution (#83) — a fixed graph that runs differently each execute, or source drift under off"
+    )
+    perf_log.warning(
+        "cached_result_expr self-heal %s: UNFAITHFUL recompute [%s] — result "
+        "digest %s != recorded %s; eviction self-healed it to different bytes "
+        "than were built",
+        content_hash,
+        kind,
+        actual,
+        recorded,
+    )
+    import shutil
+
+    from tallyman_core.paths import entry_stat_cache_dir
+
+    shutil.rmtree(entry_stat_cache_dir(project, content_hash), ignore_errors=True)
+    try:
+        from tallyman_core.errors import record_error
+
+        record_error(
+            project,
+            code="unfaithful_heal",
+            message=(
+                f"self-heal produced different bytes than were built [{kind}]: "
+                f"digest {actual} != recorded {recorded}"
+            ),
+            hash=content_hash,
         )
-        perf_log.warning(
-            "cached_result_expr self-heal %s: UNFAITHFUL recompute [%s] — result "
-            "digest %s != recorded %s; eviction self-healed it to different bytes "
-            "than were built",
-            content_hash,
-            kind,
-            actual,
-            recorded,
-        )
+    except Exception:
+        perf_log.debug("unfaithful-heal error record failed for %s", content_hash, exc_info=True)
+    for hook in list(UNFAITHFUL_HEAL_HOOKS):
+        try:
+            hook(project, content_hash)
+        except Exception:
+            perf_log.debug("unfaithful-heal hook failed for %s", content_hash, exc_info=True)
+
+
+class _ResultPlan(NamedTuple):
+    """How an entry's result is read, resolved once from its frozen build.
+
+    ``loaded`` is the build as ``load_entry_expr`` returned it — per-load backend
+    objects, exactly the expression shape the build executed, so a heal re-runs
+    the build's own computation. ``graph`` is the same graph rebound onto the
+    process default backend (ADR D3) — the composable form chaining and cheap
+    reads serve. ``path`` is the baked snapshot's location, None when the build
+    bakes none (cheap entry, worthiness disagreement, or a salt-mode build).
+    """
+
+    kind: str  # "baked" | "recompute"
+    loaded: object
+    graph: object
+    path: Path | None
 
 
 @functools.lru_cache(maxsize=256)
-def _resolve_result_plan(project: str, content_hash: str):
-    """The expensive, memoisable half of ``cached_result_expr``: reconstruct the
-    recipe and decide how the entry's result is read. Returns either
-    ``("recompute", expr)`` for a cheap/fallback entry, or ``("baked", baked, path)``
-    for an expensive entry whose snapshot ``cached_result_expr`` re-checks on every
-    call (so a snapshot evicted *after* a warm read still self-heals rather than
-    returning a dangling ``deferred_read_parquet``).
+def _resolve_result_plan(project: str, content_hash: str) -> _ResultPlan:
+    """The expensive, memoisable half of ``cached_result_expr``: load the entry's
+    frozen build and decide how its result is read. The LRU is sound because its
+    key finally determines its value — the build is immutable and the plan is a
+    pure function of it. ``cached_result_expr`` re-checks the snapshot's on-disk
+    presence on every call, so a snapshot evicted *after* a warm read still
+    self-heals rather than returning a dangling ``deferred_read_parquet``.
     """
     t0 = time.monotonic()
 
@@ -456,26 +637,19 @@ def _resolve_result_plan(project: str, content_hash: str):
             (time.monotonic() - t0) * 1000,
         )
 
-    raw = _recipe_expr(project, content_hash)
-    if not cache_worthy(project, content_hash):
-        _cold("cheap-recompute")
-        return ("recompute", raw)
-
-    # Expensive: locate the baked snapshot via the same rewrite the build used.
-    # rewrite_for_build wraps the expression in a ParquetSnapshotCache whose
-    # structural key matches the file baked at build time, so storage/calc_key
-    # give its on-disk path without re-executing.
-    from tallyman_xorq.source_cache import rewrite_for_build
-
-    baked = rewrite_for_build(raw, project)
-    path = _cached_node_path(baked)
+    loaded = load_entry_expr(project, content_hash)
+    graph = _rebind_to_default_backend(loaded)
+    path = _cached_node_path(loaded)
     if path is None:
-        # classify_build (serialized) and _is_worthy_expr (live) disagreed — fall
-        # back to recompute rather than dereference a cache that wasn't baked.
-        _cold("worthy-recompute-fallback")
-        return ("recompute", raw)
+        # No baked result cache in the build: a cheap entry, a
+        # classify_build/_is_worthy_expr disagreement, or a salt-mode build
+        # (rewrite_for_build bakes no cache under salt). Execute the frozen
+        # graph directly.
+        _cold("cheap-recompute")
+        return _ResultPlan("recompute", loaded, graph, None)
+    _assert_recorded_snapshot_key(project, content_hash, path)
     _cold("baked-read")
-    return ("baked", baked, path)
+    return _ResultPlan("baked", loaded, graph, path)
 
 
 # Per-(project, content_hash) locks serialise the snapshot heal in cached_result_expr
@@ -499,54 +673,53 @@ def _heal_lock(project: str, content_hash: str) -> threading.Lock:
 def cached_result_expr(project: str, content_hash: str):
     """The entry's result as a single-backend expression on the default backend.
 
-    Reconstituting a catalog entry for chaining (``tracked_expr_from_alias``) or diffing
-    must yield an expression rooted on the *one* in-process backend, so two
-    entries combined in a ``union`` / ``join`` resolve to a single backend
-    instead of raising "Multiple backends found" (#75). #73's predecessor loaded
-    each entry's build into its own backend, so any composition spanned two.
-    Both paths below root on the default backend and materialise no entry
-    ``result.parquet``:
+    Both paths below serve the entry's *frozen build* (``load_entry_expr``),
+    root on the default backend, and materialise no entry ``result.parquet``:
 
-      * Cheap entry — re-import its recipe (``expr.py``) and hand back the live
-        expression. Recompute on read is ~free (pushdown over a columnar source;
-        a non-parquet parse is cached at the read), and the recipe binds to the
-        default backend.
+      * Cheap entry — the loaded build's graph, rebound onto the default backend
+        (ADR D3). Recompute on read is ~free (pushdown over content-pinned
+        columnar sources; a non-parquet parse is cached at the read), and the
+        graph is frozen, so the bytes are the entry's recorded result — never
+        today's alias heads.
       * Expensive entry — read its baked ``result_cache`` snapshot directly as a
         single ``deferred_read_parquet`` on the default backend. The snapshot was
         materialised when the entry built (``rewrite_for_build``'s top-level
-        result cache); reading it skips re-running the DAG *and* keeps the cache
-        node's own backend out of the caller's expression (a baked
-        ``CachedNode`` carries its own storage connection, which is the second
-        backend #73 tripped over). Self-heals: an evicted snapshot is recomputed
-        once via the cache node, then read.
+        result cache); reading it skips re-running the DAG and keeps the cache
+        node's own storage connection out of the caller's expression. Self-heals:
+        an evicted snapshot is re-executed once *from the frozen build*, verified
+        against the recorded digest (ADR D7), then read.
+
+    For composition that must stay self-healing — chaining a child recipe off
+    this entry — use ``entry_graph_expr`` instead: it returns the graph with the
+    cache node still in place, so the child's build carries its parents' healing
+    knowledge (ADR D4).
 
     Bounded LRU so the cache can't grow without limit; entries are
-    content-addressed, so an evicted hash rebuilds an identical expression.
+    content-addressed and builds immutable, so an evicted hash reloads an
+    identical expression.
 
-    salt source-identity mode bakes no cache (path-only snapshot keys would
+    A salt-mode build carries no cache nodes (path-only snapshot keys would
     collide across salted entries — see ``rewrite_for_build``), so a salted entry
-    falls through to recompute: a cheap one via ``cheap-recompute``, an expensive
-    one via ``worthy-recompute-fallback`` (its ``rewrite_for_build`` returns the
-    expression uncached under salt, so there is no snapshot to dereference). Both
-    are single-backend recompute expressions — content-honest, no parquet.
+    falls through to the recompute path — single-backend, content-honest, no
+    parquet.
 
-    The expensive reconstruction is memoised in ``_resolve_result_plan``; the
-    snapshot's on-disk presence is re-checked HERE on every call, so an expensive
-    entry whose snapshot is evicted *after* a warm read self-heals on the next
-    read instead of handing back a stale ``deferred_read_parquet`` (which would
+    The build load is memoised in ``_resolve_result_plan``; the snapshot's
+    on-disk presence is re-checked HERE on every call, so an expensive entry
+    whose snapshot is evicted *after* a warm read self-heals on the next read
+    instead of handing back a stale ``deferred_read_parquet`` (which would
     ``ValueError: At least one path is required`` at execute time). The
     perf-namespace cold-read tag (#87) is emitted from the memoised half, so it
-    still fires once per genuine reconstruct.
+    still fires once per genuine load.
     """
     from xorq.expr.api import deferred_read_parquet
 
     plan = _resolve_result_plan(project, content_hash)
-    if plan[0] == "recompute":
-        return plan[1]
-    _, baked, path = plan
+    if plan.kind == "recompute":
+        return plan.graph
+    path = plan.path
     if not path.exists():
         # Single-flight the heal per (project, content_hash). _resolve_result_plan is
-        # lru-cached, so concurrent cold readers share one `baked` op; without this lock
+        # lru-cached, so concurrent cold readers share one loaded op; without this lock
         # both miss the evicted snapshot and both execute it, and the loser raises —
         # DataFusion "Already borrowed" on the shared in-process op, or FileNotFoundError
         # on xorq ParquetStorage's fixed <key>.parquet.tmp across processes — surfacing
@@ -554,7 +727,10 @@ def cached_result_expr(project: str, content_hash: str):
         with _heal_lock(project, content_hash):
             if not path.exists():  # a peer thread may have healed it while we waited
                 try:
-                    baked.count().execute()  # evicted snapshot: repopulate once, then read
+                    # Evicted snapshot: re-execute the frozen build once, then read.
+                    # plan.loaded is the exact expression shape the build executed,
+                    # so a faithful heal lands byte-identical parquet.
+                    plan.loaded.count().execute()
                 except (FileNotFoundError, ValueError):
                     # A peer *process* (MCP build vs companion heal sharing compute_cache)
                     # can win the shared-tmp rename out from under us. If the snapshot
@@ -562,11 +738,24 @@ def cached_result_expr(project: str, content_hash: str):
                     if not path.exists():
                         raise
                 perf_log.debug("cached_result_expr self-heal %s: evicted-self-heal", content_hash)
-                # The repopulated snapshot must match the digest recorded at build; a
-                # mismatch means this entry's recompute is execution-nondeterministic and
-                # eviction just served different bytes than were built (#83).
-                _warn_if_self_heal_unfaithful(project, content_hash, path)
+                _verify_self_heal(project, content_hash, path)
     return deferred_read_parquet(str(path))
+
+
+def entry_graph_expr(project: str, content_hash: str):
+    """The entry's frozen graph — cache nodes included — on the default backend.
+
+    The chaining primitive behind ``tracked_expr_from_alias`` /
+    ``pinned_expr_from_alias`` (ADR D4). Where ``cached_result_expr`` serves a
+    worthy entry as a bare read of its snapshot file (fast, but a file reference
+    with no regeneration knowledge), this returns the loaded build itself: the
+    entry's ``CachedNode`` stays in the graph, so a child recipe built over it
+    freezes its parents' healing knowledge into its own build — a cold load of
+    the child regenerates ancestor snapshots through ordinary cache mechanics,
+    with no pre-heal choreography. Rebound onto the process default backend so
+    it composes with ``read_project_file`` and other entries as one backend.
+    """
+    return _resolve_result_plan(project, content_hash).graph
 
 
 # Existing callers clear the result-expr memo via cached_result_expr.cache_clear()

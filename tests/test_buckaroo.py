@@ -336,20 +336,23 @@ def test_unit_ensure_session_cache_worthy_serves_recipe_no_result_parquet(
     assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
 
 
-def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, orders_parquet, monkeypatch):
-    """ensure_session must materialise an entry's baked snapshot before POSTing
-    to ``/load_expr``, so the buckaroo grid isn't empty on a cold compute cache.
+def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, orders_parquet, monkeypatch):
+    """The build ensure_session posts must feed a cold grid with no pre-heal.
 
-    The build buckaroo replays embeds a *bare* read of an expensive parent's
-    snapshot (a ``tracked_expr_from_alias`` chain — #75 strips the parent ``CachedNode`` to
-    keep the composed expression on one backend). On a cold cache (fresh clone /
-    not-yet-warmed entry) that read resolves to zero files, so the grid renders
-    empty — the same zero-row symptom as the unexpanded-build_dir case above, a
-    different cause. ensure_session must self-heal it first
-    (``cached_result_expr`` repopulates the snapshot), the same heal the
-    paginated REST read (api_data) relies on.
+    Historically ensure_session pre-executed ``cached_result_expr`` before the
+    ``/load_expr`` POST: chaining stripped an expensive parent's ``CachedNode``
+    to a *bare* snapshot read (#75), so on a cold compute cache the replay read
+    zero files and the grid rendered empty unless something healed first. Under
+    ADR D4 the pre-heal is deleted and the guarantee moves into the artifact:
+    the child's build carries the parent's cache node, so Buckaroo's replay of
+    the posted build regenerates the snapshot itself through ordinary cache
+    mechanics. This pins both halves at the same seam: the POST goes out with
+    the cache still cold (no discarded-result pre-execution), and replaying the
+    posted build dir yields the rows and lands the parent snapshot on disk.
     """
     import shutil
+
+    from xorq.ibis_yaml.compiler import load_expr
 
     from tallyman_core.paths import compute_cache_dir
     from tallyman_mcp.server import catalog_create
@@ -362,13 +365,15 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
     child_h = list_entries(project)[0]["content_hash"]  # most-recent build == chain
 
     # Cold start, as a fresh clone / not-yet-warmed entry has: evict every baked
-    # snapshot and clear the reconstruction lru the in-process build warmed.
+    # snapshot and clear the plan lru the in-process build warmed.
     shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
     cached_result_expr.cache_clear()
 
     mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    posted: dict = {}
 
     class _Resp:
         status_code = 200
@@ -379,16 +384,24 @@ def test_unit_ensure_session_self_heals_evicted_snapshot_on_cold_cache(project, 
         def json(self):
             return {"session": "sess-cold-heal"}
 
-    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: _Resp())
+    def _capture_post(url, json=None, timeout=None):
+        posted.update(json or {})
+        return _Resp()
+
+    monkeypatch.setattr(mgr._client, "post", _capture_post)
 
     mgr.ensure_session(child_h, project)
 
-    # The heal must repopulate the snapshot the *build replay* reads — the path
-    # buckaroo's /load_expr resolves — before POSTing, so the cold grid isn't
-    # empty. ensure_session ran cached_result_expr(child_h), which recomputes the
-    # evicted parent's baked snapshot; assert that snapshot is back on disk. (The
-    # snapshot key embeds the build path, so this holds when build and read share a
-    # project root, i.e. the same-machine cold cache; cross-machine clone is #77.)
+    # The POST happened on a genuinely cold cache — no pre-heal materialised
+    # anything first.
+    assert posted.get("build_dir"), "no /load_expr POST captured"
+    assert not any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
+
+    # Replay the posted build exactly as Buckaroo does: load it and execute. The
+    # child's build carries the parent's cache node (D4), so the replay heals
+    # the evicted parent snapshot itself and the grid has rows.
+    replayed = load_expr(posted["build_dir"], cache_dir=compute_cache_dir(project))
+    assert int(replayed.count().execute()) > 0
     assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
 
 

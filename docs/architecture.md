@@ -369,6 +369,10 @@ when in doubt, the code wins.
 
 ### Architecture docs (`docs/`) — describe the current system
 
+- [system-contract.md](system-contract.md) — **normative**: the invariants and
+  binding rules the system guarantees (identity, read/write/cache contracts).
+  Where the descriptive docs and this contract disagree, the difference is a
+  bug. The read path implements it as of the #163 fix (PR #167). **Current.**
 - [expression-lifecycle.md](expression-lifecycle.md) — one expression from MCP
   ingest to rendered rows, naming every artifact and cache write. **Current.**
 - [reactive-recalc.md](reactive-recalc.md) — revise an alias, recompute its

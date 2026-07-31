@@ -647,6 +647,27 @@ def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
     return sources.get(rel_path)
 
 
+def _note_parent_sources(proj: str, content_hash: str) -> None:
+    """Fold the parent's recorded source digests into the current build's collector.
+
+    A child's build inlines its parent's frozen graph — CAS clone paths included
+    — so the child's manifest must record those digests too: ``manifest.sources``
+    is the closure record ``gc_cas`` walks to keep clones alive, and the child
+    must keep its own leaves alive even if the parent entry is later evicted.
+    ``note_source`` is a no-op outside a build's collect window, so this costs
+    nothing on a plain read.
+    """
+    from tallyman_core import read_manifest
+    from tallyman_xorq import source_identity as si
+
+    try:
+        sources = read_manifest(entry_dir(proj, content_hash)).sources or {}
+    except (OSError, ValueError):
+        return
+    for rel_path, digest in sources.items():
+        si.note_source(rel_path, digest)
+
+
 def tracked_expr_from_alias(alias: str, project: str | None = None):
     """Load a catalog entry by alias and record the parent edge in the manifest DAG.
 
@@ -659,23 +680,25 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
     current head entry. Pass the alias name as it appears in ``catalog_list``.
     To read by hash without tracking, use ``pinned_expr_from_alias``.
 
-    Returns the entry's expression on the in-process default backend — an
-    expensive parent (Aggregate / Join / ...) resolves to a direct read of its
-    baked result_cache snapshot, a cheap parent re-runs its recipe (pushdown
-    makes that ~free). Either way the materialization detail is hidden from
-    the caller.
+    Returns the parent entry's *frozen build graph* on the in-process default
+    backend (``entry_graph_expr``, ADR D4): parents are inlined by value —
+    content-pinned sources, and an expensive parent's baked ``CachedNode``
+    travels along — so the child's own build becomes self-contained and
+    self-healing. When this alias is revised, recalc mints a new version of the
+    child expression; the child entry built *now* stays bound to the parent
+    revision recorded at build time forever.
 
     The parent edge is suppressed during reconstruction (when ``_RECONSTRUCTING``
-    is True) so that re-running a child recipe to compute its expression doesn't
-    accidentally record grandparents as direct parents of the entry under
-    construction.
+    is True — the structural-nondeterminism diagnostic re-running a recipe) so a
+    diagnostic re-run doesn't accidentally record grandparents as direct parents
+    of the entry under construction.
 
     Args:
         alias: A catalog alias (e.g. "shoe_sales"). Must be an alias, not a
             content hash — pass hashes to pinned_expr_from_alias instead.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, entry_graph_expr
 
     proj = resolve_project(project)
     if entry_dir(proj, alias).exists():
@@ -691,7 +714,8 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=alias, follow=True)
-    return cached_result_expr(proj, content_hash)
+    _note_parent_sources(proj, content_hash)
+    return entry_graph_expr(proj, content_hash)
 
 
 def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
@@ -713,7 +737,7 @@ def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
         alias_or_hash: An alias (e.g. "shoe_sales") or a content hash.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, entry_graph_expr
 
     proj = resolve_project(project)
     is_hash = entry_dir(proj, alias_or_hash).exists()
@@ -725,4 +749,5 @@ def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=alias_or_hash, follow=False)
-    return cached_result_expr(proj, content_hash)
+    _note_parent_sources(proj, content_hash)
+    return entry_graph_expr(proj, content_hash)

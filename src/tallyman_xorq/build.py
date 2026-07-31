@@ -531,20 +531,24 @@ def build_and_persist(
                 if cache_worthy_v:
                     # count() bakes the snapshot (the cache node forces full
                     # materialisation); then hash the baked file for the digest.
-                    # The sort-before-bake is applied to author_expr before
-                    # rewrite_for_build (see above), so the CachedNode already
-                    # wraps the sorted expression and loaded bakes in canonical order.
+                    # rewrite_for_build injected the canonical sort under the
+                    # CachedNode (ADR D5, amended), so the bake lands in a
+                    # deterministic total order and the file hash is stable
+                    # across the build and every later heal. snapshot_key
+                    # records the baked file's name so the canonical read can
+                    # assert its own derivation matches (ADR D8).
                     row_count = int(loaded.count().execute())
                     snap_path = _cached_node_path(loaded)
-                    result_digest_v: str | None = (
-                        snapshot_file_digest(snap_path) if snap_path and snap_path.exists() else None
-                    )
+                    baked_ok = snap_path is not None and snap_path.exists()
+                    result_digest_v: str | None = snapshot_file_digest(snap_path) if baked_ok else None
+                    snapshot_key_v: str | None = snap_path.name if baked_ok else None
                 else:
                     # Stream full result to force row-level evaluation (catch a
                     # failing cast / arithmetic at build time) and count rows.
                     # No digest for cheap entries — no snapshot to hash.
                     row_count = stream_row_count(loaded)
                     result_digest_v = None
+                    snapshot_key_v = None
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
@@ -606,6 +610,7 @@ def build_and_persist(
             cache_worthy_why=cache_worthy_why,
             cache_bytes=cache_bytes,
             result_digest=result_digest_v,
+            snapshot_key=snapshot_key_v,
             sources=sources or None,
             parents=parents or None,
         )

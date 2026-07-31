@@ -115,6 +115,37 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
     )
 
 
+def verify_sweep(project: str) -> dict:
+    """Opt-in corpus verification (ADR D7): do baked snapshots still match their
+    recorded ``result_digest``?
+
+    For every entry that recorded a digest, ``verify_result_faithful`` locates
+    the snapshot through the entry's own frozen build and compares file hashes.
+    Returns ``{"results": {hash: bool|None}, "unfaithful": [...], "errors":
+    {hash: message}}`` — ``None`` means nothing to check yet (snapshot not on
+    disk; the next read heals and verifies), ``errors`` carries entries whose
+    build failed to load (the D6 hard error, reported per-entry so one broken
+    entry can't abort a corpus sweep).
+    """
+    from tallyman_xorq.result_cache import verify_result_faithful
+
+    results: dict[str, bool | None] = {}
+    errors: dict[str, str] = {}
+    for entry in list_entries(project):
+        if not entry.get("result_digest"):
+            continue
+        h = entry["content_hash"]
+        try:
+            results[h] = verify_result_faithful(project, h)
+        except Exception as exc:
+            errors[h] = str(exc)
+    return {
+        "results": results,
+        "unfaithful": sorted(h for h, ok in results.items() if ok is False),
+        "errors": errors,
+    }
+
+
 def scan(project: str) -> dict[str, StaleVerdict]:
     """Actionable staleness for every live entry, tagging direct vs transitive.
 

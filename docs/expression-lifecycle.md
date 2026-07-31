@@ -194,17 +194,13 @@ The SPA issues `GET /{project}/api/entry/{hash-or-alias}`
 1. `_maybe_restart()` (revives a crashed subprocess, throttled); bail to
    `None` if Buckaroo isn't running — the SPA then falls back to a
    `pandas.to_html` preview.
-2. **Snapshot self-heal** (`buckaroo_lifecycle.py:518-533`): before anything
-   Buckaroo-facing, `ensure_session` calls `cached_result_expr(project, hash)`.
-   For an expensive entry this guarantees the baked snapshot exists on disk — on
-   a cold compute cache (a fresh clone, or an entry the startup warmup didn't
-   reach) it recomputes it once, single-flighted per `(project, content_hash)`
-   under `_heal_lock` so two tabs hitting the same cold entry don't both run the
-   shared cache op (#79). This matters because a `tracked_expr_from_alias` chain off an
-   expensive parent embeds a *bare* read of the parent's snapshot (#75 strips
-   the parent's cache node to keep one backend), so without the snapshot the
-   replay below would read zero rows. Done outside the session lock so a cold
-   recompute doesn't block other sessions.
+2. **No pre-heal** (ADR D4): entry builds are self-contained — a
+   `tracked_expr_from_alias` chain keeps the parent's cache node in the child's
+   build — so Buckaroo's replay of the posted build regenerates any evicted
+   snapshot itself through ordinary cache mechanics on first query. (Before
+   #163's fix, chaining stripped the parent's cache node to a bare snapshot
+   read, and `ensure_session` had to pre-execute `cached_result_expr` here so a
+   cold grid wasn't empty; both the stripping and the pre-heal are retired.)
 3. **Session-map check** (`buckaroo_lifecycle.py:535`+): for a new entry this
    misses, so a session is created.
 4. **Stable build expansion**: `ensure_expanded_build` materializes
@@ -239,23 +235,27 @@ by `GET /{project}/api/session/{hash}`, `app.py:617`, which is just
 row window and the summary-stats payload. The JS `SmartRowCache` holds row
 segments client-side from here on (see `caching.md`).
 
-The **result cache** is read through one function, `cached_result_expr`
-(`result_cache.py:403`), and — unlike the stat cache — it was already populated
-at build (step 5), so a read never writes it except to self-heal an eviction.
-For an expensive entry (`classify_build` worthy — Aggregate / Join / Sort /
-window / UDF, `result_cache.py:49`) it returns a `deferred_read_parquet` of the
-baked snapshot under `compute_cache/result_cache/`, on the default backend; if
-the snapshot was evicted it runs the cache node once to repopulate, then reads
-(`result_cache.py:451-473`). That heal is single-flighted per `(project,
-content_hash)` under `_heal_lock`, so concurrent cold readers don't both execute
-the shared cache op and trip DataFusion's "Already borrowed", and a peer process
-losing xorq's fixed-`.tmp` rename retries once if the snapshot landed (#79). The
-repopulated snapshot is then checked against the `result_digest` recorded at
-build, logging recompute drift on a mismatch (`_warn_if_self_heal_unfaithful`;
-#83). A cheap entry returns the live expression re-imported from `expr.py`,
-recomputed on read. Every reader takes this path: the paginated viewer
-(`api_data` calls `cached_result_expr(...).limit(...).execute()`, `app.py:517`),
-both sides of a diff, and post-processing.
+The **result cache** is read through one function, `cached_result_expr`, whose
+internals load the entry's frozen build (the canonical read of
+`docs/system-contract.md`) — and, unlike the stat cache, it was already
+populated at build (step 5), so a read never writes it except to self-heal an
+eviction. For an expensive entry (`classify_build` worthy — Aggregate / Join /
+Sort / window / UDF) it returns a `deferred_read_parquet` of the baked snapshot
+under `compute_cache/result_cache/`, on the default backend, after asserting
+the derived snapshot key matches the one the manifest recorded (ADR D8); if
+the snapshot was evicted it executes the frozen build once to repopulate, then
+reads. That heal is single-flighted per `(project, content_hash)` under
+`_heal_lock`, so concurrent cold readers don't both execute the shared op and
+trip DataFusion's "Already borrowed", and a peer process losing xorq's
+fixed-`.tmp` rename retries once if the snapshot landed (#79). The healed
+bytes are verified against the `result_digest` recorded at build before they
+are served; a mismatch records a durable `unfaithful_heal` error, wipes the
+entry's stat cache, and evicts its Buckaroo session (`_verify_self_heal`; ADR
+D7/D10/D12). A cheap entry returns the loaded build's graph rebound onto the
+default backend, recomputed on read from content-pinned sources. Every reader
+takes this path: the paginated viewer (`api_data` calls
+`cached_result_expr(...).limit(...).execute()`), both sides of a diff, and
+post-processing.
 
 ---
 
@@ -332,6 +332,10 @@ Everything keyed on the content hash is immutable and self-heals on deletion;
 the only invalidations are Buckaroo restart (RAM session map) and a
 klass-changing edit/reset (stat cache). A `reset_to` additionally
 garbage-collects orphaned `data/.cas` source clones, which live outside the
-catalog git repo (`source_identity.gc_cas`). See `caching.md` for the full
-invalidation table, including the cold-reconstruction staleness hole the `cas`
-default does not close (#74/#115).
+catalog git repo (`source_identity.gc_cas`) — an entry's own
+`manifest.sources` records every clone its frozen build reads, ancestors'
+included, so gc keeps a child's leaves alive even if the parent entry is
+evicted. See `caching.md` for the full invalidation table. (The
+cold-reconstruction staleness hole this section used to reference — #74/#115 —
+is closed: reads load the frozen build, so a cold read cannot see a post-build
+source edit.)

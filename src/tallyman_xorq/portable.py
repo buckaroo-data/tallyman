@@ -75,6 +75,37 @@ def expand_into_dir(build_dir: Path, project_root: Path, target: Path) -> None:
         (target / item.name).write_text(text.replace(PLACEHOLDER, project_root_str))
 
 
+def rewrite_cache_dirs(expr, cache_dir: Path):
+    """Point every ``CachedNode``'s storage at *cache_dir* — nested nodes included.
+
+    xorq's own ``load_expr(cache_dir=…)`` rewrite (``ExprLoader.replace_base_path``)
+    walks the graph with vendored ibis's ``.replace``, which does not descend into
+    opaque ``Expr``-typed fields — so a cache node nested inside another cache
+    node's ``parent`` (a chained parent's cache traveling in a child's build, ADR
+    D4) keeps whatever base path the build serialized. This deep variant runs the
+    same storage rewrite through xorq's ``replace_nodes``, whose traversal does
+    descend ``CachedNode.parent``, so every cache node in the closure lands in the
+    project's compute cache regardless of nesting depth or where the build was
+    written.
+    """
+    from attr import evolve
+    from xorq.common.utils.graph_utils import replace_nodes
+    from xorq.expr.relations import CachedNode
+
+    cache_dir = Path(cache_dir)
+
+    def replacer(node, kwargs):
+        if isinstance(node, CachedNode):
+            storage = getattr(node.cache, "storage", None)
+            if storage is not None and Path(str(storage.base_path)) != cache_dir:
+                evolved = evolve(node.cache, storage=evolve(storage, base_path=cache_dir))
+                return node.__recreate__(dict(zip(node.__argnames__, node.__args__)) | {"cache": evolved})
+            return node
+        return node.__recreate__(kwargs) if kwargs else node
+
+    return replace_nodes(replacer, expr).to_expr()
+
+
 def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -> Path:
     """Expand `${TALLYMAN_PROJECT_ROOT}` placeholders into a stable, persistent dir.
 

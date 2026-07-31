@@ -55,6 +55,14 @@ class Manifest(BaseModel):
     # UDF) the structural hash can't see — caught when a self-healed snapshot is
     # re-checked. Absent on entries built before #83.
     result_digest: str | None = None
+    # Filename of the baked result-cache snapshot (the xorq cache key + .parquet),
+    # recorded at build so the canonical read can assert its own derivation matches
+    # (ADR D8, plans/adr-read-path-loads-builds.md). Build and read share one
+    # derivation route; this is the tripwire that turns any future divergence (an
+    # xorq tokenization change, a rewrite drift) into an immediate, attributable
+    # failure instead of a silent wrong-file read. None for a cheap entry (bakes
+    # no snapshot) and under salt identity mode.
+    snapshot_key: str | None = None
     # rel data path -> content md5, recorded when a source-identity mode is
     # active (tallyman_xorq.source_identity); absent under mode=off.
     sources: dict[str, str] | None = None

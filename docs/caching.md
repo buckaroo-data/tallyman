@@ -103,10 +103,13 @@ path), so there is no separate `result_cache/` directory; both land under
   exempt (`_EXEMPT_READS`): re-reading a columnar source is already a pushdown.
 - **Baked result snapshot** — an expression is *worthy* when it contains an
   Aggregate / Join / Sort / window / UDF (`_EXPENSIVE_OPS`,
-  `result_cache.py:49`). A worthy expression is wrapped in a result cache with
-  `relative_path="result_cache"` (`source_cache.py:160`), so its snapshot lands
-  under `compute_cache/result_cache/`; executing the entry at build time
-  materializes it once (`build.py:491`). A non-parquet read is *not* by itself
+  `result_cache.py:49`). A worthy expression is first put in a canonical total
+  order (`_canonical_sorted`: the author's own `order_by` keys, then
+  `original_row_order`, then the remaining sortable columns — ADR D5, amended)
+  so the baked bytes are deterministic across the build and every later heal,
+  then wrapped in a result cache with `relative_path="result_cache"`, so its
+  snapshot lands under `compute_cache/result_cache/`; executing the entry at
+  build time materializes it once. A non-parquet read is *not* by itself
   worthy (`classify_build`, `result_cache.py:62`) — its parse is already
   handled by the source-read cache. Worthiness is decided by two predicates that
   must agree: `_is_worthy_expr` gates the bake (`source_cache.py:62`) and
@@ -125,24 +128,33 @@ written for any entry, cheap or expensive, at build time or on demand (#73 and
 follow-up).
 
 Every consumer reads an entry's result through one function,
-`cached_result_expr` (`result_cache.py:403`):
+`cached_result_expr`, whose internals are the canonical read of
+`docs/system-contract.md` (#163): expand the entry's frozen `xorq_build/`,
+`load_expr(expanded, cache_dir=compute_cache)`, then the deep cache-dir
+rewrite (`portable.rewrite_cache_dirs`). A missing or unloadable build is a
+hard error naming the entry — reads never re-import `expr.py` (ADR D6):
 
 - Expensive entry → `deferred_read_parquet` of the baked snapshot, on the
   default backend. The snapshot was written when the entry built, so reading it
-  skips re-running the graph. If it was evicted since, the cache node recomputes
-  it once and the read proceeds — a self-heal re-checked on every call,
-  single-flighted per `(project, content_hash)` so concurrent cold readers don't
-  both run the shared cache op; after a repopulate the snapshot's digest is
-  checked against the recorded `result_digest` and a mismatch is logged as
-  recompute drift (`result_cache.py:451-473`, `_heal_lock`,
-  `_warn_if_self_heal_unfaithful`; #79, #83).
-- Cheap entry → the live expression, re-imported from the entry's `expr.py`
-  and recomputed on read.
+  skips re-running the graph; the read asserts its derived snapshot key matches
+  the one the manifest recorded (ADR D8). If the file was evicted since, the
+  *frozen build* is executed once and the read proceeds — a self-heal
+  re-checked on every call, single-flighted per `(project, content_hash)` so
+  concurrent cold readers don't both run the shared op; the healed bytes are
+  verified against the recorded `result_digest` before they are served, and a
+  mismatch wipes the entry's Buckaroo stat cache, records a durable
+  `unfaithful_heal` error, and evicts its Buckaroo session (`_verify_self_heal`;
+  ADR D7/D10/D12, #79, #83).
+- Cheap entry → the loaded build's graph, rebound onto the default backend and
+  recomputed on read from its content-pinned sources.
 
 Either shape is a single-backend expression, so two entries compose (`union`,
-`join`, a diff) without tripping xorq's "multiple backends" guard (#75). The
-viewer's paginated reads, diffs, and post-processing all go through it; nothing
-reads a pre-existing `result.parquet`, because none is written.
+`join`, a diff) without tripping xorq's "multiple backends" guard. Chaining
+(`tracked_expr_from_alias`) uses the sibling `entry_graph_expr` instead: the
+parent's cache node stays in the graph, so a child's build is self-contained
+and self-healing (ADR D4). The viewer's paginated reads, diffs, and
+post-processing all go through `cached_result_expr`; nothing reads a
+pre-existing `result.parquet`, because none is written.
 
 Snapshot strategy is the right one here because an entry is an immutable,
 content-addressed artifact — its result must not invalidate just because an
@@ -188,17 +200,17 @@ re-added entry still computes honestly cold. `reset_to` also reclaims orphaned
 All bounded LRUs over immutable keys, so eviction means a cheap rebuild
 and staleness is impossible:
 
-- `cached_result_expr` — its reconstruction work is memoized on
-  `_resolve_result_plan`, `lru_cache(256)` keyed `(project, content_hash)`
-  (`result_cache.py:345`); `cached_result_expr` re-exposes that memo's
-  `cache_clear` / `cache_info`. The memo saves re-importing the entry's
-  `expr.py` and, for an expensive entry, re-deriving its baked-snapshot path.
-  `cached_result_expr` itself is a thin wrapper that re-checks the snapshot's
-  on-disk presence on every call, so an evicted snapshot self-heals; the heal
-  runs under a per-entry lock (`_heal_lock`, `result_cache.py:393`) so only the
-  first of several concurrent cold readers executes it, and a peer process that
-  wins xorq's fixed-`.tmp` rename is caught and retried once if the snapshot
-  landed, else re-raised (#79).
+- `cached_result_expr` — its build-loading work is memoized on
+  `_resolve_result_plan`, `lru_cache(256)` keyed `(project, content_hash)`;
+  `cached_result_expr` re-exposes that memo's `cache_clear` / `cache_info`.
+  The key finally determines the value — the plan is a pure function of the
+  immutable build — and the memo saves expanding + loading the build and
+  re-deriving its baked-snapshot path. `cached_result_expr` itself is a thin
+  wrapper that re-checks the snapshot's on-disk presence on every call, so an
+  evicted snapshot self-heals; the heal runs under a per-entry lock
+  (`_heal_lock`) so only the first of several concurrent cold readers executes
+  it, and a peer process that wins xorq's fixed-`.tmp` rename is caught and
+  retried once if the snapshot landed, else re-raised (#79).
 - `_build_compare_expr` — `lru_cache(128)` keyed
   `(project, a_hash, b_hash, keys)`; saves rebuilding diff outer-join
   expressions (`src/tallyman_companion/app.py:189`). Build dirs land under
@@ -336,23 +348,19 @@ all rely on "same key, same bytes, forever". Cleanup for those is a
 space concern (manual delete, bullpen moves on reset), and a deleted file
 self-heals by recomputing.
 
-Two documented holes break "never stale". The first is execution
-nondeterminism: an entry whose recipe calls `now()` / `random()` / an unseeded
-`sample()` produces different bytes each run under one content hash, so a cold
+One documented hole breaks "never stale": execution nondeterminism. An entry
+whose recipe calls `now()` / `random()` / an unseeded `sample()` or an impure
+UDF produces different bytes each run under one content hash, so a cold
 recompute can disagree with what was built (#88). The build flags these as
 advisory lint warnings (`_nondeterminism_warnings`, `build.py`); it does not
-block them. As of #83 the build also records a `result_digest` of the executed
-bytes in the manifest, and the self-heal compares the repopulated snapshot
-against it (`verify_result_faithful`, `result_cache.py:299`;
-`_warn_if_self_heal_unfaithful`, `result_cache.py:315`), so this drift is now
-detected on recompute even though it is still not prevented. The second is
-cold-reconstruction faithfulness under the `cas`
-default: `cas` makes *build* identity content-aware (a rebuild over an edited
-source forks the hash) but not *reconstruction*. `cached_result_expr` re-runs a
-cheap entry's `expr.py` on every read, and `read_project_file` re-digests the live
-source, so a cheap entry — or an expensive entry self-healing an evicted
-snapshot — serves the edited bytes under its original `content_hash`. Closing
-this needs digest-pinned reconstruction, tracked in #115.
+block them. The runtime backstop is `result_digest`: every self-heal verifies
+the repopulated snapshot against it before serving (`_verify_self_heal`), and
+an unfaithful heal wipes the entry's stat cache, records a durable error, and
+evicts its Buckaroo session (ADR D7/D10/D12). The second hole this section
+used to document — cold reads re-running `expr.py` and re-digesting live
+sources, serving edited bytes under the original hash (#115/#163) — is closed:
+reads load the frozen build, whose leaves are content-pinned `.cas` clones and
+inlined parent graphs, so a cold read cannot see a post-build edit at all.
 
 Where staleness is actually possible, it is handled explicitly:
 
@@ -366,11 +374,11 @@ Where staleness is actually possible, it is handled explicitly:
   Buckaroo restart, and the stat-cache deletion on reload.
 
 The one rule to remember: snapshot-strategy caches do not notice upstream data
-changes. The `cas` default papers over this at *build* time — an edited source
-forks the entry hash rather than deduping to the stale one — but a cold read of
-a cheap or evicted entry still re-digests the live source and can serve edited
-bytes under the old hash (#74, above). Anyone who needs reconstruction to be
-content-faithful today should treat a source as immutable once an entry is built.
-`off` reverts to xorq's path-only identity (an edit collides silently); `salt`
-mixes digests into the entry hash but bakes no snapshot cache at all (path-only
-keys would collide across salted entries) and recomputes on every read.
+changes. The `cas` default makes that safe end-to-end: an edited source forks
+the entry hash at build rather than deduping to the stale one, and reads —
+warm, cold, or self-healing — resolve through the frozen build to the
+content-addressed clone the entry was built from, never the live file. `off`
+reverts to xorq's path-only identity (an edit collides silently, and a loaded
+build reads whatever bytes sit at the recorded path); `salt` mixes digests
+into the entry hash but bakes no snapshot cache at all (path-only keys would
+collide across salted entries) and recomputes on every read.

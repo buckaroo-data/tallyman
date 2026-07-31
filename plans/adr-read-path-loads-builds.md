@@ -166,10 +166,10 @@ wrong-file read.
 - **The audit's W5 (MCP-process invalidation) largely dissolves:** cached
   values become pure functions of immutable builds, so cross-process
   staleness reduces to the existence checks the read already performs.
-- `docs/system-contract.md` is amended where these decisions sharpen it
-  (fallback clause → hard error; open questions 1, 3, and 5 resolved).
-  `docs/caching.md` / `expression-lifecycle.md` / `architecture.md` get
-  corrected when the fix lands, as planned.
+- `docs/system-contract.md` was amended where these decisions sharpened it
+  (fallback clause → hard error; open questions resolved), and
+  `docs/caching.md` / `expression-lifecycle.md` / `architecture.md` were
+  corrected with the fix. See the post-merge normalization note below.
 
 ## Post-acceptance decisions (grilling round 3, 2026-07-30)
 
@@ -216,3 +216,25 @@ Two defaults adopted without ceremony: `diff_stat_cache/` joins
 `_invalidate_reset_caches` and the reset prune (size caps deferred),
 resolving the contract's open question 8; and #166 (`pinned_expr_from_alias`
 version references) lands as its own PR after the fix.
+
+## Post-merge doc normalization (2026-07-31)
+
+PR #167 merged with the contract still written as a proposal. A follow-up PR
+flipped `docs/system-contract.md` to describe the system as built, cutting
+rather than adding:
+
+- Status block reduced to "Normative, implemented (PR #167)"; the
+  relation-to-other-docs paragraph dropped.
+- The "Deviations on main today" section (the pre-fix gap list, `main` @
+  d7e0867) deleted — this ADR's Problem section and the red tests in
+  `tests/test_lineage_faithful_reads.py` are the durable record; the full
+  bullet list survives in git history of the contract doc.
+- The "Open questions" section deleted — all eight were resolved here (D5
+  amendment, D6, D9, D12, the implemented deep rewrite and `replace_sources`
+  guard, D1/D4's rebuild, the reset defaults above); the two with standing
+  content (canonical sort key order, the D3 profile guard) were folded into
+  the contract body in one sentence each.
+- Remaining future/conditional phrasing ("as it will be", "under this
+  proposal", "on `main` today") rewritten as present-tense description or
+  past-tense history; the pre-heal and reconstruction footnotes now describe
+  the retired mechanisms in the past tense.

@@ -230,7 +230,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
         hints.append(
             f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `read_project_file` "
             "(raw files under <project>/data/), `tracked_expr_from_alias` (alias → records lineage), "
-            "`pinned_expr_from_alias` (alias or hash, no lineage), and `tallyman_read_csv` "
+            "`pinned_expr_from_alias` (hash or 'name-vN' version ref, pinned), and `tallyman_read_csv` "
             "(CSV ingest with original_row_order for stable digests)."
         )
 

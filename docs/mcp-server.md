@@ -145,7 +145,8 @@ script that binds a top-level `expr` to a xorq/ibis expression;
 the datafusion-only backend, data sourcing, and the `xorq.ml` MODELING section).
 Data sourcing inside `code` uses four helpers from `tallyman_xorq.io`:
 `tracked_expr_from_alias` (a catalog entry, recorded as a lineage parent),
-`pinned_expr_from_alias` (a catalog entry by alias or hash, no following),
+`pinned_expr_from_alias` (a catalog entry by hash or `"name-vN"` version
+reference, no following — a bare alias is rejected, #166),
 `read_project_file` (a raw parquet under `data/`), and `tallyman_read_csv` (CSV
 ingest — injects an `original_row_order` column so the baked snapshot is
 byte-stable across builds; use it for all CSV reads instead of

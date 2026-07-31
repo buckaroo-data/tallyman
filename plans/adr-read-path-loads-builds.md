@@ -215,7 +215,11 @@ badge land with the fix. Resolves the contract's open question 7.
 Two defaults adopted without ceremony: `diff_stat_cache/` joins
 `_invalidate_reset_caches` and the reset prune (size caps deferred),
 resolving the contract's open question 8; and #166 (`pinned_expr_from_alias`
-version references) lands as its own PR after the fix.
+version references) lands after the fix — folded into the post-merge
+normalization PR (#173) rather than its own: `pinned_expr_from_alias`
+accepts a hash or `"<alias>-v<N>"` and rejects a bare alias; alias names
+matching `-v<N>` are rejected at creation/rename (the issue's cheapest
+collision closure).
 
 ## Post-merge doc normalization (2026-07-31)
 

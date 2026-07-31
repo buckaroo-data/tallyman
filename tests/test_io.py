@@ -118,13 +118,16 @@ def test_pinned_version_ref_out_of_range_names_count(orders_parquet: Path, proje
 
 def test_alias_name_matching_version_syntax_rejected(orders_parquet: Path, project: str, monkeypatch):
     """An alias literally named "foo-v2" would collide with version-reference
-    syntax; reject it at creation and at rename (#166's cheapest closure)."""
+    syntax; reject it at creation and at rename (#166's cheapest closure),
+    steering a parallel-take to the "-o<N>" (option) convention."""
     from tallyman_mcp.server import catalog_create, catalog_rename
 
     res = catalog_create("orders-v2", _parent_code(project))
     assert "error" in res, res
+    assert "orders-o2" in res["error"], res["error"]
 
     ok = catalog_create("orders", _parent_code(project))
     assert "error" not in ok, ok
     renamed = catalog_rename("orders", "orders-v3")
     assert "error" in renamed, renamed
+    assert "orders-o3" in renamed["error"], renamed["error"]

@@ -718,36 +718,57 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
     return entry_graph_expr(proj, content_hash)
 
 
-def pinned_expr_from_alias(alias_or_hash: str, project: str | None = None):
-    """Load a catalog entry by alias or content hash, recording a pinned (non-following) edge.
+def pinned_expr_from_alias(ref: str, project: str | None = None):
+    """Load a catalog entry by content hash or version reference, pinned.
 
     Like tracked_expr_from_alias but pinned: the dependency edge is recorded in
     manifest.parents with follow=False, so recalc knows the child exists but will
     not advance it when the parent alias moves. Use this when you want to stay on
     a specific version of a parent rather than following alias changes.
 
-    Accepts an alias OR a content hash. Unlike tracked_expr_from_alias (alias-only,
-    follow=True), this records follow=False regardless of whether you pass an alias
-    or a hash — the caller is explicitly opting out of alias-following.
+    Accepts a content hash or an explicit version reference ``"<alias>-v<N>"``
+    (1-based into the alias history — the V1…Vn the UI shows). A bare alias is
+    rejected (#166): it reads like a pin but resolves to whatever the head
+    happens to be when the recipe is built, so the recipe text under-determines
+    the entry. A pinned reference must denote the same entry forever.
 
     The parent edge is suppressed during reconstruction (same as tracked_expr_from_alias)
     so re-running a child's recipe doesn't accidentally write to the manifest.
 
     Args:
-        alias_or_hash: An alias (e.g. "shoe_sales") or a content hash.
+        ref: A content hash, or a version reference like "shoe_sales-v2".
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
+    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref
     from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, entry_graph_expr
 
     proj = resolve_project(project)
-    is_hash = entry_dir(proj, alias_or_hash).exists()
-    content_hash = alias_or_hash if is_hash else get_alias(proj, alias_or_hash)
-    if content_hash is None or not entry_dir(proj, content_hash).exists():
-        raise ProjectDataNotFound(f"catalog entry {alias_or_hash!r} not found in project {proj!r}")
-    content_hash = _resolve_noncyclic_hash(proj, alias_or_hash, content_hash)
+    if entry_dir(proj, ref).exists():
+        content_hash = ref
+    elif get_alias(proj, ref) is not None:
+        raise ProjectDataNotFound(
+            f"pinned_expr_from_alias({ref!r}) is a bare alias, which would silently pin "
+            f"whatever the head happens to be right now (#166). Pin an exact version — "
+            f"a content hash, or {ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) "
+            "to follow the alias."
+        )
+    else:
+        content_hash = resolve_version_ref(proj, ref)
+        if content_hash is None:
+            m = VERSION_REF_RE.match(ref)
+            hist = history_for(proj, m["name"]) if m else []
+            if hist:
+                raise ProjectDataNotFound(
+                    f"pinned_expr_from_alias({ref!r}): alias {m['name']!r} has "
+                    f"{len(hist)} version(s) (v1..v{len(hist)})"
+                )
+            raise ProjectDataNotFound(f"catalog entry {ref!r} not found in project {proj!r}")
+    if not entry_dir(proj, content_hash).exists():
+        raise ProjectDataNotFound(f"catalog entry {ref!r} not found in project {proj!r}")
+    content_hash = _resolve_noncyclic_hash(proj, ref, content_hash)
     if not _RECONSTRUCTING.get():
         from tallyman_xorq import parent_capture as pc
 
-        pc.note_parent(content_hash, ref=alias_or_hash, follow=False)
+        pc.note_parent(content_hash, ref=ref, follow=False)
     _note_parent_sources(proj, content_hash)
     return entry_graph_expr(proj, content_hash)

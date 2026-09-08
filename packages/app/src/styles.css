@@ -457,6 +457,16 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
   width: 100%;
 }
 .nb-chart { margin: 4px 0 8px; min-height: 180px; }
+.chart-error {
+  background: #2a1b1b;
+  border: 1px solid #5a3a3a;
+  color: #ffb4b4;
+  padding: 10px 12px;
+  border-radius: 4px;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+}
 
 /* ── Buckaroo embed ── */
 .buckaroo-embed {

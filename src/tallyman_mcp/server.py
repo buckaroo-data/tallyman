@@ -30,6 +30,7 @@ from tallyman_core import (
     get_alias,
     history_for,
     list_display_klasses,
+    list_errors,
     list_post_processings,
     list_projects,
     list_stats,
@@ -844,6 +845,36 @@ def catalog_chart(hash_or_alias: str, vega_spec: dict | str) -> dict:
         return {"error": str(exc)}
     _notify("chart_attached", content_hash=target_hash)
     return {"hash": target_hash, "spec_path": str(path)}
+
+
+@mcp.tool()
+@_tag_project
+def catalog_chart_errors(hash_or_alias: str) -> list[dict]:
+    """Browser-reported chart render failures for this entry, most recent first.
+
+    catalog_chart stores a spec as-is with no server-side validation — rendering
+    happens client-side via vega-embed, so a spec that looks structurally fine
+    (e.g. a transform expression that throws on a null field value present in
+    the real data) can still fail silently in the browser. When that happens,
+    the page reports the failure back here. Call this after building or editing
+    a chart, once someone has actually viewed the page, to check whether it
+    rendered — a lot faster than asking the user to open dev tools.
+
+    Returns an empty list if no render failures have been reported (either it
+    worked, or no one has viewed the page yet since the spec was set).
+    """
+    project = _resolve_active_project()
+    target_hash = hash_or_alias
+    if not entry_dir(project, target_hash).exists():
+        resolved = get_alias(project, hash_or_alias)
+        if resolved is None:
+            return [{"error": f"no entry for {hash_or_alias!r}"}]
+        target_hash = resolved
+    return [
+        e
+        for e in list_errors(project, limit=500)
+        if e.get("hash") == target_hash and e.get("tool") == "chart_render"
+    ]
 
 
 @mcp.tool()

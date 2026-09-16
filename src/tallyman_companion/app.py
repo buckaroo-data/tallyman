@@ -935,6 +935,25 @@ def create_app(
             "total": total,
         }
 
+    @app.post("/{project}/api/chart_error")
+    async def api_chart_error(project: str, payload: dict):
+        project = _validate_project(project)
+        content_hash = payload.get("hash") or ""
+        message = payload.get("message") or "unknown chart render error"
+        _require_hash(content_hash)
+        from tallyman_core import record_error as _record_error  # noqa: PLC0415
+
+        rec = _record_error(
+            project,
+            code="",
+            message=message,
+            tool="chart_render",
+            hash=content_hash,
+            traceback=payload.get("stack"),
+        )
+        await publish({"kind": "build_failed", "error_id": rec["id"], "tool": "chart_render"})
+        return {"ok": True, "error_id": rec["id"]}
+
     @app.get("/{project}/api/entries")
     def api_entries(project: str):
         project = _validate_project(project)

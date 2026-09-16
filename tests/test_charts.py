@@ -6,8 +6,8 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from tallyman_core import ChartSpecError, get_chart, list_charts, remove_chart, set_chart
-from tallyman_mcp.server import catalog_chart, catalog_create
+from tallyman_core import ChartSpecError, get_chart, list_charts, list_errors, remove_chart, set_chart
+from tallyman_mcp.server import catalog_chart, catalog_chart_errors, catalog_create
 from tallyman_xorq import build_and_persist
 
 SAMPLE_SPEC = {
@@ -196,3 +196,71 @@ expr = read_project_file("orders.parquet")
     assert body["total"] == 200  # the test fixture
     assert len(body["data"]) == 200  # the test fixture is the same size as default cap
     assert body["limit"] == 200
+
+
+# ---------------------------------------------------------------------------
+# browser-reported render failures (chart rendering is client-side, so a spec
+# that stores fine can still fail silently in vega-embed once real data hits
+# it — the page reports that back here)
+# ---------------------------------------------------------------------------
+
+
+def test_api_chart_error_records_error(fresh_companion_app, project: str, orders_parquet: Path):
+    res = build_and_persist(project, _agg_code(project))
+    c = TestClient(fresh_companion_app)
+    r = c.post(
+        f"/{project}/api/chart_error",
+        json={"hash": res.content_hash, "message": "clamp() choked on a null field"},
+    )
+    assert r.status_code == 200
+    assert r.json()["ok"] is True
+    errors = list_errors(project)
+    assert any(
+        e["tool"] == "chart_render"
+        and e["hash"] == res.content_hash
+        and e["message"] == "clamp() choked on a null field"
+        for e in errors
+    )
+
+
+def test_api_chart_error_rejects_malformed_hash(fresh_companion_app, project: str):
+    c = TestClient(fresh_companion_app)
+    r = c.post(f"/{project}/api/chart_error", json={"hash": "not-hex!", "message": "boom"})
+    assert r.status_code == 400
+
+
+def test_catalog_chart_errors_empty_when_none_reported(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = build_and_persist(project, _agg_code(project))
+    assert catalog_chart_errors(res.content_hash)["items"] == []
+
+
+def test_catalog_chart_errors_filters_by_hash_and_tool(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = build_and_persist(project, _agg_code(project))
+    from tallyman_core import record_error
+
+    record_error(project, code="", message="render blew up", tool="chart_render", hash=res.content_hash)
+    # A build failure on the same hash from a different tool must not show up here.
+    record_error(project, code="bad code", message="unrelated build failure", tool="api_code", hash=res.content_hash)
+
+    out = catalog_chart_errors(res.content_hash)["items"]
+    assert len(out) == 1
+    assert out[0]["message"] == "render blew up"
+
+
+def test_catalog_chart_errors_resolves_alias(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    from tallyman_core import get_alias, record_error
+
+    target_hash = get_alias(project, "shoe_sales")
+    record_error(project, code="", message="render blew up", tool="chart_render", hash=target_hash)
+    out = catalog_chart_errors("shoe_sales")["items"]
+    assert [e["message"] for e in out] == ["render blew up"]
+
+
+def test_catalog_chart_errors_rejects_missing(project: str, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    out = catalog_chart_errors("nonexistent_alias")["items"]
+    assert out and "error" in out[0]

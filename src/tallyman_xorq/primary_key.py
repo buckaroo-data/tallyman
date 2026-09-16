@@ -18,10 +18,13 @@ So we detect once and propagate:
 At diff time, :func:`diff_keys` returns the resolved key that exists in *both*
 sides' schemas, so the join skips detection entirely.
 
-Detection is time-boxed.  A table with high-cardinality columns but no
-near-unique column set never lets the search stop early, and it runs one query
-per column combination.  The budget is checked before each query; when it runs
-out, :class:`PrimaryKeySearchTimeout` is raised and nothing is cached.
+Detection is cheap to rule out and time-boxed.  Before trying combinations,
+one distinct count over every candidate column settles whether *any* key can
+exist: a table whose full rows fall under the threshold (duplicated rows,
+repeated contracts) has none, and resolves to ``[]`` at once.  Otherwise the
+search runs one query per column combination, with the budget checked before
+each; when it runs out, :class:`PrimaryKeySearchTimeout` is raised and nothing
+is cached.
 """
 
 from __future__ import annotations
@@ -46,10 +49,36 @@ def _check_deadline(deadline: float, content_hash: str) -> None:
         raise PrimaryKeySearchTimeout(f"primary key search for {content_hash[:12]} exceeded {PK_SEARCH_BUDGET_S:g}s")
 
 
+def _keyable(dtype) -> bool:
+    """Scalar columns only: a list / struct / map column is never a join key."""
+    return not (dtype.is_array() or dtype.is_struct() or dtype.is_map())
+
+
+def _column_stats(expr, cols: list[str], *, deadline: float, content_hash: str) -> tuple[int, dict[str, int]]:
+    """Row count and per-column distinct counts, in one query."""
+    _check_deadline(deadline, content_hash)
+    aggs = [expr.count().name("__n__")] + [expr[c].nunique().name(c) for c in cols]
+    row = expr.aggregate(aggs).execute().iloc[0]
+    return int(row["__n__"]), {c: int(row[c]) for c in cols}
+
+
+def _any_key_possible(expr, cols: list[str], need: float, *, deadline: float, content_hash: str) -> bool:
+    """Whether some subset of ``cols`` could reach ``need`` distinct tuples.
+
+    Dropping columns from a tuple can only merge distinct tuples, never split
+    them, so no subset of ``cols`` has more distinct tuples than ``cols`` as a
+    whole.  If all of them together fall short, every combination does.
+    """
+    _check_deadline(deadline, content_hash)
+    return int(expr.select(*cols).distinct().count().execute()) >= need
+
+
 def _detect_pk(
     expr,
     columns: list[str],
     *,
+    n: int,
+    distinct: dict[str, int],
     threshold: float,
     max_group: int | None,
     deadline: float,
@@ -61,20 +90,13 @@ def _detect_pk(
     Single columns (most-unique first), then composites of width 2..``max_width``
     (shortest first); the first whose distinct-tuple fraction reaches
     ``threshold`` and whose largest group is within ``max_group`` wins.
+    ``n`` / ``distinct`` come from :func:`_column_stats`.
     """
     from buckaroo.compare import _max_group_xorq
 
     cols = [c for c in expr.schema() if c in columns]
     if not cols:
         return None
-
-    _check_deadline(deadline, content_hash)
-    aggs = [expr.count().name("__n__")] + [expr[c].nunique().name(c) for c in cols]
-    row = expr.aggregate(aggs).execute().iloc[0]
-    n = int(row["__n__"])
-    if n == 0:
-        return None
-    distinct = {c: int(row[c]) for c in cols}
     need = threshold * n
 
     def _accept(combo: tuple[str, ...], d: int) -> bool:
@@ -194,6 +216,15 @@ def resolve_primary_key(
 
     expr = cached_result_expr(project, content_hash)
     schema = expr.schema()
+    candidates = [c for c in schema if c in cols and _keyable(schema[c])]
+    if not candidates:
+        _write_cached(project, content_hash, [])
+        return []
+
+    n, distinct = _column_stats(expr, candidates, deadline=deadline, content_hash=content_hash)
+    if n == 0 or not _any_key_possible(expr, candidates, threshold * n, deadline=deadline, content_hash=content_hash):
+        _write_cached(project, content_hash, [])
+        return []
 
     # _rank_pk_xorq sorts candidates by distinctness, which lets high-cardinality
     # float columns (e.g. avg_duration_seconds) beat meaningful composite string keys.
@@ -203,9 +234,9 @@ def resolve_primary_key(
     #   2. string + integer columns       (cross-type: string+int combos)
     #   3. integer columns only           (prefer names containing "pk" or "id")
     #   4. everything (floats included)   (last resort)
-    str_cols = [c for c in cols if schema[c].is_string()]
-    pk_id_int = [c for c in cols if schema[c].is_integer() and any(w in c.lower() for w in ("pk", "id"))]
-    other_int = [c for c in cols if schema[c].is_integer() and c not in pk_id_int]
+    str_cols = [c for c in candidates if schema[c].is_string()]
+    pk_id_int = [c for c in candidates if schema[c].is_integer() and any(w in c.lower() for w in ("pk", "id"))]
+    other_int = [c for c in candidates if schema[c].is_integer() and c not in pk_id_int]
     int_cols = pk_id_int + other_int  # pk/id-named ints first within this group
 
     candidate_groups: list[list[str]] = []
@@ -215,7 +246,7 @@ def resolve_primary_key(
         candidate_groups.append(str_cols + int_cols)
     if int_cols:
         candidate_groups.append(int_cols)
-    candidate_groups.append(list(cols))  # floats only reached here
+    candidate_groups.append(candidates)  # floats only reached here
 
     keys: list[str] = []
     for group in candidate_groups:
@@ -223,6 +254,8 @@ def resolve_primary_key(
             _detect_pk(
                 expr,
                 group,
+                n=n,
+                distinct=distinct,
                 threshold=threshold,
                 max_group=max_group,
                 deadline=deadline,
@@ -249,7 +282,7 @@ def diff_keys(
     """Join key for diffing two entries: a resolved PK present in both schemas.
 
     Returns ``[]`` when neither side's key applies to both — the caller then
-    lets ``key_diff_xorq`` fall back to live detection.  Both sides share one
+    skips the keyed diff (``full_diff(keys=[])``).  Both sides share one
     ``PK_SEARCH_BUDGET_S`` budget.
     """
     a_cols = set(_entry_columns(project, a_hash))

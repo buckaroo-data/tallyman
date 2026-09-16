@@ -213,8 +213,8 @@ def test_diff_route_single_version_400(fresh_companion_app, project: str, orders
 
 
 def test_diff_route_pk_search_timeout_504(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
-    # A key-less entry whose primary-key search blows the budget → 504 with a
-    # detail the diff page renders, instead of grinding for minutes.
+    # A primary-key search that blows the budget → 504 with a detail the diff
+    # page renders, instead of grinding for minutes.
     import itertools
 
     import tallyman_xorq.primary_key as pk
@@ -229,7 +229,7 @@ expr = u
     catalog_create("dups", dup)
     catalog_revise("dups", dup.replace("expr = u", "expr = u.filter(u.qty > 1)"))
     ticks = itertools.count()
-    monkeypatch.setattr(pk, "_clock", lambda: next(ticks) * 0.3, raising=False)
+    monkeypatch.setattr(pk, "_clock", lambda: next(ticks) * 1.0)
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/diff_data/dups/1/2")
     assert r.status_code == 504

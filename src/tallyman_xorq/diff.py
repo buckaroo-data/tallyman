@@ -110,6 +110,10 @@ def full_diff(
     error, surfaced as ``ValueError`` rather than a silent empty diff.  The
     pandas / polars backends (which read a materialised parquet) are dropped —
     every live caller passes ``cached_result_expr`` exprs.
+
+    ``keys`` is the join key from ``primary_key.diff_keys``.  ``[]`` means the
+    caller established there is no key, so the keyed diff is skipped (``None``);
+    only ``None`` lets ``key_diff_xorq`` run its own, unbounded, detection.
     """
     a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
@@ -126,7 +130,7 @@ def full_diff(
 
     stats = stats_diff_xorq(a_expr, b_expr)
     head = head_diff_xorq(a_expr, b_expr)
-    keyed = key_diff_xorq(a_expr, b_expr, keys=keys)
+    keyed = None if keys == [] else key_diff_xorq(a_expr, b_expr, keys=keys)
 
     return {
         "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),

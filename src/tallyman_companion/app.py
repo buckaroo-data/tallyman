@@ -1173,7 +1173,7 @@ def create_app(
         try:
             a_expr = cached_result_expr(project, a_hash)
             b_expr = cached_result_expr(project, b_hash)
-            keys = diff_keys(project, a_hash, b_hash) or None
+            keys = diff_keys(project, a_hash, b_hash)
             diff = full_diff(
                 a_dir,
                 b_dir,

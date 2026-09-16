@@ -212,6 +212,30 @@ def test_diff_route_single_version_400(fresh_companion_app, project: str, orders
     assert r.status_code == 404
 
 
+def test_diff_route_pk_search_timeout_504(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+    # A key-less entry whose primary-key search blows the budget → 504 with a
+    # detail the diff page renders, instead of grinding for minutes.
+    import itertools
+
+    import tallyman_xorq.primary_key as pk
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    dup = f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+u = t.union(t, distinct=False)
+expr = u
+"""
+    catalog_create("dups", dup)
+    catalog_revise("dups", dup.replace("expr = u", "expr = u.filter(u.qty > 1)"))
+    ticks = itertools.count()
+    monkeypatch.setattr(pk, "_clock", lambda: next(ticks) * 0.3, raising=False)
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/diff_data/dups/1/2")
+    assert r.status_code == 504
+    assert "primary key search" in r.json()["detail"]
+
+
 def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
     assert c.get(f"/{project}/api/diff_data/missing/1/2").status_code == 404

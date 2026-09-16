@@ -58,7 +58,7 @@ export function DiffPage() {
     return (
       <main>
         <section className="panel detail" style={{ margin: "12px 16px" }}>
-          <h2 style={{ margin: "0 0 8px 0" }}>diff error</h2>
+          <h2 style={{ margin: "0 0 8px 0" }}>diff unavailable for {alias}</h2>
           <p className="meta" style={{ margin: "0 0 8px 0" }}>
             <Link to={`/${project}/catalog/${alias}`}>view {alias} in the catalog</Link>
             {" · "}

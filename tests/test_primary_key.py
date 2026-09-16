@@ -85,3 +85,12 @@ def test_search_times_out_without_caching(project, orders_parquet, monkeypatch):
         resolve_primary_key(project, h)
     # A timeout is not an answer: nothing is cached, so a later call retries.
     assert not (entry_dir(project, h) / "primary_key.json").exists()
+
+
+def test_search_within_budget_still_finds_key(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    h = _current_hash(project)
+    # A unique single column is found in a couple of queries, well inside budget.
+    monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))
+    assert resolve_primary_key(project, h) == ["order_id"]

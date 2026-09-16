@@ -48,7 +48,7 @@ from tallyman_xorq import (
     list_entries,
     read_prompts,
 )
-from tallyman_xorq.primary_key import diff_keys
+from tallyman_xorq.primary_key import PrimaryKeySearchTimeout, diff_keys
 from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
 log = logging.getLogger("tallyman.companion")
@@ -1183,6 +1183,11 @@ def create_app(
                 b_expr=b_expr,
                 keys=keys,
             )
+        except PrimaryKeySearchTimeout as exc:
+            # A key-less wide entry: the search is time-boxed rather than left
+            # grinding on the shared DataFusion connection.
+            log.warning("diff_data unavailable for %s/%s V%d→V%d: %s", project, alias, va, vb, exc)
+            raise HTTPException(504, detail=str(exc)) from exc
         except Exception as exc:
             # Full traceback to the server log; a concise type+message to the
             # client (the diff UI renders `detail`). Avoids dumping internal
@@ -1257,7 +1262,6 @@ def create_app(
         from tallyman_core.display_configs import set_display_config  # noqa: PLC0415
         from tallyman_xorq import build_and_persist as _build_and_persist  # noqa: PLC0415
         from tallyman_xorq.build import BuildError  # noqa: PLC0415
-        from tallyman_xorq.primary_key import diff_keys  # noqa: PLC0415
         from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
         hashes = history_for(project, alias)
@@ -1278,7 +1282,10 @@ def create_app(
         a_idx, a_hash = a
         b_idx, b_hash = b
 
-        keys = diff_keys(project, a_hash, b_hash) or []
+        try:
+            keys = diff_keys(project, a_hash, b_hash) or []
+        except PrimaryKeySearchTimeout as exc:
+            raise HTTPException(504, detail=str(exc)) from exc
         if not keys:
             raise HTTPException(400, "no stable join key detected; cannot build keyed diff")
 

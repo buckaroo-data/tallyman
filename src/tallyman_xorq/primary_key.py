@@ -17,12 +17,93 @@ So we detect once and propagate:
 
 At diff time, :func:`diff_keys` returns the resolved key that exists in *both*
 sides' schemas, so the join skips detection entirely.
+
+Detection is time-boxed.  A table with high-cardinality columns but no
+near-unique column set never lets the search stop early, and it runs one query
+per column combination.  The budget is checked before each query; when it runs
+out, :class:`PrimaryKeySearchTimeout` is raised and nothing is cached.
 """
 
 from __future__ import annotations
 
 import json
+import time
+from itertools import combinations
 from pathlib import Path
+
+PK_SEARCH_BUDGET_S = 1.0
+
+# Indirection so tests can drive the budget with a fake clock.
+_clock = time.monotonic
+
+
+class PrimaryKeySearchTimeout(TimeoutError):
+    """The primary-key search ran past its time budget."""
+
+
+def _check_deadline(deadline: float, content_hash: str) -> None:
+    if _clock() >= deadline:
+        raise PrimaryKeySearchTimeout(f"primary key search for {content_hash[:12]} exceeded {PK_SEARCH_BUDGET_S:g}s")
+
+
+def _detect_pk(
+    expr,
+    columns: list[str],
+    *,
+    threshold: float,
+    max_group: int | None,
+    deadline: float,
+    content_hash: str,
+    max_width: int = 4,
+) -> list[str] | None:
+    """buckaroo's ``_rank_pk_xorq`` search with a deadline checked before each query.
+
+    Single columns (most-unique first), then composites of width 2..``max_width``
+    (shortest first); the first whose distinct-tuple fraction reaches
+    ``threshold`` and whose largest group is within ``max_group`` wins.
+    """
+    from buckaroo.compare import _max_group_xorq
+
+    cols = [c for c in expr.schema() if c in columns]
+    if not cols:
+        return None
+
+    _check_deadline(deadline, content_hash)
+    aggs = [expr.count().name("__n__")] + [expr[c].nunique().name(c) for c in cols]
+    row = expr.aggregate(aggs).execute().iloc[0]
+    n = int(row["__n__"])
+    if n == 0:
+        return None
+    distinct = {c: int(row[c]) for c in cols}
+    need = threshold * n
+
+    def _accept(combo: tuple[str, ...], d: int) -> bool:
+        if d < need:
+            return False
+        if max_group is None:
+            return True
+        _check_deadline(deadline, content_hash)
+        return _max_group_xorq(expr, list(combo)) <= max_group
+
+    for c in sorted(cols, key=lambda c: distinct[c], reverse=True):
+        if _accept((c,), distinct[c]):
+            return [c]
+
+    usable = [c for c in cols if distinct[c] > 1]
+    for width in range(2, max_width + 1):
+        for combo in combinations(usable, width):
+            bound = 1
+            for c in combo:
+                bound *= distinct[c]
+                if bound >= need:
+                    break
+            if bound < need:
+                continue
+            _check_deadline(deadline, content_hash)
+            d = int(expr.select(*combo).distinct().count().execute())
+            if _accept(combo, d):
+                return list(combo)
+    return None
 
 
 def _entry_columns(project: str, content_hash: str) -> list[str]:
@@ -75,13 +156,20 @@ def resolve_primary_key(
     *,
     threshold: float = 0.98,
     max_group: int | None = 10_000,
+    deadline: float | None = None,
 ) -> list[str]:
     """Resolved primary key for an entry (``[]`` if none), cached + inherited.
 
     Cheap (row-preserving) revisions inherit the parent's key when its columns
     survive; otherwise the key is detected once and cached.  Returns the key
     columns; an empty list means "no usable key" and is cached too.
+
+    Detection must finish by ``deadline`` (a ``_clock()`` reading; default
+    ``PK_SEARCH_BUDGET_S`` from now) or :class:`PrimaryKeySearchTimeout` is
+    raised.
     """
+    if deadline is None:
+        deadline = _clock() + PK_SEARCH_BUDGET_S
     cached = _read_cached(project, content_hash)
     if cached is not None:
         return cached
@@ -94,14 +182,14 @@ def resolve_primary_key(
     if not cache_worthy(project, content_hash):
         parent = _parent_hash(project, content_hash)
         if parent is not None:
-            parent_pk = resolve_primary_key(project, parent, threshold=threshold, max_group=max_group)
+            parent_pk = resolve_primary_key(
+                project, parent, threshold=threshold, max_group=max_group, deadline=deadline
+            )
             if parent_pk and set(parent_pk) <= cols:
                 _write_cached(project, content_hash, parent_pk)
                 return parent_pk
 
     # Root, grain-changing entry, or key column dropped → detect once.
-    from buckaroo.compare import _detect_pk_xorq
-
     from tallyman_xorq.result_cache import cached_result_expr
 
     expr = cached_result_expr(project, content_hash)
@@ -131,7 +219,17 @@ def resolve_primary_key(
 
     keys: list[str] = []
     for group in candidate_groups:
-        found = _detect_pk_xorq(expr, threshold=threshold, max_group=max_group, columns=group) or []
+        found = (
+            _detect_pk(
+                expr,
+                group,
+                threshold=threshold,
+                max_group=max_group,
+                deadline=deadline,
+                content_hash=content_hash,
+            )
+            or []
+        )
         if found:
             keys = found
             break
@@ -151,12 +249,14 @@ def diff_keys(
     """Join key for diffing two entries: a resolved PK present in both schemas.
 
     Returns ``[]`` when neither side's key applies to both — the caller then
-    lets ``key_diff_xorq`` fall back to live detection.
+    lets ``key_diff_xorq`` fall back to live detection.  Both sides share one
+    ``PK_SEARCH_BUDGET_S`` budget.
     """
     a_cols = set(_entry_columns(project, a_hash))
     b_cols = set(_entry_columns(project, b_hash))
+    deadline = _clock() + PK_SEARCH_BUDGET_S
     for h in (a_hash, b_hash):
-        pk = resolve_primary_key(project, h, threshold=threshold, max_group=max_group)
+        pk = resolve_primary_key(project, h, threshold=threshold, max_group=max_group, deadline=deadline)
         if pk and set(pk) <= a_cols and set(pk) <= b_cols:
             return pk
     return []

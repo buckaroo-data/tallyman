@@ -39,6 +39,33 @@ This should go with the customizable styling that you can build into the buckaro
 Build the intelligence into the tool: use the LLM to make the injection mold, not to carve each piece of plastic by hand. The agent should be shaping      *how* you look at data — writing a summary statistic you'll use on every table for the rest of the project — while the looking itself stays instant and free.
 
 
+# Summary paragraph
+
+Two windows: Claude Code in one, a browser in the other. You work by defining a set of named results that can depend on each other, then making sure those results live up to their name. You describe them; the agent writes the queries. You tell it what `likely_customers` should mean, and a moment later the answer is a table in the browser at full size, sortable and searchable, with statistics over every column. Your prompt sits above the query the agent wrote, so you read your intent, the code that came out of it, and the result together. You notice it's catching people who already churned, so you sharpen the sentence and the agent revises the query. Everything built on top of that name updates to match, fast enough that you don't lose your place. How big the data is, what has already been computed, and what needs recomputing never enter into it.
+
+Those queries are expressions: self-contained programs that declare the raw files and other results they read. Writing the expression is the agent's entire job. An expression is declarative and can be introspected, so tallyman reads its dependencies straight off it and builds a directed graph of the project's aliased expressions.  When a parent updates, its children are recomputed; a raw file changing on disk counts as an update too. Tallyman executes each expression once and writes the result and its summary statistics to disk. Reading it back is out of core: scrolling, sorting, and searching pull only the pieces of data needed to fill the screen, so nothing has to fit in memory and four million rows opens like four thousand.
+
+
+You aren't typing `df.sort_values('lifetime_sales')` just to see which customers are at the top, you aren't waiting for the LLM to print a 10 row table like it's coming out of a 1200 baud modem.  You aren't running out of memory in the middle of a session.  You aren't building the ad-hoc cache that every long notebook grows, the pickle in /tmp behind an if not exists guard that you never quite trust. You aren't nursing a kernel along for days because one cell takes five minutes to rerun, or bracing yourself before you close the window. None of that is in your head while you work. What's in your head is the data and what it means.
+
+
+
+You run Claude Code in one window and a browser in the other. Every analysis step is an xorq expression the agent writes and sends over MCP, which tallyman stores on disk
+as a named, content-addressed entry alongside the prompt that produced it. The browser shows each entry as a live grid with per-column histograms and summary statistics,
+computed in the query engine instead of in memory, so four million rows opens like four thousand. Revise a step and everything defined in terms of it recomputes in
+dependency order; the previous version stays on disk, so you can diff the two by code, schema, column statistics, and rows. There is no kernel and no hidden state.
+
+
+-- 
+Every analysis step is an xorq expression 
+
+I don't want to say xorq expression because no one knows what that is
+
+Every analysis step is an independent program (called an expression) that records its dependencies, and produces a dataframe that is named with an alias and added to the catalog.
+When the expression is added, it is also executed and cached, along with summary stats.  The caching is written to disk.  In this way the system doesn't have to keep the entire dataframe in memory.
+
+
+
 
 # Bullet point list of features
 (Claude please fill in the features I have written about into an organized list, + features that I ahven't mentioned)

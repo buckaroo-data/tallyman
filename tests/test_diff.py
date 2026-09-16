@@ -236,6 +236,51 @@ expr = u
     assert "primary key search" in r.json()["detail"]
 
 
+def _dup_versions(project: str) -> None:
+    dup = f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+u = t.union(t, distinct=False)
+expr = u
+"""
+    catalog_create("dups", dup)
+    catalog_revise("dups", dup.replace("expr = u", "expr = u.filter(u.qty > 1)"))
+
+
+def _forbid_buckaroo_pk_search(monkeypatch) -> None:
+    # tallyman's time-boxed search is the only key search a diff may run;
+    # buckaroo's own search in key_diff_xorq has no deadline.
+    import buckaroo.compare
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("buckaroo _detect_pk_xorq must not run")
+
+    monkeypatch.setattr(buckaroo.compare, "_detect_pk_xorq", _boom)
+
+
+def test_diff_route_keyless_entry_skips_keyed_diff(
+    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _dup_versions(project)
+    _forbid_buckaroo_pk_search(monkeypatch)
+    c = TestClient(fresh_companion_app)
+    r = c.get(f"/{project}/api/diff_data/dups/1/2")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["diff"]["keyed"] is None
+    assert "stats" in body["diff"] and "head" in body["diff"]
+
+
+def test_catalog_diff_keyless_entry_skips_buckaroo_search(project: str, orders_parquet: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _dup_versions(project)
+    _forbid_buckaroo_pk_search(monkeypatch)
+    out = catalog_diff("dups", 1, 2)
+    assert "error" not in out, out
+    assert out["keyed_summary"] is None
+
+
 def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     c = TestClient(fresh_companion_app)
     assert c.get(f"/{project}/api/diff_data/missing/1/2").status_code == 404

@@ -94,3 +94,16 @@ def test_search_within_budget_still_finds_key(project, orders_parquet, monkeypat
     # A unique single column is found in a couple of queries, well inside budget.
     monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))
     assert resolve_primary_key(project, h) == ["order_id"]
+
+
+def test_keyless_table_resolves_empty_without_timing_out(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("dups", _dup_rows(project))
+    h = _current_hash(project)
+    # Same few-query budget as the timeout test: one distinct count over every
+    # candidate column shows no subset can reach the threshold, so the search
+    # answers "no key" at once instead of trying every combination.
+    monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))
+    assert resolve_primary_key(project, h) == []
+    # A definite "no key" is cached, unlike a timeout.
+    assert (entry_dir(project, h) / "primary_key.json").exists()

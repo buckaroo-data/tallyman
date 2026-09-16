@@ -915,8 +915,13 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
     # Diff the two entries' (cache-resolving) expressions — an expensive entry
     # reads its baked result cache, a cheap one recomputes (#73); neither
     # depends on a result.parquet existing.
+    from tallyman_xorq.primary_key import PrimaryKeySearchTimeout, diff_keys
     from tallyman_xorq.result_cache import cached_result_expr
 
+    try:
+        keys = diff_keys(project, a_hash, b_hash)
+    except PrimaryKeySearchTimeout as exc:
+        return {"error": f"diff unavailable: {exc}"}
     diff = full_diff(
         a_dir,
         b_dir,
@@ -924,6 +929,7 @@ def catalog_diff(name: str, va: int = -2, vb: int = -1) -> dict:
         b_label=f"V{b_idx}",
         a_expr=cached_result_expr(project, a_hash),
         b_expr=cached_result_expr(project, b_hash),
+        keys=keys,
     )
     return {
         "alias": name,
@@ -957,7 +963,7 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     from tallyman_core.display_configs import set_display_config
     from tallyman_xorq import build_and_persist as _build_and_persist
     from tallyman_xorq.build import BuildError
-    from tallyman_xorq.primary_key import diff_keys
+    from tallyman_xorq.primary_key import PrimaryKeySearchTimeout, diff_keys
     from tallyman_xorq.result_cache import cached_result_expr
 
     project = _resolve_active_project()
@@ -979,7 +985,10 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     a_idx, a_hash = a
     b_idx, b_hash = b
 
-    keys = diff_keys(project, a_hash, b_hash) or []
+    try:
+        keys = diff_keys(project, a_hash, b_hash) or []
+    except PrimaryKeySearchTimeout as exc:
+        return {"error": f"diff unavailable: {exc}"}
     if not keys:
         return {"error": "no stable join key detected between the two versions; cannot build keyed diff"}
 

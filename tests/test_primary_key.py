@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import itertools
+
+import pytest
+
+import tallyman_xorq.primary_key as pk
 from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
@@ -12,6 +17,22 @@ from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
 expr = t.select({cols})
 """
+
+
+def _dup_rows(project: str) -> str:
+    # Every order twice: high-cardinality columns, but no column set is more
+    # than 50% distinct, so the search can never stop early.
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.union(t, distinct=False)
+"""
+
+
+def _ticking_clock(step: float):
+    """A fake monotonic clock that advances ``step`` seconds per read."""
+    ticks = itertools.count()
+    return lambda: next(ticks) * step
 
 
 def _current_hash(project: str) -> str:
@@ -51,3 +72,38 @@ def test_dropping_key_column_breaks_inheritance(project, orders_parquet, monkeyp
     child = _current_hash(project)
     # order_id no longer present → can't be the join key for the pair
     assert diff_keys(project, base, child) != ["order_id"]
+
+
+def test_search_times_out_without_caching(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("dups", _dup_rows(project))
+    h = _current_hash(project)
+    # Each budget check costs the whole 1s budget, so the search stops before
+    # its first query.
+    monkeypatch.setattr(pk, "_clock", _ticking_clock(1.0))
+    with pytest.raises(TimeoutError, match="primary key search"):
+        resolve_primary_key(project, h)
+    # A timeout is not an answer: nothing is cached, so a later call retries.
+    assert not (entry_dir(project, h) / "primary_key.json").exists()
+
+
+def test_search_within_budget_still_finds_key(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    h = _current_hash(project)
+    # A unique single column is found in a couple of queries, well inside budget.
+    monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))
+    assert resolve_primary_key(project, h) == ["order_id"]
+
+
+def test_keyless_table_resolves_empty_without_timing_out(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("dups", _dup_rows(project))
+    h = _current_hash(project)
+    # Same few-query budget as the timeout test: one distinct count over every
+    # candidate column shows no subset can reach the threshold, so the search
+    # answers "no key" at once instead of trying every combination.
+    monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))
+    assert resolve_primary_key(project, h) == []
+    # A definite "no key" is cached, unlike a timeout.
+    assert (entry_dir(project, h) / "primary_key.json").exists()

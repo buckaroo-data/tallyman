@@ -400,7 +400,7 @@ def snapshot_file_digest(path: Path) -> str:
     """SHA-256 of a snapshot parquet file's raw bytes.
 
     The new ``result_digest`` for worthy entries (ADR
-    ``adr-result-digest-canonical-ordering.md``): the bake sorts by
+    ``ADR-004-result-digest-canonical-ordering.md``): the bake sorts by
     ``original_row_order`` before materialising, so the file bytes are
     deterministic run-to-run and the file hash is a sound multiset identity.
     ~0.3s for a 400 MB file — far cheaper than the retired per-row

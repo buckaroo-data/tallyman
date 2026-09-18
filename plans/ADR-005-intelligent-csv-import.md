@@ -11,7 +11,7 @@
 - **Research:** `docs/research/csv-importers/` — deep dives on DuckDB / Polars /
   Pandas (config, inference, error handling, test suites), a cross-tool
   `comparison.md`, and an `edge-cases.md` pathology corpus.
-- **Related ADR:** `plans/adr-result-digest-canonical-ordering.md` (the
+- **Related ADR:** `plans/ADR-004-result-digest-canonical-ordering.md` (the
   `original_row_order` / snapshot-worthiness invariant this design must preserve).
 
 ## Problem

@@ -6,7 +6,7 @@ inline on the catalog-write/compile path. From the long-lived, multithreaded
 tallyman server those bare-name `subprocess` calls fork, and `fork()` from a
 multithreaded process on macOS can die with SIGSEGV/SIGABRT (a child inherits
 locks held by threads that don't exist in it). See
-`plans/adr-git-subprocess-threading.md` and buckaroo-data/nokernel-notebooks#25.
+`plans/ADR-001-git-subprocess-threading.md` and buckaroo-data/nokernel-notebooks#25.
 
 These tests exercise the real xorq `get_git_state` (the unedited library
 function) through the in-repo guard, plus the real `build_and_persist` write

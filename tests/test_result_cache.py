@@ -626,7 +626,7 @@ def _overwrite_orders(project: str, seed: int) -> None:
 
 
 def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: worthy entries record a result_digest
+    # ADR-004-result-digest-canonical-ordering: worthy entries record a result_digest
     # (SHA-256 of the baked snapshot file bytes, stable run-to-run because the
     # snapshot is sorted by original_row_order before baking). Cheap entries record
     # no digest — they have no snapshot to hash.
@@ -653,7 +653,7 @@ def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch
 
 
 def test_verify_result_faithful_true_for_deterministic_entry(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: for a worthy (snapshot-baking) entry,
+    # ADR-004-result-digest-canonical-ordering: for a worthy (snapshot-baking) entry,
     # verify_result_faithful compares the snapshot file's SHA-256 to the recorded
     # digest and returns True for a clean, deterministic build. A cheap entry records
     # no digest, so verify_result_faithful returns None for it.
@@ -674,7 +674,7 @@ def test_verify_result_faithful_true_for_deterministic_entry(project, orders_par
 
 
 def test_verify_result_faithful_detects_snapshot_drift(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: verify_result_faithful checks the
+    # ADR-004-result-digest-canonical-ordering: verify_result_faithful checks the
     # baked snapshot file's SHA-256 against the recorded digest. For a worthy entry
     # whose snapshot has been tampered with (bytes differ from build time), it
     # returns False. A cheap entry always returns None (no digest recorded).
@@ -1350,7 +1350,7 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
 
 
 def test_result_digest_is_snapshot_file_hash(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: the result_digest for a worthy entry
+    # ADR-004-result-digest-canonical-ordering: the result_digest for a worthy entry
     # is the SHA-256 of the baked snapshot file bytes (not a per-row repr() hash).
     # It equals snapshot_file_digest(baked_snapshot_path(...)) and is stable because
     # the snapshot is sorted by original_row_order before baking.
@@ -1459,12 +1459,12 @@ def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_
 
 
 # ---------------------------------------------------------------------------
-# ADR adr-result-digest-canonical-ordering — new contract tests
+# ADR-004-result-digest-canonical-ordering — new contract tests
 # ---------------------------------------------------------------------------
 
 
 def test_cheap_entry_records_no_digest(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: a cheap entry (no Aggregate/Join/Sort/UDF)
+    # ADR-004-result-digest-canonical-ordering: a cheap entry (no Aggregate/Join/Sort/UDF)
     # bakes no snapshot, so there is nothing to hash. The manifest must record no
     # result_digest (None / falsy).
     from tallyman_core import entry_dir, read_manifest
@@ -1493,7 +1493,7 @@ expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count()).order_by
 
 
 def test_result_digest_stable_run_to_run(project, orders_parquet, monkeypatch):
-    # ADR adr-result-digest-canonical-ordering: the result_digest for a worthy entry
+    # ADR-004-result-digest-canonical-ordering: the result_digest for a worthy entry
     # with a deterministic (explicitly ordered) result is stable across two independent
     # materialisations. Uses an explicitly-ordered aggregate (Sort op) so the snapshot
     # bytes are deterministic and the file hash should be identical on self-heal.

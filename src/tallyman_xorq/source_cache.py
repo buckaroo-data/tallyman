@@ -94,7 +94,7 @@ def _tie_break_order(names, keyed: set[str], schema, rel) -> list[str]:
 def _canonical_sorted(expr):
     """Impose a deterministic total order before the result-cache bake.
 
-    ADR D5 (amended, plans/adr-read-path-loads-builds.md): datafusion's parallel
+    ADR D5 (amended, plans/ADR-006-read-path-loads-builds.md): datafusion's parallel
     scan/aggregation reorders rows run-to-run above its 1 MiB repartition
     threshold, so an unsorted bake produces different bytes on every heal and
     ``result_digest`` stops naming the entry's result. Sorting by every column

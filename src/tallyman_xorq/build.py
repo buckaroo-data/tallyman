@@ -518,7 +518,7 @@ def build_and_persist(
             # the full result and discard it to force row-level evaluation at author
             # time (constant memory; the one pass yields the exact row count).
             #
-            # result_digest (ADR adr-result-digest-canonical-ordering): for worthy
+            # result_digest (ADR-004-result-digest-canonical-ordering): for worthy
             # entries the baked snapshot is sorted by original_row_order before
             # materialisation, so its bytes are deterministic run-to-run and we
             # hash the file directly (cheap, ~0.3s). Cheap entries record no digest

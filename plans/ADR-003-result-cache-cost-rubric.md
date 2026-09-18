@@ -3,7 +3,7 @@
 - **Status:** Proposed (2026-06-10)
 - **Context ticket:** buckaroo-data/tallyman#30 (measured cost/size cache rubric; supersedes #12, feeds #10 and #21)
 - **Affected code:** `src/tallyman_xorq/result_cache.py` (`classify_build`, `cache_worthy`, `cached_result_expr`, `ensure_result`), `src/tallyman_xorq/build.py` (`build_and_persist`, manifest write), `src/tallyman_core/manifest.py`
-- **Related ADR:** `plans/adr-source-identity-content-hash.md` (why `content_hash` is a stable cache key)
+- **Related ADR:** `plans/ADR-002-source-identity-content-hash.md` (why `content_hash` is a stable cache key)
 
 ## Problem
 

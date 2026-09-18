@@ -544,7 +544,7 @@ def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
     order (unlike datafusion's parallel scan, whose row order is nondeterministic
     above the repartition threshold), so ``original_row_order`` is the true
     0..N-1 file sequence and the bytes are reproducible. See
-    ``plans/adr-result-digest-canonical-ordering.md``.
+    ``plans/ADR-004-result-digest-canonical-ordering.md``.
     """
     import os
     import uuid
@@ -599,7 +599,7 @@ def tallyman_read_csv(path: str, schema=None, **kwargs):
     datafusion ``ROW_NUMBER() OVER ()`` numbers rows in the nondeterministic
     arrival order of a parallel CSV scan (any file over datafusion's ~10 MB
     repartition threshold), so it would not pin file order at all. See
-    ``plans/adr-result-digest-canonical-ordering.md``.
+    ``plans/ADR-004-result-digest-canonical-ordering.md``.
 
     Args:
         path: Absolute path to the CSV file.

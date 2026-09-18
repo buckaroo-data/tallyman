@@ -1,4 +1,4 @@
-"""Reproduce the measurements behind plans/adr-result-digest-canonical-ordering.md.
+"""Reproduce the measurements behind plans/ADR-004-result-digest-canonical-ordering.md.
 
 Quantifies, on any wide CSV:
   1. how much of a build is the per-row result digest vs the actual read,

@@ -3,7 +3,7 @@
 - **Status:** Normative, implemented (PR #167, 2026-07-31). Describes the
   system as built; where code or the descriptive docs disagree with it, the
   disagreement is a bug. Design decisions and pre-fix history:
-  `plans/adr-read-path-loads-builds.md`.
+  `plans/ADR-006-read-path-loads-builds.md`.
 - **Audience:** no prior xorq knowledge assumed. The xorq section below covers
   exactly as much of xorq as the rest of the doc needs, and no more.
 
@@ -433,7 +433,7 @@ The recipe-reconstruction machinery survives only as a diagnostic. An entry
 whose build is missing or unloadable is a **hard error** naming the entry and
 the remedy (rebuild) — there is no automatic recipe fallback, because a
 warning on a background read is exactly how #163-class behavior stays
-invisible (decided in `plans/adr-read-path-loads-builds.md`, D6).[^recon]
+invisible (decided in `plans/ADR-006-read-path-loads-builds.md`, D6).[^recon]
 
 ## Composition: diff and beyond
 
@@ -576,7 +576,7 @@ wrong even if every test passes.
 
 This contract began as the proposed design for the #163 fix; the pre-fix
 deviations and the decisions that settled the design (D1–D12) are in
-[`plans/adr-read-path-loads-builds.md`](../plans/adr-read-path-loads-builds.md).
+[`plans/ADR-006-read-path-loads-builds.md`](../plans/ADR-006-read-path-loads-builds.md).
 The wider audit of the same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes

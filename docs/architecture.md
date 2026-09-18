@@ -209,7 +209,7 @@ entries with the same expression and inputs collapse to the same hash, which is
 what makes builds idempotent. Because hashes are content-addressed and globally
 unique by construction, Buckaroo sessions are keyed globally by content hash,
 not per project. The source-identity mode (`off` / `cas` / `salt`, default
-`cas`) is decided in [adr-source-identity-content-hash.md](../plans/adr-source-identity-content-hash.md).
+`cas`) is decided in [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md).
 
 **Result digest.** A second identity axis, recorded for *worthy* (snapshot-baking)
 entries only. The content hash keys the expression graph; the `result_digest`
@@ -221,7 +221,7 @@ hash is order-insensitive. Cheap, row-preserving entries record no digest — th
 have no snapshot to hash and recompute live. A mismatch when an evicted snapshot
 self-heals points at execution nondeterminism (sampling, `now()`, an impure UDF,
 source drift), not the unordered-scan row reshuffling the canonical ordering now
-absorbs. Design: [adr-result-digest-canonical-ordering.md](../plans/adr-result-digest-canonical-ordering.md).
+absorbs. Design: [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md).
 
 **Alias and V_n versions.** An alias is a named, mutable pointer (for example
 `sales`) to the latest content hash of a logical entry. Each alias carries an
@@ -385,17 +385,17 @@ when in doubt, the code wins.
 
 ### Design records / ADRs (`plans/`)
 
-- [adr-source-identity-content-hash.md](../plans/adr-source-identity-content-hash.md)
+- [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md)
   — content-addressed source reads so `content_hash` tracks source data.
   **Mostly current.**
-- [adr-git-subprocess-threading.md](../plans/adr-git-subprocess-threading.md) —
+- [ADR-001-git-subprocess-threading.md](../plans/ADR-001-git-subprocess-threading.md) —
   calling git from the multithreaded server (fork-safe `posix_spawn`).
   **Mostly current.**
-- [adr-result-cache-cost-rubric.md](../plans/adr-result-cache-cost-rubric.md) —
+- [ADR-003-result-cache-cost-rubric.md](../plans/ADR-003-result-cache-cost-rubric.md) —
   a *proposed* cost-vs-size cache rubric. **Partially stale / not adopted:** the
   structural `cache_worthy` admission test it proposes to remove is still the
   live gatekeeper, and `ensure_result` it names was removed (#73).
-- [adr-result-digest-canonical-ordering.md](../plans/adr-result-digest-canonical-ordering.md)
+- [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md)
   — `result_digest` as a row multiset via a canonically-ordered snapshot hash,
   replacing the per-row Python digest (#137). **Current** (implemented: the
   digest is now `snapshot_file_digest`, and `tallyman_read_csv` injects

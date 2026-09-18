@@ -1,7 +1,7 @@
 """Measure the cost of forcing deterministic datafusion scan order via session config.
 
 Backs the "Make datafusion's scan deterministic via session config" alternative in
-plans/adr-result-digest-canonical-ordering.md. Quantifies, on any wide CSV:
+plans/ADR-004-result-digest-canonical-ordering.md. Quantifies, on any wide CSV:
 
   1. a full read (force full decode of every cell) under datafusion config variants
      vs polars, and

@@ -16,8 +16,8 @@
   `src/tallyman_xorq/staleness.py` (verify sweep),
   `src/tallyman_companion/app.py` + `diff.py` (composition rebind),
   `src/tallyman_companion/buckaroo_lifecycle.py` (pre-heal removal).
-- **Related ADRs:** `plans/adr-source-identity-content-hash.md` (CAS — why
-  content lives in the path), `plans/adr-result-digest-canonical-ordering.md`
+- **Related ADRs:** `plans/ADR-002-source-identity-content-hash.md` (CAS — why
+  content lives in the path), `plans/ADR-004-result-digest-canonical-ordering.md`
   (the digest whose ordering claim D5 re-scopes).
 - **Evidence:** #163's verification on the `taxi2` corpus (frozen builds
   execute to distinct correct results; composition after rebinding works;

@@ -174,7 +174,7 @@ def test_cold_cache_read_reproduces_build_bytes(project, orders_parquet, monkeyp
 
 
 # ---------------------------------------------------------------------------
-# second wave — behaviors decided in plans/adr-read-path-loads-builds.md
+# second wave — behaviors decided in plans/ADR-006-read-path-loads-builds.md
 # (D4, D6, D10); also expected to fail on current main
 # ---------------------------------------------------------------------------
 

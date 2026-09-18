@@ -9,7 +9,7 @@
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),
   `src/tallyman_xorq/io.py` (`read_project_file`), `src/tallyman_xorq/build.py`
   (`build_and_persist`), `src/tallyman_core/manifest.py` (`sources` map)
-- **Related ADR:** `plans/adr-result-cache-cost-rubric.md` (relies on
+- **Related ADR:** `plans/ADR-003-result-cache-cost-rubric.md` (relies on
   `content_hash` being a content-stable cache key)
 - **Evidence:** `tests/test_cache_lab.py` (marker `cache_lab`), reports under
   `tests/cache_lab_reports/`

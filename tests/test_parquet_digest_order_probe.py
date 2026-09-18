@@ -6,7 +6,7 @@ DataFusion's parallel scan/aggregation reordered the bake on every heal above
 split, which is why small fixtures looked deterministic — see
 ``plans/datafusion-scan-order-findings.md``): 3 heals produced 3 distinct
 digests, none matching the build. That evidence flipped ADR D5
-(``plans/adr-read-path-loads-builds.md``) to the canonical sort-by-all-columns
+(``plans/ADR-006-read-path-loads-builds.md``) to the canonical sort-by-all-columns
 bake, which this test now pins: every heal must reproduce the build's exact
 bytes, ``verify_result_faithful`` must agree, and the UNFAITHFUL advisory must
 stay silent.

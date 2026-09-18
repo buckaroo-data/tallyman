@@ -7,8 +7,8 @@
   `result_cache.py:486-501`), `src/tallyman_xorq/io.py` (`read_project_file` —
   the ingest root)
 - **Related:** `plans/89-determinism-prereqs-execution.md` (#83 result-digest,
-  #88 determinism lint, #89 epic), `plans/adr-result-cache-cost-rubric.md` (#30
-  cheap/worthy classification), `plans/adr-source-identity-content-hash.md`
+  #88 determinism lint, #89 epic), `plans/ADR-003-result-cache-cost-rubric.md` (#30
+  cheap/worthy classification), `plans/ADR-002-source-identity-content-hash.md`
   (`content_hash` as cache key),
   `plans/datafusion-scan-order-findings.md` (ingest-reader decision: polars; the
   datafusion scan-order config research and benchmarks behind open question #4)

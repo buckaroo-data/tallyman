@@ -57,7 +57,7 @@ class Manifest(BaseModel):
     result_digest: str | None = None
     # Filename of the baked result-cache snapshot (the xorq cache key + .parquet),
     # recorded at build so the canonical read can assert its own derivation matches
-    # (ADR D8, plans/adr-read-path-loads-builds.md). Build and read share one
+    # (ADR D8, plans/ADR-006-read-path-loads-builds.md). Build and read share one
     # derivation route; this is the tripwire that turns any future divergence (an
     # xorq tokenization change, a rewrite drift) into an immediate, attributable
     # failure instead of a silent wrong-file read. None for a cheap entry (bakes

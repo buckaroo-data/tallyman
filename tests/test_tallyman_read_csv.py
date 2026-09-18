@@ -1,6 +1,6 @@
 """Tests for tallyman_read_csv — CSV ingest with canonical row ordering.
 
-ADR adr-result-digest-canonical-ordering: tallyman_read_csv injects
+ADR-004-result-digest-canonical-ordering: tallyman_read_csv injects
 ``original_row_order`` so snapshot bytes are deterministic across builds.
 """
 from __future__ import annotations

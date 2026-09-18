@@ -9,9 +9,9 @@
   wholesale*. The output-faithfulness portion (`result_digest`) cannot be supplied
   by xorq at all — it answers a different question xorq's cache is structurally
   blind to — and is deliberately a thin, temporary crutch for LLM-authored recipes.
-- **Related:** `plans/adr-result-digest-canonical-ordering.md`,
+- **Related:** `plans/ADR-004-result-digest-canonical-ordering.md`,
   `plans/89-determinism-prereqs-execution.md` (#83 digest / #88 lint / #89 epic),
-  `plans/adr-source-identity-content-hash.md` (`content_hash` + source identity).
+  `plans/ADR-002-source-identity-content-hash.md` (`content_hash` + source identity).
 - **Method:** traced the installed `xorq` 0.3.26 / `xorq_datafusion` 0.2.7 source and
   tallyman `src/`; each load-bearing claim below was independently re-checked against
   the code.
@@ -86,7 +86,7 @@ edits xorq's mtime strategy would miss.
   `exists(key)` short-circuits on the input-derived key and assumes the stored bytes
   are correct. There is no xorq primitive that could detect output drift.
 - **Frozen upstream.** Modifying xorq's hash to fold this in is explicitly rejected /
-  out-of-scope (`adr-source-identity-content-hash.md:111`).
+  out-of-scope (`ADR-002-source-identity-content-hash.md:111`).
 - **Abstraction mismatch.** tallyman reads results across a deliberate parquet boundary
   — `cached_result_expr` returns `deferred_read_parquet(snapshot)` rather than
   re-chaining the recipe (`result_cache.py`), to stay single-backend and skip

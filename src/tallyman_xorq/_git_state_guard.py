@@ -23,7 +23,7 @@ Provenance must never be able to fail a write, so this installs a wrapper that:
 Each call captures fresh — no permanent cache — so successive builds record the
 repo state at build time rather than freezing the first capture. The fix lives
 here, in-repo, rather than in xorq. See
-``plans/adr-git-subprocess-threading.md`` and
+``plans/ADR-001-git-subprocess-threading.md`` and
 buckaroo-data/nokernel-notebooks#25.
 """
 

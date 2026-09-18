@@ -1,6 +1,6 @@
 """Contract tests for tallyman_read_csv — the intelligent-import redesign.
 
-ADR plans/adr-intelligent-csv-import.md. Covers the #137-review cluster:
+ADR plans/ADR-005-intelligent-csv-import.md. Covers the #137-review cluster:
 
 - #144 — `time` / `decimal` / non-nullable ibis types in `_polars_overrides`.
 - #145 — timestamp tz + sub-microsecond precision preserved, not flattened.

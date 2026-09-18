@@ -1,7 +1,7 @@
 # DataFusion scan ordering — findings and decision
 
 - **Status:** Resolved (2026-06-25) — **stick with polars for the ingest reader.**
-- **Origin:** Investigation behind `plans/adr-result-digest-canonical-ordering.md`,
+- **Origin:** Investigation behind `plans/ADR-004-result-digest-canonical-ordering.md`,
   prompted by datafusion's nondeterministic parallel scan order producing false
   "drift" on the order-sensitive result digest.
 - **Repro:** `scripts/bench_scan_order.py` (read + aggregate timings);

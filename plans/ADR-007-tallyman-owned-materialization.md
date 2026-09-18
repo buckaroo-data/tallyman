@@ -216,8 +216,9 @@ record, the SSE event, the stat-cache wipe and session eviction (ADR-006 D7,
 D10), and the pin and badge (D12).
 
 Callers: the canonical read (`cached_result_expr`, on every call, where step 1
-or a handful of `stat` calls is the whole cost), chaining at mint time (D3),
-`load_session` (D6), and the verify sweep.
+or a handful of `stat` calls is the whole cost, and which covers diff
+composition), chaining at mint time (D3), `load_session` (D6), and the verify
+sweep.
 
 ADR-006 D4 rejected bare-read chaining because "builds stay non-self-contained
 and the pre-heal choreography stays load-bearing forever". The pre-heal it
@@ -227,9 +228,12 @@ because reads then re-executed recipes, and every other executor of a child
 build had no such arrangement. Here the requirement is a precondition of the
 one canonical read that every in-process consumer already uses (contract I3),
 and it is computed from the build's own reads, so it cannot drift from what
-execution opens. One out-of-process executor exists, Buckaroo, and it has one
-handoff point. What is given up is stated plainly: a child build executed by
-something other than tallyman no longer regenerates its ancestors.
+execution opens. One out-of-process executor exists, Buckaroo, and it has two
+handoff points: `load_session` for entry grids (D6), and the diff compare post
+(`app.py:1237`), whose expression is composed from `cached_result_expr` on both
+sides and so has already passed through this function. What is given up is
+stated plainly: a child build executed by something other than tallyman no
+longer regenerates its ancestors.
 
 *Rejected:* derive the required snapshots from `manifest.parents`. It needs only
 JSON reads, but it depends on the recorded edges being complete and on each
@@ -252,8 +256,8 @@ behalf and never writes a snapshot, and tallyman stops depending on
 buckaroo#972. The grid and `/api/data` read the same file (contract I5).
 
 Deleting a snapshot (the Cache page, a reset prune, a future budget eviction)
-evicts every live Buckaroo session whose plan reads it, using the hook D10
-already has. The next `/api/session` re-materializes and opens a new session.
+evicts every live Buckaroo session whose plan reads it, entry and diff sessions
+alike, using the hook D10 already has. The next `/api/session` re-materializes and opens a new session.
 Without this, a page request against an evicted file would fail inside Buckaroo
 with the `At least one path is required` error above.
 

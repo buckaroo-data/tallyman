@@ -251,9 +251,15 @@ directory's path, which is why the expanded build already lives at a stable
 path). For a cheap entry it calls `ensure_materialized` and posts the entry's
 own expanded build, as now.
 
-Buckaroo therefore never executes an Aggregate, Join or Sort on tallyman's
-behalf and never writes a snapshot, and tallyman stops depending on
-buckaroo#972. The grid and `/api/data` read the same file (contract I5).
+For an entry grid, Buckaroo therefore never executes an Aggregate, Join or
+Sort on tallyman's behalf and never writes a snapshot, and tallyman stops
+depending on buckaroo#972. The grid and `/api/data` read the same file
+(contract I5).
+
+Live diffs are not covered by this decision. `_build_compare_expr`
+(`app.py:418-441`) posts the outer-join compare expression itself, with nothing
+materialized, so every query Buckaroo runs against a diff session executes the
+join. See open question 4.
 
 Deleting a snapshot (the Cache page, a reset prune, a future budget eviction)
 evicts every live Buckaroo session whose plan reads it, entry and diff sessions
@@ -345,3 +351,8 @@ rebuild, `~/.cache/xorq/result_cache` (14 GB) and the older leaks under
    flags them today, and nothing here does either.
 3. **Eviction policy.** D6 says what eviction must do to live sessions. Which
    snapshots to evict, and when, stays with the ADR-003 rewrite.
+4. **Live diffs.** The compare expression handed to Buckaroo is an outer join
+   over both sides. Tallyman could materialize the compare once, keyed by the
+   two hashes (both immutable, so the file is a pure cache), and post a view of
+   it, which is what D6 does for entries. Promoted diffs are entries and
+   already get this through D6.

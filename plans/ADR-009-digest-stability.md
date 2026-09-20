@@ -1,7 +1,8 @@
 # ADR: Digest stability (a heal is flagged only when the result changed)
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20: D3 gains two format
-  requirements from `plans/ADR-008-row-order-of-reads.md`). Amends
+  requirements from `plans/ADR-008-row-order-of-reads.md`, and D1 lost its
+  speed gate). Amends
   `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the
   snapshot bytes") and decision D5 of
   `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
@@ -120,11 +121,13 @@ lever, because it serializes everything downstream. This decision uses the same
 setting for a different job and accepts that cost knowingly: reproducible
 arithmetic is the point, and no setting gives both.
 
-**Gate.** Rebuild the parking corpus under both settings before committing. If
-the single-partition rebuild is unacceptable, fall back to **D1b**: only plans
-with a floating-point reduction or window run single-partition. That choice is
-made once, at build, from the expression, and recorded in the manifest, so a
-heal never re-derives it.
+Paddy's call in the grilling session (2026-09-20): "I want a cohesive system
+that works reliably, then we can worry about speed problems as they come up."
+So every materialization runs single-partition, and this decision carries no
+speed gate. If the cost becomes a problem, the known variant is to run
+single-partition only for a plan with a floating-point reduction or window,
+decided once at build from the expression and recorded in the manifest so that
+a heal never re-derives it.
 
 *Rejected:* round floats before hashing. A value next to a rounding boundary
 flips under one unit of noise in the last place, and among millions of values
@@ -253,15 +256,13 @@ fix; the float-aggregate heal test and a batch-boundary digest test fail on
 
 ## Open questions
 
-1. **Rebuild time under single-partition materialization.** Decides D1 against
-   D1b.
-2. **Nested types.** The spike covers fixed-width, boolean, string and binary
+1. **Nested types.** The spike covers fixed-width, boolean, string and binary
    columns. Lists, structs and maps need a recursive definition.
-3. **Types parquet cannot store as given.** A `timestamp[s]` column comes back
+2. **Types parquet cannot store as given.** A `timestamp[s]` column comes back
    as `timestamp[ms]`, so the snapshot's schema differs from the entry's
    recorded schema. Either the writer refuses such a column, or the entry's
    schema is recorded from the snapshot. `__row_order` pushes toward the second
    answer, since the writer adds a column the entry's graph does not have.
-4. **Engine upgrades.** Single-partition execution fixes the merge order within
+3. **Engine upgrades.** Single-partition execution fixes the merge order within
    one engine version. Nothing guarantees float results across versions. D4
    attributes that case and the remedy stays a rebuild.

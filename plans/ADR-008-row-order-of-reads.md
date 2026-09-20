@@ -310,7 +310,15 @@ cannot apply it from outside. Tallyman passes the column's name in the
 `/load_expr` payload as a hint. The Buckaroo issue asks that, given the hint,
 Buckaroo sorts by it when the user has chosen no sort, appends it as the last
 key of any user sort, and may use range requests for the unfiltered, unsorted
-view. Without the hint Buckaroo behaves as it does now. Not filed yet.
+view. Without the hint Buckaroo behaves as it does now. Filed as
+buckaroo-data/buckaroo#974.
+
+The issue reproduces the defect through Buckaroo's own page builder.
+`_window_to_parquet` (`buckaroo/xorq_buckaroo.py`, lines 302-330 in 0.15.6)
+sorts on a single key, `expr.order_by(expr[sort_col].asc())`, and applies no
+`order_by` at all when the user has chosen no sort. Six identical calls for the
+same 50 rows of a 27 MB file gave 5 different results unsorted and 6 sorted by
+a column with 200 distinct values.
 
 ### D9. Correct the threshold
 
@@ -339,7 +347,9 @@ its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 - An unsorted page costs a sort of one column unless the file's order is
   declared (100 to 374 ms against 25 to 242 ms in the spike). A range request
   costs about 20 ms at any depth.
-- The grid stays unstable above 10 MB until Buckaroo's half lands.
+- The grid stays unstable until Buckaroo's half (buckaroo-data/buckaroo#974)
+  lands: above 10 MB when unsorted, and at any size when sorted by a column
+  with ties.
 
 ## Open questions
 

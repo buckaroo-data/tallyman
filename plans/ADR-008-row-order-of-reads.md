@@ -1,37 +1,68 @@
-# ADR: Row order of reads (a window is a function of its request)
+# ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
-- **Status:** Proposed (2026-09-18). Amends
-  `plans/ADR-005-intelligent-csv-import.md` INV-2 (the trailing
-  `order_by("original_row_order")`). Corrects a threshold quoted in
-  `plans/ADR-006-read-path-loads-builds.md` D5 and three other places.
+- **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
+  session). The first draft pinned row order with an engine setting. Paddy
+  proposed baking a row-order column into every file tallyman writes and
+  sorting every page by it. The measurements below favour that, so it is now
+  the decision and the engine setting is the rejected alternative under D5.
+  Amends `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position
+  of the row-order column) and INV-2 (the trailing `order_by`). Corrects a
+  threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5
+  (the canonical sort) and three other places.
 - **Context:** the 2026-09-18 cache audit (tallyman @ `a748ea6`, buckaroo
   0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7). No ticket filed yet.
-- **Affected code:** `src/tallyman_companion/app.py` (`api_data`,
-  `app.py:930`, and the chart data it feeds), `src/tallyman_xorq/backend.py`
-  (a second connection), `src/tallyman_xorq/io.py` (`tallyman_read_csv`,
-  `io.py:627`), `src/tallyman_xorq/result_cache.py` (`_EXPENSIVE_OPS`),
-  `src/tallyman_xorq/primary_key.py` (inheritance gate, `primary_key.py:204`).
-  Buckaroo's paging is Buckaroo's code and is covered by D6.
+- **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`,
+  `_tie_break_order`), `src/tallyman_xorq/io.py` (`read_project_file`,
+  `tallyman_read_csv`, `io.py:627`), `src/tallyman_xorq/result_cache.py`
+  (`_EXPENSIVE_OPS`, `classify_build`), `src/tallyman_companion/app.py`
+  (`api_data`, `app.py:930`, and the chart data it feeds),
+  `src/tallyman_xorq/primary_key.py` (candidate selection,
+  `primary_key.py:219`), `src/tallyman_companion/diff.py`
+  (`build_compare_expr`), and the `materialize` writer introduced by
+  `plans/ADR-007-tallyman-owned-materialization.md` decision D4. Buckaroo's
+  paging is Buckaroo's code and is covered by D8.
 - **Related ADRs:** `plans/ADR-004-result-digest-canonical-ordering.md` (why a
-  canonical stored order exists, and the cost of pinning scan order on a
-  connection that also aggregates), `plans/ADR-007-tallyman-owned-materialization.md`
+  canonical stored order exists), `plans/ADR-007-tallyman-owned-materialization.md`
   (what a snapshot is, and the corpus rebuild this shares),
-  `plans/ADR-009-digest-stability.md`.
-- **Evidence:** `scripts/spike_window_read_order.py`. All figures below are
-  from that script on a 14-core machine.
+  `plans/ADR-009-digest-stability.md` (the file format, which D5 adds a
+  requirement to).
+- **Evidence:** `scripts/spike_row_order_paging.py` (the decisions) and
+  `scripts/spike_window_read_order.py` (the problem, and the rejected
+  engine-setting approach). All figures are from those scripts on a 14-core
+  machine.
+
+## Terms
+
+- **Entry:** one catalog computation, stored under its content hash.
+- **Materialize:** run an entry's computation once and write the result to a
+  parquet file. That file is the entry's **snapshot**.
+- **Worthy entry:** an entry tallyman materializes. **Cheap entry:** one it
+  does not, whose small plan re-runs on every read. D4 draws the line.
+- **Page request:** a request for `limit` rows starting at `offset`. `/api/data`,
+  charts and Buckaroo's grid all issue them. The first draft of this ADR called
+  it a "window".
+- **Row-preserving:** each output row comes from exactly one input row, and no
+  input row produces more than one output row. Filters, column selections,
+  computed columns, renames and casts qualify. Aggregates, joins, unions,
+  distincts and unnests do not.
+- **Tie:** two or more rows with equal values in every sort key.
+- **Exchange operator:** a DataFusion physical-plan step (`RepartitionExec`,
+  `CoalescePartitionsExec`) that moves rows between parallel partitions. After
+  one, rows arrive in whatever order the partitions finish.
 
 ## Problem
 
-ADR-006 D5 made the bake deterministic: a worthy entry's snapshot is written in
-a canonical total order, so the file is the same on every heal. Nothing made the
-read of that file deterministic. `/api/data` serves a page as
+Decision D5 of ADR-006 (the canonical sort) made the write deterministic: a
+worthy entry's snapshot is written in a fixed total order, so the file is the
+same on every rebuild. Nothing made the read of that file deterministic.
+`/api/data` serves a page as
 `cached_result_expr(project, hash).limit(limit, offset=offset).execute()`
 (`app.py:930`), charts pull `limit=100000` through the same endpoint, and
-Buckaroo pages the grid the same way in its own process. An unsorted
-`LIMIT/OFFSET` takes rows in whatever order the plan delivers them.
+Buckaroo pages the grid the same way in its own process. A `LIMIT/OFFSET` with
+no `ORDER BY` takes rows in whatever order the plan delivers them.
 
 Eight identical requests for 50 rows from a 91 MB parquet file whose rows are
-physically sorted by `id`:
+physically sorted by `id` (`scripts/spike_window_read_order.py`):
 
 | Plan | Offset | Distinct pages out of 8 | First id seen (file order would give) |
 | --- | --- | --- | --- |
@@ -40,17 +71,21 @@ physically sorted by `id`:
 | read, filter, computed column, limit | 0 | 8 | 1, 221185, 647168 (1) |
 | read, filter, computed column, limit | 1,000,000 | 8 | 746336, 754526, 967522 (1500001) |
 
+A sort does not help when its key has ties. Sorting 3,000,000 rows by a column
+with 200 distinct values and asking for the page at offset 100,000 returned 6
+different pages for 6 identical requests (`scripts/spike_row_order_paging.py`).
+Sorting the grid by a category or a date is exactly that case.
+
 Paging through a large entry therefore repeats some rows and never shows
 others, a chart over more than 100,000 rows changes each time it mounts, and an
 author's own `order_by` is not honoured on screen: the file is sorted and the
-window over it is not.
+page taken from it is not.
 
-**The governing variable** is whether the physical plan has an exchange
-operator (`RepartitionExec`, `CoalescePartitionsExec`) between the scan and the
-limit. When it does, the rows reaching the limit are ordered by partition
-arrival. There are three ways to get one:
+**The governing variable** for the unsorted case is whether the physical plan
+has an exchange operator between the scan and the limit. There are three ways
+to get one:
 
-- DataFusion splits a file scan into `target_partitions` byte ranges when the
+- DataFusion splits a file scan into byte ranges, one per partition, when the
   file is larger than `datafusion.optimizer.repartition_file_min_size`. In this
   engine that is 10,485,760 bytes (`SHOW ...` on a fresh `xo.connect()`), not
   the 1 MiB the repo states.
@@ -60,13 +95,13 @@ arrival. There are three ways to get one:
   is what the #171 probe observed: its fixture is a 2.07 MB file, below the
   split threshold, and its plan is an aggregate.
 
-**What INV-2 was for.** ADR-005 INV-2 keeps a trailing
-`order_by("original_row_order")` on every `tallyman_read_csv` expression so that
-the entry is snapshot-worthy and its order is canonical. Its costs, measured in
-the audit:
+**What INV-2 of ADR-005 was for.** INV-2 keeps a trailing
+`order_by("original_row_order")` on every `tallyman_read_csv` expression so
+that the entry is worthy and its order is canonical. Its costs, measured in the
+audit:
 
 - Every entry in a CSV lineage is worthy for that Sort alone, so every revision
-  bakes a full sorted copy. A 9.3 MB CSV with four trivial revisions produced
+  writes a full sorted copy. A 9.3 MB CSV with four trivial revisions produced
   37 MB of snapshots. One real project holds 779 MB of data and 19 GB of
   `compute_cache`, with ten snapshots of 0.45 to 3.7 GB that are all
   `why=ops:Sort,SortKey`.
@@ -78,107 +113,191 @@ the audit:
 
 ## Decisions
 
-### D1. The contract: a window is a function of `(content_hash, sort, offset, limit)`
+### D1. The contract: a page is a function of `(content_hash, sort, offset, limit)`
 
-The same request returns the same rows in the same order, in any process and
-any cache state. With no sort the rows come in the entry's **stored order**:
+The same page request returns the same rows in the same order, in any process
+and any cache state, with or without a user sort. With no user sort the rows
+come in `__row_order` order (D2). This is the system contract's invariant I1
+("a content hash names a fixed result") applied to a page.
 
-- for a worthy entry, the order of its snapshot, which is the canonical order
-  of ADR-006 D5 (the author's `order_by` keys, then `original_row_order`, then
-  the remaining sortable columns);
-- for a cheap entry, the order its plan yields when executed with no exchange
-  operator over inputs that each have a stored order.
+### D2. Every file tallyman reads carries `__row_order`
 
-This is the system contract's I1 applied to a page: a page is part of the
-result a hash names.
+`__row_order` is an `int64` column holding `0..N-1` in the file's physical row
+order. It is the last column, and it is visible: Buckaroo shows it as the final
+column of the table.
 
-### D2. Tallyman's windows run on a single-partition connection
+Two writers produce it:
 
-A second connection, configured once with
-`SET datafusion.execution.target_partitions = 1`, serves `/api/data` and chart
-sampling. Everything else (stats, diffs, primary-key search, materialization)
-stays on the parallel default backend. Binding onto it is the rebind ADR-006 D3
-already does, which moves no data.
+- **`materialize`** (ADR-007 decision D4, the one writer of snapshots) numbers
+  the rows of the canonically sorted stream as it writes them. If the stream
+  already has a `__row_order` inherited from a parent, the writer replaces it.
+  Each materialization therefore overwrites the column with positions in its
+  own file.
+- **Ingest.** A source file enters tallyman through an ordered copy: polars
+  scans it, `with_row_index` numbers the rows in file order, and the copy is
+  written with the column last. CSVs already work this way (the intermediate
+  parquet under `csv_ordered/`). Parquet sources gain the same step, keyed by
+  the source's digest, beside the content-addressed clone that stays the
+  immutable input. A source that already has a `__row_order` column has it
+  overwritten, which is the right outcome for a file tallyman exported.
 
-With that setting the plan for both shapes above is
-`GlobalLimitExec <- (FilterExec) <- DataSourceExec` over one file group, with
-no exchange operator:
+The canonical sort's tie-break (`_tie_break_order`) puts an inherited
+`__row_order` where `original_row_order` is today: after the author's own
+`order_by` keys and before the remaining columns. A worthy entry that keeps its
+parent's rows, such as one adding a window function, therefore keeps the
+parent's order.
 
-| Setting | read, limit | read, filter, computed column, limit | 3M-row aggregate |
+*Rejected:* `row_number()` inside the entry's graph. It needs the same global
+sort, adds a window function to every worthy build, and leaves contiguity to
+the engine. A counter in the writer is contiguous and physical by construction,
+which D5's range requests depend on.
+*Rejected:* a row number kept only as file metadata. DataFusion exposes no
+parquet row number that a query can sort or filter by, so it has to be a column.
+
+### D3. Tallyman alters a cheap entry's query so `__row_order` reaches the output
+
+A column selection is an allow-list: `t.select("g", "n")` drops every column it
+does not name, whether or not anyone can see that column. So before freezing a
+cheap build, `rewrite_for_build` alters the expression:
+
+- every column selection whose input has `__row_order` and whose output lacks
+  it gains the column;
+- a `drop` that names it stops dropping it;
+- a final selection moves it to the last position.
+
+The rewrite runs before the build is hashed, so it is part of the entry's
+identity, like the canonical sort already is. A worthy entry needs no rewrite,
+because the writer numbers its rows (D2).
+
+Measured: `t.filter(t.g < 100).select("g", "v0").mutate(z=t.v0 * 2)` has
+columns `['g', 'v0', 'z']` as written and `['g', 'v0', 'z', '__row_order']` as
+altered, and its page at offset 100,000 came back identical 6 times out of 6,
+starting at the expected row (199584). `t.drop("__row_order", "v11")` as
+altered still ends in `__row_order` and still drops `v11`.
+
+*Rejected:* make dropping the column a build error. That puts the burden on
+every recipe an LLM writes, and one forgotten column brings back unstable
+paging for that entry.
+*Rejected:* carry the column and hide it from the grid. Paddy's call: it is
+shown, as the final column.
+
+### D4. Cheap means row-preserving over one file; everything else is materialized
+
+A cheap entry inherits its row order, so it must be a row-preserving plan over
+exactly one file. The classifier changes from a deny-list to an allow-list: an
+entry is cheap only if every relation operation in its graph is known to be
+row-preserving (a file read, a filter, a column selection, a computed column, a
+rename, a cast, a column drop). Anything else is worthy, including operations
+nobody has thought about yet. Today's `_EXPENSIVE_OPS` deny-list classes
+`Union`, `Distinct` and `Unnest` as cheap, and none of them can carry one
+parent's row order.
+
+A new or unknown operation now costs a copy (safe) instead of unstable paging
+(unsafe). `classify_build` (which reads the serialized build) and
+`_is_worthy_expr` (which reads the live expression) flip together, as they must
+today.
+
+Supporting measurement from the first draft: a union of two files returned 2
+different pages for 8 identical requests even on a single-partition
+connection, because `UnionExec` emits one partition per input and an exchange
+operator merges them.
+
+### D5. Every page request orders by `__row_order`
+
+- No user sort: `ORDER BY __row_order`.
+- User sort: the user's keys, then `__row_order` as the last key, which breaks
+  every tie.
+- The unfiltered, unsorted view of a materialized file, where a row's position
+  equals its `__row_order`: a **range request**,
+  `__row_order >= offset AND __row_order < offset + limit`, instead of
+  `OFFSET`. `/api/data` on a worthy entry is always this case.
+
+Measured on 3,000,000 rows by 14 columns (287 MB), on the default parallel
+connection with no engine settings. Every row of the table returned the correct
+page 6 times out of 6:
+
+| Page request | Offset 0 | Offset 1,000,000 | Offset 2,900,000 |
 | --- | --- | --- | --- |
-| default | 5 to 8 pages of 8, wrong rows | 6 to 8 pages of 8, wrong rows | 10 ms |
-| `repartition_file_scans = false` | 1 of 8, file order | 1 of 8, **wrong page** on 100,000-row groups (first id 1423744, not 1500001); file order on 8,192-row groups | 25 ms |
-| that plus `enable_round_robin_repartition = false` | 1 of 8, file order | 1 of 8, file order | 35 ms |
-| `target_partitions = 1` | 1 of 8, file order | 1 of 8, file order | 33 ms |
+| `ORDER BY __row_order LIMIT 50 OFFSET k` | 100 ms | 332 ms | 374 ms |
+| The same, with the file's order declared to the engine (`WITH ORDER`) | 25 ms | 102 ms | 242 ms |
+| Range request, row-group statistics only | 90 ms | 90 ms | 79 ms |
+| Range request, file written with a parquet page index | 19 ms | 24 ms | 23 ms |
+| First draft's approach: bare `LIMIT/OFFSET`, single-partition connection | 21 ms | 90 ms | 249 ms |
 
-`repartition_file_scans = false` alone is not enough. It keeps the scan in one
-piece, the planner adds a round-robin repartition under the filter anyway, and
-the page is then decided by how 14 partitions interleave. It returned the same
-wrong page 8 times out of 8 on one file and the right page on another, which
-is how a fix that is not one passes a test.
+And the sorted case, at offset 100,000: `ORDER BY g` gave 6 distinct pages in 6
+requests (214 ms); `ORDER BY g, __row_order` gave 1 (302 ms).
 
-The aggregate column is the reason for a second connection: an order-pinning
-setting on the shared backend would make every aggregate about three times
-slower (ADR-004 measured 0.5 s against 3.4 to 3.9 s at 11.8M rows).
+Two consequences for the file format, recorded in ADR-009 decision D3: the
+writer emits a parquet page index, which is what takes a range request from 90
+ms to 20 ms, and it writes `__row_order` last.
 
-*Rejected:* the pair of optimizer settings. It works today, and it depends on
-the optimizer having no other rule that introduces an exchange.
-`target_partitions = 1` removes them by construction.
-*Rejected:* an explicit `ORDER BY` on every window. Correct, and a full sort
-of the entry per page.
+Declaring the file's order to the engine removes the sort from the plan
+(`GlobalLimitExec <- SortPreservingMergeExec <- DataSourceExec`, no
+`SortExec`). The spike registers the file through
+`CREATE EXTERNAL TABLE ... WITH ORDER`. Whether the declaration can travel
+inside a xorq build is untested (open question 3), so it is an optimization
+here and not part of the decision.
 
-### D3. The test asserts the plan's shape, not the absence of observed shuffling
+*Rejected:* the first draft's decision, a second connection with
+`target_partitions = 1` for page requests. It makes unsorted pages repeatable
+(bottom row of the table) at the same cost as a declared order. It was
+rejected because:
 
-The window path's test compiles a window on the window connection and asserts
-that the physical plan contains no `RepartitionExec`, `CoalescePartitionsExec`
-or `SortPreservingMergeExec`. A test that watches for shuffled rows passes on
-any fixture below the split threshold, which is how the 1 MiB figure went
-unchallenged and how `repartition_file_scans = false` looked sufficient.
+- it depends on the engine's planner never introducing an exchange operator,
+  and `repartition_file_scans = false`, which looked sufficient in an earlier
+  experiment, returned the same wrong page 8 times out of 8 for a filtered plan
+  on a file with 100,000-row groups;
+- it has to be reproduced inside Buckaroo's process;
+- it does nothing for a user sort with ties;
+- it fails for a union.
 
-### D4. A cheap plan that keeps an exchange operator is classed worthy
+An `ORDER BY` on a column with no ties is repeatable by the query's own
+semantics, in any engine and any process.
 
-`Union` is not in `_EXPENSIVE_OPS`, and `UnionExec` emits one partition per
-input, so `CoalescePartitionsExec` survives `target_partitions = 1`: a union of
-two files returned 2 distinct pages out of 8 on the single-partition
-connection. Such an entry has no stored order to serve. `Union` (with
-`Intersection` and `Difference`, which plan as joins) joins `_EXPENSIVE_OPS`,
-so the entry is materialized in canonical order and its windows become bare
-reads. D3's assertion is what reports the next op of this kind.
+### D6. `__row_order` is reserved
 
-*Rejected:* sort such windows on demand. A full sort of the union per page.
+- Names beginning with `__row_order` are reserved. A recipe may read the column.
+  A recipe that assigns to it is a build error.
+- `materialize` removes every column whose name begins with `__row_order`
+  before appending the fresh one. A join of two entries otherwise leaves a
+  second copy behind under the join's collision name (`__row_order_right`).
+- The primary-key search skips it. Nothing excludes `original_row_order` from
+  the candidates today (`primary_key.py:219`), and a column that is unique in
+  every table would win the search for any table without a string or id key.
+  Row positions shift between versions, so a diff keyed on it would be
+  meaningless.
+- `build_compare_expr` drops it from both sides before joining. The diff is an
+  entry (ADR-007 decision D10) and gets its own when it is materialized.
 
-### D5. `tallyman_read_csv` drops its trailing `order_by` (amends ADR-005 INV-2)
+### D7. `tallyman_read_csv` loses its trailing `order_by`, and its column becomes `__row_order`
 
-`io.py:627` returns `deferred_read_parquet(intermediate)` with no sort. INV-1
-stays: `original_row_order` is still a column holding `0..N-1` in file order,
-and polars writes the intermediate in that order. The root entry becomes a
-cheap bare read of the intermediate, whose stored order is file order, so D1
-and D2 give file-order pages with no Sort and no second copy.
+Amends ADR-005. INV-2: `io.py:627` returns a plain read of the intermediate
+parquet with no `order_by`. INV-1: the row-index column is named `__row_order`
+and written last, so a CSV root has one row-order column and not two with
+identical values. The root entry becomes a cheap read of the intermediate, and
+D5 gives file-order pages with no Sort and no second copy.
 
 What INV-2 provided, and what replaces it:
 
 | INV-2 gave | Replacement |
 | --- | --- |
-| A canonical display order | D1 and D2. INV-2 did not deliver this above 10 MB. |
+| A canonical display order | D5. INV-2 did not deliver this above 10 MB. |
 | A parquet boundary for chained children | A cheap root's graph is one read node. |
-| A `result_digest` on the root, so a re-parse that produced different rows would be caught | Lost as it stands: cheap entries record no digest (ADR-006 D9). See open question 1. |
+| A `result_digest` on the root, so a re-parse that produced different rows would be caught | Lost as it stands: cheap entries record no digest (ADR-006 decision D9, "no cheap-entry digests"). See open question 5. |
 
 Every hash in every CSV lineage changes, so this rides the corpus rebuild of
-ADR-007 D9. It does not depend on ADR-007: with or without bare-read chaining
-the root becomes cheap, and children become cheap unless they do expensive
-work themselves.
+ADR-007 decision D9 ("one change, one rebuild").
 
-### D6. Buckaroo's half is a Buckaroo issue
+### D8. Buckaroo's half is one hint and one Buckaroo issue
 
-Buckaroo pages in its own process on its own connection, so the grid has the
-same defect and tallyman cannot fix it from outside. The issue to file asks
-for D1's contract (unsorted windows repeatable and in stored order; sorted
-windows repeatable when the sort key has ties) and leaves the mechanism to
-Buckaroo. After ADR-007 D6 the file Buckaroo reads for a worthy entry is
-tallyman's snapshot, so the stored order is already in place on the file side.
-Not filed yet.
+Buckaroo pages in its own process, so the grid needs the same rule and tallyman
+cannot apply it from outside. Tallyman passes the column's name in the
+`/load_expr` payload as a hint. The Buckaroo issue asks that, given the hint,
+Buckaroo sorts by it when the user has chosen no sort, appends it as the last
+key of any user sort, and may use range requests for the unfiltered, unsorted
+view. Without the hint Buckaroo behaves as it does now. Not filed yet.
 
-### D7. Correct the threshold
+### D9. Correct the threshold
 
 `repartition_file_min_size` is 10,485,760 in this engine. Four places say 1 MiB
 and are corrected with this change: `plans/ADR-006-read-path-loads-builds.md:98`,
@@ -190,33 +309,36 @@ its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 
 ## Consequences
 
-- `/api/data` pages and chart samples become repeatable and come in stored
-  order, for worthy and cheap entries alike.
-- Latency on the window connection in the spike: 1 to 4 ms at offset 0 and 13
-  to 34 ms at offset 1,000,000, against 1 to 10 ms for the unstable default.
-  DataFusion decodes and discards the skipped rows, so the cost grows with the
-  offset (open question 2).
-- CSV lineages stop baking sorted copies. With ADR-007, revisions of a CSV
-  entry are cheap reads over one intermediate file, and primary-key
-  inheritance applies to them.
-- Union entries gain a materialized copy, which is the price of having a
-  defined row order.
+- Pages are repeatable for unsorted and sorted requests, in tallyman and in
+  Buckaroo, with no engine settings and no second connection.
+- Every table shows one more column, at the end.
+- CSV lineages stop writing sorted copies. With ADR-007, revisions of a CSV
+  entry are cheap reads over one intermediate file, and primary-key inheritance
+  applies to them.
+- Unions, distincts and unnests are materialized, which is the price of having
+  a defined row order.
+- Each parquet source costs one ordered copy, about the size of the source.
+- An unsorted page costs a sort of one column unless the file's order is
+  declared (100 to 374 ms against 25 to 242 ms in the spike). A range request
+  costs about 20 ms at any depth.
 - The grid stays unstable above 10 MB until Buckaroo's half lands.
 
 ## Open questions
 
-1. **A digest for the CSV intermediate.** The intermediate parquet is the
-   record of a parse and is re-created from the CAS clone if deleted. Recording
-   its digest in the root entry's manifest, and verifying it on re-creation,
-   would restore what D5 gives up. It wants ADR-009's digest definition, and it
-   touches where the intermediate lives: `csv_ordered` is global, is never
-   collected, and is not packed.
-2. **Deep offsets.** A window far into a wide snapshot decodes everything
-   before it. Because tallyman writes the snapshot (ADR-007, ADR-009), a bare
-   read's window is a row range, and row-group metadata says which one or two
-   row groups hold it. Measure on the parking corpus before building anything.
-3. **`Distinct` is classed cheap** although it executes as a hash aggregate.
-   Its single-partition window was repeatable in the spike (1 page of 8, no
-   exchange operator), which reflects the aggregate's emission order in this
-   engine version rather than a guarantee. Classing it worthy would make its
-   order canonical and stop a full scan per page.
+1. **Ordered copies of parquet sources.** D2 adds a copy per parquet source.
+   This has not been discussed with Paddy. It also assumes polars numbers a
+   parquet scan's rows in file order, as ADR-004 measured for CSV, which needs
+   checking.
+2. **Renaming `original_row_order`.** D7 replaces it with `__row_order`. Also
+   not yet discussed. The alternative keeps it as a data column meaning "line of
+   the source file", at the cost of two identical columns on every CSV root.
+3. **Declaring a file's order inside a xorq build.** It works through DDL on a
+   connection. If it can ride in a build's read node, Buckaroo's unsorted pages
+   get the cheaper plan too.
+4. **Deep offsets on a cheap entry.** Positions in a filtered view have gaps,
+   so it pages with `OFFSET`, whose cost grows with depth.
+5. **A digest for an ordered copy.** An ordered copy is the record of a parse
+   and is re-created from the clone if deleted. Recording its digest in the root
+   entry's manifest, and verifying it on re-creation, would restore what D7
+   gives up. It wants ADR-009's digest definition, and it touches where the
+   copies live: `csv_ordered` is global, is never collected, and is not packed.

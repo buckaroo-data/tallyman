@@ -2,8 +2,10 @@
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
   session, which added the governing rule, decisions D10 to D12, and the
-  resolution recorded under D5). Awaiting Paddy's review; nothing here is
-  implemented. Supersedes two decisions of
+  resolution recorded under D5, and again the same day after a review of
+  PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's
+  session-ending clause was dropped, and D12's rule was restated). Awaiting
+  Paddy's review; nothing here is implemented. Supersedes two decisions of
   `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the
   parent's cache node) and its D8 (the manifest records the snapshot key and
   reads assert it). Five other ADR-006 decisions keep their intent: D5 (the
@@ -19,6 +21,10 @@
   buckaroo-data/buckaroo#972 (`/load_expr` has no `cache_dir`). The direction
   was set by Paddy the same day: "I want to depend on xorq as little as
   possible for caching."
+- **Tickets:** #188 (diffs, moved out of this ADR), #186 (the waiting that
+  D11's lock causes), #185 (non-pure recipes), #183 (two servers on one
+  project), #168 (CSV source identity, which the shared rebuild of D9 needs),
+  #118 (concurrent reads on the shared backend, which D11 does not cover).
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`),
   `src/tallyman_xorq/result_cache.py` (`_resolve_result_plan`,
   `cached_result_expr`, `entry_graph_expr`, `baked_snapshot_path`,
@@ -154,6 +160,10 @@ computation, writes result files, or repairs tallyman's cache. Besides being
 simpler, this puts every failure of a computation in tallyman's process, where
 it can be logged and reported, and none inside a grid query in Buckaroo.
 
+One exception is known and accepted for now. The live diff still hands
+Buckaroo an unmaterialized join, because the decision that fixed it (D10) was
+moved out of this set to #188.
+
 ## Decisions
 
 ### D1. Builds carry no cache nodes
@@ -201,9 +211,12 @@ snapshot comes from the manifest's `cache_worthy`, as it does now.
 the facade"). For a worthy
 entry it returns one bare read of `snapshot_path`, memoized per
 `(project, content_hash)` for the life of the process, so repeated reads stop
-registering tables and stop re-opening the footer. A worthy entry whose file
-exists is served without loading its build at all. For a cheap entry it returns
-the loaded graph, as now.
+piling up tables in the shared backend: one read has one table name. It does
+not stop the footer being opened per query, because xorq registers a deferred
+read's table again on every execute (`xorq/expr/api.py`,
+`_transform_deferred_reads`). With the format of ADR-009 decision D3 that is a
+2.7 KB read. A worthy entry whose file exists is served without loading its
+build at all. For a cheap entry it returns the loaded graph, as now.
 
 Deleted: `manifest.snapshot_key`, `_assert_recorded_snapshot_key`,
 `_cached_node_path`, `rewrite_cache_dirs`, and the `cache_dir` argument. With
@@ -292,8 +305,26 @@ badge (ADR-006 decision D12).
 
 Callers: the canonical read (`cached_result_expr`, on every call, where step 1
 or a handful of `stat` calls is the whole cost, and which covers diff
-composition), chaining at mint time (D3), `load_session` (D6), and the verify
-sweep.
+composition), chaining at mint time (D3), and `load_session` (D6).
+
+The verify sweep (`verify_sweep`, `staleness.py:118`, reached through
+`catalog_scan_staleness(verify_results=True)`) is not a caller. It checks the
+files that exist, reports each entry that recorded a digest as faithful,
+unfaithful or absent, and writes nothing, which is what it does today. A sweep
+that called this function would rewrite every deleted snapshot in the project,
+which D12 forbids. Nothing is lost by leaving absent files alone: every file
+this function writes is verified before it is served, so an absent file is
+checked at the moment it next exists. A file that exists with the wrong digest
+is reported through the same loud path and left in place, since deleting it is
+the user's action (D12).
+
+One gap is known and accepted. Step 2 collects only reads under
+`compute_cache/result_cache/`. A root entry also reads an ordered copy of its
+source (decision D2 of `plans/ADR-008-row-order-of-reads.md`), which lives
+elsewhere and which this function does not re-create. If one is missing,
+Buckaroo fails with `At least one path is required`. Paddy, 2026-09-20:
+Buckaroo erroring when tallyman has not provided a prerequisite is acceptable
+for now, and follow-on work closes it.
 
 ADR-006 decision D4 rejected bare-read chaining because "builds stay
 non-self-contained and the pre-heal choreography stays load-bearing forever".
@@ -361,16 +392,37 @@ The same rule covers the session itself. Buckaroo drops a session that has had
 no browser attached for an hour, and tallyman's session map assumes a session
 lives as long as the Buckaroo process, so an entry reopened after an idle hour
 is handed an id Buckaroo no longer knows and the grid never loads. Tallyman
-stops remembering sessions. The session id is derived from the project, the
-content hash and the view kind (D10), and `load_session` posts `/load_expr`
-every time, which Buckaroo already treats as a no-op for a session it has.
+stops remembering sessions. The session id is derived from the project and the
+content hash, and `load_session` posts `/load_expr` with that id every time.
+Buckaroo 0.15.6 skips the work when it already has a session with that id and
+the same build directory, provided the post carries none of
+`component_config`, `column_config_overrides`, `extra_grid_config`, `init_sd`
+and `skip_stat_columns` (`buckaroo/server/handlers.py`, lines 429-454).
+Tallyman sends none of them for an ordinary entry, so the repeat post is a
+no-op there. A promoted diff entry sends `column_config_overrides` and so
+reloads on every open, which #188 covers. Putting the project in the id also
+closes #172 (one project's session served to another on a hash collision).
 
-Deleting a snapshot (D12) ends every live Buckaroo session whose plan reads it
-first, using the session-eviction hook that ADR-006 decision D10 introduced. The next
-`/api/session` re-materializes and opens a new session. Without this, a page
-request against a deleted file would fail inside Buckaroo with the
-`At least one path is required` error above, which is exactly the kind of
-failure the rule says belongs to tallyman.
+Deleting a snapshot (D12) ends no session. A tab that already has the entry
+open fails on its next query, inside Buckaroo, with the
+`At least one path is required` error above. That is accepted: the user
+deleted the file on purpose, and reopening the entry fixes it, because every
+open goes through `ensure_materialized` before it posts. The session Buckaroo
+still holds then works again. xorq registers the path afresh on every query,
+and a faithful rewrite has the same content, so the session's stats are still
+right. An earlier draft ended every session whose plan read the deleted file.
+It was dropped in review: it needs an index from each snapshot to every entry
+that reads it, and Buckaroo has no route that ends a session.
+
+An unfaithful heal is the one event that leaves a session wrong, since the
+path now holds different rows and the session holds stats computed from the
+old ones. ADR-006 decision D10 handles it today through `evict_session`, which
+works by dropping tallyman's own record of the session so that the next load
+mints a new one. With no record to drop, the companion's unfaithful-heal hook
+wipes the entry's stat cache, as now, and posts `/load_expr` for the entry's
+id with `force_reload: true`, which Buckaroo already accepts and which re-runs
+its pipeline for that session. Sessions of entries built on the healed file
+are stale too, as they are today; that is part of #185.
 
 This resembles what #104 removed: #102's viewer build over
 `<entry>/result.parquet`. #104's objection was two materialized copies per
@@ -402,9 +454,11 @@ cache node has crept back in.
 
 Removing the cache node changes the hash of every worthy entry, and bare-read
 chaining changes every child's. This lands together with ADR-008's change to
-`tallyman_read_csv` and ADR-009's digest definition, behind a single corpus
-rebuild. After the rebuild, `~/.cache/xorq/result_cache` (14 GB) and the older
-leaks under `~/.cache/xorq/parquet/` (2.6 GB) can be deleted by hand.
+`tallyman_read_csv`, the fix for #168 that the change depends on (CSV sources
+go through source identity, ADR-008 decision D2), and ADR-009's digest
+definition, behind a single corpus rebuild. After the rebuild,
+`~/.cache/xorq/result_cache` (14 GB) and the older leaks under
+`~/.cache/xorq/parquet/` (2.6 GB) can be deleted by hand.
 
 Order of work, agreed 2026-09-20. Nothing starts until Paddy has reviewed all
 three ADRs.
@@ -417,46 +471,28 @@ three ADRs.
    per entry, `tallyman pack` shipping the cache, the primary-key search that
    never converges, and the over-broad stat-cache wipes.
 
-### D10. Every diff is built as an entry before it is displayed
+### D10. Diffs: moved to a follow-on (#188)
 
-Live and promoted diffs already build the same expression
-(`build_compare_expr`). The live path posts it to Buckaroo unmaterialized
-(`_build_compare_expr`, `app.py:418-441`), so the outer join runs again for
-every page, sort and stat query in the diff grid, and a failure of the join
-surfaces inside Buckaroo. The promote path writes a recipe that calls
-`build_diff_expr(a_hash, b_hash, keys)` and runs the normal build.
+This decision said that every diff is built as an entry before it is
+displayed, with an unnamed diff stored as an ephemeral entry under
+`compute_cache/`. Paddy moved it out of this set on 2026-09-20, so that the set
+stays about the core structure of the cache. Its text, and what the review
+found about it, are in #188. The number is kept so that references to D11 and
+D12 stay valid.
 
-Every diff now takes the promote path. When a diff view is opened, tallyman
-builds the diff entry and waits for the build to finish. A diff contains a
-join, so it is worthy and is materialized, and Buckaroo is then handed a view
-build of the finished file (D6) with the diff's display configuration. The page
-shows a "building diff" state while it waits. Promoting a diff is reduced to
-putting an alias on an entry that already exists.
+What this set still does for diffs:
 
-- **An unnamed diff entry is ephemeral.** The checkpoint zips and commits every
-  complete directory under `entries/`, aliased or not (`zip_pending_entries`,
-  `catalog.py:160-180`), so an unnamed diff stored there would put every diff
-  ever viewed into the catalog's git history. Ephemeral entries live under
-  `compute_cache/ephemeral_entries/<content_hash>/`, where everything is
-  already defined as deletable at any time, and they can be rebuilt from the
-  two hashes and the keys. Promote moves the directory into `entries/`, sets
-  the alias and checkpoints. The content hash is computed from the graph, so
-  the move does not change it, and the snapshot path stays the same.
-- **Parents.** A worthy side is read from its snapshot. A cheap side is not
-  copied first: because the diff is itself materialized, each side is read
-  exactly once, while the diff is written.
-- **Sessions.** The same entry can be opened as a diff, with the diff display
-  classes, or as a plain entry, so the Buckaroo session key includes the view
-  kind and is no longer the content hash alone.
-- **Retired with this:** `_build_compare_expr` and its temp build directory,
-  the separate diff-session bookkeeping (`diff_session_is_loaded`,
-  `mark_diff_session_loaded`), and `diff_stat_cache/`, since a diff's Buckaroo
-  stats become its entry's own. The audit finding that every recalc wipes all
-  of `diff_stat_cache/` goes with it.
+- `build_compare_expr` drops `__row_order` from both sides before joining
+  (decision D6 of `plans/ADR-008-row-order-of-reads.md`).
+- Both sides are read through `cached_result_expr`, so both files exist before
+  the join is composed (D5). A diff is the one consumer that needs two files
+  at once, which makes it the natural test of D5.
+- A promoted diff is an ordinary worthy entry. It contains a join, so it is
+  materialized by D4 like any other.
 
-*Rejected:* keep posting the join and materialize nothing. It shows a first
-page sooner, and it breaks the governing rule in both directions: Buckaroo runs
-tallyman's join, repeatedly, and tallyman never learns whether it succeeded.
+Until #188 lands the live diff works as it does today. It posts an
+unmaterialized join to Buckaroo (`_build_compare_expr`, `app.py:418-441`),
+which is the known exception recorded under the governing rule.
 
 ### D11. One write at a time per project
 
@@ -472,6 +508,24 @@ finding that two builds of one entry can end with the failing one deleting the
 winner's directory (`build.py:447-468`, `618-627`). FastMCP runs tool calls on
 a thread pool, so parallel tool calls did build at once. They now queue.
 
+Three limits, recorded here so that the implementation does not have to
+discover them:
+
+- Re-entrant has to mean per thread. `_project_lock` takes `flock` on a fresh
+  file descriptor, so a nested acquire in one process blocks forever. The
+  companion also moves work between threads with `run_in_threadpool`, so the
+  lock cannot be held across an `await`.
+- Whether a recalc takes the lock once per build or once for the whole walk is
+  left to the implementation. Either is correct.
+- The lock covers writes only. Concurrent reads on the shared default backend
+  fail with `RuntimeError: Already borrowed`. That is #118, and this ADR does
+  not change it.
+
+The lock is blocking and has no timeout, and the work it now covers is long: a
+materialization runs single-partition and twice (ADR-009 decisions D1 and D6).
+A page request that needs a heal therefore waits behind any build in the other
+process. Paddy, 2026-09-20: correct first. #186 tracks the waiting.
+
 Two tallyman servers pointed at one project is unsupported. Paddy: "you have
 done something diabolical and deserve the results." The file lock would still
 serialize their writes on one machine, and nothing else about them is safe,
@@ -480,31 +534,39 @@ buckaroo-data/tallyman#183 tracks detecting that case and refusing to start.
 
 ### D12. Files are deleted only by an explicit user action
 
-Nothing deletes a materialized file on its own, and nothing rewrites one except
-opening an entry that needs it (D5). There is no disk budget yet. That is the
-rewrite of `plans/ADR-003-result-cache-cost-rubric.md`, deferred.
+Nothing deletes a materialized file on its own, and nothing writes one
+speculatively. A file is written only because something is about to read it: a
+read of the entry, or a build or a read of an entry whose plan reads its file
+(a page request, a chart, chaining at mint time, a recalc). Those are D5's
+callers. There is no disk budget yet. That is the rewrite of
+`plans/ADR-003-result-cache-cost-rubric.md`, deferred.
 
-- The startup warm-up stops calling `cached_result_expr`. Today it rewrites
-  every snapshot that was deleted, which undoes the Cache page's delete button
-  and can block startup on one large file.
+- The startup warm-up stops calling `cached_result_expr`. Today it heals
+  deleted snapshots until a 3 s budget is spent, and the budget is checked only
+  between entries (`app.py:807-824`). That undoes the Cache page's delete
+  button, and one large heal blocks startup for as long as it takes.
+- The verify sweep reads and never writes (D5).
 - An explicit delete skips an entry marked not reproducible (decision D6 of
-  `plans/ADR-009-digest-stability.md`), whose file cannot be recreated.
-- Ephemeral diff entries (D10) follow the same rule and are not collected
-  automatically.
+  `plans/ADR-009-digest-stability.md`), whose file cannot be recreated. The
+  skip protects the file from the Cache page only. `compute_cache/` as a whole
+  is still deletable by definition (D7), and where such a file should live is
+  part of #185.
 
 ## Testing
 
-Tests marked *red* fail on `main` today and belong in the failing-tests commit.
-The others cannot fail before the code exists and ride with the change.
+Every test below goes in the failing-tests commit and is seen red on CI before
+the change lands (D9, step 1). A test of a function that does not exist yet
+fails on import, and that counts as red. An earlier draft let such tests ride
+with the change. Paddy, 2026-09-20: do normal TDD.
 
-- **Sentinel** (*red*, D8). With `XORQ_CACHE_DIR` pointing at an empty
+- **Sentinel** (D8). With `XORQ_CACHE_DIR` pointing at an empty
   directory, a build, a chained child build, a view, a delete and a reopen
   leave that directory empty.
-- **Concurrent builds** (*red*, D11). Two threads building the same entry both
+- **Concurrent builds** (D11). Two threads building the same entry both
   return it, and the entry's directory is intact afterwards.
-- **Forgotten session** (*red*, D6). After Buckaroo has dropped a session,
+- **Forgotten session** (D6). After Buckaroo has dropped a session,
   reopening the entry yields a grid that loads.
-- **Warm-up leaves deleted files alone** (*red*, D12). A snapshot deleted before
+- **Warm-up leaves deleted files alone** (D12). A snapshot deleted before
   startup is still absent after startup with no requests made.
 - **Identity** (D3). A child's hash changes when its parent's snapshot path
   changes and not when the file's bytes do, and a filter over an aggregate's
@@ -516,11 +578,15 @@ The others cannot fail before the code exists and ride with the change.
   entry needs is reproduced with its recorded digest.
 - **Handoff** (D6). A worthy entry's grid is posted a view build of its
   snapshot, and Buckaroo writes nothing under `compute_cache/result_cache/`.
-- **Diffs** (D10). Opening a diff builds an entry under
-  `compute_cache/ephemeral_entries/` before Buckaroo is called, the checkpoint
-  does not zip it, and promoting it keeps the same content hash.
-- **Explicit delete** (D12). Deleting a snapshot ends the sessions that read it,
-  and the next open rewrites it.
+- **Two files at once** (D5, D10). With both sides' snapshots deleted,
+  composing a diff rewrites and verifies both before the join is built, and the
+  diff carries no row-order column from either side.
+- **Explicit delete** (D12). After a snapshot is deleted, the next open
+  rewrites it and verifies it before Buckaroo is called.
+- **The sweep writes nothing** (D5, D12). With a snapshot deleted, a verify
+  sweep reports the entry as absent, and the file is still absent afterwards.
+- **Forced reload** (D6). After an unfaithful heal, Buckaroo receives a
+  `/load_expr` for that entry's session id with `force_reload` set.
 
 ## Consequences
 
@@ -529,7 +595,9 @@ The others cannot fail before the code exists and ride with the change.
   `manifest.snapshot_key` and `_assert_recorded_snapshot_key`; the `baked` /
   `recompute` plan split keyed on a `CachedNode`; the thread-only `_heal_lock`
   and the `(FileNotFoundError, ValueError)` retry around xorq's shared temp
-  file; `entry_graph_expr` as a separate function.
+  file; `entry_graph_expr` as a separate function; tallyman's record of
+  Buckaroo sessions (`_sessions`, `~/.tallyman/buckaroo_sessions.json`) and
+  `evict_session`, which worked by dropping an entry of it (D6).
 - **ADR-006:** its D4 (inlined chaining) and D8 (snapshot-key tripwire) are
   superseded. Its D2's "snapshot path derived from the loaded expression"
   becomes `snapshot_path`. Its D3 (rebind composition onto the default backend)
@@ -562,7 +630,10 @@ The others cannot fail before the code exists and ride with the change.
   become unnecessary. Not tested.
 - **Cost accepted:** a worthy parent's snapshot must exist before a child can
   be built. A build also no longer repairs its own ancestors when something
-  outside tallyman executes it, and under the governing rule nothing does.
+  outside tallyman executes it, and under the governing rule nothing does. A
+  tab open on an entry whose file the user deletes errors until the entry is
+  reopened (D6). A missing ordered copy of a source surfaces as a Buckaroo
+  error (D5).
 
 ## Open questions
 
@@ -582,10 +653,20 @@ The others cannot fail before the code exists and ride with the change.
    open question 1 is answered with one kind of entry.
 3. **Where ordered copies of sources live.** ADR-008 decision D2 adds one per
    parquet source. `csv_ordered/` is global today, is never collected, and is
-   not included by `tallyman pack`. If every entry is materialized, a root
-   entry's own file could serve as the ordered copy.
+   not included by `tallyman pack`. Its path is also outside the project root,
+   so `make_portable_inplace` does not rewrite it and a CSV entry's build is
+   not portable. The fix for #168 proposes keeping a CSV's ordered copy under
+   the project, next to the content-addressed clone it is built from, which
+   would settle this for CSVs. If every entry is materialized, a root entry's
+   own file could serve as the ordered copy.
 
-Closed in the grilling session: an unfaithful parent's descendants (ADR-009
+Closed in the grilling session: eviction policy (D12).
+
+Reopened in review and moved out of this set: an unfaithful parent's
+descendants. The grilling session closed it on the grounds that ADR-009
 decision D6 finds a non-reproducible entry when it is created and pins its
-file, so it is never rewritten underneath its descendants); eviction policy
-and the collection of ephemeral entries (D12).
+file. The pin holds against the Cache page only, the file lives under
+`compute_cache/`, which D7 defines as deletable, and an entry built on a
+non-reproducible parent is itself recorded as reproducible, because both of
+its runs read the same parent file. #185 has it. The collection of ephemeral
+diff entries went to #188 with D10.

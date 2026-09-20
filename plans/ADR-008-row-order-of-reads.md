@@ -1,7 +1,9 @@
 # ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session). Awaiting Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy
+  session, and again the same day after a review of PR #184, which made the
+  fix for #168 a precondition of D2 and D7). Awaiting Paddy's review; nothing
+  here is implemented. The first draft pinned row order with an engine setting. Paddy
   proposed baking a row-order column into every file tallyman writes and
   sorting every page by it. The measurements below favour that, so it is now
   the decision and the engine setting is the rejected alternative under D5.
@@ -10,10 +12,15 @@
   threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5
   (the canonical sort) and three other places.
 - **Context:** the 2026-09-18 cache audit (tallyman @ `a748ea6`, buckaroo
-  0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7). No ticket filed yet.
+  0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7).
+- **Tickets:** #168 (CSV sources bypass source identity; D2 and D7 depend on
+  its fix), buckaroo-data/buckaroo#974 (Buckaroo's half of D5, see D8), #188
+  (diffs, moved out of ADR-007).
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`,
   `_tie_break_order`), `src/tallyman_xorq/io.py` (`read_project_file`,
-  `tallyman_read_csv`, `io.py:627`), `src/tallyman_xorq/result_cache.py`
+  `tallyman_read_csv`, `io.py:627`, and for #168 `_ordered_csv_key` and
+  `_ordered_csv_parquet`), `src/tallyman_xorq/source_identity.py` (the three
+  steps a CSV now goes through), `src/tallyman_xorq/result_cache.py`
   (`_EXPENSIVE_OPS`, `classify_build`), `src/tallyman_companion/app.py`
   (`api_data`, `app.py:930`, and the chart data it feeds),
   `src/tallyman_xorq/primary_key.py` (candidate selection,
@@ -26,10 +33,12 @@
   (what a snapshot is, and the corpus rebuild this shares),
   `plans/ADR-009-digest-stability.md` (the file format, which D5 adds a
   requirement to).
-- **Evidence:** `scripts/spike_row_order_paging.py` (the decisions) and
+- **Evidence:** `scripts/spike_row_order_paging.py` (the decisions),
   `scripts/spike_window_read_order.py` (the problem, and the rejected
-  engine-setting approach). All figures are from those scripts on a 14-core
-  machine.
+  engine-setting approach), `scripts/spike_csv_source_identity.py` (D2 and D7:
+  what a CSV edit does to a content hash) and
+  `scripts/spike_deep_page_memory.py` (the memory figures under Consequences).
+  All figures are from those scripts on a 14-core machine.
 
 ## Terms
 
@@ -135,11 +144,24 @@ Two writers produce it:
   positions in its own file.
 - **Ingest.** A source file enters tallyman through an ordered copy: polars
   scans it, `with_row_index` numbers the rows in file order, and the copy is
-  written with the column last. CSVs already work this way (the intermediate
-  parquet under `csv_ordered/`). Parquet sources gain the same step, keyed by
-  the source's digest, beside the content-addressed clone that stays the
+  written with the column last. The copy is keyed by the source's content and
+  written once. Both kinds of source go through source identity first
+  (`si.digest_for`, then `si.ensure_cas_path`, then `si.note_source`, the three
+  steps `read_project_file` performs for parquet today, `io.py:78-84`), and the
+  ordered copy is built from the content-addressed clone, which stays the
   immutable input. A source that already has a `__row_order` column has it
   overwritten, which is the right outcome for a file tallyman exported.
+
+  CSVs have the ordered-copy step today and not the keying. The first draft of
+  this decision said they already worked this way, which was wrong. The
+  intermediate under `csv_ordered/` is keyed by `md5(absolute path | schema |
+  reader options)` (`io.py:515-527`), it is overwritten in place when the CSV's
+  mtime changes (`io.py:558-582`), and `tallyman_read_csv` never touches source
+  identity. That is #168, and D7 cannot land before its fix. Building the copy
+  from the clone is enough: the key function already hashes the path, and the
+  clone's path carries the digest, which is the device of
+  `plans/ADR-002-source-identity-content-hash.md`. The clone never changes, so
+  the in-place overwrite becomes dead code and is deleted.
 
 The canonical sort's tie-break (`_tie_break_order`) puts an inherited
 `__row_order` where `original_row_order` is today: after the author's own
@@ -290,8 +312,10 @@ semantics, in any engine and any process.
   every table would win the search for any table without a string or id key.
   Row positions shift between versions, so a diff keyed on it would be
   meaningless.
-- `build_compare_expr` drops it from both sides before joining. The diff is an
-  entry (ADR-007 decision D10) and gets its own when it is materialized.
+- `build_compare_expr` drops it from both sides before joining. A promoted
+  diff is a worthy entry, since it contains a join, and gets its own when it is
+  materialized. The live diff grid has none until #188 lands (diffs built as
+  entries, moved out of ADR-007), so its paging stays as it is today.
 
 ### D7. `tallyman_read_csv` loses its trailing `order_by`, and its column becomes `__row_order`
 
@@ -301,13 +325,26 @@ and written last, so a CSV root has one row-order column and not two with
 identical values. The root entry becomes a cheap read of the intermediate, and
 D5 gives file-order pages with no Sort and no second copy.
 
+This depends on the fix for #168 (D2). Today the trailing Sort is the only
+thing that keeps a CSV root's rows fixed: it makes the root worthy, so a baked
+snapshot freezes them, and a heal that read a changed intermediate would be
+flagged. Without the Sort and without the fix, editing a CSV and re-running the
+same recipe gives the same content hash, so no new version is created, and the
+first version's frozen build returns the edited rows (`[10, 999, 30, 40]` where
+it was built from `[10, 20, 30]`). With the ordered copy keyed on the clone, the
+edit gives a new hash and the first version keeps its rows
+(`scripts/spike_csv_source_identity.py`). The hash does not move today either,
+with the Sort in place, so an edited CSV under an unchanged recipe produces no
+new version. The fix for #168 corrects that as well.
+
 What INV-2 provided, and what replaces it:
 
 | INV-2 gave | Replacement |
 | --- | --- |
 | A canonical display order | D5. INV-2 did not deliver this above 10 MB. |
 | A parquet boundary for chained children | A cheap root's graph is one read node. |
-| A `result_digest` on the root, so a re-parse that produced different rows would be caught | Lost as it stands: cheap entries record no digest (ADR-006 decision D9, "no cheap-entry digests"). See open question 5. |
+| Fixed rows under the root's hash, through its baked snapshot | The content-keyed ordered copy of D2, written once. Requires the fix for #168. |
+| A `result_digest` on the root, so a re-parse that produced different rows would be caught | Lost as it stands: cheap entries record no digest (ADR-006 decision D9, "no cheap-entry digests"). It matters only when an ordered copy is deleted and re-created. See open question 5. |
 
 Every hash in every CSV lineage changes, so this rides the corpus rebuild of
 ADR-007 decision D9 ("one change, one rebuild").
@@ -341,13 +378,21 @@ its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 
 ## Testing
 
-Tests marked *red* fail on `main` today and belong in the failing-tests commit.
-The others cannot fail before the code exists and ride with the change.
+Every test below goes in the failing-tests commit and is seen red on CI before
+the change lands (ADR-007 decision D9, the order of work). A test of a function
+that does not exist yet fails on import, and that counts as red. Paddy,
+2026-09-20: do normal TDD.
 
-- **Repeatable pages** (*red*, D5). Eight identical `/api/data` requests at a
-  deep offset into an entry whose file is larger than 10,485,760 bytes return
-  identical rows, for a worthy entry and for a cheap one. The sorted case is
-  Buckaroo's code and is tested there (buckaroo-data/buckaroo#974).
+- **Repeatable pages** (D5). Eight identical `/api/data` requests at a deep
+  offset into an entry whose file is larger than 10,485,760 bytes each return
+  exactly the rows at positions `offset` to `offset + limit - 1` in
+  `__row_order` order, for a worthy entry and for a cheap one. Asserting only
+  that the eight agree is not enough: one rejected setting returned the same
+  wrong page 8 times out of 8 (D5). The sorted case is Buckaroo's code and is
+  tested there (buckaroo-data/buckaroo#974).
+- **An edited CSV forks the hash** (D2, #168). Editing a CSV and re-running the
+  same recipe gives a new content hash, and the earlier entry still returns the
+  rows it was built from.
 - **The column** (D2). Every file tallyman writes ends in `__row_order`, holding
   `0..N-1` with no gaps, and a materialization replaces an inherited one.
 - **Dropping it fails the build** (D3). A cheap recipe whose select list omits
@@ -379,10 +424,18 @@ The others cannot fail before the code exists and ride with the change.
   applies to them.
 - Unions, distincts and unnests are materialized, which is the price of having
   a defined row order.
-- Each parquet source costs one ordered copy, about the size of the source.
+- Each source costs one ordered copy, about the size of the source. A CSV
+  source also gains a content-addressed clone of the CSV, which is
+  copy-on-write where the filesystem offers it.
 - An unsorted page costs a sort of one column unless the file's order is
   declared (100 to 374 ms against 25 to 242 ms in the spike). A range request
   costs about 20 ms at any depth.
+- A sorted page also holds more in memory the deeper it is. On the spike's
+  file (336 MB as Arrow) peak process memory was 626 MB at offset 0, 1,142 MB
+  at 1,000,000 and 1,176 MB at 2,900,000, against 300 MB for a bare limit and
+  248 MB for a range request (`scripts/spike_deep_page_memory.py`). The corpus
+  holds a 3.68 GB snapshot. Paddy, 2026-09-20: a performance matter, taken up
+  after correctness. The range request is the path with bounded memory.
 - The grid stays unstable until Buckaroo's half (buckaroo-data/buckaroo#974)
   lands: above 10 MB when unsorted, and at any size when sorted by a column
   with ties.
@@ -403,7 +456,12 @@ The others cannot fail before the code exists and ride with the change.
 4. **Deep offsets on a cheap entry.** Positions in a filtered view have gaps,
    so it pages with `OFFSET`, whose cost grows with depth.
 5. **A digest for an ordered copy.** An ordered copy is the record of a parse
-   and is re-created from the clone if deleted. Recording its digest in the root
-   entry's manifest, and verifying it on re-creation, would restore what D7
-   gives up. It wants ADR-009's digest definition, and it touches where the
-   copies live: `csv_ordered` is global, is never collected, and is not packed.
+   and is re-created from the clone if deleted. With the copy keyed by content
+   (D2) a given path always holds the same parse, so what is left unverified is
+   a re-creation, for example after a polars upgrade that parses differently.
+   Recording the copy's digest in the root entry's manifest, and verifying it
+   on re-creation, would cover that. It wants ADR-009's digest definition, and
+   it touches where the copies live: `csv_ordered` is global, is never
+   collected, and is not packed (ADR-007 open question 3). Nothing re-creates a
+   missing copy automatically yet, which ADR-007 decision D5 (one entry point
+   makes files exist) records as an accepted gap.

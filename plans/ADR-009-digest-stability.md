@@ -3,7 +3,9 @@
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
   session: D3 gains two format requirements from
   `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is
-  new). Awaiting Paddy's review; nothing here is implemented. Amends
+  new; and again the same day after a review of PR #184: D1 and D3 now say
+  what single-partition execution leaves undetermined, and D6's cheap-entry
+  half moved to #185). Awaiting Paddy's review; nothing here is implemented. Amends
   `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the
   snapshot bytes") and decision D5 of
   `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
@@ -13,7 +15,9 @@
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
 - **Context:** the 2026-09-18 cache audit (tallyman @ `a748ea6`, xorq 0.3.26,
-  xorq-datafusion 0.2.7, pyarrow 21.0.0). No ticket filed yet.
+  xorq-datafusion 0.2.7, pyarrow 21.0.0).
+- **Tickets:** #187 (a float total depends on the parent file's layout; D1 and
+  D3), #185 (non-pure recipes, which D6 only partly covers).
 - **Affected code:** `src/tallyman_xorq/result_cache.py`
   (`snapshot_file_digest`, `verify_result_faithful`, `_verify_self_heal`),
   `src/tallyman_xorq/build.py` (the execute-once step),
@@ -23,11 +27,14 @@
   introduces (one writer for snapshots, used by the build and by every heal).
   D2 and D3 assume that writer. If ADR-007 were rejected, D1 would stand as
   written and D2 would need restating against xorq's writer.
-- **Related ADRs:** `plans/ADR-008-row-order-of-reads.md` (uses the same
-  single-partition setting for a different job, and has an open question this
+- **Related ADRs:** `plans/ADR-008-row-order-of-reads.md` (its first draft used
+  the same single-partition setting for page reads, and it now rejects that;
+  its open question 5, a digest for an ordered copy of a source, is one this
   digest would answer).
 - **Evidence:** `scripts/spike_float_aggregate_digest.py`,
-  `scripts/spike_logical_digest.py`.
+  `scripts/spike_logical_digest.py`, and
+  `scripts/spike_float_layout_digest.py` (D1 and D3: what the layout of the
+  parent file does to a float total).
 
 ## Terms
 
@@ -106,11 +113,12 @@ rebuilt.
 
 `materialize` (ADR-007 decision D4, the one writer of snapshots) executes on a
 connection configured with
-`SET datafusion.execution.target_partitions = 1`. The build and every heal use
-it, so both run one plan with one merge order, on any machine. It is a
-different connection object from ADR-008's window connection, with the same
-setting, because a long materialization must not share a context with page
-reads.
+`SET datafusion.execution.target_partitions = 1` and an explicit
+`datafusion.execution.batch_size`. The build and every heal use it, so both run
+one plan with one merge order, on any machine, given input files with the same
+layout (see "What this does not fix" below). It is a separate connection from
+the default backend that serves page reads, because a long materialization
+must not share a context with them.
 
 Cost: about 3x on the spike's aggregate. ADR-004 measured a 3.1M-group
 aggregate at 0.5 s parallel against 3.4 to 3.9 s single-partition, and a full
@@ -129,6 +137,28 @@ speed gate. If the cost becomes a problem, the known variant is to run
 single-partition only for a plan with a floating-point reduction or window,
 decided once at build from the expression and recorded in the manifest so that
 a heal never re-derives it.
+
+**What this does not fix.** A single stream fixes the order in which partial
+results are merged. It does not make a float total a function of the rows
+alone. With one partition and the same rows in the same order, an ungrouped
+float `SUM` or `AVG` took three different bit patterns across four copies of
+one file that differed only in row-group size (1,048,576, 777,777, 100,000 and
+8,192 rows), each stable run to run (`scripts/spike_float_layout_digest.py`).
+The variable is association, meaning where the running total is cut into
+sub-sums. The likely mechanism, not confirmed in DataFusion's source, is that
+the ungrouped accumulator sums each record batch as a block while batch
+boundaries follow row-group boundaries. Sorting the input first changes
+nothing, because DataFusion removes the sort: the plan is
+`AggregateExec <- DataSourceExec` with or without it. A grouped aggregate,
+`GROUP BY` a constant key, and the window form `SUM(v) OVER ()` were all
+independent of the layout, so an ibis percent-of-total is not affected. Only a
+true ungrouped reduction is exposed.
+
+So the layout of every file an entry reads is part of what makes its digest
+reproducible. Tallyman writes all of those files (snapshots through D3, and
+sources through the ordered copies of ADR-008 decision D2), which is why
+pinning the layout is enough. D3 pins it. #187 tracks the rest: confirming the
+mechanism, other reductions, and results across machines.
 
 *Rejected:* round floats before hashing. A value next to a rounding boundary
 flips under one unit of noise in the last place, and among millions of values
@@ -212,8 +242,7 @@ ADR-008 adds two requirements. The writer numbers the rows in a last column
 named `__row_order` (ADR-008 decision D2). And it writes a parquet page index,
 which is what lets a page be fetched as a range of `__row_order` values without
 decoding a whole row group: 19 to 24 ms at any depth with the index against 79
-to 90 ms without it, on a 287 MB file (`scripts/spike_row_order_paging.py` on
-the ADR-008 branch).
+to 90 ms without it, on a 287 MB file (`scripts/spike_row_order_paging.py`).
 
 The entry's recorded schema (`schema.json`) is read from the written file and
 not from the expression. The file is what every consumer reads, the writer
@@ -222,18 +251,28 @@ types on the way in: a `timestamp[s]` column comes back as `timestamp[ms]`.
 
 Combining each row group keeps the file bytes reproducible as well. Nothing
 depends on that after D2, and it means two writes of the same entry can still
-be compared with `cmp` when debugging. Because of D2 these settings can change later without
-touching any digest.
+be compared with `cmp` when debugging.
+
+Because of D2 the codec, the compression level and the statistics can change
+later without touching this entry's digest. The row-group size cannot. It
+decides the batch boundaries that an entry built on this file sees, and an
+ungrouped float total depends on them (D1). An earlier draft said every
+setting here was free to change. The row-group size and the materialization
+connection's `batch_size` are therefore part of the reproducibility contract:
+the manifest records a snapshot format version that stands for both, and
+changing either is a corpus rebuild.
 
 ### D4. A mismatch record names its likely cause
 
 With D1 and D2 in place the causes left are the recipe's own nondeterminism
 (`sample()`, `now()`, an impure UDF), source drift under `off` identity mode,
 and an engine upgrade that changed results. The manifest records the xorq,
-xorq-datafusion and pyarrow versions at build, and the `unfaithful_heal` record
-carries them alongside the versions at heal. When they differ, the message says
-so instead of blaming the recipe. The contract's attribution table gains that
-row.
+xorq-datafusion and pyarrow versions at build, together with the snapshot
+format version (D3), and the `unfaithful_heal` record carries them alongside
+the values at heal. When they differ, the message says so instead of blaming
+the recipe. The contract's attribution table gains that row. One cause has no
+attribution yet: a parent that is not reproducible was rewritten, so every
+entry built on it heals to different rows. That belongs to #185.
 
 ### D5. It lands with the rebuild
 
@@ -245,10 +284,13 @@ decision D9 (one change, one rebuild). The manifest field keeps its name.
 Decided by Paddy in the grilling session (2026-09-20): "call the same query
 twice... put some tests around this."
 
-Today tallyman learns that an entry is not reproducible only when a deleted
-file is rewritten and its digest differs. By then the original rows are gone,
-and everything built on them disagrees with the new file without anyone
-knowing. So the check moves to the moment the entry is created:
+Today the build lint from #88 (`_nondeterminism_warnings`, `build.py`) warns
+when a recipe uses one of five known non-pure operations, and nothing records
+its verdict. Beyond that warning, tallyman learns that an entry is not
+reproducible only when a deleted file is rewritten and its digest differs. By
+then the original rows are gone, and everything built on them disagrees with
+the new file without anyone knowing. So a check moves to the moment a
+materialized entry is created:
 
 - `materialize` runs the entry's query twice through the same writer, on the
   same single-partition connection (D1), and compares the two content digests
@@ -261,16 +303,27 @@ knowing. So the check moves to the moment the entry is created:
   the UI, and the build result tells the author so, with the columns whose
   digests differed. This is the state ADR-006 decision D12 (unfaithful entries
   are pinned and badged) reaches after the damage is done. D6 reaches it first.
-- A cheap entry gets the same check. Its two runs are streamed and digested
-  without writing a file. If they differ, the entry is materialized and pinned
-  like any other non-reproducible entry, because re-running it on every read
-  would show different values each time. A computed column that calls
-  `random()` is row-preserving, so it is classed cheap today, and nothing
-  detects it: ADR-006 decision D9 ("no cheap-entry digests") assumed a frozen
-  graph over pinned inputs always gives the same rows.
+- A cheap entry is not checked here. An earlier draft ran it twice as well, and
+  materialized and pinned it when the runs differed. That made a third kind of
+  entry, a graph the classifier calls cheap with a file the manifest says
+  exists, and whether an entry has a file stopped being a function of its
+  graph, which decisions D2, D3 and D5 of
+  `plans/ADR-007-tallyman-owned-materialization.md` all rely on. Paddy moved
+  it to #185 on 2026-09-20. Until that is settled a cheap entry that calls
+  `random()` behaves as it does today: the #88 lint warns, and the entry
+  re-runs on every read.
 
-The cost is a second execution of every create. It is accepted under the
-priority recorded in ADR-007 ("a cohesive system that works reliably" first).
+The cost is a second execution of every create of a materialized entry. It is
+accepted under the priority recorded in ADR-007 ("a cohesive system that works
+reliably" first).
+
+Running twice has two limits, both part of #185. It cannot see `today()`,
+since both runs agree; the #88 lint does. And it cannot see what an entry
+inherits: an entry built on a non-reproducible parent reads the same parent
+file in both runs and is recorded as reproducible, which holds only while that
+file survives. The pin protects the file from the Cache page's delete and from
+nothing else, since `compute_cache/` is deletable by definition (ADR-007
+decision D7, the cold state is an empty `compute_cache`).
 
 A heal is still verified against the recorded digest, as now. After D6 a
 mismatch there means something changed underneath a reproducible entry, which
@@ -278,10 +331,12 @@ D4 attributes.
 
 ## Testing
 
-Tests marked *red* fail on `main` today and belong in the failing-tests commit.
-The others cannot fail before the code exists and ride with the change.
+Every test below goes in the failing-tests commit and is seen red on CI before
+the change lands (ADR-007 decision D9, the order of work). A test of a function
+that does not exist yet fails on import, and that counts as red. Paddy,
+2026-09-20: do normal TDD.
 
-- **Float aggregate reproduces** (*red*). An entry with a float `SUM` and `AVG`
+- **Float aggregate reproduces** (D1). An entry with a float `SUM` and `AVG`
   over a source large enough to run in parallel is created, its file deleted,
   and the entry reopened, three times. Every rewrite must match the recorded
   digest, and no `unfaithful_heal` record may be written.
@@ -295,8 +350,9 @@ The others cannot fail before the code exists and ride with the change.
   reproducible, names the offending column, and has a pinned file.
 - **Create passes a reproducible recipe.** A deterministic recipe is recorded
   as reproducible, and the query is observed to run exactly twice.
-- **A non-reproducible cheap recipe is materialized.** A computed column that
-  calls `random()` ends up with a pinned file instead of re-running per read.
+- **The layout is pinned** (D1, D3). Every snapshot has row groups of 1,048,576
+  rows, the materialization connection reports the pinned `batch_size`, and
+  the manifest records the snapshot format version.
 - **A pinned file survives an explicit delete.** The Cache page's delete skips
   it and says why.
 - **The schema comes from the file.** An entry with a `timestamp[s]` column
@@ -311,8 +367,10 @@ The others cannot fail before the code exists and ride with the change.
 - Materializations and heals are slower, by about 3x on aggregation at spike
   scale and up to 7x in ADR-004's parking measurement, and a create runs its
   query twice (D6). Reads are unaffected.
-- A recipe that is not reproducible is known to be so from the moment it is
-  created, and its file is never rewritten underneath the entries built on it.
+- A materialized entry whose recipe is not reproducible is known to be so from
+  the moment it is created, and the Cache page's delete leaves its file alone.
+  What that does not yet cover (a cheap entry, an entry that inherits the
+  problem from its parent, a file lost with `compute_cache/`) is #185.
 - Verify decodes the file instead of hashing its bytes. It runs on a heal and
   in `catalog_scan_staleness(verify_results=True)`, never on a read.
 - Snapshots are smaller, and their footers were 85 times smaller in the spike,
@@ -320,8 +378,10 @@ The others cannot fail before the code exists and ride with the change.
 - `docs/system-contract.md` changes in "Result digest" and in the manifest
   table ("SHA-256 of the baked result snapshot"), and its verification table
   gains the engine-change row.
-- The same function can digest the CSV intermediate (ADR-008, open
-  question 1).
+- The same function can digest an ordered copy of a source (ADR-008, open
+  question 5).
+- The row-group size and the materialization connection's `batch_size` are
+  frozen for the life of the corpus, and changing either is a rebuild (D3).
 
 ## Open questions
 
@@ -330,3 +390,8 @@ The others cannot fail before the code exists and ride with the change.
 2. **Engine upgrades.** Single-partition execution fixes the merge order within
    one engine version. Nothing guarantees float results across versions. D4
    attributes that case and the remedy stays a rebuild.
+3. **What else decides a float's low bits.** D1 and D3 pin the two variables
+   found so far, the merge order and the batch boundaries. #187 tracks the
+   mechanism, other reductions (variance, correlation, window frames), a filter
+   between the scan and the aggregate, and results across machines and CPU
+   architectures.

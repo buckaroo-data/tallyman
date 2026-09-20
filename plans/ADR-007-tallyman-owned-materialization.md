@@ -135,6 +135,10 @@ reason several decisions below are consequences and not separate choices:
 > sorting and paging. Anything more is done by tallyman first. If something
 > tallyman asked Buckaroo to display does not exist, that is on tallyman.
 
+> When the MCP asks tallyman to create an entry, tallyman should run the query
+> and materialize the parquet if necessary immediately. Tallyman shouldn't call
+> Buckaroo to display an entry until the original query has finished.
+
 So tallyman runs an entry's computation, or a diff, to completion before it
 asks Buckaroo to show anything. No other process runs an entry's expensive
 computation, writes result files, or repairs tallyman's cache. Besides being
@@ -326,8 +330,23 @@ expanded build. A cheap build is a view in the database sense: a stored
 definition (filter these rows, keep these columns) over files that exist.
 Buckaroo's stats, sorts and pages run through it. Tallyman has already executed
 that plan once, in full, at build time, so an error in it has already surfaced
-in tallyman. Whether this reading of the rule is the intended one is open
-question 4.
+in tallyman.
+
+Paddy confirmed this reading on 2026-09-20 (question 4 of the grilling
+session). The words that decide it are "materialize the parquet if necessary":
+a file is written when the entry is created and only for a worthy entry, and
+nothing is written when an entry is viewed. The alternative, writing a file the
+first time a cheap entry is opened so that Buckaroo only ever reads one file,
+was set aside. It costs a wait on first open and a full copy per viewed
+revision; the audit measured 19 GB of cache against 779 MB of data when every
+CSV revision wrote a copy.
+
+The timing half of the rule already holds for creation. The build executes the
+entry once before it writes the manifest, a worthy entry's snapshot is written
+in that step (D4), and an entry with no manifest is treated as absent, so
+Buckaroo cannot be asked to display an entry whose query is still running. The
+same ordering now covers a snapshot that was deleted later: `load_session`
+waits for `ensure_materialized` before it posts anything.
 
 Deleting a snapshot (the Cache page, a reset prune, a future budget eviction)
 ends every live Buckaroo session whose plan reads it first, using the
@@ -466,12 +485,6 @@ tallyman's join, repeatedly, and tallyman never learns whether it succeeded.
    flags them today, and nothing here does either.
 3. **Eviction policy.** D6 says what eviction must do to live sessions. Which
    snapshots to evict, and when, stays with the ADR-003 rewrite.
-4. **What a cheap entry's grid is handed.** D6 hands Buckaroo the cheap
-   entry's own build, read as a view. The stricter reading of the governing
-   rule would have tallyman write a file on first view, so that Buckaroo only
-   ever reads one file. That costs a full copy per viewed revision (the audit
-   measured 19 GB of cache against 779 MB of data when every CSV revision wrote
-   one) and a wait on first open. Awaiting Paddy's answer.
-5. **Garbage collection of ephemeral entries.** D10 says where they live and
+4. **Garbage collection of ephemeral entries.** D10 says where they live and
    that they are deletable. When to delete them belongs with the eviction
    policy of open question 3.

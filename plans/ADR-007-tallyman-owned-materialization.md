@@ -139,6 +139,14 @@ reason several decisions below are consequences and not separate choices:
 > and materialize the parquet if necessary immediately. Tallyman shouldn't call
 > Buckaroo to display an entry until the original query has finished.
 
+> I want a cohesive system that works reliably, then we can worry about speed
+> problems as they come up. We don't have a cohesive system now.
+
+That last statement sets the priority for all three ADRs of this set (this one,
+`plans/ADR-008-row-order-of-reads.md` and `plans/ADR-009-digest-stability.md`):
+where a uniform rule and a faster special case compete, the uniform rule is the
+decision and the faster path is noted for later.
+
 So tallyman runs an entry's computation, or a diff, to completion before it
 asks Buckaroo to show anything. No other process runs an entry's expensive
 computation, writes result files, or repairs tallyman's cache. Besides being

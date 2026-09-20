@@ -1,8 +1,9 @@
 # ADR: Digest stability (a heal is flagged only when the result changed)
 
-- **Status:** Proposed (2026-09-18, revised 2026-09-20: D3 gains two format
-  requirements from `plans/ADR-008-row-order-of-reads.md`, and D1 lost its
-  speed gate). Amends
+- **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
+  session: D3 gains two format requirements from
+  `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is
+  new). Awaiting Paddy's review; nothing here is implemented. Amends
   `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the
   snapshot bytes") and decision D5 of
   `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
@@ -214,6 +215,11 @@ decoding a whole row group: 19 to 24 ms at any depth with the index against 79
 to 90 ms without it, on a 287 MB file (`scripts/spike_row_order_paging.py` on
 the ADR-008 branch).
 
+The entry's recorded schema (`schema.json`) is read from the written file and
+not from the expression. The file is what every consumer reads, the writer
+adds a column the graph does not have (`__row_order`), and parquet changes some
+types on the way in: a `timestamp[s]` column comes back as `timestamp[ms]`.
+
 Combining each row group keeps the file bytes reproducible as well. Nothing
 depends on that after D2, and it means two writes of the same entry can still
 be compared with `cmp` when debugging. Because of D2 these settings can change later without
@@ -232,18 +238,81 @@ row.
 ### D5. It lands with the rebuild
 
 Every worthy entry's digest is recomputed by the corpus rebuild of ADR-007
-decision D9 (one change, one rebuild).
-The manifest field keeps its name. Tests that cannot fail first ride with the
-fix; the float-aggregate heal test and a batch-boundary digest test fail on
-`main` and belong in the failing-tests commit.
+decision D9 (one change, one rebuild). The manifest field keeps its name.
+
+### D6. Create runs the query twice and compares
+
+Decided by Paddy in the grilling session (2026-09-20): "call the same query
+twice... put some tests around this."
+
+Today tallyman learns that an entry is not reproducible only when a deleted
+file is rewritten and its digest differs. By then the original rows are gone,
+and everything built on them disagrees with the new file without anyone
+knowing. So the check moves to the moment the entry is created:
+
+- `materialize` runs the entry's query twice through the same writer, on the
+  same single-partition connection (D1), and compares the two content digests
+  (D2). Both runs go through the writer because D2's digest is defined on the
+  file as read back. The second file is then discarded.
+- When they match, the entry is recorded as reproducible, with its digest.
+- When they differ, the build still succeeds, because a recipe that calls
+  `sample()` is legitimate. The entry is recorded as not reproducible, its file
+  is pinned (never deleted by tallyman, ADR-007 decision D12), it is badged in
+  the UI, and the build result tells the author so, with the columns whose
+  digests differed. This is the state ADR-006 decision D12 (unfaithful entries
+  are pinned and badged) reaches after the damage is done. D6 reaches it first.
+- A cheap entry gets the same check. Its two runs are streamed and digested
+  without writing a file. If they differ, the entry is materialized and pinned
+  like any other non-reproducible entry, because re-running it on every read
+  would show different values each time. A computed column that calls
+  `random()` is row-preserving, so it is classed cheap today, and nothing
+  detects it: ADR-006 decision D9 ("no cheap-entry digests") assumed a frozen
+  graph over pinned inputs always gives the same rows.
+
+The cost is a second execution of every create. It is accepted under the
+priority recorded in ADR-007 ("a cohesive system that works reliably" first).
+
+A heal is still verified against the recorded digest, as now. After D6 a
+mismatch there means something changed underneath a reproducible entry, which
+D4 attributes.
+
+## Testing
+
+Tests marked *red* fail on `main` today and belong in the failing-tests commit.
+The others cannot fail before the code exists and ride with the change.
+
+- **Float aggregate reproduces** (*red*). An entry with a float `SUM` and `AVG`
+  over a source large enough to run in parallel is created, its file deleted,
+  and the entry reopened, three times. Every rewrite must match the recorded
+  digest, and no `unfaithful_heal` record may be written.
+- **Digest ignores batching and format.** The same rows delivered as 8,192-row
+  batches, 100,000-row batches and one table give one digest, and so do the
+  same rows written Snappy with small row groups.
+- **Digest sees what it must.** One changed value, one null replaced by `0.0`,
+  and two swapped rows each change the digest.
+- **Create detects a non-reproducible recipe.** A recipe whose UDF returns a
+  different value on every call builds successfully, is recorded as not
+  reproducible, names the offending column, and has a pinned file.
+- **Create passes a reproducible recipe.** A deterministic recipe is recorded
+  as reproducible, and the query is observed to run exactly twice.
+- **A non-reproducible cheap recipe is materialized.** A computed column that
+  calls `random()` ends up with a pinned file instead of re-running per read.
+- **A pinned file survives an explicit delete.** The Cache page's delete skips
+  it and says why.
+- **The schema comes from the file.** An entry with a `timestamp[s]` column
+  records `timestamp[ms]`, and every entry's recorded schema ends in
+  `__row_order`.
 
 ## Consequences
 
 - A float-aggregate entry heals to the same digest, and a pyarrow upgrade no
   longer flags anything. The loud responses of ADR-006 decisions D10 and D12
   are left for the causes they were designed for.
-- Materializations and heals are slower, by about 3x on aggregation at spike scale and up
-  to 7x in ADR-004's parking measurement. Reads are unaffected.
+- Materializations and heals are slower, by about 3x on aggregation at spike
+  scale and up to 7x in ADR-004's parking measurement, and a create runs its
+  query twice (D6). Reads are unaffected.
+- A recipe that is not reproducible is known to be so from the moment it is
+  created, and its file is never rewritten underneath the entries built on it.
 - Verify decodes the file instead of hashing its bytes. It runs on a heal and
   in `catalog_scan_staleness(verify_results=True)`, never on a read.
 - Snapshots are smaller, and their footers were 85 times smaller in the spike,
@@ -258,11 +327,6 @@ fix; the float-aggregate heal test and a batch-boundary digest test fail on
 
 1. **Nested types.** The spike covers fixed-width, boolean, string and binary
    columns. Lists, structs and maps need a recursive definition.
-2. **Types parquet cannot store as given.** A `timestamp[s]` column comes back
-   as `timestamp[ms]`, so the snapshot's schema differs from the entry's
-   recorded schema. Either the writer refuses such a column, or the entry's
-   schema is recorded from the snapshot. `__row_order` pushes toward the second
-   answer, since the writer adds a column the entry's graph does not have.
-3. **Engine upgrades.** Single-partition execution fixes the merge order within
+2. **Engine upgrades.** Single-partition execution fixes the merge order within
    one engine version. Nothing guarantees float results across versions. D4
    attributes that case and the remedy stays a rebuild.

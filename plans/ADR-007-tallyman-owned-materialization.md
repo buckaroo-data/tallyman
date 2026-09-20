@@ -1,8 +1,9 @@
 # ADR: Tallyman owns result materialization (no xorq cache nodes in builds)
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session, which added the governing rule, decision D10, and the resolution
-  recorded under D5). Supersedes two decisions of
+  session, which added the governing rule, decisions D10 to D12, and the
+  resolution recorded under D5). Awaiting Paddy's review; nothing here is
+  implemented. Supersedes two decisions of
   `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the
   parent's cache node) and its D8 (the manifest records the snapshot key and
   reads assert it). Five other ADR-006 decisions keep their intent: D5 (the
@@ -257,8 +258,8 @@ of every descendant would re-run the parent's expensive subgraph.
 record-batch stream, and writes the snapshot itself:
 
 - a unique temp name in the destination directory, then `os.replace`;
-- under a per-hash cross-process `flock`, with the existence check repeated
-  inside the lock, so a second process waits and then finds the file;
+- under the project's write lock (D11), with the existence check repeated
+  inside the lock, so a second writer waits and then finds the file;
 - it numbers the rows as it writes them, in a last column named `__row_order`
   (decision D2 of `plans/ADR-008-row-order-of-reads.md`);
 - it returns the digest of what it wrote.
@@ -356,9 +357,16 @@ Buckaroo cannot be asked to display an entry whose query is still running. The
 same ordering now covers a snapshot that was deleted later: `load_session`
 waits for `ensure_materialized` before it posts anything.
 
-Deleting a snapshot (the Cache page, a reset prune, a future budget eviction)
-ends every live Buckaroo session whose plan reads it first, using the
-session-eviction hook that ADR-006 decision D10 introduced. The next
+The same rule covers the session itself. Buckaroo drops a session that has had
+no browser attached for an hour, and tallyman's session map assumes a session
+lives as long as the Buckaroo process, so an entry reopened after an idle hour
+is handed an id Buckaroo no longer knows and the grid never loads. Tallyman
+stops remembering sessions. The session id is derived from the project, the
+content hash and the view kind (D10), and `load_session` posts `/load_expr`
+every time, which Buckaroo already treats as a no-op for a session it has.
+
+Deleting a snapshot (D12) ends every live Buckaroo session whose plan reads it
+first, using the session-eviction hook that ADR-006 decision D10 introduced. The next
 `/api/session` re-materializes and opens a new session. Without this, a page
 request against a deleted file would fail inside Buckaroo with the
 `At least one path is required` error above, which is exactly the kind of
@@ -395,9 +403,19 @@ cache node has crept back in.
 Removing the cache node changes the hash of every worthy entry, and bare-read
 chaining changes every child's. This lands together with ADR-008's change to
 `tallyman_read_csv` and ADR-009's digest definition, behind a single corpus
-rebuild, with the failing tests committed and seen red first. After the
-rebuild, `~/.cache/xorq/result_cache` (14 GB) and the older leaks under
-`~/.cache/xorq/parquet/` (2.6 GB) can be deleted by hand.
+rebuild. After the rebuild, `~/.cache/xorq/result_cache` (14 GB) and the older
+leaks under `~/.cache/xorq/parquet/` (2.6 GB) can be deleted by hand.
+
+Order of work, agreed 2026-09-20. Nothing starts until Paddy has reviewed all
+three ADRs.
+
+1. One commit of failing tests covering everything the three ADRs change, plus
+   the audit's independent bugs, pushed and seen red on CI.
+2. The redesign as one change, then the corpus rebuild.
+3. The independent bugs that remain, which change no hash: the chart error
+   loop, eager notebook sessions, the staleness scan re-hashing every source
+   per entry, `tallyman pack` shipping the cache, the primary-key search that
+   never converges, and the over-broad stat-cache wipes.
 
 ### D10. Every diff is built as an entry before it is displayed
 
@@ -439,6 +457,70 @@ putting an alias on an entry that already exists.
 *Rejected:* keep posting the join and materialize nothing. It shows a first
 page sooner, and it breaks the governing rule in both directions: Buckaroo runs
 tallyman's join, repeatedly, and tallyman never learns whether it succeeded.
+
+### D11. One write at a time per project
+
+Every write takes the project's existing lock: a build, a materialization, a
+promote and a recalc, as well as the checkpoint that takes it today.
+`_project_lock` (`catalog_state.py:232-242`) is an OS file lock on
+`.checkpoint.lock`, so it holds between the two processes of a normal tallyman,
+the MCP server and the companion, which both build. It becomes re-entrant
+within a process, since a promote builds and then checkpoints.
+
+This replaces the per-entry lock of this ADR's first draft and closes the audit
+finding that two builds of one entry can end with the failing one deleting the
+winner's directory (`build.py:447-468`, `618-627`). FastMCP runs tool calls on
+a thread pool, so parallel tool calls did build at once. They now queue.
+
+Two tallyman servers pointed at one project is unsupported. Paddy: "you have
+done something diabolical and deserve the results." The file lock would still
+serialize their writes on one machine, and nothing else about them is safe,
+because each holds in-process state the other never sees.
+buckaroo-data/tallyman#183 tracks detecting that case and refusing to start.
+
+### D12. Files are deleted only by an explicit user action
+
+Nothing deletes a materialized file on its own, and nothing rewrites one except
+opening an entry that needs it (D5). There is no disk budget yet. That is the
+rewrite of `plans/ADR-003-result-cache-cost-rubric.md`, deferred.
+
+- The startup warm-up stops calling `cached_result_expr`. Today it rewrites
+  every snapshot that was deleted, which undoes the Cache page's delete button
+  and can block startup on one large file.
+- An explicit delete skips an entry marked not reproducible (decision D6 of
+  `plans/ADR-009-digest-stability.md`), whose file cannot be recreated.
+- Ephemeral diff entries (D10) follow the same rule and are not collected
+  automatically.
+
+## Testing
+
+Tests marked *red* fail on `main` today and belong in the failing-tests commit.
+The others cannot fail before the code exists and ride with the change.
+
+- **Sentinel** (*red*, D8). With `XORQ_CACHE_DIR` pointing at an empty
+  directory, a build, a chained child build, a view, a delete and a reopen
+  leave that directory empty.
+- **Concurrent builds** (*red*, D11). Two threads building the same entry both
+  return it, and the entry's directory is intact afterwards.
+- **Forgotten session** (*red*, D6). After Buckaroo has dropped a session,
+  reopening the entry yields a grid that loads.
+- **Warm-up leaves deleted files alone** (*red*, D12). A snapshot deleted before
+  startup is still absent after startup with no requests made.
+- **Identity** (D3). A child's hash changes when its parent's snapshot path
+  changes and not when the file's bytes do, and a filter over an aggregate's
+  snapshot is classed cheap.
+- **Files exist before anything runs** (D5). With an ancestor's snapshot
+  deleted, opening a descendant rewrites the ancestor first, verifies it, and
+  never executes a plan whose file is missing.
+- **Cold equals warm** (D7). With `compute_cache/` removed, every snapshot an
+  entry needs is reproduced with its recorded digest.
+- **Handoff** (D6). A worthy entry's grid is posted a view build of its
+  snapshot, and Buckaroo writes nothing under `compute_cache/result_cache/`.
+- **Diffs** (D10). Opening a diff builds an entry under
+  `compute_cache/ephemeral_entries/` before Buckaroo is called, the checkpoint
+  does not zip it, and promoting it keeps the same content hash.
+- **Explicit delete** (D12). Deleting a snapshot ends the sessions that read it,
+  and the next open rewrites it.
 
 ## Consequences
 
@@ -484,15 +566,26 @@ tallyman's join, repeatedly, and tallyman never learns whether it succeeded.
 
 ## Open questions
 
-1. **Deep cheap chains.** Nothing cuts the graph between cheap entries. Run
-   `tests/test_perf_chain_depth.py` against this design and decide whether a
-   node-count or `compile_seconds` threshold should make an otherwise cheap
-   entry worthy.
-2. **An unfaithful parent's descendants.** Descendants of an entry whose heal
-   failed verification were computed from bytes that no longer exist. Nothing
-   flags them today, and nothing here does either.
-3. **Eviction policy.** D6 says what eviction must do to live sessions. Which
-   snapshots to evict, and when, stays with the ADR-003 rewrite.
-4. **Garbage collection of ephemeral entries.** D10 says where they live and
-   that they are deletable. When to delete them belongs with the eviction
-   policy of open question 3.
+1. **Do two kinds of entry survive?** This is the largest open question of the
+   set and Paddy has not answered it. Materializing every entry when it is
+   created would remove the cheap and worthy classifier, the build error of
+   ADR-008 decision D3, the allow-list of ADR-008 decision D4, the view case in
+   D6, and open question 2 below, and it would give every entry a digest. An
+   entry built on another would always read the parent's file, so no graph
+   would be more than one entry deep, which is the parquet boundary Paddy wanted
+   in June. `plans/ADR-003-result-cache-cost-rubric.md` already proposes
+   admitting every result and evicting by budget. The cost is one file per
+   entry: one project measured 19 GB of cache for 779 MB of data while every
+   CSV revision wrote a file. His answer to question 4 ("materialize the
+   parquet if necessary") stands until he says otherwise.
+2. **Deep cheap chains.** Nothing cuts the graph between cheap entries. Moot if
+   open question 1 is answered with one kind of entry.
+3. **Where ordered copies of sources live.** ADR-008 decision D2 adds one per
+   parquet source. `csv_ordered/` is global today, is never collected, and is
+   not included by `tallyman pack`. If every entry is materialized, a root
+   entry's own file could serve as the ordered copy.
+
+Closed in the grilling session: an unfaithful parent's descendants (ADR-009
+decision D6 finds a non-reproducible entry when it is created and pins its
+file, so it is never rewritten underneath its descendants); eviction policy
+and the collection of ephemeral entries (D12).

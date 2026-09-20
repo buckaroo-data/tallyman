@@ -1,7 +1,7 @@
 # ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session). The first draft pinned row order with an engine setting. Paddy
+  session). Awaiting Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy
   proposed baking a row-order column into every file tallyman writes and
   sorting every page by it. The measurements below favour that, so it is now
   the decision and the engine setting is the rejected alternative under D5.
@@ -338,6 +338,33 @@ and are corrected with this change: `plans/ADR-006-read-path-loads-builds.md:98`
 does not establish a split scan and is not what makes that test meaningful;
 its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 `tests/test_tallyman_read_csv.py:159` already says about 10 MB.
+
+## Testing
+
+Tests marked *red* fail on `main` today and belong in the failing-tests commit.
+The others cannot fail before the code exists and ride with the change.
+
+- **Repeatable pages** (*red*, D5). Eight identical `/api/data` requests at a
+  deep offset into an entry whose file is larger than 10,485,760 bytes return
+  identical rows, for a worthy entry and for a cheap one. The sorted case is
+  Buckaroo's code and is tested there (buckaroo-data/buckaroo#974).
+- **The column** (D2). Every file tallyman writes ends in `__row_order`, holding
+  `0..N-1` with no gaps, and a materialization replaces an inherited one.
+- **Dropping it fails the build** (D3). A cheap recipe whose select list omits
+  the column raises a build error whose message contains the corrected select.
+  A worthy recipe that omits it builds.
+- **Asking for an order renumbers** (D3). An `order_by` recipe's file is
+  numbered in the requested order, and assigning to the column is a build
+  error.
+- **A debugging copy survives** (D6). `__row_order_v1` is still present, with
+  the parent's positions, after the child is materialized.
+- **Classification** (D4). A union, a distinct, an unnest and an operation the
+  allow-list has never seen are all classed worthy.
+- **Reserved** (D6). The primary-key search never returns `__row_order`, and a
+  diff has no `__row_order_v2` column.
+- **CSV roots** (D7). A `tallyman_read_csv` entry has no Sort in its build, is
+  classed cheap, and has exactly one row-order column.
+- **The hint** (D8). The `/load_expr` payload names `__row_order`.
 
 ## Consequences
 

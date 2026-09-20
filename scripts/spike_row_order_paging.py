@@ -8,9 +8,10 @@ DEFAULT parallel connection with no engine settings:
 3. Does a user sort on a column with ties page repeatably, without and with ``__row_order`` as the last key?
 4. What does a range request (``__row_order >= k AND __row_order < k + n``) cost at depth, without and with a
    parquet page index in the file?
-5. Can tallyman alter a cheap recipe so the column survives a ``select`` that does not name it, and ends up last?
-   (``carry_row_order`` below is the rewrite; a ``select`` is an allow-list, so an unnamed column is dropped
-   whether or not anyone can see it.)
+5. Could tallyman alter a cheap recipe so the column survives a ``select`` that does not name it? A ``select`` is
+   an allow-list, so an unnamed column is dropped whether or not anyone can see it. ``carry_row_order`` below is
+   the rewrite. It works, and ADR-008 D3 rejects it in favour of a build error.
+6. What do joins and a debugging copy do with the column's name?
 
 For reference it also times the first draft's approach, a bare LIMIT/OFFSET on a single-partition connection.
 
@@ -26,6 +27,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import xorq.api as xo
@@ -134,6 +136,16 @@ def main() -> None:
         dropped = carry_row_order(t.drop(ROW, "v11"))
         last, kept = dropped.columns[-1], "v11" in dropped.columns
         print(f"   t.drop({ROW!r}, 'v11') as altered: last column {last!r}, v11 kept: {kept}")
+
+        print("\n6. names")
+        mem = xo.connect()
+        a, b, c = (
+            mem.create_table(name, pd.DataFrame({"k": [1, 2, 3], col: [10, 20, 30], ROW: [0, 1, 2]}))
+            for name, col in (("a", "x"), ("b", "y"), ("c", "z"))
+        )
+        print(f"   two-way join:   {list(a.join(b, 'k').columns)}")
+        print(f"   three-way join: {list(a.join(b, 'k').join(c, 'k').columns)}")
+        print(f"   debugging copy: {list(a.mutate(__row_order_v1=a[ROW]).columns)}")
 
         print("\nreference: first draft's approach, bare LIMIT/OFFSET on a single-partition connection")
         single = xo.connect()

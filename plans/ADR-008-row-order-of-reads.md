@@ -130,9 +130,9 @@ Two writers produce it:
 
 - **`materialize`** (ADR-007 decision D4, the one writer of snapshots) numbers
   the rows of the canonically sorted stream as it writes them. If the stream
-  already has a `__row_order` inherited from a parent, the writer replaces it.
-  Each materialization therefore overwrites the column with positions in its
-  own file.
+  already has a `__row_order` inherited from a parent, the writer replaces that
+  one column. Each materialization therefore overwrites `__row_order` with
+  positions in its own file.
 - **Ingest.** A source file enters tallyman through an ordered copy: polars
   scans it, `with_row_index` numbers the rows in file order, and the copy is
   written with the column last. CSVs already work this way (the intermediate
@@ -154,30 +154,41 @@ which D5's range requests depend on.
 *Rejected:* a row number kept only as file metadata. DataFusion exposes no
 parquet row number that a query can sort or filter by, so it has to be a column.
 
-### D3. Tallyman alters a cheap entry's query so `__row_order` reaches the output
+### D3. A cheap entry that drops `__row_order` is a build error
 
-A column selection is an allow-list: `t.select("g", "n")` drops every column it
-does not name, whether or not anyone can see that column. So before freezing a
-cheap build, `rewrite_for_build` alters the expression:
+`__row_order` is metadata that happens to be a column, and it is not to be
+deleted. A column selection is an allow-list: `t.select("g", "n")` drops every
+column it does not name, so an author who is not thinking about row order
+drops it without meaning to. When a cheap entry's output lacks `__row_order`,
+the build fails, and the error names the parent entry, says that a
+row-preserving view must keep `__row_order` so that paging stays repeatable,
+and shows the fix (`t.select("g", "n", "__row_order")`). The MCP tool
+descriptions say the same thing up front. This is the feedback channel
+`tallyman_read_csv` already uses when a CSV has a column named
+`original_row_order`.
 
-- every column selection whose input has `__row_order` and whose output lacks
-  it gains the column;
-- a `drop` that names it stops dropping it;
-- a final selection moves it to the last position.
+A worthy entry is exempt, because the writer numbers its rows (D2). An author
+changes `__row_order` by asking for an order: `order_by` makes the entry worthy,
+and the writer numbers the rows in the requested order. Assigning to the column
+directly stays an error (D6).
 
-The rewrite runs before the build is hashed, so it is part of the entry's
-identity, like the canonical sort already is. A worthy entry needs no rewrite,
-because the writer numbers its rows (D2).
+Tallyman makes one alteration of its own, at the top of the expression only: it
+moves `__row_order` to the last position, since a computed column added after
+it would otherwise push it into the middle of the table.
 
-Measured: `t.filter(t.g < 100).select("g", "v0").mutate(z=t.v0 * 2)` has
-columns `['g', 'v0', 'z']` as written and `['g', 'v0', 'z', '__row_order']` as
-altered, and its page at offset 100,000 came back identical 6 times out of 6,
-starting at the expected row (199584). `t.drop("__row_order", "v11")` as
-altered still ends in `__row_order` and still drops `v11`.
+The column can be copied for debugging.
+`foo_v1.mutate(__row_order_v1=foo_v1["__row_order"])` gives the new entry both
+columns. Once the new entry is materialized, `__row_order` holds its own
+positions and `__row_order_v1` still says where each row sat in the parent.
 
-*Rejected:* make dropping the column a build error. That puts the burden on
-every recipe an LLM writes, and one forgotten column brings back unstable
-paging for that entry.
+*Rejected:* carry the column automatically. `rewrite_for_build` can rewrite
+every column selection in a cheap graph to keep it, and the spike shows that
+working: `t.filter(t.g < 100).select("g", "v0").mutate(z=t.v0 * 2)` comes out
+with columns `['g', 'v0', 'z', '__row_order']` and pages repeatably. It was
+rejected because the recipe text and the entry's columns would then disagree,
+because it is surgery inside an expression an LLM wrote, and because a mistake
+the author can fix in one line is better reported than silently repaired. The
+cost accepted is a failed build whenever a select list forgets the column.
 *Rejected:* carry the column and hide it from the grid. Paddy's call: it is
 shown, as the final column.
 
@@ -254,13 +265,17 @@ rejected because:
 An `ORDER BY` on a column with no ties is repeatable by the query's own
 semantics, in any engine and any process.
 
-### D6. `__row_order` is reserved
+### D6. The exact name `__row_order` is reserved
 
-- Names beginning with `__row_order` are reserved. A recipe may read the column.
-  A recipe that assigns to it is a build error.
-- `materialize` removes every column whose name begins with `__row_order`
-  before appending the fresh one. A join of two entries otherwise leaves a
-  second copy behind under the join's collision name (`__row_order_right`).
+- A recipe may read the column and may copy it under another name (D3). A
+  recipe that assigns to `__row_order` is a build error, because arbitrary
+  values could contain ties or gaps, and D5 depends on `0..N-1` with neither.
+- Only the exact name is special. `__row_order_v1`, or any other name an author
+  picks for a copy, is ordinary data and survives materialization.
+- A join of two entries leaves the right side's copy behind under ibis's
+  collision name, `__row_order_right`, and a three-way join silently keeps only
+  the first two. That column is ordinary data too: it says where the row sat in
+  the right-hand parent. The writer replaces only `__row_order` itself.
 - The primary-key search skips it. Nothing excludes `original_row_order` from
   the candidates today (`primary_key.py:219`), and a column that is unique in
   every table would win the search for any table without a string or id key.
@@ -311,7 +326,10 @@ its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 
 - Pages are repeatable for unsorted and sorted requests, in tallyman and in
   Buckaroo, with no engine settings and no second connection.
-- Every table shows one more column, at the end.
+- Every table shows one more column, at the end. A join result also shows
+  `__row_order_right` unless the recipe drops it.
+- A recipe whose select list forgets `__row_order` fails to build until the
+  author adds it.
 - CSV lineages stop writing sorted copies. With ADR-007, revisions of a CSV
   entry are cheap reads over one intermediate file, and primary-key inheritance
   applies to them.

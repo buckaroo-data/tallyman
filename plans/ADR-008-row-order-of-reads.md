@@ -216,12 +216,21 @@ operator merges them.
 ### D5. Every page request orders by `__row_order`
 
 - No user sort: `ORDER BY __row_order`.
-- User sort: the user's keys, then `__row_order` as the last key, which breaks
-  every tie.
-- The unfiltered, unsorted view of a materialized file, where a row's position
-  equals its `__row_order`: a **range request**,
-  `__row_order >= offset AND __row_order < offset + limit`, instead of
-  `OFFSET`. `/api/data` on a worthy entry is always this case.
+- User sort: the user's keys, then `__row_order` ascending as the last key,
+  which breaks every tie.
+
+That is the whole rule, for every entry and both processes. Two faster paths
+exist and are deliberately not part of this decision (Paddy, 2026-09-20: a
+cohesive system that works reliably comes first, and speed problems are handled
+as they come up):
+
+- **Declared file order.** Telling the engine the file is already sorted by
+  `__row_order` removes the sort from the plan.
+- **Range request.** For the unfiltered, unsorted view of a materialized file a
+  row's position equals its `__row_order`, so a page can be fetched as
+  `__row_order >= offset AND __row_order < offset + limit` instead of `OFFSET`.
+
+Both are measured below so the numbers are on hand when they are wanted.
 
 Measured on 3,000,000 rows by 14 columns (287 MB), on the default parallel
 connection with no engine settings. Every row of the table returned the correct
@@ -238,9 +247,9 @@ page 6 times out of 6:
 And the sorted case, at offset 100,000: `ORDER BY g` gave 6 distinct pages in 6
 requests (214 ms); `ORDER BY g, __row_order` gave 1 (302 ms).
 
-Two consequences for the file format, recorded in ADR-009 decision D3: the
-writer emits a parquet page index, which is what takes a range request from 90
-ms to 20 ms, and it writes `__row_order` last.
+One consequence for the file format, recorded in ADR-009 decision D3: the
+writer puts `__row_order` last. It also emits a parquet page index, which costs
+nothing now and is what takes a later range request from 90 ms to 20 ms.
 
 Declaring the file's order to the engine removes the sort from the plan
 (`GlobalLimitExec <- SortPreservingMergeExec <- DataSourceExec`, no
@@ -354,11 +363,12 @@ its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 ## Open questions
 
 1. **Ordered copies of parquet sources.** D2 adds a copy per parquet source.
-   This has not been discussed with Paddy. It also assumes polars numbers a
+   Adopted as the uniform rule under Paddy's "cohesive first" priority, and not
+   yet confirmed by him in so many words. It also assumes polars numbers a
    parquet scan's rows in file order, as ADR-004 measured for CSV, which needs
    checking.
-2. **Renaming `original_row_order`.** D7 replaces it with `__row_order`. Also
-   not yet discussed. The alternative keeps it as a data column meaning "line of
+2. **Renaming `original_row_order`.** D7 replaces it with `__row_order`.
+   Adopted on the same basis, and also not yet confirmed. The alternative keeps it as a data column meaning "line of
    the source file", at the cost of two identical columns on every CSV root.
 3. **Declaring a file's order inside a xorq build.** It works through DDL on a
    connection. If it can ride in a build's read node, Buckaroo's unsorted pages

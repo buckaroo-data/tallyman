@@ -3,20 +3,22 @@
 Content hashes are globally unique by definition (content-addressed), so one
 Buckaroo subprocess can serve sessions backed by xorq builds from any project.
 The manager no longer captures a single project at construction time; the
-project travels with each ``ensure_session(hash, project)`` call. Session
-state lives in a single global file at ``~/.tallyman/buckaroo_sessions.json``
-keyed by hash, with the project recorded so a restart can find the parquet
-again.
+project travels with each ``ensure_session(hash, project)`` call.
+
+Tallyman keeps no record of Buckaroo's sessions (plans/ADR-007-tallyman-owned-materialization.md D6). A session's id
+is derived from the project and the hash, so the two projects' sessions never share one and there is nothing to
+persist: the global ``~/.tallyman/buckaroo_sessions.json`` this file used to pin is gone.
 """
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 
+from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
-from tallyman_core import ensure_project
-from tallyman_core.paths import buckaroo_sessions_path
+from tallyman_core import data_dir, ensure_project
+from tallyman_core.paths import artifacts_dir
+from tallyman_xorq import build_and_persist
 
 # ---------------------------------------------------------------------------
 # Constructor shape
@@ -32,16 +34,65 @@ def test_manager_constructor_no_longer_takes_project(isolated_home: Path):
 
 
 # ---------------------------------------------------------------------------
-# Multi-project session bookkeeping
+# Multi-project sessions
 # ---------------------------------------------------------------------------
 
 
+def _entry_code(project: str) -> str:
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.group_by("region").aggregate(n=t.count())
+"""
+
+
 def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatch):
-    """``ensure_session(hash, project)`` accepts the project per call;
-    sessions across projects coexist in one manager."""
+    """``ensure_session(hash, project)`` accepts the project per call; sessions of entries in different projects
+    coexist in one manager, each with its own derived id, and each is loaded against its own project's files."""
+    hashes = {}
+    for proj in ("alpha", "beta"):
+        ensure_project(proj)
+        write_shoe_orders(data_dir(proj) / "orders.parquet", n_rows=50, seed=1)
+        hashes[proj] = build_and_persist(proj, _entry_code(proj)).content_hash
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+
+    posted: list[dict] = []
+
+    class FakeResp:
+        def __init__(self, session: str):
+            self._session = session
+
+        def raise_for_status(self): ...
+        def json(self):
+            return {"session": self._session}
+
+    def fake_post(url, json=None, timeout=None):
+        posted.append(json)
+        return FakeResp(json["session"])
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
+
+    sid_a = mgr.ensure_session(hashes["alpha"], "alpha")
+    sid_b = mgr.ensure_session(hashes["beta"], "beta")
+
+    # The id is a function of the project and the hash, so two projects never share a session.
+    assert sid_a == mgr.session_id_for("alpha", hashes["alpha"])
+    assert sid_b == mgr.session_id_for("beta", hashes["beta"])
+    assert sid_a != sid_b
+    # Each load names its own project's artifacts dir (where Buckaroo finds that project's klasses).
+    assert [body["project_root"] for body in posted] == [str(artifacts_dir("alpha")), str(artifacts_dir("beta"))]
+
+
+def test_no_session_file_is_written_anywhere(isolated_home: Path, monkeypatch):
+    """Negative assertion: nothing gets written to ``~/.tallyman/buckaroo_sessions.json``, nor to a project's
+    ``artifacts/catalog/buckaroo_sessions.json``, nor anywhere else, when sessions are opened (ADR-007 D6)."""
     ensure_project("alpha")
-    ensure_project("beta")
-    # Set up a fake "running" manager that returns a session id for any /load_expr.
+    write_shoe_orders(data_dir("alpha") / "orders.parquet", n_rows=50, seed=1)
+    h = build_and_persist("alpha", _entry_code("alpha")).content_hash
+
     mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
@@ -49,100 +100,9 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
     class FakeResp:
         def raise_for_status(self): ...
         def json(self):
-            return {"session": "sess-A"}
+            return {"session": "sess-1"}
 
     monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResp())
 
-    # An xorq_build dir must exist for ensure_session not to short-circuit.
-    from tallyman_core.paths import entry_dir
-
-    for proj, h in (("alpha", "hash_a"), ("beta", "hash_b")):
-        d = entry_dir(proj, h) / "xorq_build"
-        d.mkdir(parents=True, exist_ok=True)
-        # Minimal expr.yaml so the build expansion has something to read.
-        (d / "expr.yaml").write_text("dummy: yes\n")
-
-    # First call from project alpha.
-    sid_a = mgr.ensure_session("hash_a", "alpha")
-    assert sid_a == "sess-A"
-
-    # Second call from project beta — independent session lookup.
-    sid_b = mgr.ensure_session("hash_b", "beta")
-    assert sid_b == "sess-A"  # mocked POST always returns the same id
-
-    # Both entries are in the in-memory map.
-    assert "hash_a" in mgr._sessions
-    assert "hash_b" in mgr._sessions
-
-
-def test_session_file_lives_at_global_location(isolated_home: Path):
-    """The on-disk session map is one file under ``~/.tallyman/``, not under
-    any specific project's catalog. Schema includes the project per hash so
-    a restart-reload knows which parquet to find."""
-    from tallyman_core.paths import entry_build_dir
-
-    ensure_project("alpha")
-    # Minimal built entry so the prune check on _load_session_file lets the
-    # session through (_entry_exists keys on the xorq_build/ dir now).
-    entry_build_dir("alpha", "abc").mkdir(parents=True, exist_ok=True)
-
-    mgr = BuckarooManager()
-    mgr._sessions["abc"] = {"session_id": "sess-1", "project": "alpha"}
-    mgr._buckaroo_started_at = 123.456
-    mgr._persist_sessions()
-
-    expected = buckaroo_sessions_path()
-    assert expected.exists()
-    assert expected == isolated_home / "buckaroo_sessions.json"
-    data = json.loads(expected.read_text())
-    assert data["sessions"]["abc"]["session_id"] == "sess-1"
-    assert data["sessions"]["abc"]["project"] == "alpha"
-
-    # Fresh instance picks up the same map.
-    mgr2 = BuckarooManager()
-    assert mgr2._sessions["abc"]["session_id"] == "sess-1"
-    assert mgr2._sessions["abc"]["project"] == "alpha"
-
-
-def test_startup_prunes_entries_for_missing_builds(isolated_home: Path):
-    """If a session entry points at a project/hash whose build no longer exists
-    on disk, the manager drops it on load. Defensive against catalog cleanup or
-    project deletion happening behind our back."""
-    ensure_project("alpha")
-    # Write a session file with one valid entry (build exists) and one stale
-    # entry (no such project at all).
-    from tallyman_core.paths import entry_build_dir
-
-    entry_build_dir("alpha", "valid_hash").mkdir(parents=True, exist_ok=True)
-
-    sessions_path = buckaroo_sessions_path()
-    sessions_path.parent.mkdir(parents=True, exist_ok=True)
-    sessions_path.write_text(
-        json.dumps(
-            {
-                "sessions": {
-                    "valid_hash": {"session_id": "sess-valid", "project": "alpha"},
-                    "stale_hash": {"session_id": "sess-stale", "project": "ghost"},
-                },
-                "buckaroo_started_at": 1.0,
-            }
-        )
-    )
-
-    mgr = BuckarooManager()
-    assert "valid_hash" in mgr._sessions
-    assert "stale_hash" not in mgr._sessions
-
-
-def test_persist_only_writes_global_file_not_per_project(isolated_home: Path):
-    """Negative assertion: nothing gets written under
-    ``<project>/artifacts/catalog/buckaroo_sessions.json`` anymore."""
-    from tallyman_core.paths import catalog_dir
-
-    ensure_project("alpha")
-    mgr = BuckarooManager()
-    mgr._sessions["abc"] = {"session_id": "sess-1", "project": "alpha"}
-    mgr._persist_sessions()
-
-    legacy = catalog_dir("alpha") / "buckaroo_sessions.json"
-    assert not legacy.exists()
+    assert mgr.ensure_session(h, "alpha") == "sess-1"
+    assert not list(isolated_home.rglob("buckaroo_sessions.json"))

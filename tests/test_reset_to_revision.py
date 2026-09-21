@@ -2,8 +2,9 @@
 
 These tests pin the four invariants #33 kept re-breaking (see
 plans/adr-reset-to-revision.md): fork-safe git, commit faithfulness,
-non-destructive materialize, untracked-artifact reconciliation — plus the
-per-project compute cache that gives the demo its honest cold add.
+non-destructive materialize, untracked-artifact reconciliation. A reset leaves
+``compute_cache/`` alone (plans/ADR-007-tallyman-owned-materialization.md D14);
+that is pinned in tests/test_reset_keeps_compute_cache.py.
 
 Tests shell out to git directly to assert on the catalog repo; that is the
 sanctioned exception to the no-bare-subprocess-git guard (which scans src/).
@@ -29,10 +30,10 @@ ST_SRC = "def compute(col):\n    return col.count()\n"
 SPEC = {"mark": "bar", "encoding": {"x": {"field": "region"}}}
 
 
-def _agg_code(parquet_path: Path) -> str:
+def _agg_code(project: str) -> str:
     return (
-        "import xorq.api as xo\n"
-        f"t = xo.deferred_read_parquet({str(parquet_path)!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file('orders.parquet', project={project!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
     )
 
@@ -123,16 +124,6 @@ def test_prune_entries_noop_when_key_absent(project):
     assert paths.entry_dir(project, "aaaa").exists()
 
 
-def test_prune_compute_cache_to_recorded(project):
-    cdir = paths.compute_cache_dir(project)
-    cdir.mkdir(parents=True)
-    (cdir / "keep.parquet").write_bytes(b"x")
-    (cdir / "drop.parquet").write_bytes(b"y")
-    cs.write_tallyman_state(project, compute_cache=["keep.parquet"])
-    assert cs.prune_compute_cache(project) == 1
-    assert {p.name for p in cdir.iterdir()} == {"keep.parquet"}
-
-
 # ---------------------------------------------------------------------------
 # Invariant 2 — commit faithfulness (one commit per op, clean tree)
 # ---------------------------------------------------------------------------
@@ -196,37 +187,25 @@ def test_reset_roundtrip_over_every_kind(project):
 
 
 # ---------------------------------------------------------------------------
-# Per-project compute cache + honest cold add
+# Per-project compute cache
 # ---------------------------------------------------------------------------
 
 
 def test_compute_cache_is_per_project(project, orders_parquet):
-    # W4 routes xorq's compute cache to a per-project dir, not the global
-    # ~/.cache/xorq. A build creates compute_cache_dir under the project; the
-    # guarantee is the *location* (a plain aggregate may cache nothing).
-    build_and_persist(project, _agg_code(orders_parquet))
+    # Tallyman's materialized files live in a per-project dir, not the global
+    # ~/.cache/xorq: a build of a worthy entry writes its snapshot (and the ordered
+    # copy of its source) under compute_cache_dir inside the project. The guarantee
+    # is the *location*. A reset does not manage this directory (ADR-007 D14), which
+    # tests/test_reset_keeps_compute_cache.py pins.
+    from tallyman_xorq.result_cache import baked_snapshot_path
+
+    res = build_and_persist(project, _agg_code(project))
     cdir = paths.compute_cache_dir(project)
     assert cdir.is_dir()
     assert str(cdir).startswith(str(paths.project_dir(project)))
-
-
-def test_reset_prunes_compute_cache_to_warm_set(project):
-    # Caches warm lazily when entries are viewed, not at build time — so seed
-    # the warm-set directly and assert the reset prunes it back to the step's
-    # recorded set (a file added after the checkpoint is gone → recomputes cold).
-    cs.ensure_catalog_repo(project)
-    cc = paths.compute_cache_dir(project)
-    cc.mkdir(parents=True)
-    (cc / "baseline.parquet").write_bytes(b"a")
-    s1 = cs.checkpoint_catalog(project, "baseline")
-    assert set(cs.read_tallyman_state(project)["compute_cache"]) == {"baseline.parquet"}
-
-    (cc / "added.parquet").write_bytes(b"b")
-    cs.checkpoint_catalog(project, "added later")
-    assert {p.name for p in cc.iterdir()} == {"baseline.parquet", "added.parquet"}
-
-    cs.reset_to(project, s1)
-    assert {p.name for p in cc.iterdir()} == {"baseline.parquet"}  # added pruned → cold
+    snap = baked_snapshot_path(project, res.content_hash)
+    assert snap is not None and snap.is_file()
+    assert cdir in snap.parents
 
 
 def _read_project_file_code(project: str, rel: str) -> str:
@@ -236,10 +215,11 @@ def _read_project_file_code(project: str, rel: str) -> str:
 def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
     # #86: under the cas default a read_project_file build clones its source into
     # data/.cas/<digest>. That dir lives outside the catalog git repo, so the
-    # reset's `git reset --hard` can't roll it back — reset_to's _gc_cas_clones
-    # step reclaims clones no *surviving* entry references, keeping those a
-    # surviving entry still does. This guards the wiring (the gc_cas unit test
-    # only covers the leaf); the post-prune live set is what matters here.
+    # reset's `git reset --hard` can't roll it back — reset_to's _retire_cas_clones
+    # step retires clones no *surviving* entry references (into the bullpen, never
+    # deleted: ADR-007 D14), keeping those a surviving entry still does. This
+    # guards the wiring (the gc_cas unit test only covers the leaf); the
+    # post-prune live set is what matters here.
     import pandas as pd
 
     from tallyman_core import data_dir
@@ -265,8 +245,8 @@ def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
 
 
 def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_parquet, monkeypatch):
-    # _gc_cas_clones is conservative: if any surviving entry's manifest can't be
-    # read it skips the whole sweep rather than delete a clone on partial info.
+    # _retire_cas_clones is conservative: if any surviving entry's manifest can't be
+    # read it skips the whole sweep rather than retire a clone on partial info.
     # An unreadable manifest must therefore leave every .cas clone in place.
     import pandas as pd
 
@@ -282,13 +262,13 @@ def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_pa
     cs.checkpoint_catalog(project, "added later")
     before = {p.name for p in cas.iterdir()}
 
-    # _gc_cas_clones does a local `from tallyman_core.manifest import read_manifest`,
+    # _live_source_digests does a local `from tallyman_core.manifest import read_manifest`,
     # so patch it at the source module, not on catalog_state.
     def _boom(*_a, **_k):
         raise OSError("boom")
 
     monkeypatch.setattr("tallyman_core.manifest.read_manifest", _boom)
-    cs.reset_to(project, s1)  # must still succeed; GC skipped on the read failure
+    cs.reset_to(project, s1)  # must still succeed; the sweep is skipped on the read failure
     assert {p.name for p in cas.iterdir()} == before  # nothing reclaimed
 
 
@@ -346,7 +326,7 @@ def test_mcp_multi_mutator_tool_is_one_step(project, orders_parquet):
     from tallyman_mcp.server import catalog_create
 
     base = _steps(project)
-    res = catalog_create(name="agg", code=_agg_code(orders_parquet))
+    res = catalog_create(name="agg", code=_agg_code(project))
     assert "error" not in res
     assert len(_steps(project)) == len(base) + 1  # build+alias+notebook → one step
 
@@ -555,23 +535,18 @@ def test_label_step_rejects_unsafe_names(project):
 
 def test_prune_retires_to_bullpen_not_delete(project):
     """Reset evictions move to the bullpen: the live tree stays honest (a
-    re-add finds nothing and computes cold) while the artifact survives for a
-    forward reset to restore."""
+    re-add finds nothing) while the artifact survives for a forward reset to
+    restore."""
     cs.ensure_catalog_repo(project)
     paths.entry_dir(project, "aaaa").mkdir(parents=True)
     (paths.entry_dir(project, "aaaa") / "result.parquet").write_bytes(b"r")
-    cc = paths.compute_cache_dir(project)
-    cc.mkdir(parents=True)
-    (cc / "warm.parquet").write_bytes(b"w")
 
-    cs.write_tallyman_state(project, entry_hashes=[], compute_cache=[])
+    cs.write_tallyman_state(project, entry_hashes=[])
     assert cs.prune_entries(project) == 1
-    assert cs.prune_compute_cache(project) == 1
 
     bp = paths.bullpen_dir(project)
     assert (bp / "entries" / "aaaa" / "result.parquet").read_bytes() == b"r"
-    assert (bp / "compute_cache" / "warm.parquet").read_bytes() == b"w"
-    assert not paths.entry_dir(project, "aaaa").exists()  # live tree is cold
+    assert not paths.entry_dir(project, "aaaa").exists()  # the live tree no longer has it
 
 
 def test_scrub_back_then_forward_restores_from_bullpen(project):
@@ -587,9 +562,6 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
     (ed / "manifest.json").write_text("{}")  # a complete entry — capture only records manifest-bearing dirs
     (ed / "result.parquet").write_bytes(b"big")
     _stage_recipe_zip(project, "bbbb")  # durable recipe, so the step's two views agree (#52)
-    cc = paths.compute_cache_dir(project)
-    cc.mkdir(parents=True)
-    (cc / "later.parquet").write_bytes(b"warm")
     s2 = cs.checkpoint_catalog(project, "added entry")
 
     cs.reset_to(project, s1)
@@ -598,7 +570,6 @@ def test_scrub_back_then_forward_restores_from_bullpen(project):
 
     cs.reset_to(project, s2)
     assert (ed / "result.parquet").read_bytes() == b"big"  # restored, not recomputed
-    assert (cc / "later.parquet").read_bytes() == b"warm"
     assert (paths.bullpen_dir(project) / "entries" / "bbbb").is_dir()  # bullpen retains its copy
 
 
@@ -645,44 +616,34 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
 # and test_n_builds_track_n_zips.
 
 
-def test_reset_prune_self_heals_warmed_expensive_entry(project, orders_parquet, monkeypatch):
-    """A warmed expensive entry whose snapshot a prune retires must self-heal, not
-    dangle on the stale memoised ``deferred_read_parquet``.
+def test_deleted_snapshot_of_a_warmed_entry_self_heals_without_cache_clear(project, orders_parquet, monkeypatch):
+    """A warmed worthy entry whose snapshot file goes away must be made again on the next read, never dangle on the
+    memoised bare read of a file that no longer exists.
 
-    Complementary coverage for ``cached_result_expr``'s self-heal arm — NOT the #80
-    fix. ``prune_compute_cache`` (the function ``reset_to`` invokes) retires the
-    snapshot; before the plan-resolver split ``cached_result_expr`` memoised the
-    snapshot existence check, so a *warmed* entry kept returning
-    ``deferred_read_parquet(<pruned path>)`` and the next execute raised
-    ``ValueError: At least one path is required``. ``ee0a90a`` moved that check to
-    run on every call, so the entry now recomputes its snapshot and serves the
-    right rows without any ``cache_clear``. That self-heal covers
-    ``cached_result_expr`` only; the non-self-healing ``_build_compare_expr`` LRU
-    (which bakes the snapshot path into a serialized build with no recheck) is the
-    real #80/#96 gap, closed by PR #124's reset-time cache invalidation.
+    Before the plan-resolver split ``cached_result_expr`` memoised the snapshot's existence, so a *warmed* entry kept
+    returning ``deferred_read_parquet(<missing path>)`` and the next execute raised
+    ``ValueError: At least one path is required`` (#96). Now every read goes through ``ensure_materialized``, which
+    re-checks the file on each call (ADR-007 D5): the memo holds the read, never the fact that the file exists.
+
+    A reset used to be the thing that removed the snapshot (``prune_compute_cache``). It no longer touches
+    ``compute_cache/`` (ADR-007 D14), so the file is removed here the way an explicit delete does. The non-self-healing
+    ``_build_compare_expr`` LRU, which bakes the snapshot path into a serialized build with no recheck, is the real
+    #80/#96 gap, closed by the reset-time cache invalidation of PR #124.
     """
-    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, verify_result_faithful
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    code = (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file('orders.parquet', project={project!r})\n"
-        "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
-    )
-    h = build_and_persist(project, code).content_hash
+    h = build_and_persist(project, _agg_code(project)).content_hash
 
-    # Warm the LRU exactly as a view / tracked_expr_from_alias read does.
+    # Warm the memo exactly as a view / tracked_expr_from_alias read does.
     expected = len(cached_result_expr(project, h).execute())
     snap = baked_snapshot_path(project, h)
     assert snap is not None and snap.exists()
 
-    # Record a target warm-set that EXCLUDES this entry's snapshot (a step recorded
-    # before the snapshot warmed), then prune to it — the exact path reset_to drives.
-    cs.write_tallyman_state(project, compute_cache=[])
-    assert cs.prune_compute_cache(project) >= 1
-    assert not snap.exists()  # retired to the bullpen
+    snap.unlink()  # the file goes away while the entry is warm
 
-    # Re-read the SAME warmed entry WITHOUT cache_clear: self-heals, never dangles.
+    # Re-read the SAME warmed entry WITHOUT cache_clear: made again and verified, never dangling.
     df = cached_result_expr(project, h).execute()
     assert len(df) == expected
-    assert snap.exists()  # the snapshot was recomputed in place
+    assert snap.exists()  # the snapshot was written again in place
+    assert verify_result_faithful(project, h) is True

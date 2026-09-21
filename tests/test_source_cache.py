@@ -8,8 +8,8 @@ from tallyman_core import data_dir, entry_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.result_cache import cache_worthy
 
-# Rewrite-then-build (#73): non-parquet source reads are cached at the read,
-# parquet/delta reads are exempt, and in-memory reads are rejected.
+# The rewrite step before a build (ADR-007 D1): no xorq cache node is ever created, raw CSV reads are banned (every
+# CSV goes through tallyman_read_csv), and in-memory reads are rejected.
 
 
 @pytest.fixture
@@ -45,7 +45,7 @@ def _parquet_projection(project: str) -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
 
 
@@ -74,8 +74,8 @@ def test_deferred_read_csv_banned_for_aggregate(project, sales_csv, monkeypatch)
 def test_parquet_read_has_no_source_cache(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _parquet_projection(project))
-    # A parquet read is exempt — re-reading a columnar source is cheap, so no
-    # cache node is injected and nothing is materialised.
+    # No build carries a cache node (ADR-007 D1), and a projection over a parquet source is cheap: nothing is
+    # materialised for it.
     assert "op: CachedNode" not in _build_yaml(project, res.content_hash)
     assert cache_worthy(project, res.content_hash) is False
 
@@ -90,17 +90,3 @@ expr = xo.memtable(pd.DataFrame({"a": [1, 2, 3]}))
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, code)
     assert "in-memory" in str(exc.value)
-
-
-def test_should_cache_read_treats_json_like_csv_not_exempt():
-    # read_csv and read_json both parse text and get a source-cache node; the
-    # columnar formats are exempt. The CSV build test above can't cover read_json
-    # (this xorq exposes no deferred_read_json), so lock the read_csv/read_json
-    # parity here — guarding against a regression that special-cases read_csv
-    # instead of caching every non-exempt reader.
-    from tallyman_xorq.source_cache import _should_cache_read
-
-    assert _should_cache_read("read_csv") is True
-    assert _should_cache_read("read_json") is True
-    assert _should_cache_read("read_parquet") is False
-    assert _should_cache_read("read_delta") is False

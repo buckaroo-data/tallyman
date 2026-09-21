@@ -1,9 +1,11 @@
 """Tests for the Buckaroo lifecycle.
 
 Three layers:
-- `test_buckaroo_unit_*`: BuckarooManager session bookkeeping with no
-  subprocess (we manually poke its state).
-- `test_buckaroo_integration_*`: real subprocess + real /load round-trip.
+- `test_unit_*`: BuckarooManager with no subprocess (its HTTP client is stubbed). Tallyman keeps no record of Buckaroo's
+  sessions (plans/ADR-007-tallyman-owned-materialization.md D6): a session id is derived from the project and the
+  content hash, and every open posts. tests/test_buckaroo_handoff.py covers the hand-off itself (forgotten sessions,
+  the view build, forced reload, the klass reload of an open grid).
+- `test_integration_*`: real subprocess + real /load_expr round-trip.
   Marked slow; run with `pytest -m integration`.
 - companion-level: entry_detail with a stub manager that returns a
   fixed session id, verifying the iframe lands in the response.
@@ -11,7 +13,6 @@ Three layers:
 
 from __future__ import annotations
 
-import json
 import tempfile
 import threading
 import time
@@ -24,6 +25,7 @@ from fastapi.testclient import TestClient
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
 from tallyman_core import entry_dir
+from tallyman_core.paths import entry_stat_cache_dir, entry_view_build_dir
 from tallyman_xorq import build_and_persist
 
 
@@ -35,7 +37,15 @@ expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
-def _chain_parent_code(project: str) -> str:  # Aggregate → expensive → baked snapshot
+def _cheap_code(project: str) -> str:  # a filter over one file: a cheap entry, re-run on every read
+    return f"""
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.filter(t.qty > 1)
+"""
+
+
+def _chain_parent_code(project: str) -> str:  # Aggregate → expensive → snapshot
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
@@ -52,25 +62,8 @@ expr = t.mutate(total2=t.total * 2)
 
 
 # ---------------------------------------------------------------------------
-# unit: session map only
+# unit: the manager, with its HTTP client stubbed
 # ---------------------------------------------------------------------------
-
-
-def test_unit_session_file_round_trip(project: str, orders_parquet: Path):
-    # Build one entry so the project/hash on disk satisfies the prune check
-    # that runs on _load_session_file.
-    res = build_and_persist(project, _code(project))
-    h = res.content_hash
-
-    mgr = BuckarooManager()
-    mgr._sessions[h] = {"session_id": "sess-1", "project": project}
-    mgr._buckaroo_started_at = 123.456
-    mgr._persist_sessions()
-
-    # Fresh instance picks up persisted sessions and the start-time anchor.
-    mgr2 = BuckarooManager()
-    assert mgr2._sessions == {h: {"session_id": "sess-1", "project": project}}
-    assert mgr2._buckaroo_started_at == 123.456
 
 
 def test_unit_ensure_session_short_circuits_when_not_running(project: str):
@@ -167,16 +160,28 @@ def test_unit_ensure_session_restart_throttled(project: str, orders_parquet: Pat
     assert restart_calls["n"] == 1
 
 
-def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatch):
+def _running_manager() -> BuckarooManager:
     mgr = BuckarooManager()
     mgr.bound_port = 65000
     mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
-    mgr._sessions = {
-        "hash_a": {"session_id": "sess-aaa", "project": project},
-        "hash_b": {"session_id": "sess-bbb", "project": project},
-        "hash_c": {"session_id": "sess-ccc", "project": "other_project"},
-    }
+    return mgr
 
+
+def test_unit_reload_project_sessions_posts_one_reload_per_entry_of_the_project(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """Klass hot-reload posts ``/reload_expr/<derived id>`` for every entry of THE project (ADR-007 D6): tallyman keeps
+    no record of open sessions, so it asks Buckaroo about each entry. Another project's entries are never touched."""
+    from tallyman_cli.fixtures import write_shoe_orders
+    from tallyman_core import data_dir, ensure_project
+
+    a = build_and_persist(project, _code(project)).content_hash
+    b = build_and_persist(project, _cheap_code(project)).content_hash
+    ensure_project("other")
+    write_shoe_orders(data_dir("other") / "orders.parquet", n_rows=50, seed=1)
+    build_and_persist("other", _code("other"))
+
+    mgr = _running_manager()
     posted_urls: list[str] = []
 
     class FakeResponse:
@@ -189,57 +194,50 @@ def test_unit_reload_project_sessions_calls_reload_expr(project: str, monkeypatc
 
     reloaded = mgr.reload_project_sessions(project)
     assert reloaded == 2
-    assert sorted(posted_urls) == sorted(
-        [
-            f"{mgr.base_url}/reload_expr/sess-aaa",
-            f"{mgr.base_url}/reload_expr/sess-bbb",
-        ]
-    )
-    # Sessions are NOT evicted — they remain cached for fast reconnect.
-    assert len(mgr._sessions) == 3
+    assert sorted(posted_urls) == sorted(f"{mgr.base_url}/reload_expr/{mgr.session_id_for(project, h)}" for h in (a, b))
 
 
-def test_unit_reload_project_sessions_returns_zero_when_not_running(project: str):
+def test_unit_reload_project_sessions_returns_zero_when_not_running(project: str, orders_parquet: Path):
+    build_and_persist(project, _code(project))
     mgr = BuckarooManager()
-    mgr._sessions = {"hash_a": {"session_id": "s1", "project": project}}
+    # is_running is False because we never called start(): nothing is posted, nothing is reloaded.
     assert mgr.reload_project_sessions(project) == 0
 
 
-def test_unit_reload_project_sessions_evicts_stale_session(project: str, monkeypatch):
-    """When /reload_expr returns 404 or 400, the session is evicted so the
-    next ensure_session call re-creates it cleanly."""
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
-    mgr._sessions = {
-        "hash_a": {"session_id": "stale-session", "project": project},
-        "hash_b": {"session_id": "live-session", "project": project},
+def test_unit_reload_project_sessions_skips_sessions_buckaroo_does_not_hold(
+    project: str, orders_parquet: Path, monkeypatch
+):
+    """A 404 (never opened, or idle-evicted) or a 400 (no longer an xorq session) from /reload_expr means "not open"
+    (ADR-007 D6): skipped and not counted, and the entry's stat cache is left alone. Only a grid that reloaded has its
+    stat cache cleared, so its next request recomputes the stats with the new klass."""
+    live = build_and_persist(project, _code(project)).content_hash
+    unopened = build_and_persist(project, _cheap_code(project)).content_hash
+    not_xorq = build_and_persist(project, _code(project) + "\nexpr = expr.mutate(_v=1)").content_hash
+    for h in (live, unopened, not_xorq):
+        sentinel = entry_stat_cache_dir(project, h) / "parquet" / "stats.parquet"
+        sentinel.parent.mkdir(parents=True, exist_ok=True)
+        sentinel.write_text("stats")
+
+    mgr = _running_manager()
+    status_for = {
+        mgr.session_id_for(project, live): 200,
+        mgr.session_id_for(project, unopened): 404,
+        mgr.session_id_for(project, not_xorq): 400,
     }
 
-    call_count = {"n": 0}
-
-    class StaleResponse:
-        status_code = 404
-
-        def raise_for_status(self):
-            pass
-
-    class LiveResponse:
-        status_code = 200
+    class _Response:
+        def __init__(self, status_code: int):
+            self.status_code = status_code
 
         def raise_for_status(self):
             pass
 
-    def fake_post(url, **kw):
-        call_count["n"] += 1
-        return StaleResponse() if "stale-session" in url else LiveResponse()
+    monkeypatch.setattr(mgr._client, "post", lambda url, **kw: _Response(status_for[url.rsplit("/", 1)[1]]))
 
-    monkeypatch.setattr(mgr._client, "post", fake_post)
-
-    reloaded = mgr.reload_project_sessions(project)
-    assert reloaded == 1  # only live-session reloaded
-    assert "hash_a" not in mgr._sessions  # stale evicted
-    assert "hash_b" in mgr._sessions  # live kept
+    assert mgr.reload_project_sessions(project) == 1  # only the live grid reloaded
+    assert not (entry_stat_cache_dir(project, live) / "parquet").exists()  # its stale stats are gone
+    assert (entry_stat_cache_dir(project, unopened) / "parquet" / "stats.parquet").exists()
+    assert (entry_stat_cache_dir(project, not_xorq) / "parquet" / "stats.parquet").exists()
 
 
 def test_unit_status_shape(project: str):
@@ -247,7 +245,7 @@ def test_unit_status_shape(project: str):
     s = mgr.status()
     assert s["running"] is False
     assert s["port"] is None
-    assert s["session_count"] == 0
+    assert "session_count" not in s  # there is no session record to count (ADR-007 D6)
 
 
 def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, orders_parquet: Path, monkeypatch):
@@ -295,23 +293,18 @@ def test_unit_ensure_session_uses_load_expr_with_xorq_build_dir(project: str, or
     assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
 
 
-def test_unit_ensure_session_cache_worthy_serves_recipe_no_result_parquet(
+def test_unit_ensure_session_worthy_entry_is_served_from_its_snapshot_no_result_parquet(
     project: str, orders_parquet: Path, monkeypatch
 ):
-    """With the on-demand result.parquet layer gone, ensure_session serves the
-    entry's recipe build dir to Buckaroo for every entry. A cache-worthy entry's
-    recipe replays onto its baked snapshot (a read, not a recompute), so no
-    per-entry result.parquet is materialised for the viewer.
-    """
-    from tallyman_xorq.result_cache import cache_worthy, classify_build
+    """A worthy entry's grid is handed a build that only READS its snapshot (ADR-007 D6): Buckaroo is never given the
+    aggregate to re-run, and no per-entry result.parquet is materialised for the viewer."""
+    from tallyman_xorq.materialize import snapshot_path
+    from tallyman_xorq.result_cache import cache_worthy
 
     res = build_and_persist(project, _code(project))  # group_by.aggregate → worthy
     assert cache_worthy(project, res.content_hash) is True
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
-
+    mgr = _running_manager()
     captured: dict[str, Any] = {}
 
     class FakeResponse:
@@ -330,25 +323,21 @@ def test_unit_ensure_session_cache_worthy_serves_recipe_no_result_parquet(
 
     posted = Path(captured["json"]["build_dir"])
     assert posted.is_dir(), posted
-    # The posted build is the (expanded) recipe — still the expensive aggregate.
-    assert classify_build(posted)["worthy"] is True, classify_build(posted)
+    posted_yaml = (posted / "expr.yaml").read_text()
+    assert "op: Aggregate" not in posted_yaml  # nothing for Buckaroo to compute
+    assert str(snapshot_path(project, res.content_hash)) in posted_yaml  # the one file it reads
     # No on-demand result.parquet was materialised for the viewer.
     assert not (entry_dir(project, res.content_hash) / "result.parquet").exists()
 
 
-def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, orders_parquet, monkeypatch):
-    """The build ensure_session posts must feed a cold grid with no pre-heal.
+def test_unit_ensure_session_posts_a_build_over_files_that_exist_on_a_cold_cache(project, orders_parquet, monkeypatch):
+    """Everything the posted build reads exists by the time Buckaroo is called, on a cold compute cache.
 
-    Historically ensure_session pre-executed ``cached_result_expr`` before the
-    ``/load_expr`` POST: chaining stripped an expensive parent's ``CachedNode``
-    to a *bare* snapshot read (#75), so on a cold compute cache the replay read
-    zero files and the grid rendered empty unless something healed first. Under
-    ADR D4 the pre-heal is deleted and the guarantee moves into the artifact:
-    the child's build carries the parent's cache node, so Buckaroo's replay of
-    the posted build regenerates the snapshot itself through ordinary cache
-    mechanics. This pins both halves at the same seam: the POST goes out with
-    the cache still cold (no discarded-result pre-execution), and replaying the
-    posted build dir yields the rows and lands the parent snapshot on disk.
+    Historically the build ensure_session posted had to feed a cold grid with no pre-heal: under ADR-006 D4 the child's
+    build carried the parent's cache node, so Buckaroo's replay regenerated the evicted snapshot itself. ADR-007
+    retires that (a child's build holds a bare read of the parent's snapshot, and Buckaroo never heals): tallyman makes
+    every file exist first (``ensure_materialized``, D5), so the POST goes out over files that are there, and replaying
+    the posted build exactly as Buckaroo does (``load_expr`` with no cache directory) reads them and writes nothing.
     """
     import shutil
 
@@ -356,24 +345,21 @@ def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, o
 
     from tallyman_core.paths import compute_cache_dir
     from tallyman_mcp.server import catalog_create
-    from tallyman_xorq.build import list_entries
+    from tallyman_xorq.materialize import snapshot_path
     from tallyman_xorq.result_cache import cached_result_expr
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("agg", _chain_parent_code(project))  # expensive parent (Aggregate)
-    catalog_create("chain", _chain_child_code("agg"))  # tracked_expr_from_alias child off it
-    child_h = list_entries(project)[0]["content_hash"]  # most-recent build == chain
+    parent_h = catalog_create("agg", _chain_parent_code(project))["hash"]  # expensive parent (Aggregate)
+    child_h = catalog_create("chain", _chain_child_code("agg"))["hash"]  # cheap child chained off it
 
-    # Cold start, as a fresh clone / not-yet-warmed entry has: evict every baked
-    # snapshot and clear the plan lru the in-process build warmed.
+    # Cold start, as a fresh clone / not-yet-warmed entry has: evict every file under compute_cache (the parent's
+    # snapshot and the ordered copy of the source under it) and clear the plan memo the in-process build warmed.
     shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
     cached_result_expr.cache_clear()
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
-
+    mgr = _running_manager()
     posted: dict = {}
+    parent_existed_at_post: list[bool] = []
 
     class _Resp:
         status_code = 200
@@ -385,6 +371,7 @@ def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, o
             return {"session": "sess-cold-heal"}
 
     def _capture_post(url, json=None, timeout=None):
+        parent_existed_at_post.append(snapshot_path(project, parent_h).is_file())
         posted.update(json or {})
         return _Resp()
 
@@ -392,17 +379,15 @@ def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, o
 
     mgr.ensure_session(child_h, project)
 
-    # The POST happened on a genuinely cold cache — no pre-heal materialised
-    # anything first.
     assert posted.get("build_dir"), "no /load_expr POST captured"
-    assert not any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
+    assert parent_existed_at_post == [True], "the parent's snapshot must be made again before Buckaroo is called"
 
-    # Replay the posted build exactly as Buckaroo does: load it and execute. The
-    # child's build carries the parent's cache node (D4), so the replay heals
-    # the evicted parent snapshot itself and the grid has rows.
-    replayed = load_expr(posted["build_dir"], cache_dir=compute_cache_dir(project))
+    # Replay the posted build exactly as Buckaroo does: load it with no cache directory and execute. It reads files
+    # that exist and writes nothing under compute_cache.
+    before = {str(p) for p in compute_cache_dir(project).rglob("*") if p.is_file()}
+    replayed = load_expr(posted["build_dir"])
     assert int(replayed.count().execute()) > 0
-    assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
+    assert {str(p) for p in compute_cache_dir(project).rglob("*") if p.is_file()} == before
 
 
 # ---------------------------------------------------------------------------
@@ -411,18 +396,18 @@ def test_unit_ensure_session_posts_self_contained_build_on_cold_cache(project, o
 
 
 def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_parquet: Path, monkeypatch):
-    """ensure_session expands into a stable per-entry .xorq_build_expanded dir.
+    """A cheap entry is handed its own build, expanded into a stable per-entry .xorq_build_expanded dir.
 
     The expansion used to go to a random mkdtemp tracked in _expanded_dirs and
     deleted by stop(); it now lives under the (immutable, content-addressed)
-    entry dir so the path is identical across restarts — which is what lets the
-    ParquetSnapshotCache hit. It must therefore survive stop().
+    entry dir so the path is identical across restarts — Buckaroo's stat-cache keys include the build directory's path,
+    so a stable path is what lets them hit. It must therefore survive stop(). (A worthy entry's stable directory is its
+    view build, under .xorq_view_build: tests/test_buckaroo_handoff.py.)
     """
-    res = build_and_persist(project, _code(project))
+    res = build_and_persist(project, _cheap_code(project))
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr = _running_manager()
+    posted: list[str] = []
 
     class FakeResponse:
         def raise_for_status(self):
@@ -431,11 +416,16 @@ def test_unit_ensure_session_writes_stable_expanded_dir(project: str, orders_par
         def json(self):
             return {"session": "s"}
 
-    monkeypatch.setattr(mgr._client, "post", lambda *a, **kw: FakeResponse())
+    def fake_post(url, json=None, timeout=None):
+        posted.append(json["build_dir"])
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "post", fake_post)
 
     mgr.ensure_session(res.content_hash, project)
     expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
     assert expanded.is_dir()
+    assert posted == [str(expanded)]
 
     # Simulate already-exited subprocess so stop()'s early-return path runs.
     mgr.proc = None
@@ -454,11 +444,9 @@ def test_unit_ensure_session_heals_partial_expansion(project: str, orders_parque
     FileExistsError out of the lock on every later load. ensure_session must key
     off a completion marker written last, and re-expand when it's absent.
     """
-    res = build_and_persist(project, _code(project))
+    res = build_and_persist(project, _cheap_code(project))
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr = _running_manager()
 
     class FakeResponse:
         def raise_for_status(self):
@@ -491,27 +479,24 @@ def test_unit_diff_sessions_invalidated_on_buckaroo_restart(project: str):
     """A buckaroo restart must drop loaded diff-compare sessions.
 
     Buckaroo's /load_expr sessions live only in the subprocess's RAM, so a
-    restart (fresh ``started_at`` from /health) invalidates every session_id —
-    entry sessions (``_sessions``) and diff-compare sessions alike. The diff
-    bookkeeping used to be a module global that nothing reset, so a post-restart
-    diff view skipped the re-POST and handed the client a session the new
-    process never loaded.
+    restart (fresh ``started_at`` from /health) invalidates every session_id.
+    Entry sessions need no record on tallyman's side (their ids are derived and every open
+    posts, ADR-007 D6), but the live diff still keeps one: the bookkeeping used to be a module global that nothing
+    reset, so a post-restart diff view skipped the re-POST and handed the client a session the new process never
+    loaded.
     """
     mgr = BuckarooManager()
     mgr._buckaroo_started_at = 1000.0
-    mgr._sessions = {"h": {"session_id": "s", "project": project}}
     mgr.mark_diff_session_loaded("diff-aaaa-bbbb")
     assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
 
     # Same started_at → not a restart → bookkeeping preserved.
     mgr._reset_session_bookkeeping_if_restarted(1000.0)
     assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
-    assert mgr._sessions
 
-    # Fresh started_at → restart → entry and diff sessions both dropped.
+    # Fresh started_at → restart → the diff sessions are dropped.
     mgr._reset_session_bookkeeping_if_restarted(2000.0)
     assert not mgr.diff_session_is_loaded("diff-aaaa-bbbb")
-    assert mgr._sessions == {}
 
 
 def test_unit_stop_cleans_many_expanded_dirs(project: str):
@@ -536,30 +521,37 @@ def test_unit_stop_cleans_many_expanded_dirs(project: str):
         assert not p.exists(), p
 
 
-def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path, monkeypatch):
-    """N threads racing on the same content_hash must produce exactly one
-    /load_expr POST and one tmp dir — the session_lock serialises.
+@pytest.mark.parametrize("recipe", [_code, _cheap_code], ids=["worthy", "cheap"])
+def test_unit_concurrent_opens_of_one_entry_share_one_intact_build_dir(
+    project: str, orders_parquet: Path, monkeypatch, recipe
+):
+    """N threads opening the same entry at once all get its derived session id and are all handed the SAME build
+    directory, complete (ADR-007 D6).
+
+    Tallyman keeps no session map, so every open posts (Buckaroo's own short-circuit makes a repeat post cheap) and
+    there is no session lock to serialise on. What must hold is that racing writers of the stable build dir (the view
+    build of a worthy entry, the expanded build of a cheap one) never hand Buckaroo a half-written one.
     """
-    res = build_and_persist(project, _code(project))
+    res = build_and_persist(project, recipe(project))
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
-
-    post_urls: list[str] = []
+    mgr = _running_manager()
+    posted: list[dict] = []
 
     class FakeResponse:
+        def __init__(self, session: str):
+            self._session = session
+
         def raise_for_status(self):
             pass
 
         def json(self):
-            return {"session": "shared"}
+            return {"session": self._session}
 
     def fake_post(url, json=None, timeout=None):
-        post_urls.append(url)
-        # Small sleep so threads have a chance to contend on the lock.
+        posted.append(json)
+        # Small sleep so threads have a chance to contend.
         time.sleep(0.02)
-        return FakeResponse()
+        return FakeResponse(json["session"])
 
     monkeypatch.setattr(mgr._client, "post", fake_post)
 
@@ -576,26 +568,26 @@ def test_unit_concurrent_same_hash_loads_once(project: str, orders_parquet: Path
     for t in threads:
         t.join()
 
-    assert results == ["shared"] * 8
-    assert len(post_urls) == 1, post_urls
-    assert (entry_dir(project, res.content_hash) / ".xorq_build_expanded").is_dir()
+    assert results == [mgr.session_id_for(project, res.content_hash)] * 8
+    assert len(posted) == 8  # every open posts: tallyman remembers nothing
+    build_dirs = {body["build_dir"] for body in posted}
+    assert len(build_dirs) == 1, build_dirs
+    (build_dir,) = build_dirs
+    assert (Path(build_dir) / "expr.yaml").is_file()
 
 
 def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_parquet: Path, monkeypatch):
     """Threads racing on N distinct content_hashes each get their own
-    /load_expr POST + tmp dir; no cross-talk through the session_lock.
+    /load_expr POST, session id and build dir; no cross-talk.
     """
     hashes = [
         build_and_persist(project, _code(project) + f"\nexpr = expr.mutate(_v={i})").content_hash
         for i in range(5)
     ]
 
-    mgr = BuckarooManager()
-    mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr = _running_manager()
 
-    post_count = {"n": 0}
-    posted_build_dirs: list[str] = []
+    posted: list[dict] = []
     posted_lock = threading.Lock()
 
     class FakeResponse:
@@ -607,8 +599,7 @@ def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_pa
 
     def fake_post(url, json=None, timeout=None):
         with posted_lock:
-            post_count["n"] += 1
-            posted_build_dirs.append(json["build_dir"])
+            posted.append(json)
         time.sleep(0.01)
         return FakeResponse()
 
@@ -626,9 +617,10 @@ def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_pa
     for t in threads:
         t.join()
 
-    assert post_count["n"] == len(hashes)
-    assert len(set(posted_build_dirs)) == len(hashes)  # one expansion dir per hash
-    assert all((entry_dir(project, h) / ".xorq_build_expanded").is_dir() for h in hashes)
+    assert len(posted) == len(hashes)
+    assert {body["session"] for body in posted} == {mgr.session_id_for(project, h) for h in hashes}
+    assert len({body["build_dir"] for body in posted}) == len(hashes)  # one build dir per hash
+    assert all(entry_view_build_dir(project, h).is_dir() for h in hashes)  # these are worthy: a view build each
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +629,8 @@ def test_unit_concurrent_different_hashes_each_load_once(project: str, orders_pa
 
 
 @pytest.mark.integration
-def test_integration_spawn_and_load(project: str, orders_parquet: Path):
-    # Build at least one catalog entry so we have a result.parquet to /load.
+def test_integration_spawn_and_load(project: str, orders_parquet: Path, isolated_home: Path):
+    # Build at least one catalog entry so there is a build to /load_expr.
     res = build_and_persist(project, _code(project))
 
     # Use port=0 to dodge collisions with anything else on :8700.
@@ -648,14 +640,12 @@ def test_integration_spawn_and_load(project: str, orders_parquet: Path):
         assert mgr.is_running
         assert mgr.bound_port is not None and mgr.bound_port > 0
         session = mgr.ensure_session(res.content_hash, project)
-        assert session is not None and len(session) >= 16
-        # Cached lookup returns the same session id.
+        # The id is derived from the project and the hash (ADR-007 D6), and Buckaroo honours the id it is given.
+        assert session == mgr.session_id_for(project, res.content_hash)
+        # A repeat open posts again and gets the same id: Buckaroo skips the work while it holds the session.
         assert mgr.ensure_session(res.content_hash, project) == session
-        # Persisted on disk under the new envelope shape.
-        sessions_file = json.loads((mgr._session_file_path()).read_text())
-        assert sessions_file["sessions"][res.content_hash]["session_id"] == session
-        assert sessions_file["sessions"][res.content_hash]["project"] == project
-        assert sessions_file["buckaroo_started_at"] is not None
+        # Tallyman keeps no record of the session anywhere.
+        assert not list(isolated_home.rglob("buckaroo_sessions.json"))
     finally:
         mgr.stop()
     assert not mgr.is_running
@@ -671,34 +661,43 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_parquet
     parquet read returns empty. The original
     ``test_integration_spawn_and_load`` test passed even with that bug
     in place because it only asserted a session id came back. This
-    test asserts the actual contract callers care about: data flows.
+    test asserts the actual contract callers care about: data flows, for the
+    build tallyman hands Buckaroo (a worthy entry's view build of its snapshot;
+    a cheap entry's own expanded build).
     """
-    res = build_and_persist(project, _code(project))
+    worthy = build_and_persist(project, _code(project))
+    cheap = build_and_persist(project, _cheap_code(project))
 
     mgr = BuckarooManager(port=0, startup_timeout=15.0)
     try:
         mgr.start()
-        session_id = mgr.ensure_session(res.content_hash, project)
-        assert session_id is not None
+        for res in (worthy, cheap):
+            assert mgr.ensure_session(res.content_hash, project) is not None
 
-        # The expansion lives in the entry's stable .xorq_build_expanded dir;
-        # expr.yaml must be placeholder-free so xorq can read the upstream parquet.
-        expanded = entry_dir(project, res.content_hash) / ".xorq_build_expanded"
-        expr_yaml = (expanded / "expr.yaml").read_text()
-        assert "${TALLYMAN_PROJECT_ROOT}" not in expr_yaml
-
-        # /load_expr's response surfaces rows — POST a probe directly to
-        # inspect it. With unexpanded paths this comes back rows=0.
-        resp = httpx.post(
-            f"{mgr.base_url}/load_expr",
-            json={"build_dir": str(expanded), "no_browser": True},
-            timeout=10.0,
-        )
+        # A worthy entry: Buckaroo reads the snapshot through the view build, whose columns are the snapshot's, and
+        # __row_order is the last of them.
+        view = entry_view_build_dir(project, worthy.content_hash)
+        assert "${TALLYMAN_PROJECT_ROOT}" not in (view / "expr.yaml").read_text()
+        # /load_expr's response surfaces rows — POST a probe directly to inspect it. With unexpanded paths this comes
+        # back rows=0.
+        resp = httpx.post(f"{mgr.base_url}/load_expr", json={"build_dir": str(view), "no_browser": True}, timeout=10.0)
         resp.raise_for_status()
         body = resp.json()
         assert body["rows"] > 0, body
         # Same schema buckaroo will report over WS to the embed.
-        assert [c["name"] for c in body["columns"]] == ["region", "n"]
+        assert [c["name"] for c in body["columns"]] == ["region", "n", "__row_order"]
+
+        # A cheap entry: the expansion lives in the entry's stable .xorq_build_expanded dir; expr.yaml must be
+        # placeholder-free so xorq can read the upstream ordered copy.
+        expanded = entry_dir(project, cheap.content_hash) / ".xorq_build_expanded"
+        assert "${TALLYMAN_PROJECT_ROOT}" not in (expanded / "expr.yaml").read_text()
+        resp = httpx.post(
+            f"{mgr.base_url}/load_expr", json={"build_dir": str(expanded), "no_browser": True}, timeout=10.0
+        )
+        resp.raise_for_status()
+        body = resp.json()
+        assert body["rows"] > 0, body
+        assert [c["name"] for c in body["columns"]][-1] == "__row_order"
     finally:
         mgr.stop()
 

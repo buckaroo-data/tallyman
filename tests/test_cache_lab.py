@@ -173,7 +173,8 @@ def _warm_xorq_once(staged_data: Path) -> None:
     shutil.copy2(staged_data / "stations.parquet", dd / "stations.parquet")
     build_and_persist(
         "lab-warmup",
-        _prelude("lab-warmup") + 'expr = read_project_file("stations.parquet", project=_P).select("station_id")\n',
+        _prelude("lab-warmup")
+        + 'expr = read_project_file("stations.parquet", project=_P).select("station_id", "__row_order")\n',
     )
     _WARMED = True
 
@@ -423,7 +424,7 @@ def cleaned_trips_code(project: str) -> str:
         "t = trips.filter((trips.start_station_id != trips.end_station_id)\n"
         "                 & (trips.ended_at > trips.started_at))\n"
         "expr = t.select('ride_id', 'rideable_type', 'started_at', 'ended_at',\n"
-        "                'start_station_id', 'end_station_id', 'member_casual')\n"
+        "                'start_station_id', 'end_station_id', 'member_casual', '__row_order')\n"
     )
 
 
@@ -454,7 +455,7 @@ def wide_compile_code(project: str, depth: int) -> str:
         "band = ibis.cases(*[ (f.start_station_id % 20 == k, float(k)) for k in range(19) ], else_=19.0)\n"
         "f = f.mutate(zone_band=band)\n"
         f"expr = f.select('ride_id', 'minutes', 'hour', 'zone_band', f'score_{depth}',\n"
-        "                *[f'is_h{h:02d}' for h in range(24)])\n"
+        "                *[f'is_h{h:02d}' for h in range(24)], '__row_order')\n"
     )
 
 
@@ -508,7 +509,7 @@ def label_balloon_code(project: str) -> str:
         "t = t.mutate(route_label=t.start_station_name.concat(' -> ').concat(t.end_station_name))\n"
         "t = t.mutate(trip_summary=t.member_casual.concat(' ').concat(t.rideable_type)\n"
         "             .concat(' ride ').concat(t.ride_id).concat(' via ').concat(t.route_label))\n"
-        "expr = t.select('ride_id', 'route_label', 'trip_summary', 'minutes')\n"
+        "expr = t.select('ride_id', 'route_label', 'trip_summary', 'minutes', '__row_order')\n"
     )
 
 

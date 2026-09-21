@@ -1,137 +1,32 @@
-"""Rewrite-then-build source caching for catalog entries.
+"""The rewrite step between a recipe and its build (ADR-007 D1, ADR-008).
 
-Before a build, tallyman rewrites the submitted expression: every non-parquet
-*file* read (``read_csv`` / ``read_json``) gets a ``.cache()`` node injected
-immediately downstream, so the CSV→parquet parse is materialised once and
-shared — the snapshot strategy keys on the read's path only, so every entry
-that reads the same source hits the same cached parquet. ``read_parquet`` /
-``read_delta`` are exempt: already columnar, re-reading them costs about the
-same as reading a cached copy.
+Before a build, tallyman looks at the submitted expression, rejects what cannot become a sound entry, and adds the one
+thing a materialized entry needs. No xorq cache node is created or kept: tallyman writes its own result files
+(``tallyman_xorq.materialize``), so nothing in a build points at xorq's cache, and xorq stays the expression, build,
+load, hashing and execution layer.
 
-An in-memory read (``read_in_memory`` or an ``ibis.memtable``) is a hard error.
-It signals the author dropped to pandas (e.g. ``pd.read_csv`` then
-``read_in_memory``) instead of a native deferred reader; the bytes would not
-round-trip through the portable build, and what actually wants caching is the
-native parse. The error steers the author back to ``deferred_read_csv``.
+The rewrite rejects:
 
-The author never writes ``.cache()``. ``build_and_persist`` builds the
-*rewritten* expression, so the entry's ``content_hash`` and ``xorq_build/``
-always carry the cache node while ``expr.py`` keeps the LLM's literal source —
-tallyman does not depend on the submitted form (the LLM doesn't reliably track
-it). The injected cache's ``base_path`` is supplied at load time by xorq's
-``load_expr(cache_dir=...)`` (``compiler.replace_base_path`` rewrites every
-``CachedNode`` storage to that dir), which tallyman points at the project's
-``compute_cache`` — so the source-read parquet lands under the per-project,
-reset-reconciled compute cache, content-addressed and self-healing.
+- **In-memory reads** (``read_in_memory`` or an ``ibis.memtable``). They signal that the author dropped to pandas
+  instead of reading a file through ``read_project_file`` or ``tallyman_read_csv``; the bytes would not round-trip
+  through the portable build.
+- **A recipe that already contains a cache node.** A node with default storage would write under ``~/.cache/xorq``.
+- **A recipe that assigns to ``__row_order``**, and **a cheap entry that drops it** (ADR-008 D3, D6).
+
+And it adds:
+
+- for a **worthy** entry, the canonical sort (ADR-006 D5, ADR-008 D10 and D11): a deterministic total order, so the
+  snapshot is the same on every rebuild and the writer numbers the rows in the order the author asked for;
+- for a **cheap** entry, nothing but moving ``__row_order`` to the last column.
+
+Whether an entry is cheap or worthy is decided once, by ``worthiness.classify_expr`` on the expression the author
+wrote, and recorded in the manifest. This module never re-derives it from the serialized build.
 """
 
 from __future__ import annotations
 
-# File reads cheap enough to re-read rather than cache: columnar formats whose
-# scan is already a pushdown read. Everything else (read_csv, read_json) parses
-# text and is worth materialising once.
-_EXEMPT_READS = frozenset({"read_parquet", "read_delta"})
-
-
-def _should_cache_read(method_name: str) -> bool:
-    """True if a deferred file read should get a source-cache node injected.
-
-    Membership-based, not format-special-cased: every non-exempt reader
-    (``read_csv``, ``read_json``) is cached; columnar formats are exempt. Kept a
-    named predicate so the read_csv/read_json parity stays unit-testable — this
-    xorq has no ``deferred_read_json``, so the read_json path has no end-to-end
-    producer to build a fixture from.
-    """
-    return method_name not in _EXEMPT_READS
-
-
-def _sortable(dtype) -> bool:
-    """Whether a column can serve as a canonical-order sort key.
-
-    Nested / geospatial types can't be sort keys in datafusion; leaving them out
-    of the tie-breakers is safe — any remaining ties are between rows identical
-    on every sortable column, and identical prefixes write identical bytes.
-    """
-    for pred in ("is_array", "is_map", "is_struct", "is_json", "is_geospatial"):
-        if getattr(dtype, pred, None) and getattr(dtype, pred)():
-            return False
-    return True
-
-
-def _constant_names(rel) -> set[str]:
-    """Columns the relation defines as scalars (projected literals/constants).
-
-    A constant column adds no ordering information — every row ties on it — and
-    ibis dereferences a sort key straight through to the defining value, so
-    ``ORDER BY <literal>`` reaches datafusion's planner, which rejects a bare
-    literal there ("invalid digit found in string": it reads a numeric literal
-    as a column ordinal). Skipping them is both necessary and free.
-    """
-    values = getattr(rel, "values", None)
-    if not values:
-        return set()
-    out = set()
-    for name, v in values.items():
-        shape = getattr(v, "shape", None)
-        if shape is not None and shape.is_scalar():
-            out.add(name)
-    return out
-
-
-def _tie_break_order(names, keyed: set[str], schema, rel) -> list[str]:
-    """Sortable, non-constant columns not already keyed, ``original_row_order`` first.
-
-    ``original_row_order`` is tallyman's canonical total order for CSV-sourced
-    entries (``tallyman_read_csv``); leading with it keeps a baked CSV result in
-    file order rather than lexicographic-by-first-column order.
-    """
-    skip = keyed | _constant_names(rel)
-    remaining = [n for n in names if n not in skip and _sortable(schema[n])]
-    remaining.sort(key=lambda n: n != "original_row_order")  # stable: row order first, schema order after
-    return remaining
-
-
-def _canonical_sorted(expr):
-    """Impose a deterministic total order before the result-cache bake.
-
-    ADR D5 (amended, plans/ADR-006-read-path-loads-builds.md): datafusion's parallel
-    scan/aggregation reorders rows run-to-run above its 1 MiB repartition
-    threshold, so an unsorted bake produces different bytes on every heal and
-    ``result_digest`` stops naming the entry's result. Sorting by every column
-    makes the bytes deterministic: rows still tied after all sortable columns are
-    byte-identical, so any permutation among them writes the same file.
-
-    Key priority: the author's own top-level ``order_by`` keys stay primary (the
-    served row order is part of what they asked for), then ``original_row_order``
-    (the canonical CSV file order), then the remaining sortable columns in schema
-    order. An author sort is extended in place rather than wrapped, so the graph
-    carries one Sort node.
-    """
-    import xorq.vendor.ibis.expr.operations as ops
-
-    node = expr.op()
-    if isinstance(node, ops.Sort):
-        parent = node.parent
-        keyed = {k.expr.name for k in node.keys if isinstance(k.expr, ops.Field)}
-        remaining = _tie_break_order(parent.schema.names, keyed, parent.schema, parent)
-        if not remaining:
-            return expr
-        extra = tuple(ops.SortKey(ops.Field(parent, n)) for n in remaining)
-        return ops.Sort(parent, tuple(node.keys) + extra).to_expr()
-    schema = expr.schema()
-    names = _tie_break_order(schema.names, set(), schema, node)
-    if not names:
-        return expr  # nothing sortable — the digest stays best-effort for this entry
-    return expr.order_by(names)
-
-
-_IN_MEMORY_MSG = (
-    "expression reads in-memory data (read_in_memory / ibis.memtable). This "
-    "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
-    "handed to xorq in memory, instead of a native deferred reader. Read the "
-    "file with tallyman_read_csv(abs_path, schema=...) for CSVs or "
-    "xo.deferred_read_parquet(abs_path) for parquet, so the source round-trips "
-    "through the portable build and is cached at the read."
+from tallyman_xorq.row_order import (
+    canonical_sorted as _canonical_sorted,  # noqa: F401 (the evidence scripts import it here)
 )
 
 
@@ -139,107 +34,65 @@ class InMemoryReadError(RuntimeError):
     """The expression reads in-memory data instead of a deferred file read."""
 
 
-def _is_worthy_expr(expr) -> bool:
-    """True if the expression does expensive work worth materialising.
-
-    Mirrors ``result_cache.classify_build`` (which decides the same thing from
-    the serialized build) on the *live* expression, so the bake decision below
-    and the read-time worthiness check stay in lockstep: an Aggregate / Join /
-    Sort / window / UDF anywhere in the graph makes the result worth caching.
-
-    UDFs are matched by ancestry, not leaf name. A ``make_pandas_udf`` node is
-    classed after the user's function (e.g. ``plusone``), so its live leaf name
-    carries no "UDF" — but its MRO holds the base op name (``ScalarUDF`` /
-    ``AggUDF`` / …) that the serialized YAML emits and ``classify_build`` greps.
-    Testing the leaf name only missed scalar UDFs and broke the lockstep (#81).
-    """
-    from xorq.common.utils.graph_utils import walk_nodes
-    from xorq.vendor.ibis.expr.operations.core import Node
-
-    from tallyman_xorq.result_cache import _EXPENSIVE_OPS
-
-    for node in walk_nodes((Node,), expr):
-        if type(node).__name__ in _EXPENSIVE_OPS:
-            return True
-        if any("UDF" in base.__name__ for base in type(node).__mro__):
-            return True
-    return False
+class CacheNodeError(RuntimeError):
+    """The recipe contains a xorq cache node."""
 
 
-def rewrite_for_build(expr, project: str):
-    """Rewrite the submitted expression before build (#73).
+_IN_MEMORY_MSG = (
+    "expression reads in-memory data (read_in_memory / ibis.memtable). This "
+    "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
+    "handed to xorq in memory, instead of a native reader. Read the "
+    "file with tallyman_read_csv(abs_path, schema=...) for CSVs or "
+    "read_project_file(rel_path) for parquet, so the source round-trips "
+    "through the portable build and is ingested with a stable __row_order."
+)
 
-    Three rewrites, in order:
+_CACHE_NODE_MSG = (
+    "the recipe calls .cache(), which puts a xorq cache node in the build. Tallyman writes its own result files "
+    "(entries that do expensive work are materialized when they are created), and a cache node with default storage "
+    "would write under ~/.cache/xorq. Remove the .cache() call."
+)
 
-    1. **Reject in-memory reads** (always). ``read_in_memory`` / an
-       ``ibis.memtable`` signals the author dropped to pandas instead of a
-       native deferred reader — raise :class:`InMemoryReadError`.
-    2. **Cache each non-parquet source read.** A ``.cache()`` after every
-       ``read_csv`` / ``read_json`` materialises the parse once, shared across
-       entries (path-only snapshot key). ``read_parquet`` / ``read_delta`` are
-       exempt — re-reading a columnar source is already cheap.
-    3. **Bake a top-level result cache when the expression is expensive.** The
-       cache node becomes part of the durable recipe, so *every* loader — the
-       Buckaroo viewer, diffs, ``tracked_expr_from_alias`` chaining — reads the cached
-       result instead of re-running the whole DAG (the bug #71 papered over at
-       read time). A cheap expression bakes nothing and recomputes ~free.
 
-    All cache nodes resolve their storage at load time to the per-project
-    compute cache (xorq's ``load_expr(cache_dir=…)`` rewrites every node's base
-    path uniformly), so there is no separate ``result_cache/`` dir — source
-    parses and baked results co-locate there, content-addressed and
-    reset-reconciled.
+def rewrite_for_build(expr, project: str, *, verdict=None, reading: str | None = None):
+    """Rewrite the submitted expression before build.
 
-    Cache injection is skipped under ``salt`` source-identity mode: its
-    path-only snapshot keys would collide across salted entries with identical
-    paths but different content. In-memory rejection still applies.
+    In order:
+
+    1. **Reject in-memory reads** — raise :class:`InMemoryReadError`.
+    2. **Reject cache nodes** — raise :class:`CacheNodeError` (ADR-007 D1).
+    3. **Reject assignment to ``__row_order``**, and, for a cheap entry, a select that drops it — raise
+       :class:`tallyman_xorq.row_order.RowOrderError` (ADR-008 D3, D6). ``reading`` names what the entry reads, for
+       the message.
+    4. A worthy entry gets the **canonical sort**; a cheap entry gets ``__row_order`` moved last.
+
+    ``verdict`` is the entry's ``worthiness.Verdict`` (computed here when the caller has not already).
     """
     import xorq.vendor.ibis.expr.operations as ops
-    from xorq.caching import ParquetSnapshotCache
-    from xorq.common.utils.graph_utils import replace_nodes, walk_nodes
-    from xorq.expr.relations import Read
+    from xorq.common.utils.graph_utils import walk_nodes
+    from xorq.expr.relations import CachedNode, Read
 
-    from tallyman_core.paths import compute_cache_dir
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq.backend import connect
+    from tallyman_xorq import row_order
+    from tallyman_xorq.worthiness import classify_expr
 
     reads = walk_nodes(Read, expr)
     if walk_nodes(ops.InMemoryTable, expr) or any(r.method_name == "read_in_memory" for r in reads):
         raise InMemoryReadError(_IN_MEMORY_MSG)
+    if walk_nodes(CachedNode, expr):
+        raise CacheNodeError(_CACHE_NODE_MSG)
 
-    if si.mode() == "salt":
-        return expr
-
-    base = str(compute_cache_dir(project))
-
-    # 2. Source-read caches. One cache (one connection) shared by every read;
-    # the snapshot key is path-only so distinct reads get distinct keys. The
-    # `wrapped` memo breaks re-descent recursion: replace_nodes re-applies the
-    # replacer to a fresh CachedNode's `parent` (graph_utils process_node), the
-    # same Read — without the memo it would wrap it again, forever.
-    targets = {r for r in reads if _should_cache_read(r.method_name)}
-    if targets:
-        src_cache = ParquetSnapshotCache.from_kwargs(source=connect(), base_path=base)
-        wrapped: dict = {}
-
-        def replacer(node, kwargs):
-            if isinstance(node, Read) and node in targets:
-                if node in wrapped:
-                    return node
-                cached = node.to_expr().cache(cache=src_cache).op()
-                wrapped[node] = cached
-                return cached
-            return node.__recreate__(kwargs) if kwargs else node
-
-        expr = replace_nodes(replacer, expr).to_expr()
-
-    # 3. Bake the result cache for an expensive expression, canonically ordered
-    # first so the snapshot's bytes — and therefore result_digest — are
-    # deterministic across the build and every later heal (ADR D5, amended).
-    # A distinct relative_path keeps baked results inspectable apart from
-    # source parses under the same compute-cache root.
-    if _is_worthy_expr(expr):
-        result_cache = ParquetSnapshotCache.from_kwargs(source=connect(), base_path=base, relative_path="result_cache")
-        expr = _canonical_sorted(expr).cache(cache=result_cache)
-
-    return expr
+    verdict = verdict or classify_expr(expr)
+    row_order.assert_not_assigned(expr)
+    row_order.assert_joinable(expr)
+    if verdict.worthy:
+        try:
+            return row_order.canonical_sorted(expr)
+        except row_order.RowOrderError:
+            raise
+        except Exception as exc:
+            translated = row_order.translate_collision(exc)
+            if translated is not None:
+                raise translated from exc
+            raise
+    row_order.require_on_cheap(expr, reading=reading or "a file")
+    return row_order.move_last(expr)

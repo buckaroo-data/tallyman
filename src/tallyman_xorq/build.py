@@ -92,6 +92,10 @@ class BuildResult:
     cache_worthy: bool | None = None
     cache_worthy_why: str | None = None
     cache_bytes: int | None = None
+    # Whether two runs of the query at create time gave the same digest (ADR-009 D6): None for a cheap entry, which is
+    # not run twice, False when the recipe is not reproducible, with the columns whose digests differed.
+    reproducible: bool | None = None
+    nonreproducible_columns: list[str] = field(default_factory=list)
 
 
 class BuildError(RuntimeError):
@@ -115,7 +119,7 @@ def _user_imports_bare_ibis(code: str) -> bool:
 
 
 # Read helpers the model reaches for on the wrong namespace. The project-aware
-# way is read_project_file/tracked_expr_from_alias; xo.deferred_read_parquet handles a raw path.
+# way is read_project_file/tracked_expr_from_alias/tallyman_read_csv.
 _READ_FNS = frozenset(
     {"read_parquet", "read_csv", "read_in_memory", "read_delta", "deferred_read_parquet", "deferred_read_csv"}
 )
@@ -196,14 +200,14 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
                 "(`import xorq.api as xo`). Read data with `from tallyman_xorq.io "
                 "import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
                 "use `tallyman_read_csv(abs_path, schema=...)` for CSVs (the only "
-                "supported CSV ingest) and `xo.deferred_read_parquet(abs_path)` "
-                "for a raw parquet path."
+                "supported CSV ingest) and `read_project_file(rel_path)` for a "
+                "parquet file under <project>/data/."
             )
         else:
             hints.append(
                 f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint. "
                 f"`import xorq.api as xo` and call `xo.{name}` "
-                "(e.g. xo.memtable, xo.deferred_read_parquet, xo.connect)."
+                "(e.g. xo.memtable, xo.connect)."
             )
 
     m = re.search(r"module 'ibis' has no attribute '(\w+)'", exc_msg)
@@ -231,7 +235,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `read_project_file` "
             "(raw files under <project>/data/), `tracked_expr_from_alias` (alias → records lineage), "
             "`pinned_expr_from_alias` (hash or 'name-vN' version ref, pinned), and `tallyman_read_csv` "
-            "(CSV ingest with original_row_order for stable digests)."
+            "(CSV ingest with a stable __row_order)."
         )
 
     if "duckdb" in exc_msg.lower():
@@ -275,10 +279,9 @@ _NONDETERMINISTIC_OPS = {
 def _csv_direct_read_check(expr) -> None:
     """Raise BuildError if the recipe calls xo.deferred_read_csv directly.
 
-    tallyman_read_csv is the only supported CSV ingest path — it bakes an
-    order-stable polars intermediate so result_digest is byte-reproducible
-    across builds. A raw deferred_read_csv bypasses that and produces a
-    nondeterministic row order above datafusion's repartition threshold.
+    tallyman_read_csv is the only supported CSV ingest path — it goes through source identity and writes an ordered
+    copy with a stable ``__row_order``, so the entry's rows are fixed under its hash and paging is repeatable. A raw
+    deferred_read_csv bypasses that and gives a nondeterministic row order above datafusion's repartition threshold.
     """
     try:
         from xorq.expr.relations import Read
@@ -294,9 +297,36 @@ def _csv_direct_read_check(expr) -> None:
         raise BuildError(
             "xo.deferred_read_csv is not allowed in tallyman recipes — "
             "use tallyman_read_csv(abs_path, schema=...) instead. "
-            "tallyman_read_csv bakes an order-stable polars intermediate so "
-            "result_digest is byte-reproducible; deferred_read_csv gives "
+            "tallyman_read_csv ingests the CSV once into an ordered copy with a stable __row_order, so the "
+            "entry's rows are fixed under its hash; deferred_read_csv gives "
             "nondeterministic row order above datafusion's repartition threshold."
+        )
+
+
+def _raw_parquet_read_check(expr, project: str) -> None:
+    """Raise BuildError if the recipe reads a parquet file that tallyman did not write (ADR-008 D12).
+
+    Such a read has no digest, no clone and no ordered copy, so an entry built on it has no ``__row_order`` to page by.
+    Tallyman's own files are the snapshots and ordered copies under the project's ``compute_cache/``; everything else
+    goes through ``read_project_file``.
+    """
+    from xorq.common.utils.graph_utils import walk_nodes
+    from xorq.expr.relations import Read
+
+    from tallyman_core.paths import compute_cache_dir
+
+    root = compute_cache_dir(project).resolve()
+    for node in walk_nodes(Read, expr):
+        if node.method_name != "read_parquet":
+            continue
+        path = dict(node.read_kwargs).get("hash_path")
+        if path is None or Path(str(path)).resolve().is_relative_to(root):
+            continue
+        raise BuildError(
+            f"the recipe reads {path} with xo.deferred_read_parquet, which is not allowed: the file gets no "
+            "content digest, no clone and no ordered copy, so the entry would have no __row_order to page by. "
+            "Read a parquet file under <project>/data/ with read_project_file('<name>.parquet'), and a catalog "
+            "entry with tracked_expr_from_alias('<alias>')."
         )
 
 
@@ -364,68 +394,105 @@ def build_and_persist(
     expr_name: str = "expr",
     prompt: str | None = None,
 ) -> BuildResult:
-    """Compile user code with xorq, materialize a parquet, write a catalog entry.
+    """Compile user code with xorq, materialize a worthy entry's snapshot, write a catalog entry.
 
     The user code must bind a variable named `expr_name` (default "expr") to an
     ibis/xorq expression. Imports happen in a fresh module scope.
+
+    The whole build holds the project's write lock (ADR-007 D11): one write at a time per project, so two builds of
+    one entry cannot end with the failing one deleting the winner's directory, and a chained build waits for the
+    materialization of its parent.
     """
+    from tallyman_core.catalog_state import project_lock
+
+    ensure_project(project)
+    with project_lock(project):
+        return _build_and_persist(project, code, expr_name, prompt)
+
+
+def _reading(expr, project: str, ordered: dict[str, dict]) -> str:
+    """What a cheap entry reads, in words, for the message that says it must keep ``__row_order`` (ADR-008 D3)."""
+    from xorq.common.utils.graph_utils import walk_nodes
+    from xorq.expr.relations import Read
+
+    from tallyman_xorq.ordered_copy import describe_read
+
+    paths = [dict(r.read_kwargs).get("hash_path") for r in walk_nodes(Read, expr)]
+    paths = [Path(str(p)) for p in paths if p]
+    return describe_read(project, paths[0], ordered) if len(paths) == 1 else "a file"
+
+
+def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | None) -> BuildResult:
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
-    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq import ordered_copy as oc
     from tallyman_xorq._git_state_guard import install_git_state_guard
+    from tallyman_xorq.materialize import SNAPSHOT_FORMAT_VERSION, engine_versions, materialize, snapshot_path
+    from tallyman_xorq.result_cache import stream_row_count
+    from tallyman_xorq.row_order import RowOrderError
+    from tallyman_xorq.worthiness import classify_expr
 
     # git-provenance capture in xorq's compiler can crash (git SIGSEGV when forked
     # from the long-lived server) and abort the whole build. Make it best-effort.
     install_git_state_guard()
 
-    ensure_project(project)
-
     # Collect source digests while user code imports (read_project_file notes each
-    # file it reads); cas/salt identity modes consume them below.
+    # file it reads), and the ordered copies each source was ingested into (what a
+    # manifest needs so ensure_materialized can make one again).
     from tallyman_xorq import parent_capture as pc
     from tallyman_xorq import source_identity as si
 
     collect_token = si.begin_collect()
     parent_token = pc.begin_collect()
+    copies_token = oc.begin_collect()
     try:
         module, tmp_script = _import_script(code)
     finally:
         sources = si.end_collect(collect_token)
         # Resolved tracked_expr_from_alias parent edges captured during import (#84).
         parents = pc.end_collect(parent_token)
+        ordered = oc.end_collect(copies_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
         raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
 
-    # Advisory nondeterminism lint (#88) on the author's expression, before the
-    # rewrite wraps it in cache nodes. Surfaced on the result, never fatal.
+    # Advisory nondeterminism lint (#88) on the author's expression, surfaced on the result, never fatal.
     lint_warnings = _nondeterminism_warnings(expr_obj)
 
-    # Fatal: raw deferred_read_csv is banned — tallyman_read_csv is the only
-    # supported CSV ingest path (order-stable polars intermediate).
+    # Fatal: raw reads are banned. tallyman_read_csv and read_project_file are the only ingest paths (each writes an
+    # ordered copy with a stable __row_order); a raw deferred_read_csv or deferred_read_parquet bypasses them.
     _csv_direct_read_check(expr_obj)
+    _raw_parquet_read_check(expr_obj, project)
 
-    # Rewrite-then-build (#73): cache each non-parquet source read, bake a
-    # top-level result cache when the expression is expensive (so every loader,
-    # incl. the Buckaroo viewer, reads the cached result instead of re-running
-    # the DAG), and reject in-memory reads. The content_hash below is computed
-    # from this rewritten expression; xorq_build/ carries the cache nodes, while
-    # expr.py keeps the author's literal source (tallyman does not depend on the
-    # submitted form).
-    from tallyman_xorq.source_cache import InMemoryReadError, rewrite_for_build
+    # Whether the entry is materialized is decided ONCE, here, on the expression the author wrote (ADR-008 D4), and
+    # recorded in the manifest. The rewrite below then adds the canonical sort to a worthy entry and checks that a
+    # cheap one keeps __row_order; no cache node is created (ADR-007 D1).
+    from tallyman_xorq.source_cache import CacheNodeError, InMemoryReadError, rewrite_for_build
 
-    # The author's DAG before cache injection — compile_seconds (#87) times its
-    # expr->backend-plan step, the un-truncated "large expression DAG" recompile
-    # that #30's profiling found dominates per-view cost. The rewritten expression
-    # carries cache boundaries that would truncate that compile.
+    verdict = classify_expr(expr_obj)
+    # The author's DAG before the canonical sort: compile_seconds (#87) times its expr->backend-plan step, the
+    # un-truncated "large expression DAG" recompile that #30's profiling found dominates per-view cost.
     author_expr = expr_obj
     try:
-        expr_obj = rewrite_for_build(expr_obj, project)
-    except InMemoryReadError as exc:
+        expr_obj = rewrite_for_build(
+            expr_obj,
+            project,
+            verdict=verdict,
+            reading=_reading(expr_obj, project, ordered) if not verdict.worthy else None,
+        )
+    except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
         raise BuildError(str(exc)) from exc
+    except Exception as exc:
+        from tallyman_xorq.row_order import translate_collision
+
+        translated = translate_collision(exc)
+        if translated is not None:
+            raise BuildError(str(translated)) from exc
+        raise
 
     created_target = False
+    wrote_snapshot: Path | None = None
     try:
         # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
         # things into our catalog layout afterwards.
@@ -462,6 +529,8 @@ def build_and_persist(
                         cache_worthy=meta.get("cache_worthy"),
                         cache_worthy_why=meta.get("cache_worthy_why"),
                         cache_bytes=meta.get("cache_bytes"),
+                        reproducible=meta.get("reproducible"),
+                        nonreproducible_columns=meta.get("nonreproducible_columns") or [],
                     )
 
             target.mkdir(parents=True, exist_ok=True)
@@ -486,90 +555,49 @@ def build_and_persist(
             code_persisted = code.replace(str(project_dir(project)), "${TALLYMAN_PROJECT_ROOT}")
             (target / "expr.py").write_text(code_persisted)
 
-            # Load + execute.
-            try:
-                # Per-project compute cache (not the global ~/.cache/xorq), so a
-                # reset can prune it to the revision's warm-set and a freshly added
-                # expression computes cold. See plans/adr-reset-to-revision.md.
-                cache_dir = compute_cache_dir(project)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                loaded = load_expr(build_path, cache_dir=cache_dir)
-            except Exception as exc:
-                hint = _ibis_import_hint(str(exc), code)
-                raise BuildError(f"load_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
-
-            # Classify before executing (reads the serialized build, no eval): the
-            # verdict selects the execution strategy below and is reused for the #87
-            # admission instrumentation after the temp dir is gone.
-            from tallyman_xorq.result_cache import _cached_node_path, classify_build  # noqa: PLC0415
-
-            verdict = classify_build(xorq_build_dir)
-            cache_worthy_v, cache_worthy_why = verdict["worthy"], verdict["why"]
-
-            # Execute (#73). A worthy entry's build carries a baked result-cache
-            # node (rewrite_for_build), so executing materialises it once into the
-            # compute cache — and every later loader (the Buckaroo viewer, diffs,
-            # tracked_expr_from_alias) reads that cached result instead of re-running the DAG;
-            # baking evaluates every row, so count() there both validates and counts.
-            # A cheap entry materialises nothing, so count() alone is satisfied from
-            # source metadata and PRUNES the row projection — a failing cast /
-            # arithmetic / UDF would never evaluate at build, committing + aliasing a
-            # broken entry that throws only on the first materialising read. Stream
-            # the full result and discard it to force row-level evaluation at author
-            # time (constant memory; the one pass yields the exact row count).
-            #
-            # result_digest (ADR-004-result-digest-canonical-ordering): for worthy
-            # entries the baked snapshot is sorted by original_row_order before
-            # materialisation, so its bytes are deterministic run-to-run and we
-            # hash the file directly (cheap, ~0.3s). Cheap entries record no digest
-            # — their result has no snapshot to hash.
-            from tallyman_xorq.result_cache import snapshot_file_digest, stream_row_count  # noqa: PLC0415
-
+            # Execute (ADR-007 D4). A worthy entry is materialized: the ONE writer runs the frozen build on a
+            # single-partition connection and writes the snapshot, twice, so a recipe that is not reproducible is known
+            # from birth (ADR-009 D6). A cheap entry writes nothing: one full streaming pass forces row-level evaluation
+            # at author time (a failing cast / arithmetic / UDF surfaces here, in tallyman's process, and not later in
+            # a grid query), and the one pass yields the exact row count.
+            cache_worthy_v, cache_worthy_why = verdict.worthy, verdict.why
+            reproducible: bool | None = None
+            differing: list[str] = []
             t0 = time.monotonic()
             try:
-                arrow_schema = loaded.schema().to_pyarrow()
                 if cache_worthy_v:
-                    # count() bakes the snapshot (the cache node forces full
-                    # materialisation); then hash the baked file for the digest.
-                    # rewrite_for_build injected the canonical sort under the
-                    # CachedNode (ADR D5, amended), so the bake lands in a
-                    # deterministic total order and the file hash is stable
-                    # across the build and every later heal. snapshot_key
-                    # records the baked file's name so the canonical read can
-                    # assert its own derivation matches (ADR D8).
-                    row_count = int(loaded.count().execute())
-                    snap_path = _cached_node_path(loaded)
-                    baked_ok = snap_path is not None and snap_path.exists()
-                    result_digest_v: str | None = snapshot_file_digest(snap_path) if baked_ok else None
-                    snapshot_key_v: str | None = snap_path.name if baked_ok else None
+                    wrote_snapshot = snapshot_path(project, content_hash)
+                    result = materialize(project, content_hash, check_reproducible=True)
+                    row_count = result.row_count
+                    result_digest_v: str | None = result.digest
+                    arrow_schema = result.schema
+                    reproducible, differing = result.reproducible, result.differing_columns
                 else:
-                    # Stream full result to force row-level evaluation (catch a
-                    # failing cast / arithmetic at build time) and count rows.
-                    # No digest for cheap entries — no snapshot to hash.
+                    loaded = load_expr(build_path)
+                    arrow_schema = loaded.schema().to_pyarrow()
                     row_count = stream_row_count(loaded)
                     result_digest_v = None
-                    snapshot_key_v = None
             except Exception as exc:
                 hint = _ibis_import_hint(str(exc), code)
+                from tallyman_xorq.row_order import translate_collision
+
+                translated = translate_collision(exc)
+                if translated is not None:
+                    raise BuildError(str(translated)) from exc
                 raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
             execute_seconds = round(time.monotonic() - t0, 3)
 
-        # Schema + row count come from the expression directly (no result.parquet to
-        # read back); a worthy entry's rows are already materialised in its cache.
+        # Schema + row count: a worthy entry's schema is read from the file it wrote (parquet changes some types, and
+        # the writer adds __row_order), a cheap entry's from the expression, which by the D3 check already ends in it.
         schema_doc = {
             "fields": [{"name": f.name, "type": str(f.type)} for f in arrow_schema],
             "row_count": row_count,
         }
         atomic_write_text(entry_schema_path(project, content_hash), json.dumps(schema_doc, indent=2))
 
-        # Cache-admission instrumentation (#87): record the structural verdict
-        # (computed above, before execute, since it now also selects the execution
-        # strategy) alongside the measured value-per-byte inputs, so #30's
-        # structural→measured flip is decidable from data. compile_seconds times the
-        # author DAG's expr->backend-plan step (the dominant per-view cost per #30),
-        # separate from execute; cache_bytes is the baked snapshot size (None for a
-        # cheap entry that bakes nothing). loaded is the build_path expression whose
-        # execute just baked the snapshot, so its CachedNode names that exact file.
+        # Cache-admission instrumentation (#87): record the structural verdict alongside the measured inputs.
+        # compile_seconds times the author DAG's expr->backend-plan step (the dominant per-view cost per #30),
+        # separate from execute; cache_bytes is the snapshot size (None for a cheap entry that writes nothing).
         compile_seconds: float | None = None
         try:
             from xorq.expr.api import to_sql
@@ -582,10 +610,9 @@ def build_and_persist(
             pass
 
         cache_bytes: int | None = None
-        snap = _cached_node_path(loaded)
-        if snap is not None and snap.exists():
+        if cache_worthy_v:
             try:
-                cache_bytes = snap.stat().st_size
+                cache_bytes = snapshot_path(project, content_hash).stat().st_size
             except OSError:
                 pass
 
@@ -610,7 +637,11 @@ def build_and_persist(
             cache_worthy_why=cache_worthy_why,
             cache_bytes=cache_bytes,
             result_digest=result_digest_v,
-            snapshot_key=snapshot_key_v,
+            reproducible=reproducible,
+            nonreproducible_columns=differing or None,
+            snapshot_format=SNAPSHOT_FORMAT_VERSION,
+            engine_versions=engine_versions(),
+            ordered_copies=ordered or None,
             sources=sources or None,
             parents=parents or None,
         )
@@ -624,8 +655,20 @@ def build_and_persist(
         # durable entry, which always early-returns before created_target is set.
         if created_target:
             shutil.rmtree(target, ignore_errors=True)
+            if wrote_snapshot is not None:
+                wrote_snapshot.unlink(missing_ok=True)
         raise
     _append_prompt(project, content_hash, prompt)
+
+    if reproducible is False:
+        lint_warnings = [
+            *lint_warnings,
+            "this entry's query is not reproducible: two runs at create time gave different results in column(s) "
+            + ", ".join(differing)
+            + ". The entry was built, and its snapshot file is pinned (never deleted by the Cache page) because it "
+            "cannot be re-created faithfully. Seed a sample, or replace now()/random()/an impure UDF with a value "
+            "fixed at author time, for a reproducible entry.",
+        ]
 
     # Best-effort: drop the temp script.
     try:
@@ -652,6 +695,8 @@ def build_and_persist(
         cache_worthy=cache_worthy_v,
         cache_worthy_why=cache_worthy_why,
         cache_bytes=cache_bytes,
+        reproducible=reproducible,
+        nonreproducible_columns=differing,
     )
 
 

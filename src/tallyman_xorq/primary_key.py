@@ -34,6 +34,8 @@ import time
 from itertools import combinations
 from pathlib import Path
 
+from tallyman_xorq.row_order import ROW_ORDER
+
 PK_SEARCH_BUDGET_S = 1.0
 
 # Indirection so tests can drive the budget with a fake clock.
@@ -196,7 +198,9 @@ def resolve_primary_key(
     if cached is not None:
         return cached
 
-    cols = set(_entry_columns(project, content_hash))
+    # __row_order is unique in every table, so it would win the search for any table without a real key, and row
+    # positions shift between versions, so a diff keyed on it would be meaningless (ADR-008 D6).
+    cols = set(_entry_columns(project, content_hash)) - {ROW_ORDER}
 
     # Row-preserving revision → inherit the parent's key if it still applies.
     from tallyman_xorq.result_cache import cache_worthy
@@ -285,8 +289,8 @@ def diff_keys(
     skips the keyed diff (``full_diff(keys=[])``).  Both sides share one
     ``PK_SEARCH_BUDGET_S`` budget.
     """
-    a_cols = set(_entry_columns(project, a_hash))
-    b_cols = set(_entry_columns(project, b_hash))
+    a_cols = set(_entry_columns(project, a_hash)) - {ROW_ORDER}
+    b_cols = set(_entry_columns(project, b_hash)) - {ROW_ORDER}
     deadline = _clock() + PK_SEARCH_BUDGET_S
     for h in (a_hash, b_hash):
         pk = resolve_primary_key(project, h, threshold=threshold, max_group=max_group, deadline=deadline)

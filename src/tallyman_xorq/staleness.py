@@ -116,20 +116,21 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
 
 
 def verify_sweep(project: str) -> dict:
-    """Opt-in corpus verification (ADR D7): do baked snapshots still match their
-    recorded ``result_digest``?
+    """Opt-in corpus verification (ADR-006 D7): do materialized snapshots still match their recorded ``result_digest``?
 
-    For every entry that recorded a digest, ``verify_result_faithful`` locates
-    the snapshot through the entry's own frozen build and compares file hashes.
-    Returns ``{"results": {hash: bool|None}, "unfaithful": [...], "errors":
-    {hash: message}}`` — ``None`` means nothing to check yet (snapshot not on
-    disk; the next read heals and verifies), ``errors`` carries entries whose
-    build failed to load (the D6 hard error, reported per-entry so one broken
-    entry can't abort a corpus sweep).
+    For every entry that recorded a digest, ``verify_result_faithful`` compares the content digest of the snapshot on
+    disk with the recorded one. It READS AND NEVER WRITES (ADR-007 D5, D12): a snapshot that is missing stays missing,
+    because a sweep that rewrote every deleted file would undo the Cache page's delete, and every file
+    ``ensure_materialized`` writes is verified before it is served, so an absent file is checked at the moment it next
+    exists. Returns ``{"results": {hash: bool|None}, "unfaithful": [...], "absent": [...], "errors": {hash: message}}``:
+    ``None`` in ``results`` means nothing to check (the snapshot is absent), ``absent`` lists those hashes, and
+    ``errors`` carries entries whose check failed (reported per-entry so one broken entry can't abort a corpus sweep).
     """
+    from tallyman_xorq.materialize import snapshot_path
     from tallyman_xorq.result_cache import verify_result_faithful
 
     results: dict[str, bool | None] = {}
+    absent: list[str] = []
     errors: dict[str, str] = {}
     for entry in list_entries(project):
         if not entry.get("result_digest"):
@@ -137,11 +138,14 @@ def verify_sweep(project: str) -> dict:
         h = entry["content_hash"]
         try:
             results[h] = verify_result_faithful(project, h)
+            if not snapshot_path(project, h).exists():
+                absent.append(h)
         except Exception as exc:
             errors[h] = str(exc)
     return {
         "results": results,
         "unfaithful": sorted(h for h, ok in results.items() if ok is False),
+        "absent": sorted(absent),
         "errors": errors,
     }
 

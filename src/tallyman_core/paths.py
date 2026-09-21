@@ -4,7 +4,6 @@ Layout (per-project):
 
     ~/.tallyman/
     ├── active_project                 # one-line plain text; source of truth
-    ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
         │   ├── catalog/               # the native catalog git repo
@@ -16,7 +15,7 @@ Layout (per-project):
         │   │   ├── display_configs/<hash>.json
         │   │   ├── post_processing/<name>.py , stats/<name>.py
         │   │   ├── prompts/<hash>.jsonl
-        │   │   └── entries.jsonl , compute_cache.jsonl   # untracked-artifact pointers
+        │   │   └── entries.jsonl                         # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
         └── data/                      # input parquets (fixtures or user)
@@ -53,16 +52,6 @@ def active_project_file_path() -> Path:
     return tallyman_home() / "active_project"
 
 
-def buckaroo_sessions_path() -> Path:
-    """Global Buckaroo session table (one file, all projects).
-
-    Schema: ``{<content_hash>: {session_id, project, buckaroo_started_at}}``.
-    Migrates to a Buckaroo-side enumeration endpoint once
-    buckaroo-data/buckaroo#860 lands.
-    """
-    return tallyman_home() / "buckaroo_sessions.json"
-
-
 # ---------------------------------------------------------------------------
 # Layout segment + per-entry artifact/cache names (single source of truth)
 # ---------------------------------------------------------------------------
@@ -84,6 +73,9 @@ ENTRY_SCHEMA_FILENAME = "schema.json"
 # first hit is honestly cold; production deletes them to recompute.
 ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
 ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
+# The "view build" a worthy entry's grid is handed: a build whose whole graph is one bare read of the entry's snapshot
+# (ADR-007 D6). Derived from the snapshot's path, so it is regenerated on demand like the expanded build.
+ENTRY_VIEW_BUILD_DIRNAME = ".xorq_view_build"
 # No per-entry result.parquet exists: an expensive entry's rows live in its baked
 # result cache (under the per-project compute_cache), a cheap entry recomputes on
 # read. The single materialised copy is the xorq .cache() snapshot — nothing
@@ -104,6 +96,7 @@ ENTRY_ARTIFACT_NAMES = (
 ENTRY_CACHE_NAMES = (
     ENTRY_STAT_CACHE_DIRNAME,
     ENTRY_EXPANDED_BUILD_DIRNAME,
+    ENTRY_VIEW_BUILD_DIRNAME,
 )
 
 
@@ -204,6 +197,11 @@ def entry_stat_cache_dir(project: str, content_hash: str) -> Path:
 def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     """Stable expanded-build dir beside the entry (regenerated on demand)."""
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
+
+
+def entry_view_build_dir(project: str, content_hash: str) -> Path:
+    """Stable per-entry dir holding the view build of the entry's snapshot (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_VIEW_BUILD_DIRNAME
 
 
 def compute_cache_dir(project: str) -> Path:

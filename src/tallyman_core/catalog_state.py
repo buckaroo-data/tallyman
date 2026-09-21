@@ -8,20 +8,26 @@ in ``prompts/<hash>.jsonl``). Their own mutators write them; ``reset_to``'s
 ``git reset --hard`` restores them all at once. There is no longer a
 ``catalog.yaml`` round-trip (no ``capture``/``materialize`` of those sections).
 
-What remains here is the *pointer* bookkeeping for the two **untracked**
-artifact sets — the entry build dirs and the compute-cache warm set — in two
-tracked JSONL files:
+What remains here is the *pointer* bookkeeping for the untracked entry build
+dirs, in one tracked JSONL file:
 
     entries.jsonl:       {"hash": content_hash}   # untracked entries/<hash>/ dirs
-    compute_cache.jsonl: {"path": relpath}        # untracked compute-cache warm set
 
 Those heavy artifacts are content-addressed, additive, and gitignored, so
 ``git reset`` can't roll them back; ``reset_to`` reconciles them to the recorded
-pointers via the bullpen — evictions retire (not deleted), and anything a
+pointers via the bullpen: evictions retire (not deleted), and anything a
 restored step records but is missing comes back by copy. Live operations never
-read the bullpen, so a re-added expression still computes cold.
+read the bullpen.
 
-A checkpoint captures the pointer lists, zips any pending recipe (catalog.py),
+``compute_cache/`` is not managed here (ADR-007 D14). Its files are named by
+content hash and each one can be made again by ``ensure_materialized``, so a
+reset leaves them alone and a snapshot that is missing afterwards is healed and
+verified like any other. The source clones under ``data/.cas/`` are data, the
+only frozen copy of the bytes an entry was built from, so a reset moves the ones
+no surviving entry refers to into the bullpen (never deletes them) and a reset
+forward copies them back.
+
+A checkpoint captures the pointer list, zips any pending recipe (catalog.py),
 ``git add -A``, and commits once — through the fork-safe git primitive
 (git_util) under a per-project lock — keeping the four invariants #33 kept
 re-breaking structural rather than reviewed.
@@ -36,6 +42,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 from pathlib import Path
 
 from tallyman_core import catalog
@@ -44,7 +51,7 @@ from tallyman_core.paths import (
     ENTRIES_DIRNAME,
     bullpen_dir,
     catalog_dir,
-    compute_cache_dir,
+    data_dir,
     entries_dir,
 )
 
@@ -60,16 +67,12 @@ _TAG_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 # ---------------------------------------------------------------------------
-# pointer bookkeeping: the two tracked JSONL files that replace catalog.yaml
+# pointer bookkeeping: the tracked JSONL file that replaces catalog.yaml
 # ---------------------------------------------------------------------------
 
 
 def _entries_file(project: str) -> Path:
     return catalog_dir(project) / "entries.jsonl"
-
-
-def _compute_cache_file(project: str) -> Path:
-    return catalog_dir(project) / "compute_cache.jsonl"
 
 
 def _read_jsonl(path: Path, field: str) -> list[str] | None:
@@ -87,46 +90,32 @@ def _write_jsonl(path: Path, field: str, values: list[str]) -> None:
 
 
 def read_tallyman_state(project: str) -> dict:
-    """The pointer lists for the *untracked* artifacts the bullpen reconciles —
-    entry build dirs (``entry_hashes``) and the compute-cache warm set
-    (``compute_cache``). Each defaults to [] so callers never KeyError.
+    """The pointer list for the *untracked* entry build dirs the bullpen
+    reconciles (``entry_hashes``). Defaults to [] so callers never KeyError.
 
     The decomposed mutable sections (charts, display, post-processing, stats,
     aliases, notebook) are tracked files now, restored by ``git reset`` directly,
     so they are no longer carried here.
     """
-    return {
-        "entry_hashes": _read_jsonl(_entries_file(project), "hash") or [],
-        "compute_cache": _read_jsonl(_compute_cache_file(project), "path") or [],
-    }
+    return {"entry_hashes": _read_jsonl(_entries_file(project), "hash") or []}
 
 
-def write_tallyman_state(
-    project: str, *, entry_hashes: list[str] | None = None, compute_cache: list[str] | None = None
-) -> None:
-    """Persist whichever pointer list is given to its tracked JSONL (the other
-    is left untouched)."""
+def write_tallyman_state(project: str, *, entry_hashes: list[str] | None = None) -> None:
+    """Persist the entry pointer list to its tracked JSONL."""
     if entry_hashes is not None:
         _write_jsonl(_entries_file(project), "hash", entry_hashes)
-    if compute_cache is not None:
-        _write_jsonl(_compute_cache_file(project), "path", compute_cache)
 
 
 # ---------------------------------------------------------------------------
-# capture: live untracked-artifact listings -> the two tracked pointer files
+# capture: the live entry listing -> the tracked pointer file
 # ---------------------------------------------------------------------------
-
-
-def _list_cache_files(root: Path) -> list[str]:
-    if not root.exists():
-        return []
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
 
 
 def capture_tallyman_state(project: str) -> dict:
-    """Snapshot the pointer lists for the untracked artifacts into their tracked
-    JSONL files. The decomposed sections write their own tracked files, so
-    capture no longer touches charts/display/pp/stats/aliases/notebook."""
+    """Snapshot the entry pointer list into its tracked JSONL file. The
+    decomposed sections write their own tracked files, so capture no longer
+    touches charts/display/pp/stats/aliases/notebook, and it no longer lists
+    ``compute_cache/`` (ADR-007 D14), whose cost grew with the cache (#22)."""
     ed = entries_dir(project)
     # Only COMPLETE entry dirs (a manifest is the build's last write) — the same
     # filter zip_pending_entries uses, so capture and the zip writer agree on the
@@ -136,13 +125,12 @@ def capture_tallyman_state(project: str) -> dict:
     entry_hashes = (
         sorted(c.name for c in ed.iterdir() if c.is_dir() and (c / "manifest.json").is_file()) if ed.exists() else []
     )
-    compute_cache = _list_cache_files(compute_cache_dir(project))
-    write_tallyman_state(project, entry_hashes=entry_hashes, compute_cache=compute_cache)
-    return {"entry_hashes": entry_hashes, "compute_cache": compute_cache}
+    write_tallyman_state(project, entry_hashes=entry_hashes)
+    return {"entry_hashes": entry_hashes}
 
 
 # ---------------------------------------------------------------------------
-# prune/restore: reconcile untracked artifacts to the pointer lists, via the
+# prune/restore: reconcile untracked artifacts to the pointer list, via the
 # bullpen — evictions are retired (moved), not destroyed, and a forward reset
 # copies the step's recorded set back instead of recomputing it.
 # ---------------------------------------------------------------------------
@@ -180,30 +168,39 @@ def prune_entries(project: str) -> int:
     return removed
 
 
-def prune_compute_cache(project: str) -> int:
-    valid = _read_jsonl(_compute_cache_file(project), "path")
-    if valid is None:
-        return 0
-    valid = set(valid)
-    root = compute_cache_dir(project)
-    if not root.exists():
-        return 0
-    removed = 0
-    for p in root.rglob("*"):
-        if p.is_file() and (rel := str(p.relative_to(root))) not in valid:
-            _retire(p, bullpen_dir(project) / "compute_cache" / rel)
-            removed += 1
-    return removed
+def _cas_bullpen(project: str) -> Path:
+    return bullpen_dir(project) / "cas"
+
+
+def _live_source_digests(project: str) -> set[str] | None:
+    """The union of every surviving entry's ``manifest.sources`` digests, or None when a manifest can't be read.
+
+    An unreadable manifest means the sweep would run on partial information, and a clone wrongly retired is the only
+    frozen copy of somebody's bytes, so callers skip the sweep.
+    """
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    live: set[str] = set()
+    for h in read_tallyman_state(project)["entry_hashes"]:
+        try:
+            sources = read_manifest(entry_dir(project, h)).sources
+        except Exception:
+            return None
+        if sources:
+            live.update(sources.values())
+    return live
 
 
 def restore_from_bullpen(project: str) -> int:
     """Copy recorded-but-missing artifacts back from the bullpen.
 
-    The inverse of the prunes, for a reset that walks forward: anything the
-    restored pointer files name that is absent from the live tree comes back by
-    *copy*, so the bullpen keeps its set and the back/forward rehearsal loop can
-    repeat. Only ``reset_to`` calls this — live operations never see the
-    bullpen, which is what keeps a re-added expression honest (cold).
+    The inverse of the prunes, for a reset that walks forward: every entry dir the
+    restored pointer file names that is absent from the live tree comes back by
+    *copy*, and so does every source clone (``data/.cas/``) that a restored entry
+    refers to, so the bullpen keeps its set and the back/forward rehearsal loop
+    can repeat. Only ``reset_to`` calls this — live operations never see the
+    bullpen.
     """
     bp = bullpen_dir(project)
     restored = 0
@@ -213,13 +210,15 @@ def restore_from_bullpen(project: str) -> int:
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1
-    root = compute_cache_dir(project)
-    for rel in _read_jsonl(_compute_cache_file(project), "path") or []:
-        live, parked = root / rel, bp / "compute_cache" / rel
-        if not live.exists() and parked.is_file():
-            live.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(parked, live)
-            restored += 1
+    parked_clones = _cas_bullpen(project)
+    live_digests = _live_source_digests(project)
+    if live_digests and parked_clones.is_dir():
+        cas = data_dir(project) / ".cas"
+        for parked in parked_clones.iterdir():
+            if parked.is_file() and parked.stem in live_digests and not (cas / parked.name).exists():
+                cas.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(parked, cas / parked.name)
+                restored += 1
     return restored
 
 
@@ -228,19 +227,46 @@ def restore_from_bullpen(project: str) -> int:
 # ---------------------------------------------------------------------------
 
 
+# The project locks this thread holds, and how deep. flock takes a lock per open file description, so a nested
+# acquire on a fresh descriptor would block forever behind the outer one: re-entrancy has to be counted per thread.
+_held = threading.local()
+
+
 @contextlib.contextmanager
-def _project_lock(project: str):
-    """Cross-process file lock so the companion and MCP server can't race a
-    checkpoint (the git index.lock race that swallowed #33 writes)."""
+def project_lock(project: str):
+    """One write at a time per project (ADR-007 D11): a build, a materialization, a promote, a recalc, a checkpoint.
+
+    A cross-process file lock, so it holds between the two processes of a normal tallyman (the MCP server and the
+    companion, which both build), and re-entrant within a thread, since a promote builds and then checkpoints and a
+    build materializes. Another thread or process waits. It is blocking with no timeout (ADR-007 D11, #186), and it
+    cannot be held across an ``await``: the companion moves work between threads with ``run_in_threadpool``.
+    """
+    depth = getattr(_held, "depth", None)
+    if depth is None:
+        depth = _held.depth = {}
+    if depth.get(project, 0) > 0:
+        depth[project] += 1
+        try:
+            yield
+        finally:
+            depth[project] -= 1
+        return
     cd = catalog_dir(project)
     cd.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(cd / ".checkpoint.lock"), os.O_CREAT | os.O_RDWR, 0o644)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        yield
+        depth[project] = 1
+        try:
+            yield
+        finally:
+            depth.pop(project, None)
     finally:
         fcntl.flock(fd, fcntl.LOCK_UN)
         os.close(fd)
+
+
+_project_lock = project_lock  # the name the lock had before it became public
 
 
 def ensure_catalog_repo(project: str) -> bool:
@@ -286,7 +312,7 @@ def checkpoint_catalog(project: str, message: str, *, step: int | None = None, l
     which keys rows by commit.
     """
     cd = catalog_dir(project)
-    with _project_lock(project):
+    with project_lock(project):
         ensure_catalog_repo(project)
         capture_tallyman_state(project)
         # The checkpoint is the sole zip writer and sole git transaction: zip any
@@ -328,62 +354,46 @@ def reset_to(project: str, ref: int | str) -> None:
     """Restore the catalog to a step/label: ``git reset --hard`` (which restores
     every tracked file — the recipe zips and all decomposed mutable state — at
     once), then reconcile the *untracked* artifacts to the recorded pointers:
-    evictions retire to the bullpen, recorded-but-missing files come back from
-    it. Finally re-validate the tracked recipe set against the pointers, so a
-    step whose two views disagree fails loudly rather than returning a masked
-    divergence (#52)."""
+    evicted entry dirs retire to the bullpen, recorded-but-missing ones come back
+    from it, and so do the source clones a restored entry refers to. Clones no
+    surviving entry refers to are moved to the bullpen too, never deleted.
+    ``compute_cache/`` is left alone (ADR-007 D14). Finally re-validate the
+    tracked recipe set against the pointers, so a step whose two views disagree
+    fails loudly rather than returning a masked divergence (#52)."""
     cd = catalog_dir(project)
     tag = f"step-{ref:03d}" if isinstance(ref, int) else str(ref)
-    with _project_lock(project):
+    with project_lock(project):
         commit = _resolve_tag(project, tag)
         rc, _, err = run_git(["reset", "--hard", commit], cwd=cd)
         if rc != 0:
             raise RuntimeError(f"catalog reset to {tag!r} failed: {err}")
         prune_entries(project)
-        prune_compute_cache(project)
         restore_from_bullpen(project)
-        _gc_cas_clones(project)
+        _retire_cas_clones(project)
         catalog.assert_catalog_consistent(project, set(read_tallyman_state(project)["entry_hashes"]))
-    # The prune above retires baked snapshots on disk. Clear the in-process
-    # result-plan memo that resolved their paths: #96's literal complaint is that
-    # the LRU outlives the prune, so drop it. For the dangling-read *symptom* this
-    # clear is belt-and-suspenders — cached_result_expr re-checks path.exists()
-    # and self-heals on every read (ee0a90a), so its own reads already survive a
-    # prune. The load-bearing protection against the symptom is the companion's
-    # _build_compare_expr clear (#80): that is the one LRU that bakes the resolved
-    # path into a serialized build with no per-call recheck, and it lives in the
-    # companion layer (see app._invalidate_reset_caches), not here. Blunt global
-    # clear is correct and cheap: entries are content-addressed, so the next read
-    # rebuilds an identical plan. Lazy import avoids a core->xorq import cycle.
+    # Clear the in-process result-plan memo: a reset changes which entries exist, and a memoised plan for a retired
+    # entry would outlive it. Entries are content-addressed, so the next read rebuilds an identical plan. Lazy import
+    # avoids a core->xorq import cycle.
     from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
     cached_result_expr.cache_clear()
 
 
-def _gc_cas_clones(project: str) -> int:
-    """Reclaim content-addressed source clones (``data/.cas``) no surviving entry
-    references, after a reset has pruned the entry set.
+def _retire_cas_clones(project: str) -> int:
+    """Move the source clones (``data/.cas``) no surviving entry references into the bullpen (ADR-007 D14).
 
-    ``.cas`` lives under ``data/`` — outside the catalog git repo — so the
-    ``git reset`` above cannot roll it back; this is the explicit reclaim.
-    Liveness is the union of every surviving entry's ``manifest.sources``
-    digests. Conservative and best-effort: if any entry's manifest can't be read
-    we skip the sweep rather than risk deleting a live clone on partial
-    information, and a failure here never aborts the reset.
+    ``.cas`` lives under ``data/`` — outside the catalog git repo — so the ``git reset`` above cannot roll it back.
+    A clone is data, the only frozen copy of the bytes an entry was built from once the live file is edited, so
+    nothing deletes one: a reset forward brings it back (``restore_from_bullpen``). Liveness is the union of every
+    surviving entry's ``manifest.sources`` digests. Conservative and best-effort: if any entry's manifest can't be
+    read we skip the sweep, and a failure here never aborts the reset.
     """
-    from tallyman_core.manifest import read_manifest
-    from tallyman_core.paths import entry_dir
     from tallyman_xorq import source_identity  # lazy: avoid a core->xorq import cycle
 
-    live_digests: set[str] = set()
-    for h in read_tallyman_state(project)["entry_hashes"]:
-        try:
-            sources = read_manifest(entry_dir(project, h)).sources
-        except Exception:
-            return 0  # unreadable manifest — don't GC on partial information
-        if sources:
-            live_digests.update(sources.values())
-    return source_identity.gc_cas(project, live_digests)
+    live_digests = _live_source_digests(project)
+    if live_digests is None:
+        return 0
+    return source_identity.gc_cas(project, live_digests, bullpen=_cas_bullpen(project))
 
 
 def genesis(project: str) -> int | None:

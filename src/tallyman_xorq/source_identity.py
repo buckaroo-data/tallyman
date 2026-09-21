@@ -41,6 +41,7 @@ import os
 import shutil
 import subprocess
 import sys
+import uuid
 from pathlib import Path
 
 from tallyman_core import artifacts_dir, data_dir
@@ -134,9 +135,13 @@ def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
     cas_dir.mkdir(parents=True, exist_ok=True)
     dst = cas_dir / f"{digest}{src.suffix}"
     if not dst.exists():
-        tmp = dst.with_suffix(dst.suffix + ".tmp")
-        _clone(src, tmp)
-        os.replace(tmp, dst)
+        # A unique temp name (not a fixed <digest>.tmp): two builders cloning one source at once must not share one.
+        tmp = dst.with_name(f"{dst.name}.{uuid.uuid4().hex}.tmp")
+        try:
+            _clone(src, tmp)
+            os.replace(tmp, dst)
+        finally:
+            tmp.unlink(missing_ok=True)
     return dst
 
 
@@ -174,28 +179,40 @@ def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
     return live_src
 
 
-def gc_cas(project: str, live_digests: set[str]) -> int:
-    """Delete ``.cas`` clones whose digest no live entry references.
+def gc_cas(project: str, live_digests: set[str], *, bullpen: Path | None = None) -> int:
+    """Retire ``.cas`` clones whose digest no live entry references.
 
     ``live_digests`` is the union of every live entry's ``manifest.sources``
     values — the md5 the clone is named by (``<digest><suffix>``). Returns the
-    number of files removed; a no-op when the ``.cas`` dir is absent. ``.cas``
+    number of files retired; a no-op when the ``.cas`` dir is absent. ``.cas``
     lives under ``data/``, outside the catalog git repo, so a reset's
-    ``git reset`` never reclaims it — this is the explicit reclaim, called from
+    ``git reset`` never reclaims it — this is the explicit sweep, called from
     ``reset_to`` against the post-prune live entry set.
+
+    A clone is data (ADR-007 D13), the only frozen copy of the bytes an entry was built from once the live source is
+    edited, so with ``bullpen`` given it is MOVED there instead of deleted, and a reset forward copies it back.
+    Without one it is unlinked, which nothing in tallyman does any more.
     """
     cas_dir = data_dir(project) / ".cas"
     if not cas_dir.is_dir():
         return 0
-    removed = 0
+    retired = 0
     for f in cas_dir.iterdir():
         if f.is_file() and f.stem not in live_digests:
             try:
-                f.unlink()
-                removed += 1
+                if bullpen is None:
+                    f.unlink()
+                else:
+                    bullpen.mkdir(parents=True, exist_ok=True)
+                    dest = bullpen / f.name
+                    if dest.exists():
+                        f.unlink()  # content-addressed: an existing copy is the same bytes
+                    else:
+                        shutil.move(str(f), str(dest))
+                retired += 1
             except OSError:
-                pass  # best-effort reclaim; never fail a reset over GC
-    return removed
+                pass  # best-effort sweep; never fail a reset over it
+    return retired
 
 
 # ---------------------------------------------------------------------------

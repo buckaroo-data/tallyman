@@ -40,12 +40,19 @@ perf_log = logging.getLogger("tallyman.perf")
 def cache_worthy(project: str, content_hash: str) -> bool:
     """Whether the entry is materialized, read from its manifest: the verdict recorded at build (ADR-008 D4).
 
-    Nothing re-derives it: the manifest is the record, and ``expr.yaml`` is never parsed to work it out.
+    Nothing re-derives it: the manifest is the record, and ``expr.yaml`` is never parsed to work it out. An entry whose
+    manifest is gone (half-built, or pruned) still has its build and may still serve a page (#90), so a snapshot on disk
+    stands in for the verdict: it can only have been written for a worthy entry.
     """
     from tallyman_core import read_manifest
     from tallyman_core.paths import entry_dir
 
-    return bool(read_manifest(entry_dir(project, content_hash)).cache_worthy)
+    try:
+        return bool(read_manifest(entry_dir(project, content_hash)).cache_worthy)
+    except FileNotFoundError:
+        from tallyman_xorq.materialize import snapshot_path
+
+        return snapshot_path(project, content_hash).exists()
 
 
 # Entries currently being reconstructed by cached_result_expr, on this call

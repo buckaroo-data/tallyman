@@ -2,8 +2,9 @@
 
 - **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
   session, and again the same day after a review of PR #184, which made the
-  fix for #168 a precondition of D2 and D7). Awaiting Paddy's review; nothing
-  here is implemented. The first draft pinned row order with an engine setting. Paddy
+  fix for #168 a precondition of D2 and D7, and a third time that day after a
+  second review: D4 and D6 were tightened, and D10 to D12 are new). Awaiting
+  Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy
   proposed baking a row-order column into every file tallyman writes and
   sorting every page by it. The measurements below favour that, so it is now
   the decision and the engine setting is the rejected alternative under D5.
@@ -15,9 +16,14 @@
   0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7).
 - **Tickets:** #168 (CSV sources bypass source identity; D2 and D7 depend on
   its fix), buckaroo-data/buckaroo#974 (Buckaroo's half of D5, see D8), #188
-  (diffs, moved out of ADR-007).
+  (diffs, moved out of ADR-007), #12 (the classifier reads `expr.yaml` with a
+  regex, which D4 retires), #146 (ordering inside window functions and
+  ordered aggregates, which D10 leaves there).
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`,
-  `_tie_break_order`), `src/tallyman_xorq/io.py` (`read_project_file`,
+  `_tie_break_order`, `_canonical_sorted`, `_is_worthy_expr`),
+  `src/tallyman_xorq/build.py` (`_csv_direct_read_check`, which gains a
+  parquet sibling, and the hint that turns ibis's name-collision error into
+  an instruction), `src/tallyman_xorq/io.py` (`read_project_file`,
   `tallyman_read_csv`, `io.py:627`, and for #168 `_ordered_csv_key` and
   `_ordered_csv_parquet`), `src/tallyman_xorq/source_identity.py` (the three
   steps a CSV now goes through), `src/tallyman_xorq/result_cache.py`
@@ -36,8 +42,12 @@
 - **Evidence:** `scripts/spike_row_order_paging.py` (the decisions),
   `scripts/spike_window_read_order.py` (the problem, and the rejected
   engine-setting approach), `scripts/spike_csv_source_identity.py` (D2 and D7:
-  what a CSV edit does to a content hash) and
-  `scripts/spike_deep_page_memory.py` (the memory figures under Consequences).
+  what a CSV edit does to a content hash),
+  `scripts/spike_deep_page_memory.py` (the memory figures under Consequences),
+  and four from the second review: `scripts/spike_cheap_classifier.py` (D4),
+  `scripts/spike_row_order_joins.py` (D6), `scripts/spike_sort_grafting.py`
+  (D10, D11 and the note on parquet statistics under D5) and
+  `scripts/spike_ordered_copy_layout.py` (D2 and open question 1).
   All figures are from those scripts on a 14-core machine.
 
 ## Terms
@@ -55,6 +65,11 @@
   computed columns, renames and casts qualify. Aggregates, joins, unions,
   distincts and unnests do not.
 - **Tie:** two or more rows with equal values in every sort key.
+- **Natural order:** the order of rows in the file they came from, which
+  `__row_order` records (D2).
+- **Graft:** to add sort keys to a query that its author did not write.
+- **Hoist:** to take the keys of a sort from lower in a recipe and lead the
+  top-level sort with them (D11).
 - **Exchange operator:** a DataFusion physical-plan step (`RepartitionExec`,
   `CoalescePartitionsExec`) that moves rows between parallel partitions. After
   one, rows arrive in whatever order the partitions finish.
@@ -150,7 +165,11 @@ Two writers produce it:
   steps `read_project_file` performs for parquet today, `io.py:78-84`), and the
   ordered copy is built from the content-addressed clone, which stays the
   immutable input. A source that already has a `__row_order` column has it
-  overwritten, which is the right outcome for a file tallyman exported.
+  overwritten, which is the right outcome for a file tallyman exported. The
+  copy lives under the project's `compute_cache/`, and `ensure_materialized`
+  makes it again from the clone when it is missing (decision D13 of
+  `plans/ADR-007-tallyman-owned-materialization.md`, which files are cache).
+  D12 closes the one way a parquet file could enter without a copy.
 
   CSVs have the ordered-copy step today and not the keying. The first draft of
   this decision said they already worked this way, which was wrong. The
@@ -167,7 +186,8 @@ The canonical sort's tie-break (`_tie_break_order`) puts an inherited
 `__row_order` where `original_row_order` is today: after the author's own
 `order_by` keys and before the remaining columns. A worthy entry that keeps its
 parent's rows, such as one adding a window function, therefore keeps the
-parent's order.
+parent's order. D10 applies the same tie-break to every sort in a recipe, not
+only to the last one.
 
 *Rejected:* `row_number()` inside the entry's graph. It needs the same global
 sort, adds a window function to every worthy build, and leaves contiguity to
@@ -191,8 +211,10 @@ descriptions say the same thing up front. This is the feedback channel
 
 A worthy entry is exempt, because the writer numbers its rows (D2). An author
 changes `__row_order` by asking for an order: `order_by` makes the entry worthy,
-and the writer numbers the rows in the requested order. Assigning to the column
-directly stays an error (D6).
+and the writer numbers the rows in the requested order. That holds for an
+`order_by` anywhere in the recipe only because of D11. As first drafted it was
+true of an `order_by` that is the recipe's last step, and of no other.
+Assigning to the column directly stays an error (D6).
 
 Tallyman makes one alteration of its own, at the top of the expression only: it
 moves `__row_order` to the last position, since a computed column added after
@@ -220,15 +242,63 @@ A cheap entry inherits its row order, so it must be a row-preserving plan over
 exactly one file. The classifier changes from a deny-list to an allow-list: an
 entry is cheap only if every relation operation in its graph is known to be
 row-preserving (a file read, a filter, a column selection, a computed column, a
-rename, a cast, a column drop). Anything else is worthy, including operations
-nobody has thought about yet. Today's `_EXPENSIVE_OPS` deny-list classes
-`Union`, `Distinct` and `Unnest` as cheap, and none of them can carry one
-parent's row order.
+rename, a cast, a column drop, a drop of null rows, a fill of nulls). Anything
+else is worthy, including operations nobody has thought about yet. Today's
+`_EXPENSIVE_OPS` deny-list classes `Union`, `Distinct` and `Unnest` as cheap,
+and none of them can carry one parent's row order.
+
+A list of relation operations is not enough, which the second review measured
+(`scripts/spike_cheap_classifier.py`). Paddy confirmed on 2026-09-20 that two
+kinds of entry stay (open question 1 of
+`plans/ADR-007-tallyman-owned-materialization.md`), so this test is what
+guarantees that a cheap entry pages repeatably, and it has to look inside the
+allowed operations as well. The parent has 6 rows:
+
+| Recipe shape | Relation operations | Today's deny-list | Relation allow-list alone | Rows | `__row_order` unique |
+| --- | --- | --- | --- | --- | --- |
+| `t.select("k", "__row_order", tag=t.tags.unnest())` | read, select | cheap | cheap | 8 | no |
+| `t.mutate(rn=ibis.row_number())` | read, select | worthy | cheap | 6 | yes |
+| `t.mutate(prev=t.v.lag())` | read, select | worthy | cheap | 6 | yes |
+| `t.mutate(r=ibis.random())` | read, select | cheap | cheap | 6 | yes |
+| `t.filter(t.k.isin(u.k))` | two reads, filter, select | cheap | cheap | 3 | yes |
+
+An `unnest` written inside a select is an ordinary column selection to a list
+of relation operations. It multiplied the rows and duplicated `__row_order`,
+which breaks the "no ties" that D5 depends on. A window function inside a
+computed column is an ordinary selection too, and its values depend on the
+order the rows arrive in (D10).
+
+So the test has three parts, each decided on the live expression by the class
+of the operation:
+
+- every relation operation is on the list above;
+- the plan reads exactly one file;
+- no value operation multiplies rows (`Unnest`), depends on row order
+  (`WindowFunction`, which also covers `row_number`, `lag` and a total used
+  inside a computed column), or is not pure (`Impure`, which is `random()` and
+  `uuid()`; `now()` and `today()` by name, since xorq's ibis classes them as
+  constants; and any UDF, matched as it is today).
+
+The verdict is computed once, when the entry is built, and recorded in the
+manifest. `result_cache.cache_worthy()` and the gate on primary-key
+inheritance (`primary_key.py:204`) read the manifest and stop classifying.
+`classify_build` and its regex over `expr.yaml` are retired, which closes #12.
+A regex cannot hold an allow-list: `op:` in that file also matches `DataType`,
+`FrozenDict`, `float` and `tuple`, which are not operations, and `Field` and
+`Literal`, which are not relations. There is then one implementation, and
+nothing to keep in lockstep.
 
 A new or unknown operation now costs a copy (safe) instead of unstable paging
-(unsafe). `classify_build` (which reads the serialized build) and
-`_is_worthy_expr` (which reads the live expression) flip together, as they must
-today.
+(unsafe). So does a second file, and so does `random()`.
+
+The three parts are what keeping two kinds requires, as proposed in the second
+review, and Paddy has not confirmed the list in so many words. The "not pure"
+part reaches into #185 (non-pure recipes). It makes a recipe that calls
+`random()` worthy, so decision D6 of `plans/ADR-009-digest-stability.md`
+(create runs the query twice) checks it and pins its file, and the cheap half
+of #185 has nothing left to decide. If that is unwanted, striking `Impure` and
+the two names restores today's behaviour, where such an entry re-runs on every
+read.
 
 Supporting measurement from the first draft: a union of two files returned 2
 different pages for 8 identical requests even on a single-partition
@@ -241,7 +311,8 @@ operator merges them.
 - User sort: the user's keys, then `__row_order` ascending as the last key,
   which breaks every tie.
 
-That is the whole rule, for every entry and both processes. Two faster paths
+That is the whole rule, for every entry and both processes. It is the
+page-request half of Paddy's rule in D10. Two faster paths
 exist and are deliberately not part of this decision (Paddy, 2026-09-20: a
 cohesive system that works reliably comes first, and speed problems are handled
 as they come up):
@@ -253,6 +324,18 @@ as they come up):
   `__row_order >= offset AND __row_order < offset + limit` instead of `OFFSET`.
 
 Both are measured below so the numbers are on hand when they are wanted.
+
+A third was asked about in the second review: leaving the last key off when
+the user's sort key is already unique. Parquet's statistics cannot show that.
+pyarrow writes a minimum, a maximum and a null count for each column chunk and
+no distinct count, so a unique column and one holding a value twice have the
+same statistics (`scripts/spike_sort_grafting.py`), and a distinct count would
+be per row group in any case. Tallyman's writer could record the fact itself,
+since rows reach it sorted and ties on the author's keys are adjacent. It
+would save little: when the leading key is unique the comparison never reaches
+`__row_order`, and when it is not, the key is needed. It could apply to page
+requests only, because the keys D10 adds at build time are part of the hashed
+graph, and it would have to be repeated inside Buckaroo. Not planned.
 
 Measured on 3,000,000 rows by 14 columns (287 MB), on the default parallel
 connection with no engine settings. Every row of the table returned the correct
@@ -301,12 +384,25 @@ semantics, in any engine and any process.
 - A recipe may read the column and may copy it under another name (D3). A
   recipe that assigns to `__row_order` is a build error, because arbitrary
   values could contain ties or gaps, and D5 depends on `0..N-1` with neither.
-- Only the exact name is special. `__row_order_v1`, or any other name an author
-  picks for a copy, is ordinary data and survives materialization.
+- Only the exact name is special, and ibis's collision name for it, which the
+  next item covers. `__row_order_v1`, or any other name an author picks for a
+  copy, is ordinary data and survives materialization.
 - A join of two entries leaves the right side's copy behind under ibis's
-  collision name, `__row_order_right`, and a three-way join silently keeps only
-  the first two. That column is ordinary data too: it says where the row sat in
-  the right-hand parent. The writer replaces only `__row_order` itself.
+  collision name, `__row_order_right`. The writer drops that one column, as
+  well as replacing `__row_order`. An earlier draft kept it as ordinary data
+  and said that a three-way join "silently keeps only the first two". Both
+  were wrong (`scripts/spike_row_order_joins.py`). A three-way join written in
+  one recipe shows the expected columns and passes `build_expr`, then raises
+  `IntegrityError: Name collisions: {'__row_order_right'}` from the canonical
+  sort, which is the next build step. A join entry that kept the column fails
+  the same way as soon as it is joined to a third entry, and with the column
+  dropped from its file that second join builds. For a three-way join in one
+  recipe the author has to drop `__row_order` from the right-hand inputs, and
+  the build turns ibis's message into that instruction, since the author never
+  wrote the name it complains about. An author who wants the right-hand
+  positions keeps them under a name of their own, as D3 describes. Proposed in
+  the second review as part of what keeping two kinds requires, and not yet
+  confirmed by Paddy in so many words.
 - The primary-key search skips it. Nothing excludes `original_row_order` from
   the candidates today (`primary_key.py:219`), and a column that is unique in
   every table would win the search for any table without a string or id key.
@@ -344,7 +440,7 @@ What INV-2 provided, and what replaces it:
 | A canonical display order | D5. INV-2 did not deliver this above 10 MB. |
 | A parquet boundary for chained children | A cheap root's graph is one read node. |
 | Fixed rows under the root's hash, through its baked snapshot | The content-keyed ordered copy of D2, written once. Requires the fix for #168. |
-| A `result_digest` on the root, so a re-parse that produced different rows would be caught | Lost as it stands: cheap entries record no digest (ADR-006 decision D9, "no cheap-entry digests"). It matters only when an ordered copy is deleted and re-created. See open question 5. |
+| A `result_digest` on the root, so a re-parse that produced different rows would be caught | A digest recorded for the ordered copy itself, which a re-created copy is checked against (ADR-007 decision D13, which files are cache). Cheap entries still record no digest of their own (ADR-006 decision D9, "no cheap-entry digests"). Not yet confirmed; see open question 5. |
 
 Every hash in every CSV lineage changes, so this rides the corpus rebuild of
 ADR-007 decision D9 ("one change, one rebuild").
@@ -375,6 +471,135 @@ and are corrected with this change: `plans/ADR-006-read-path-loads-builds.md:98`
 does not establish a split scan and is not what makes that test meaningful;
 its aggregate is), and `src/tallyman_xorq/source_cache.py:98`.
 `tests/test_tallyman_read_csv.py:159` already says about 10 MB.
+
+### D10. The natural order is imposed on every `order_by`
+
+Paddy's rule, 2026-09-20: "every query should have a unique sortby clause, if
+the base query didn't have one, it needs to be grafted onto the query so that
+everything else is order deterministic", and then: "when the user/mcp supplied
+sort isn't deterministic, impose the natural order into each order by so the
+resulting query becomes deterministic."
+
+The reading that was put to him the same day, which he did not overrule:
+
+- **Always.** Tallyman cannot know whether a supplied sort is unique without
+  scanning the table (D5 records why parquet statistics do not help), and a
+  last key added to a sort that is already unique changes nothing.
+- **The natural order, then the remaining sortable columns.** The natural
+  order alone is unique only while rows come one for one from a single file
+  tallyman wrote. Above a join or a union it has ties, above an outer join it
+  has nulls, a value-level `unnest` duplicates it (D4), and after an aggregate
+  it is gone. With the remaining columns after it the sort is total up to rows
+  that are identical in every sortable column, and those write the same bytes
+  in either order. This is the tie-break `_tie_break_order` already builds.
+- **At every sort in the recipe, and on every page request.** Page requests
+  are D5. The build-time half is new: `_canonical_sorted` extends an author's
+  sort only when it is the top node of the expression
+  (`source_cache.py:113`), and leaves every other `Sort` node as written.
+
+Why this has to reach every sort: a sort that feeds a `limit` decides which
+rows the entry holds, and the top of the expression is too late to break its
+ties. `order_by(g).limit(1000)` over 3,000,000 rows, where about 15,000
+rows tie on the smallest `g`, five runs each
+(`scripts/spike_sort_grafting.py`):
+
+| Connection | Sort key | Distinct sets of rows in 5 runs | Equals the rows `(g, id)` picks |
+| --- | --- | --- | --- |
+| default | `g` | 5 | no |
+| `target_partitions = 1` | `g` | 1 | yes |
+| default | `g`, then the row position | 1 | yes |
+
+The middle row is how this case works today. It is repeatable because
+materialization runs single-partition (decision D1 of
+`plans/ADR-009-digest-stability.md`), which is the engine's behaviour and the
+kind of dependence D5 rejects for page requests. The last row is repeatable by
+the query's own meaning, on any connection. A cheap entry cannot contain a
+sort, because a sort makes an entry worthy (D4), so the build-time half only
+ever runs at materialization.
+
+The added keys are part of the build's graph, so the content hash covers them,
+and this rides the corpus rebuild of ADR-007 decision D9 ("one change, one
+rebuild").
+
+Left to #146 (a lint for row-ordering nondeterminism): the `order_by` inside a
+window function, and ordered aggregates such as `first`, `last` and `collect`.
+They are the same rule. `cumsum()` with no order gave 5 distinct sets of
+values in 5 runs on the default connection and 1 on a single-partition one.
+Ordered by the tied key `g`, and by `g` then the row position, it gave 1 on
+both. An entry with a window function is always materialized, so it is
+repeatable today, by the engine's behaviour again. Only `cumsum()` was
+measured.
+
+*Rejected:* add the keys only when the supplied sort is not unique. That needs
+a scan of the table for every sort, to save a key that costs almost nothing
+when the leading key is unique.
+
+### D11. A sort that is not the recipe's last step is hoisted, or the build fails
+
+`_canonical_sorted` recognizes an author's sort only when it is the top node.
+When another step follows, the check fails and the whole expression is wrapped
+in a sort that leads with the inherited row order. That column is unique, so
+the author's sort has no effect on what is written. The parent's rows are in
+the order 40, 10, 60, 20, 50, 30 and the author asks for `amount` descending
+(`scripts/spike_sort_grafting.py`):
+
+| Recipe | Classed | Written as |
+| --- | --- | --- |
+| `order_by` last | worthy | 60, 50, 40, 30, 20, 10 |
+| `order_by`, then `mutate` | worthy | 40, 10, 60, 20, 50, 30 |
+| `order_by`, then `select` | worthy | 40, 10, 60, 20, 50, 30 |
+| `order_by`, then `filter(amount > 15)` | worthy | 40, 60, 20, 50, 30 |
+| `order_by`, then `limit(3)` | worthy | 40, 60, 50 |
+
+Each of these is classed worthy because of that sort, so the author pays for a
+full copy that ignores it, and a top-three entry is not shown in rank order.
+Under Paddy's rule (D10) the author did supply a sort, so the system keeps it:
+
+- From the top of the expression, walk down through steps that keep the order
+  of rows (a selection, a computed column, a filter, a limit, a column drop, a
+  rename, a cast, a drop of null rows, a fill of nulls) to the nearest sort.
+- When each of that sort's keys is still an output column, unchanged (a rename
+  is followed), the top-level sort leads with those keys, then the tie-break
+  of D10.
+- When a key did not survive, because it was dropped, overwritten, or was an
+  expression and not a column, the build fails. The error names the key and
+  tells the author to keep the column or to sort as the last step. This is the
+  choice D3 makes for a dropped `__row_order`: report what the author can fix
+  in one line, and do not repair it silently.
+
+Paddy, 2026-09-20: "I like your suggestion." The change is about 40 lines in
+`_canonical_sorted`.
+
+*Rejected:* make any `order_by` that is not the last step a build error. It is
+one rule, but a top-N recipe would then have to be written
+`order_by(...).limit(n).order_by(...)`.
+
+### D12. A raw parquet read is a build error
+
+D2 says every file tallyman reads carries `__row_order`, and that both kinds
+of source go through source identity first. Neither is enforced for parquet.
+A recipe can call `xo.deferred_read_parquet(abs_path)`, and tallyman's own
+hints recommend it (`build.py:199`, `source_cache.py:133`, and the namespace
+note in a tool description, `src/tallyman_mcp/server.py:275`). Such a read has no digest, no clone and
+no `manifest.sources` record, which is the defect of #168 for a parquet file.
+It also has no ordered copy, so a root entry built on it has no `__row_order`
+to page by. Only the CSV form is banned today (`_csv_direct_read_check`).
+
+A read of a parquet file that tallyman did not write becomes a build error
+that points the author to `read_project_file`, next to the CSV check, and the
+three hints change with it. Tallyman's files are the snapshots and ordered
+copies under the project's `compute_cache/` (decision D13 of
+`plans/ADR-007-tallyman-owned-materialization.md`, which files are cache), so
+the check is on the path of each `Read`. Nine files under `tests/` call
+`deferred_read_parquet` today, 23 calls in all, so the change carries test
+churn.
+
+Proposed in the second review as part of what keeping two kinds requires, and
+not yet confirmed by Paddy in so many words.
+
+*Rejected:* rewrite a raw read into an ingest at build time. It is the surgery
+inside an author's expression that D3 turned down, and the recipe text would
+name one file while the entry read another.
 
 ## Testing
 
@@ -410,15 +635,38 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - **CSV roots** (D7). A `tallyman_read_csv` entry has no Sort in its build, is
   classed cheap, and has exactly one row-order column.
 - **The hint** (D8). The `/load_expr` payload names `__row_order`.
+- **The cheap test looks inside** (D4). A value-level `unnest`, a window
+  function in a computed column, `random()` and a filter against a second file
+  are each classed worthy, a drop of null rows is classed cheap, and the
+  verdict is read from the manifest with no `expr.yaml` parsed.
+- **Joins** (D6). A join entry's file has no `__row_order_right`, joining it to
+  a third entry builds, and a three-way join in one recipe fails with a
+  message that says to drop `__row_order` from the right-hand inputs.
+- **Every sort is total** (D10). An `order_by(g).limit(k)` recipe over a file
+  above the split threshold, with ties on `g` at the cut, holds exactly the
+  rows that `(g, __row_order)` picks.
+- **A sort that is not last is kept** (D11). A top-three recipe is written in
+  rank order, `order_by` then `mutate` is written in the sorted order, and a
+  recipe that drops its sort key in a later select fails to build with a
+  message that names the key.
+- **Raw reads** (D12). A recipe that calls `xo.deferred_read_parquet` on a
+  source file fails to build with a message that names `read_project_file`.
 
 ## Consequences
 
 - Pages are repeatable for unsorted and sorted requests, in tallyman and in
   Buckaroo, with no engine settings and no second connection.
-- Every table shows one more column, at the end. A join result also shows
-  `__row_order_right` unless the recipe drops it.
+- Every table shows one more column, at the end. A join result does not carry
+  `__row_order_right`, because the writer drops it (D6).
 - A recipe whose select list forgets `__row_order` fails to build until the
-  author adds it.
+  author adds it. So does a three-way join that keeps the column on its
+  right-hand inputs (D6), a recipe that drops the key of a sort it made
+  earlier (D11), and a recipe that reads a parquet file directly (D12).
+- Every sort in a recipe gains keys its author did not write (D10), and a sort
+  that is not the last step now decides the order that is written (D11).
+- Whether an entry is cheap is decided once, at build, and read from the
+  manifest afterwards (D4). More recipes are worthy than before: one that
+  unnests inside a select, reads a second file, or calls `random()`.
 - CSV lineages stop writing sorted copies. With ADR-007, revisions of a CSV
   entry are cheap reads over one intermediate file, and primary-key inheritance
   applies to them.
@@ -444,9 +692,12 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 
 1. **Ordered copies of parquet sources.** D2 adds a copy per parquet source.
    Adopted as the uniform rule under Paddy's "cohesive first" priority, and not
-   yet confirmed by him in so many words. It also assumes polars numbers a
-   parquet scan's rows in file order, as ADR-004 measured for CSV, which needs
-   checking.
+   yet confirmed by him in so many words. With two kinds of entry kept, a
+   cheap root pages by this column, so the copy is needed. It assumed polars
+   numbers a parquet scan's rows in file order, as ADR-004 measured for CSV.
+   Checked in the second review (`scripts/spike_ordered_copy_layout.py`, polars
+   1.40.1): `scan_parquet().with_row_index()` numbered a source of 184 row
+   groups in file order on 1, 3 and 14 threads.
 2. **Renaming `original_row_order`.** D7 replaces it with `__row_order`.
    Adopted on the same basis, and also not yet confirmed. The alternative keeps it as a data column meaning "line of
    the source file", at the cost of two identical columns on every CSV root.
@@ -462,6 +713,9 @@ that does not exist yet fails on import, and that counts as red. Paddy,
    Recording the copy's digest in the root entry's manifest, and verifying it
    on re-creation, would cover that. It wants ADR-009's digest definition, and
    it touches where the copies live: `csv_ordered` is global, is never
-   collected, and is not packed (ADR-007 open question 3). Nothing re-creates a
-   missing copy automatically yet, which ADR-007 decision D5 (one entry point
-   makes files exist) records as an accepted gap.
+   collected, and is not packed (ADR-007 open question 3). The second review
+   made re-creation a designed path and not a gap: ADR-007 decision D13 (which
+   files are cache) puts the copies under the project's `compute_cache/`, has
+   `ensure_materialized` make a missing one again from the clone, and records
+   the digest the new copy is checked against. That answer follows from
+   D13's rule and is not yet confirmed by Paddy in so many words.

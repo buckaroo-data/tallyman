@@ -5,7 +5,10 @@
   `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is
   new; and again the same day after a review of PR #184: D1 and D3 now say
   what single-partition execution leaves undetermined, and D6's cheap-entry
-  half moved to #185). Awaiting Paddy's review; nothing here is implemented. Amends
+  half moved to #185; and a third time that day after a second review: D1 now
+  says how a loaded build gets onto the single-partition connection, and D3's
+  format version covers the ordered copies of sources). Awaiting Paddy's
+  review; nothing here is implemented. Amends
   `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the
   snapshot bytes") and decision D5 of
   `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
@@ -34,7 +37,10 @@
 - **Evidence:** `scripts/spike_float_aggregate_digest.py`,
   `scripts/spike_logical_digest.py`, and
   `scripts/spike_float_layout_digest.py` (D1 and D3: what the layout of the
-  parent file does to a float total).
+  parent file does to a float total), and two from the second review:
+  `scripts/spike_single_partition_loaded_build.py` (D1: a loaded build has to
+  be rebound) and `scripts/spike_ordered_copy_layout.py` (D3: the layout
+  polars writes).
 
 ## Terms
 
@@ -119,6 +125,31 @@ one plan with one merge order, on any machine, given input files with the same
 layout (see "What this does not fix" below). It is a separate connection from
 the default backend that serves page reads, because a long materialization
 must not share a context with them.
+
+Making that connection is not enough. `materialize` executes a build that
+`load_expr` loaded, and `load_expr` makes its own backend objects, so a loaded
+build ignores a single-partition connection it was never bound to
+(`scripts/spike_single_partition_loaded_build.py`, a float `SUM` and `AVG`
+group-by over 3,000,000 rows):
+
+| How the loaded build is executed | Distinct digests in 5 runs |
+| --- | --- |
+| as loaded | 5 |
+| as loaded, while a single-partition connection exists on the side | 5 (the build's own backend reports 14 partitions) |
+| rebound onto that connection with `replace_sources` | 1 |
+| `SET` applied to each backend the load made | 1 |
+
+Either of the last two works, and neither changes the process default
+backend, which still reports 14. `materialize` rebinds. That is what
+`_rebind_to_default_backend` (ADR-006 decision D3, rebind composition onto the
+default backend) already does, aimed at the materialization connection.
+
+The same connection is why a bare `limit`, or a window function with no order,
+is repeatable at materialization: on it a row-preserving plan streams its rows
+in the parent file's order (`scripts/spike_stream_order.py`). That is the
+engine's behaviour and not the query's meaning, which is what decision D10 of
+`plans/ADR-008-row-order-of-reads.md` (the natural order is imposed on every
+`order_by`) is for.
 
 Cost: about 3x on the spike's aggregate. ADR-004 measured a 3.1M-group
 aggregate at 0.5 s parallel against 3.4 to 3.9 s single-partition, and a full
@@ -262,6 +293,19 @@ connection's `batch_size` are therefore part of the reproducibility contract:
 the manifest records a snapshot format version that stands for both, and
 changing either is a corpus rebuild.
 
+The same holds for the ordered copy of a source (ADR-008 decision D2), which
+polars writes and this writer does not. Its layout is pinned separately, in
+`_CSV_PARQUET_WRITE` (`io.py:91-96`, row groups of 122,880 rows), and an entry
+that totals a float column straight from a source reads that layout. The
+format version covers those settings too. The second review checked that
+polars honours them: `sink_parquet` wrote full row groups of exactly 122,880
+rows, with an identical layout, on 1, 3 and 14 threads, from a CSV source and
+from a parquet one (`scripts/spike_ordered_copy_layout.py`, polars 1.40.1).
+
+The size is fixed in rows and not in bytes. A table with long text columns
+therefore holds a large row group in memory while it is written, and the
+contract above means the size cannot be tuned for one table.
+
 ### D4. A mismatch record names its likely cause
 
 With D1 and D2 in place the causes left are the recipe's own nondeterminism
@@ -311,7 +355,11 @@ materialized entry is created:
   `plans/ADR-007-tallyman-owned-materialization.md` all rely on. Paddy moved
   it to #185 on 2026-09-20. Until that is settled a cheap entry that calls
   `random()` behaves as it does today: the #88 lint warns, and the entry
-  re-runs on every read.
+  re-runs on every read. The second review proposed a smaller answer, recorded
+  in ADR-008 decision D4 (the test for cheap) and not yet confirmed by Paddy:
+  an operation that is not pure makes an entry worthy. Such a recipe is then
+  checked here like any other materialized entry, and no cheap entry calls
+  `random()`.
 
 The cost is a second execution of every create of a materialized entry. It is
 accepted under the priority recorded in ADR-007 ("a cohesive system that works
@@ -325,9 +373,10 @@ file survives. The pin protects the file from the Cache page's delete and from
 nothing else, since `compute_cache/` is deletable by definition (ADR-007
 decision D7, the cold state is an empty `compute_cache`).
 
-A heal is still verified against the recorded digest, as now. After D6 a
-mismatch there means something changed underneath a reproducible entry, which
-D4 attributes.
+A heal runs the query once and is verified against the recorded digest, as
+now. Only a create runs it twice, since a create has nothing recorded to
+compare against. After D6 a mismatch at a heal means something changed
+underneath a reproducible entry, which D4 attributes.
 
 ## Testing
 
@@ -351,8 +400,14 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - **Create passes a reproducible recipe.** A deterministic recipe is recorded
   as reproducible, and the query is observed to run exactly twice.
 - **The layout is pinned** (D1, D3). Every snapshot has row groups of 1,048,576
-  rows, the materialization connection reports the pinned `batch_size`, and
-  the manifest records the snapshot format version.
+  rows, every ordered copy of a source has row groups of 122,880 rows, the
+  materialization connection reports the pinned `batch_size`, and the manifest
+  records the snapshot format version.
+- **The build runs on the single-partition connection** (D1). While
+  `materialize` executes a loaded build, every backend the plan touches reports
+  `target_partitions = 1`, and the process default backend does not.
+- **A heal runs once** (D6). Reopening an entry whose file was deleted runs its
+  query exactly once.
 - **A pinned file survives an explicit delete.** The Cache page's delete skips
   it and says why.
 - **The schema comes from the file.** An entry with a `timestamp[s]` column
@@ -381,7 +436,8 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - The same function can digest an ordered copy of a source (ADR-008, open
   question 5).
 - The row-group size and the materialization connection's `batch_size` are
-  frozen for the life of the corpus, and changing either is a rebuild (D3).
+  frozen for the life of the corpus, and so are the settings polars writes an
+  ordered copy of a source with. Changing any of them is a rebuild (D3).
 
 ## Open questions
 

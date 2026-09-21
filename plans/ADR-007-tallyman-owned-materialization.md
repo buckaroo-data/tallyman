@@ -4,7 +4,10 @@
   session, which added the governing rule, decisions D10 to D12, and the
   resolution recorded under D5, and again the same day after a review of
   PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's
-  session-ending clause was dropped, and D12's rule was restated). Awaiting
+  session-ending clause was dropped, and D12's rule was restated, and a third
+  time that day after a second review of PR #184: two kinds of entry were
+  confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass
+  reload, and D13 and D14 are new). Awaiting
   Paddy's review; nothing here is implemented. Supersedes two decisions of
   `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the
   parent's cache node) and its D8 (the manifest records the snapshot key and
@@ -24,7 +27,11 @@
 - **Tickets:** #188 (diffs, moved out of this ADR), #186 (the waiting that
   D11's lock causes), #185 (non-pure recipes), #183 (two servers on one
   project), #168 (CSV source identity, which the shared rebuild of D9 needs),
-  #118 (concurrent reads on the shared backend, which D11 does not cover).
+  #118 (concurrent reads on the shared backend, which D11 does not cover),
+  #77 (an empty grid on a clone of the project at another path, which D2
+  closes), #76 (closed: how bare-read chaining failed the last time it was
+  tried, which D5 answers), #22 (the checkpoint's cost grows with the cache,
+  which D14 removes).
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`),
   `src/tallyman_xorq/result_cache.py` (`_resolve_result_plan`,
   `cached_result_expr`, `entry_graph_expr`, `baked_snapshot_path`,
@@ -33,7 +40,11 @@
   `src/tallyman_xorq/io.py` (`tracked_expr_from_alias`,
   `pinned_expr_from_alias`), `src/tallyman_xorq/portable.py`
   (`rewrite_cache_dirs`), `src/tallyman_core/manifest.py` (`snapshot_key`),
-  `src/tallyman_companion/buckaroo_lifecycle.py` (`load_session`),
+  `src/tallyman_companion/buckaroo_lifecycle.py` (`load_session`,
+  `reload_project_sessions`), `src/tallyman_core/catalog_state.py`
+  (`reset_to`, `prune_compute_cache`, `restore_from_bullpen`,
+  `capture_tallyman_state`, `_gc_cas_clones`),
+  `src/tallyman_xorq/source_identity.py` (`gc_cas`, `recon_cas_path`),
   `docs/system-contract.md`.
 - **Related ADRs:** `plans/ADR-002-source-identity-content-hash.md` (content in
   the path; D3 reuses the device), `plans/ADR-003-result-cache-cost-rubric.md`
@@ -41,8 +52,11 @@
   `plans/ADR-008-row-order-of-reads.md` and
   `plans/ADR-009-digest-stability.md` (the other two hash- or digest-changing
   decisions that share this ADR's corpus rebuild).
-- **Evidence:** `scripts/spike_bare_read_chaining.py` (results under D3), and
-  the audit measurements quoted in the Problem section.
+- **Evidence:** `scripts/spike_bare_read_chaining.py` (results under D3),
+  `scripts/spike_reset_roundtrip.py` (D13 and D14: a reset back and forward,
+  played through on today's code), `scripts/spike_stream_order.py` (open
+  question 1, the alternative that was not taken), and the audit measurements
+  quoted in the Problem section.
 
 ## Terms
 
@@ -72,6 +86,17 @@
   **promoted diff** is one that has been saved as a catalog entry.
 - **Checkpoint:** tallyman's step that zips new entries and makes one git
   commit in the catalog repository.
+- **Clone:** the copy of a source file under `data/.cas/`, named by the digest
+  of the source's bytes, which a build reads in place of the live file
+  (`plans/ADR-002-source-identity-content-hash.md`).
+- **Ordered copy:** the parquet copy of a source that carries `__row_order`,
+  which a root entry reads (decision D2 of
+  `plans/ADR-008-row-order-of-reads.md`).
+- **Reset:** `reset_to`, which returns the catalog to an earlier step. The
+  **bullpen** is the directory a reset moves retired files into, so that a
+  later reset forward can bring them back.
+- **Klass:** a summary stat, post-processing or display class written for the
+  project, which Buckaroo loads into each grid.
 
 ## Problem
 
@@ -271,8 +296,12 @@ of every descendant would re-run the parent's expensive subgraph.
 record-batch stream, and writes the snapshot itself:
 
 - a unique temp name in the destination directory, then `os.replace`;
-- under the project's write lock (D11), with the existence check repeated
-  inside the lock, so a second writer waits and then finds the file;
+- under the project's write lock (D11). A heal repeats the existence check
+  inside the lock, so a second reader waits and then finds the file. A create
+  does not look: it always runs the query and replaces whatever is at the
+  path. That keeps an entry that is added again after a reset honest (D14),
+  and decision D6 of `plans/ADR-009-digest-stability.md` (create runs the
+  query twice) needs it;
 - it numbers the rows as it writes them, in a last column named `__row_order`
   (decision D2 of `plans/ADR-008-row-order-of-reads.md`);
 - it returns the digest of what it wrote.
@@ -291,10 +320,12 @@ and keeps items 3 and 4.
 entry's plan reads is on disk before anything executes:
 
 1. If the entry is worthy and its snapshot exists, return. No build is loaded.
-2. Otherwise load the entry's build and collect the snapshot paths its `Read`
-   nodes point at (any read under `compute_cache/result_cache/`). The list is
-   kept with the loaded plan in the existing LRU.
-3. For each of those that is missing, recurse on the hash in its file name.
+2. Otherwise load the entry's build and collect every file its `Read` nodes
+   point at. The list is kept with the loaded plan in the existing LRU.
+3. Re-create each of those that is missing, by the rule for its class (D13): a
+   snapshot by recursing on the hash in its file name, an ordered copy of a
+   source from its clone, a clone from the live source while the bytes still
+   match.
 4. If the entry is worthy, `materialize` it.
 
 Every file it writes is verified against the manifest's `result_digest` before
@@ -318,13 +349,19 @@ checked at the moment it next exists. A file that exists with the wrong digest
 is reported through the same loud path and left in place, since deleting it is
 the user's action (D12).
 
-One gap is known and accepted. Step 2 collects only reads under
-`compute_cache/result_cache/`. A root entry also reads an ordered copy of its
-source (decision D2 of `plans/ADR-008-row-order-of-reads.md`), which lives
-elsewhere and which this function does not re-create. If one is missing,
-Buckaroo fails with `At least one path is required`. Paddy, 2026-09-20:
-Buckaroo erroring when tallyman has not provided a prerequisite is acceptable
-for now, and follow-on work closes it.
+An earlier draft stopped at snapshots. Step 2 collected only reads under
+`compute_cache/result_cache/`, and a missing ordered copy of a source
+(decision D2 of `plans/ADR-008-row-order-of-reads.md`) surfaced inside
+Buckaroo as `At least one path is required`. Paddy accepted that on
+2026-09-20 as the case of someone deleting a directory by hand. The second
+review played a reset through and found the same state reachable by an
+ordinary reset back and forward, on today's code
+(`scripts/spike_reset_roundtrip.py`, results under D13). After decision D7 of
+`plans/ADR-008-row-order-of-reads.md` (a CSV root becomes a cheap read) every
+page of a CSV-rooted cheap entry reads that copy, so the gap is closed here
+and not left to follow-on work. When nothing can re-create a file, because the
+clone is gone and the live source has changed, the error names the source
+file.
 
 ADR-006 decision D4 rejected bare-read chaining because "builds stay
 non-self-contained and the pre-heal choreography stays load-bearing forever".
@@ -335,6 +372,14 @@ relied on it: "Buckaroo's replay of the build regenerates any evicted snapshot
 through ordinary cache mechanics on first query." Under the governing rule
 Buckaroo never does that, so the property has no user and nothing is given up.
 This was question 1 of the grilling session, resolved 2026-09-20.
+
+Bare-read chaining has failed here once before. #76 (closed) is a child
+frozen on its parent's snapshot path and read after a reset had pruned that
+snapshot, or on a clone of the project that never had it: the read died with
+`At least one path is required` and nothing recomputed the parent. ADR-006
+decision D4 (chaining inlines the parent's cache node) was the answer then.
+This function is the answer now, and the
+"files exist before anything runs" test below is #76's reproduction.
 
 The old pre-heal was also weaker than this function. It was a
 `cached_result_expr` call with a discarded result at one call site, and
@@ -403,6 +448,17 @@ no-op there. A promoted diff entry sends `column_config_overrides` and so
 reloads on every open, which #188 covers. Putting the project in the id also
 closes #172 (one project's session served to another on a hash collision).
 
+One caller still needs to know which grids are open. When a klass is added or
+changed, `reload_project_sessions` (`buckaroo_lifecycle.py:386`, four call
+sites in `app.py`) posts `/reload_expr/<session id>` to every session of the
+project, and it finds them in the record this decision deletes. Buckaroo
+0.15.6 has no route that lists sessions. With derived ids none is needed:
+tallyman posts `/reload_expr/<id>` for each entry of the project and treats
+the 404 that Buckaroo returns for an unknown session as "not open", a case
+the function already handles. That is one request per entry per klass change.
+Found in the second review; the first draft of this decision did not mention
+the reload.
+
 Deleting a snapshot (D12) ends no session. A tab that already has the entry
 open fails on its next query, inside Buckaroo, with the
 `At least one path is required` error above. That is accepted: the user
@@ -449,6 +505,12 @@ chained child build, a view, an eviction and a heal must leave the sentinel
 empty. The test fails on `main` today (finding 1), so it belongs in the
 failing-tests commit, and it outlives this change as the check that no xorq
 cache node has crept back in.
+
+xorq reads `XORQ_CACHE_DIR` once, when it is first imported, and
+`tests/conftest.py` points the whole test session at one directory for that
+reason. So the sentinel cannot be a fresh directory per test. The test either
+asserts that no file appears in the session's directory while it runs, or runs
+its steps in a child process with a value of its own.
 
 ### D9. One change, one rebuild
 
@@ -522,7 +584,9 @@ discover them:
   not change it.
 
 The lock is blocking and has no timeout, and the work it now covers is long: a
-materialization runs single-partition and twice (ADR-009 decisions D1 and D6).
+materialization runs single-partition, and a create runs its query twice
+(ADR-009 decisions D1 and D6). A heal runs it once, since the recorded digest
+is what it is compared against.
 A page request that needs a heal therefore waits behind any build in the other
 process. Paddy, 2026-09-20: correct first. #186 tracks the waiting.
 
@@ -546,11 +610,122 @@ callers. There is no disk budget yet. That is the rewrite of
   between entries (`app.py:807-824`). That undoes the Cache page's delete
   button, and one large heal blocks startup for as long as it takes.
 - The verify sweep reads and never writes (D5).
+- A reset does not touch `compute_cache/` (D14).
 - An explicit delete skips an entry marked not reproducible (decision D6 of
   `plans/ADR-009-digest-stability.md`), whose file cannot be recreated. The
   skip protects the file from the Cache page only. `compute_cache/` as a whole
   is still deletable by definition (D7), and where such a file should live is
   part of #185.
+
+### D13. A file is cache only if `ensure_materialized` can re-create it
+
+Three classes of file sit behind an entry, and until now only the first had a
+whole lifecycle:
+
+| File | Written by | If it is missing | So it is |
+| --- | --- | --- | --- |
+| Snapshot, `compute_cache/result_cache/<content_hash>.parquet` | `materialize` (D4) | re-run the entry's build and verify the digest (D5) | cache |
+| Ordered copy of a source (decision D2 of `plans/ADR-008-row-order-of-reads.md`) | ingest, through polars | re-run ingest on the clone, with the reader options the manifest records | cache |
+| Clone, `data/.cas/<digest><suffix>` | `ensure_cas_path` | copy the live source again, but only while its bytes still hash to the digest | data |
+
+The rule: a file is cache only if `ensure_materialized` can re-create it from
+files that are not cache, and check what it made. Everything under
+`compute_cache/` has to satisfy that, and then anything may delete it (D7,
+D12). A file that is not cache is never deleted by machinery.
+
+What follows from the rule:
+
+- **Ordered copies are cache, so they live under `compute_cache/`**, inside
+  the project, where the portable-path placeholder covers them and the cold
+  test of D7 deletes them. `csv_ordered/` under `TALLYMAN_HOME` is retired.
+  For `ensure_materialized` to re-run ingest, the manifest's `sources` records
+  each source's reader options (the schema spec and the `scan_csv` options)
+  next to its digest. It holds only `{path: digest}` today. A re-created copy
+  is checked against a digest recorded when the copy was first written, which
+  is the rule D5 applies to snapshots. Where the copies live and the recorded
+  digest both follow from the rule and are not yet confirmed by Paddy in so
+  many words. They settle open question 3 here and open question 5 of
+  `plans/ADR-008-row-order-of-reads.md`.
+- **Clones are data.** A clone is the only frozen copy of the bytes an entry
+  was built from, and it cannot be made again once the live file has been
+  edited. `gc_cas` deletes one today as soon as no surviving entry refers to
+  it, which D14 changes. `recon_cas_path` already re-clones a missing clone
+  from the live source when the live bytes still hash to the digest, but it is
+  reached only by re-running a recipe, which reads stopped doing in ADR-006.
+  That check moves into step 3 of D5.
+- **The snapshot of an entry that is not reproducible** (decision D6 of
+  `plans/ADR-009-digest-stability.md`, create runs the query twice and
+  compares) is data that sits in the cache directory. Where it should live is
+  part of #185, as D12 already says.
+
+Measured on today's code (`scripts/spike_reset_roundtrip.py`). Step s1 holds
+an entry over `orders.parquet`. Step s2 adds a cheap entry and a worthy entry
+over `extra.parquet`, which is never touched:
+
+| After | Cheap entry | Worthy entry |
+| --- | --- | --- |
+| building s2 | reads | reads |
+| a reset to s1, then a reset forward to s2 | `ValueError: At least one path is required` | reads, from the snapshot the bullpen gave back |
+| the same, then `compute_cache/` emptied | the same error | the same error, from the heal |
+
+The reset to s1 deleted the clone of `extra.parquet`, the reset forward
+restored the entries that read it, and nothing on the read path makes a clone
+again. This is a defect in today's code and does not depend on this ADR.
+
+*Rejected:* keep ordered copies next to the clone under `data/.cas/`, as the
+fix for #168 first proposed. `gc_cas` deletes every file in that directory
+whose stem is not a live source digest, and an ordered copy is named by a key
+and not by a digest, so every reset would delete every ordered copy.
+
+### D14. A reset leaves `compute_cache/` alone
+
+`reset_to` (`catalog_state.py:327`) returns the catalog to an earlier step
+with `git reset --hard`, and then reconciles the files git does not track. For
+`compute_cache/` it keeps a git-tracked list, `compute_cache.jsonl`, of every
+file that was under the directory at each checkpoint
+(`capture_tallyman_state`). A reset moves each file that is not on the target
+step's list into the bullpen (`prune_compute_cache`), copies back each listed
+file that is missing (`restore_from_bullpen`, a bare `shutil.copy2` onto the
+final path), and then deletes every clone that no surviving entry refers to
+(`gc_cas`). None of the three ADRs of this set mentioned it before the second
+review.
+
+Against this ADR that machinery is a second owner of the cache:
+
+- the copy back is a second writer of snapshot files, outside D4. It is not
+  atomic, and since D5 treats "the file exists" as a hit, a page request can
+  open a half-copied file;
+- the prune moves files that D12 says only the user deletes, including the
+  file of an entry that is not reproducible, which cannot be rebuilt;
+- the list records whatever is under the directory, so it would pick up the
+  writer's temp files after a crash;
+- capturing the list is a cost every checkpoint pays, and it grows with the
+  cache (#22).
+
+Decision: a reset stops managing `compute_cache/`. Snapshots are named by
+content hash, so a file left behind by a retired entry cannot be served for
+another entry. It is unreferenced disk until that entry comes back or the user
+deletes it, and a snapshot that is missing after a reset is healed and
+verified like any other (D5). `compute_cache.jsonl`, `prune_compute_cache` and
+the `compute_cache/` half of `restore_from_bullpen` are deleted.
+
+The prune existed for one property: after a reset, an expression that is added
+again should compute cold, so that a rehearsed demo shows real work. A create
+always runs the query (D4), so that property holds without the prune.
+
+Clones are data (D13), so a reset stops deleting them. It moves a clone that
+no surviving entry refers to into the bullpen, and a reset forward brings it
+back, which is how a reset already treats entry directories.
+
+Three options were played through in the second review. Keeping today's
+machinery needs an atomic, verified copy back and an exception for files that
+cannot be rebuilt. Pruning without restoring keeps one writer and still needs
+that exception. Leaving the directory alone needs neither. Paddy, 2026-09-20:
+"I guess your suggestions sound good."
+
+Cost accepted: the snapshot of a retired entry stays on disk until the user
+deletes it. The Cache page lists files by entry, so it needs a row for files
+whose entry is not in the catalog.
 
 ## Testing
 
@@ -559,9 +734,8 @@ the change lands (D9, step 1). A test of a function that does not exist yet
 fails on import, and that counts as red. An earlier draft let such tests ride
 with the change. Paddy, 2026-09-20: do normal TDD.
 
-- **Sentinel** (D8). With `XORQ_CACHE_DIR` pointing at an empty
-  directory, a build, a chained child build, a view, a delete and a reopen
-  leave that directory empty.
+- **Sentinel** (D8). A build, a chained child build, a view, a delete and a
+  reopen write nothing under xorq's cache directory.
 - **Concurrent builds** (D11). Two threads building the same entry both
   return it, and the entry's directory is intact afterwards.
 - **Forgotten session** (D6). After Buckaroo has dropped a session,
@@ -587,6 +761,19 @@ with the change. Paddy, 2026-09-20: do normal TDD.
   sweep reports the entry as absent, and the file is still absent afterwards.
 - **Forced reload** (D6). After an unfaithful heal, Buckaroo receives a
   `/load_expr` for that entry's session id with `force_reload` set.
+- **Klass reload without a session record** (D6). After a klass is added, a
+  grid that is open shows it, and an entry that was never opened has no
+  session afterwards.
+- **A create always runs** (D4, D14). Building an entry whose snapshot file is
+  already on disk runs the query and replaces the file.
+- **Every class of file is re-created** (D13). With an ordered copy deleted,
+  opening a root entry makes it again from the clone and checks it. With a
+  clone deleted and the live source unchanged, the clone is made again. With
+  the live source changed as well, the error names the source file.
+- **A reset back and forward breaks nothing** (D13, D14). After a reset to an
+  earlier step and a reset forward, every entry of the restored step reads,
+  cheap and worthy, and still reads after `compute_cache/` is emptied. The
+  reset moved and copied nothing under `compute_cache/`.
 
 ## Consequences
 
@@ -597,7 +784,18 @@ with the change. Paddy, 2026-09-20: do normal TDD.
   and the `(FileNotFoundError, ValueError)` retry around xorq's shared temp
   file; `entry_graph_expr` as a separate function; tallyman's record of
   Buckaroo sessions (`_sessions`, `~/.tallyman/buckaroo_sessions.json`) and
-  `evict_session`, which worked by dropping an entry of it (D6).
+  `evict_session`, which worked by dropping an entry of it (D6);
+  `compute_cache.jsonl`, `prune_compute_cache` and the `compute_cache/` half
+  of `restore_from_bullpen` (D14); `csv_ordered/` under `TALLYMAN_HOME` (D13).
+- **#77:** closed by D2, though not tested on a second machine. #77 is an
+  empty grid on a clone of the project at another path. The snapshot's name
+  came from xorq's tokenization of a graph that contains the build-time path,
+  so a heal on the new machine wrote its file under the key that machine
+  computed, while the child's frozen build read the key computed at build
+  time. Under D2 the name is the entry's recorded content hash, which is its
+  directory name and is the same on every machine, and the literal path in a
+  child's build goes through the `${TALLYMAN_PROJECT_ROOT}` placeholder. D5
+  then heals the file where the build reads it.
 - **ADR-006:** its D4 (inlined chaining) and D8 (snapshot-key tripwire) are
   superseded. Its D2's "snapshot path derived from the loaded expression"
   becomes `snapshot_path`. Its D3 (rebind composition onto the default backend)
@@ -627,38 +825,55 @@ with the change. Paddy, 2026-09-20: do normal TDD.
 - **Source identity `salt` mode:** `rewrite_for_build` returns early under
   `salt` because xorq's path-only snapshot keys would collide. A snapshot named
   by the entry's content hash has no such collision, so the early return should
-  become unnecessary. Not tested.
+  become unnecessary. Not tested. The early return also skips the canonical
+  sort, so while it stays a worthy entry built under `salt` is written in the
+  engine's order.
 - **Cost accepted:** a worthy parent's snapshot must exist before a child can
   be built. A build also no longer repairs its own ancestors when something
   outside tallyman executes it, and under the governing rule nothing does. A
   tab open on an entry whose file the user deletes errors until the entry is
-  reopened (D6). A missing ordered copy of a source surfaces as a Buckaroo
-  error (D5).
+  reopened (D6). The snapshot of an entry that a reset retired stays on disk
+  until the user deletes it (D14).
 
 ## Open questions
 
-1. **Do two kinds of entry survive?** This is the largest open question of the
-   set and Paddy has not answered it. Materializing every entry when it is
-   created would remove the cheap and worthy classifier, the build error of
-   ADR-008 decision D3, the allow-list of ADR-008 decision D4, the view case in
-   D6, and open question 2 below, and it would give every entry a digest. An
-   entry built on another would always read the parent's file, so no graph
-   would be more than one entry deep, which is the parquet boundary Paddy wanted
-   in June. `plans/ADR-003-result-cache-cost-rubric.md` already proposes
-   admitting every result and evicting by budget. The cost is one file per
-   entry: one project measured 19 GB of cache for 779 MB of data while every
-   CSV revision wrote a file. His answer to question 4 ("materialize the
-   parquet if necessary") stands until he says otherwise.
-2. **Deep cheap chains.** Nothing cuts the graph between cheap entries. Moot if
-   open question 1 is answered with one kind of entry.
+1. **Do two kinds of entry survive?** Closed on 2026-09-20. Paddy: "yep keep
+   two kinds". A worthy entry is materialized when it is created, and a cheap
+   entry is a stored plan over files that exist (D6). The number is kept so
+   that references to open questions 2 and 3 stay valid.
+
+   The alternative was to materialize every entry when it is created. It
+   would have removed the cheap and worthy classifier, the build error of
+   ADR-008 decision D3, the view case in D6 and open question 2, given every
+   entry a digest, and cut every graph at one entry deep, which is the parquet
+   boundary Paddy wanted in June. Its cost is one file per entry: one project
+   measured 19 GB of cache for 779 MB of data while every CSV revision wrote a
+   file. The second review measured that it was workable. On the
+   single-partition connection `materialize` uses, every row-preserving plan
+   streamed its rows in the parent file's order, three runs out of three,
+   against none on the default connection (`scripts/spike_stream_order.py`),
+   so the writer could have numbered rows in parent order with no column
+   carried through the recipe.
+
+   What keeping two kinds costs is that the test for "cheap" becomes a
+   guarantee. A cheap entry has no file of its own and pages by its parent's
+   `__row_order`, so the test has to ensure that the column is still present
+   and still unique at the top of the plan. Four decisions of
+   `plans/ADR-008-row-order-of-reads.md` carry that, and each was tightened or
+   added in the second review: D3 (dropping the column is a build error), D4
+   (the test itself), D6 (joins) and D12 (a raw parquet read is a build
+   error).
+2. **Deep cheap chains.** Nothing cuts the graph between cheap entries. Still
+   open, now that open question 1 is closed with two kinds.
 3. **Where ordered copies of sources live.** ADR-008 decision D2 adds one per
    parquet source. `csv_ordered/` is global today, is never collected, and is
    not included by `tallyman pack`. Its path is also outside the project root,
    so `make_portable_inplace` does not rewrite it and a CSV entry's build is
-   not portable. The fix for #168 proposes keeping a CSV's ordered copy under
-   the project, next to the content-addressed clone it is built from, which
-   would settle this for CSVs. If every entry is materialized, a root entry's
-   own file could serve as the ordered copy.
+   not portable. Settled in outline by D13: an ordered copy is cache, so it
+   lives under the project's `compute_cache/`, and `ensure_materialized` makes
+   it again from the clone when it is missing, so `tallyman pack` has no need
+   to ship it. Not yet confirmed by Paddy in so many words. What remains is
+   the directory's name.
 
 Closed in the grilling session: eviction policy (D12).
 

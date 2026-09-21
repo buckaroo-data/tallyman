@@ -23,12 +23,11 @@ entry warms the on-disk stat cache with one un-profiled cold run, then measures:
   ``expr.count().execute()`` (a full ``COUNT(*)``) plus a ``LIMIT 300`` slice
   materialised to parquet bytes (``window_to_parquet``).
 
-Both calls execute the **bare build recipe** loaded by ``/load_expr`` — not the
-cached-result expression — so for a cache-worthy entry (Aggregate/Join) the
-count and the window each re-run the whole DAG instead of reading the
-materialised ``result.parquet``. The per-stage attribution below makes that
-visible: ``count s`` + ``window s`` are the recompute cost, ``stats s`` is the
-only thing the (stat) cache actually covers.
+Both calls page over the build the companion hands ``/load_expr`` (the harness's
+``_paged_build``): a cache-worthy entry's view build of its snapshot, a cheap
+entry's own expanded build, whose small plan re-runs over its ordered copy. The
+entry's files are made to exist first, untimed. ``stats s`` is the only thing
+the (stat) cache covers.
 
 Usage::
 
@@ -46,7 +45,6 @@ from __future__ import annotations
 import argparse
 import cProfile
 import importlib.util
-import json
 import os
 import pstats
 import sys
@@ -72,16 +70,14 @@ def _load_test_module():
     return mod
 
 
-def _built_entries(real_dir: Path) -> list[str]:
-    entries = real_dir / "artifacts" / "catalog" / "entries"
-    return sorted(c.name for c in entries.iterdir() if (c / "xorq_build").is_dir() and (c / "result.parquet").exists())
+def _built_entries(tm, real_dir: Path) -> list[str]:
+    return tm._entries_with_build(real_dir)
 
 
-def _resolve_entry(real_dir: Path, token: str) -> str:
+def _resolve_entry(tm, real_dir: Path, token: str) -> str:
     """Resolve an alias or hash prefix to a full content hash with a build."""
-    built = _built_entries(real_dir)
-    aliases_path = real_dir / "artifacts" / "catalog" / "aliases.json"
-    aliases = json.loads(aliases_path.read_text()) if aliases_path.exists() else {}
+    built = _built_entries(tm, real_dir)
+    aliases = tm._load_aliases(real_dir)
 
     if token in aliases and aliases[token] in built:
         return aliases[token]
@@ -153,16 +149,9 @@ def _profile_entry(
     accurate, low-overhead path; on attributes each wall to its call stack
     (``count`` / ``stats`` / ``window``) and dumps ``.prof`` files.
     """
-    from tallyman_core.paths import (  # noqa: PLC0415
-        entry_build_dir,
-        entry_expanded_build_dir,
-        entry_stat_cache_dir,
-        project_dir,
-    )
-    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+    from tallyman_core.paths import entry_stat_cache_dir  # noqa: PLC0415
 
-    build_dir = entry_build_dir(project, content_hash)
-    expanded = ensure_expanded_build(build_dir, project_dir(project), entry_expanded_build_dir(project, content_hash))
+    expanded, _ = tm._paged_build(project, content_hash)
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     # Cold run (always un-profiled): populate the on-disk stat cache so the
@@ -207,15 +196,18 @@ def _profile_entry(
     return row
 
 
-def _classify(build_dir: Path) -> str:
-    from tallyman_xorq.result_cache import classify_build  # noqa: PLC0415
+def _classify(entry: Path) -> str:
+    """The worthiness verdict the build recorded (``worthiness.classify_expr``, stored as ``cache_worthy_why``)."""
+    from tallyman_core.manifest import read_manifest  # noqa: PLC0415
 
-    return classify_build(build_dir)["why"]
+    try:
+        return read_manifest(entry).cache_worthy_why or "?"
+    except (OSError, ValueError):
+        return "?"
 
 
-def _render(project: str, rows: list[dict], real_dir: Path, profiled: bool) -> str:
-    aliases = real_dir / "artifacts" / "catalog" / "aliases.json"
-    by_hash = {h: a for a, h in (json.loads(aliases.read_text()) if aliases.exists() else {}).items()}
+def _render(tm, project: str, rows: list[dict], real_dir: Path, profiled: bool) -> str:
+    by_hash = {h: a for a, h in tm._load_aliases(real_dir).items()}
 
     def cell(v) -> str:
         return f"{v:.2f}" if isinstance(v, (int, float)) else "—"
@@ -231,17 +223,17 @@ def _render(project: str, rows: list[dict], real_dir: Path, profiled: bool) -> s
         f"{len(rows)} entries · {mode}",
         "",
         "`count` is `expr.count().execute()`; `stats` is the XorqDfStatsV2 pipeline (the only stage the "
-        "stat cache covers); `window` is the `LIMIT 300` slice to parquet. For an aggregate/join recipe "
-        "`count`+`window` recompute the whole DAG — the materialised `result.parquet` is never read by "
-        "the viewer path.",
+        "stat cache covers); `window` is the `LIMIT 300` slice to parquet. A worthy entry pages over its "
+        "snapshot; a cheap entry re-runs its small plan.",
         "",
         "| entry | rows | class | warm s | ↳load | ↳count | ↳stats | page s | ↳count | ↳window |",
         "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         h = r["entry"]
-        bd = real_dir / "artifacts" / "catalog" / "entries" / h / "xorq_build"
-        cls = _classify(bd).replace("cheap (parquet read + projection/scalar only)", "cheap")
+        cls = _classify(real_dir / "artifacts" / "catalog" / "entries" / h).replace(
+            "cheap (row-preserving over one file)", "cheap"
+        )
         label = f"{by_hash.get(h, '(scratch)')} `{h[:8]}`"
         L.append(
             f"| {label} | {r['rows']:,} | {cls} | {cell(r['warm_wall'])} | {cell(r['warm_load'])} | "
@@ -276,7 +268,7 @@ def main() -> None:
     if not real_dir.is_dir():
         sys.exit(f"corpus absent: {real_dir}")
 
-    hashes = _built_entries(real_dir) if args.all else [_resolve_entry(real_dir, args.entry)]
+    hashes = _built_entries(tm, real_dir) if args.all else [_resolve_entry(tm, real_dir, args.entry)]
 
     overlay_root = Path(tempfile.mkdtemp(prefix="profile-pageload-"))
     tm._build_overlay(overlay_root, args.project, real_dir)
@@ -309,7 +301,7 @@ def main() -> None:
             )
 
     rows.sort(key=lambda r: -r["rows"])
-    report = _render(args.project, rows, real_dir, args.profile)
+    report = _render(tm, args.project, rows, real_dir, args.profile)
     if args.out:
         args.out.mkdir(parents=True, exist_ok=True)
         (args.out / "profile_corpus.md").write_text(report)

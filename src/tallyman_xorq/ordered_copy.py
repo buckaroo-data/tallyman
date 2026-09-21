@@ -260,22 +260,49 @@ def _clone_or_live(project: str, record: dict) -> Path:
     )
 
 
+def _find_record(project: str, owner_hash: str, key: str) -> dict | None:
+    """The record of the copy *key*: from the owner's manifest, else from any entry in the catalog that recorded it.
+
+    The build that first reads a source records its copy, and entries are never deleted, so the record is always in
+    some manifest, whichever path (``tracked_expr_from_alias``, a diff, ``cached_result_expr`` in a recipe) carried the
+    copy into the owner's plan. A copy's key is a function of the source digest and the reader options, so any
+    manifest's record of it makes the same file.
+    """
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entries_dir, entry_dir
+
+    def records_of(entry: Path) -> dict:
+        try:
+            return read_manifest(entry).ordered_copies or {}
+        except (OSError, ValueError):
+            return {}
+
+    record = records_of(entry_dir(project, owner_hash)).get(key)
+    if record is not None:
+        return record
+    base = entries_dir(project)
+    for entry in sorted(base.iterdir()) if base.is_dir() else []:
+        record = records_of(entry).get(key)
+        if record is not None:
+            return record
+    return None
+
+
 def recreate_ordered_copy(project: str, owner_hash: str, path: Path) -> None:
     """Make a deleted ordered copy again for the entry *owner_hash*, and check it against its recorded digest.
 
-    Uses the reader options the entry's manifest recorded. A copy whose digest differs from the one recorded when it
-    was first written is served all the same, but never silently (ADR-007 D5): a durable error record and a warning.
+    Uses the reader options recorded by the entry that wrote the copy (``_find_record``). A copy whose digest differs
+    from the one recorded when it was first written is served all the same, but never silently (ADR-007 D5): a durable
+    error record and a warning.
     """
     from tallyman_core.catalog_state import project_lock
-    from tallyman_core.manifest import read_manifest
-    from tallyman_core.paths import entry_dir
 
     key = Path(path).stem
-    record = ((read_manifest(entry_dir(project, owner_hash)).ordered_copies) or {}).get(key)
+    record = _find_record(project, owner_hash, key)
     if record is None:
         raise SourceUnavailable(
-            f"entry {owner_hash} reads {path.name} but its manifest has no record of the source it was made from, so "
-            "it cannot be made again; rebuild the entry"
+            f"entry {owner_hash} reads {path.name} but no manifest in the catalog records the source it was made "
+            "from, so it cannot be made again; rebuild the entry"
         )
     reader = record["reader"]
     if reader.get("lossless") is False:

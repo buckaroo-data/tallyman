@@ -477,41 +477,42 @@ def measure_execute(project: str, content_hash: str, scratch: Path) -> dict:
     }
 
 
-def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
-    """Tier-B proxy: make the files exist, load the build, run the stat pipeline (cold/warm), 1st page."""
+def _paged_build(project: str, content_hash: str) -> tuple[Path, float]:
+    """Make the entry's files exist, then return the build the companion pages over and the seconds the first took.
+
+    Mirrors the live companion: load_session makes every file the entry reads exist (ensure_materialized: a deleted
+    snapshot is written again and verified, an ordered copy is made again from its clone) BEFORE Buckaroo is asked to
+    show anything (ADR-007 D6), so the load reads files that are there. A corpus built before ADR-007 embeds parent
+    cache nodes this cannot make again — rebuild it (scripts/rebuild_parking_catalog.py); see the module docstring.
+    The build is a worthy entry's view build of its snapshot, a cheap entry's own expanded build
+    (buckaroo_lifecycle.BuckarooManager._load_body). ``scripts/profile_pageload.py`` calls this too.
+    """
     from tallyman_companion.buckaroo_lifecycle import ensure_view_build  # noqa: PLC0415
-    from tallyman_core.paths import (  # noqa: PLC0415
-        entry_build_dir,
-        entry_expanded_build_dir,
-        entry_stat_cache_dir,
-        project_dir,
-    )
+    from tallyman_core.paths import entry_build_dir, entry_expanded_build_dir, project_dir  # noqa: PLC0415
     from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
     from tallyman_xorq.result_cache import cache_worthy, cached_result_expr  # noqa: PLC0415
+
+    t0 = time.monotonic()
+    cached_result_expr(project, content_hash)
+    heal_s = round(time.monotonic() - t0, 2)
+    if cache_worthy(project, content_hash):
+        return ensure_view_build(project, content_hash), heal_s
+    return ensure_expanded_build(
+        entry_build_dir(project, content_hash),
+        project_dir(project),
+        entry_expanded_build_dir(project, content_hash),
+    ), heal_s
+
+
+def measure_pageload(project: str, content_hash: str, scratch: Path) -> dict:
+    """Tier-B proxy: make the files exist, load the build, run the stat pipeline (cold/warm), 1st page."""
+    from tallyman_core.paths import entry_stat_cache_dir  # noqa: PLC0415
 
     xorq_loading = _import_buckaroo_loading()
     stat_cache = entry_stat_cache_dir(project, content_hash)
 
     sampler = pr.RssSampler(psutil.Process(), interval=0.05)
-    # Mirror the live companion: load_session makes every file the entry reads exist (ensure_materialized: a
-    # deleted snapshot is written again and verified, an ordered copy is made again from its clone) BEFORE Buckaroo
-    # is asked to show anything (ADR-007 D6), so the load below reads files that are there. A corpus built before
-    # ADR-007 embeds parent cache nodes this cannot make again — rebuild it (scripts/rebuild_parking_catalog.py);
-    # see the module docstring.
-    t0 = time.monotonic()
-    cached_result_expr(project, content_hash)
-    heal_s = round(time.monotonic() - t0, 2)
-
-    # Page over the build the companion actually hands Buckaroo: a worthy entry's view build of its snapshot, a
-    # cheap entry's own expanded build (buckaroo_lifecycle.BuckarooManager._load_body).
-    if cache_worthy(project, content_hash):
-        expanded = ensure_view_build(project, content_hash)
-    else:
-        expanded = ensure_expanded_build(
-            entry_build_dir(project, content_hash),
-            project_dir(project),
-            entry_expanded_build_dir(project, content_hash),
-        )
+    expanded, heal_s = _paged_build(project, content_hash)
 
     t0 = time.monotonic()
     expr = xorq_loading.load_expr_build_dir(str(expanded))

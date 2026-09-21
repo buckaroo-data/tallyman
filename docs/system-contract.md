@@ -1,9 +1,13 @@
 # Tallyman: primitives and the system contract
 
-- **Status:** Normative, implemented (PR #167, 2026-07-31). Describes the
-  system as built; where code or the descriptive docs disagree with it, the
-  disagreement is a bug. Design decisions and pre-fix history:
-  `plans/ADR-006-read-path-loads-builds.md`.
+- **Status:** Normative, implemented. Describes the system as built; where
+  code or the descriptive docs disagree with it, the disagreement is a bug.
+  Design decisions and history: `plans/ADR-006-read-path-loads-builds.md`
+  (the read path, still in force for what the later ADRs did not change) and
+  `plans/ADR-007-tallyman-owned-materialization.md`,
+  `plans/ADR-008-row-order-of-reads.md` and
+  `plans/ADR-009-digest-stability.md` (tallyman writes its own result files,
+  every file carries `__row_order`, and the digest is a content digest).
 - **Audience:** no prior xorq knowledge assumed. The xorq section below covers
   exactly as much of xorq as the rest of the doc needs, and no more.
 
@@ -54,11 +58,11 @@ backends shape tallyman's design:
 
 The remedy for the identity trap is **`replace_sources`**: given a mapping
 {old backend object → new backend object}, it rewrites an expression rebinding
-every leaf and every cache reference onto the new object. This is the
+every leaf onto the new object. This is the
 sanctioned way to take expressions that arrived on different backend objects
 and compose them onto one shared backend.
 
-**Rebinding is zero-copy.** A file read or cache node is a path plus a recipe
+**Rebinding is zero-copy.** A file read is a path plus a recipe
 for reading it; swapping which connection executes it moves no data — the new
 backend reads the same files at execute time. (Tallyman's backends are
 stateless in-process engines; all data state lives in files.) The one node
@@ -102,43 +106,31 @@ Three properties matter:
   you want content identity, you must put the content in the path.** Tallyman
   does (Part 2, CAS).
 
-`load_expr(build_dir, cache_dir=...)` is the inverse: it reads the yaml,
-mints **fresh backend objects** from the profiles (nothing is memoized — two
-loads of the same build yield two distinct backend objects, which is the
-identity trap again), and rebases cache storage into `cache_dir` (next
-section). The `cache_dir` parameter is the seam that lets the same build run
-against any cache directory, including an empty one.
+`load_expr(build_dir)` is the inverse: it reads the yaml and mints **fresh
+backend objects** from the profiles (nothing is memoized — two loads of the
+same build yield two distinct backend objects, which is the identity trap
+again). A build that holds no cache node needs nothing else to load, and
+tallyman's builds hold none (Part 2, "Materialization").
 
-## 4. Caching: snapshot keys, and existence as the only check
+## 4. xorq's cache nodes, which tallyman does not use
 
 Calling `.cache()` on an expression wraps it in a **cache node**. At execution
-time xorq computes a **key** from the wrapped subgraph and looks for
-`<cache_dir>/<relative_path>/<key>.parquet`:
+time xorq computes a key from the wrapped subgraph and looks for
+`<cache_dir>/<relative_path>/<key>.parquet`: if the file exists it is read back
+and the subgraph does not run, and if it is missing the subgraph runs and the
+file is written. A hit is decided by filename existence alone, so the cache is
+only as honest as the key derivation and whoever writes the files. The node
+survives serialization, but its base directory does not: a loader has to supply
+one, and xorq's load-time rewrite of it misses nodes nested inside another
+cache node's subgraph.
 
-- file exists → read it back; the subgraph does not run;
-- file missing → execute the subgraph, write the file (atomically), read it.
-
-That is the entire mechanism. There is no invalidation step and no validation
-of the file's contents: **a cache hit is decided by filename existence
-alone**, and the stored bytes are trusted by assumption. Consequently the
-cache is only as honest as two things: the key derivation, and whoever writes
-the files.
-
-Tallyman uses xorq's **snapshot** keying everywhere: the key is a token over
-the subgraph's structure and its read *paths* — again deliberately blind to
-file content and mtime.[^mtime] Under CAS paths (Part 2) this blindness is
-harmless: content is in the path, so the key is content-honest. The cache node survives
-serialization: a build of a cached expression carries the cache node in its
-yaml, so *any* loader of that build reads through the same cache key. What is
-**not** serialized is the cache's base directory — every loader must supply
-`cache_dir`, which is why the parameter exists.
-
-One xorq wart tallyman must own: xorq's load-time cache-dir rewrite walks the
-graph shallowly and misses cache nodes nested *inside* another cache node's
-subgraph. Tallyman's loader therefore does its own deep rewrite (over xorq's
-deep-walking primitives) so that every cache node in a loaded build — nested
-or not — lands in the project's cache directory, never in the global default
-(`~/.cache/xorq`).
+Tallyman stopped depending on all of this (`plans/ADR-007-tallyman-owned-materialization.md`).
+No build holds a cache node, so no loader has to aim one at a directory, the
+file names come from tallyman and not from xorq's tokenization of a graph, and
+the writer is tallyman's own (Part 2, "Materialization"). A recipe that calls
+`.cache()` is a build error, because a node with default storage would write
+under `~/.cache/xorq`. What remains of xorq here is the expression, build, load,
+hashing and execution layer.
 
 ## 5. What the hash sees, and what it cannot
 
@@ -193,11 +185,20 @@ depend on a live source path. At build time each source is:
 3. read through the clone.
 
 This is **CAS** (content-addressed sources), and it is the answer to xorq's
-path-only hashing: the path *is* the digest, so every xorq-level key — the
-expression hash, every cache key — becomes content-honest for free. Edit a
-source and rebuild: the digest changes, the path changes, the hash changes, a
-new entry forks. The clone is the entry's immutable input forever; the live
-file is merely where the *next* build will look.
+path-only hashing: the path *is* the digest, so every xorq-level key (the
+expression hash, and the name of every file tallyman writes) becomes
+content-honest for free. Edit a source and rebuild: the digest changes, the path
+changes, the hash changes, a new entry forks. The clone is the entry's immutable
+input forever; the live file is merely where the *next* build will look.
+
+A recipe never reads the source or its clone directly. Ingest writes an
+**ordered copy** of the clone under the project's `compute_cache/ordered_sources/`:
+polars reads the clone in file order and writes a parquet file with the same
+columns and one more at the end, `__row_order`, `0..N-1`. The copy is named by
+the source's digest and the reader options (the schema and `scan_csv` options
+of a CSV), and the recipe reads that file. So a recipe's reads are all files
+tallyman wrote, each carrying the column that pages sort by (Part 2, "Row
+order").
 
 ## Recipe
 
@@ -258,25 +259,26 @@ re-bound to today's parents.)
 An entry's `content_hash` is xorq's expression hash (Part 1 §3), taken at
 build time. Two details determine what it covers:
 
-- the expression hashed is the **rewritten** one — cache injection (below)
-  has already happened — so an entry's caching shape is part of its identity;
-- every file read in the graph points at a CAS clone, so each read path
-  carries a digest of the input bytes; and since parent expressions are
-  inlined into the graph, the same holds all the way up the lineage.
+- the expression hashed is the one after the rewrite (below), which adds the
+  canonical sort to a worthy entry and adds no cache node to anything;
+- every file read in the graph is a file tallyman wrote under a name that
+  carries content: an ordered copy named by its source's digest, or a worthy
+  parent's snapshot named by the parent's content hash. So the hash covers the
+  input bytes, and a child's hash is a function of its parent's.
 
 The hash therefore names "this computation over these exact input bytes."
 That one property makes builds idempotent and history append-only. Rebuild
 the same computation over unchanged inputs and you land on the existing
 entry: the build recognizes the hash and stops. Change anything that alters
 the computation or its inputs — the recipe's logic, a source's bytes, a
-parent's graph — and a new entry forks under a new hash, while every existing
+parent's identity — and a new entry forks under a new hash, while every existing
 entry keeps its name and its meaning.
 
 Two limits are deliberate. The hash cannot see execution behavior (Part 1
 §5): a recipe calling `sample()` or `now()` hashes identically run to run,
 which is the gap `result_digest` (below) exists to police. And it makes no
-attempt at cross-machine portability: absolute path prefixes participate in
-the hash.
+attempt at cross-machine portability: absolute path prefixes participate in the
+hash.
 
 ## Manifest: the closure record
 
@@ -288,9 +290,11 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 | `content_hash` | the entry's identity |
 | `parents` | `[{hash, ref, follow}]` — each alias reference, **resolved to the exact hash it meant at build time** |
 | `sources` | `{rel_path: digest}` — each source, pinned to the bytes read |
-| `result_digest` | SHA-256 of the baked result snapshot (worthy entries) — the output identity |
-| `snapshot_key` | the baked snapshot's cache key, recorded at build (see write path) |
-| `cache_worthy`, `cache_worthy_why`, `cache_bytes` | the worthiness verdict and its evidence |
+| `ordered_copies` | `{key: {source, digest, reader, content_digest}}` — each ordered copy the plan reads, with the reader options and the digest that let it be made again |
+| `cache_worthy`, `cache_worthy_why`, `cache_bytes` | whether the entry is materialized, decided once at build, and the evidence |
+| `result_digest` | `arrow-sha256:` digest of the snapshot's content (worthy entries) — the output identity |
+| `reproducible`, `nonreproducible_columns` | whether two runs at create gave the same digest, and the columns that differed |
+| `snapshot_format`, `engine_versions` | the format version and the xorq, xorq-datafusion and pyarrow versions at build |
 | `row_count`, `execute_seconds`, `compile_seconds`, timings | build measurements |
 
 The manifest is written last, atomically: its presence is the "this entry is
@@ -319,41 +323,117 @@ Once an entry is selected, serving it consults no name again. `follow` is a
 entry?), never a read policy: reads are lineage-faithful for followed and
 pinned parents alike.
 
-## Worthiness: cheap and expensive entries
+## Worthiness: cheap and worthy entries
 
-At build time, tallyman rewrites the author's expression before freezing it
-(**the worthiness rewrite**):
+Whether an entry has a file of its own is decided once, when it is built, by
+one test on the expression the author wrote (`worthiness.classify_expr`), and
+recorded in the manifest as `cache_worthy`. Nothing derives it again.
 
-- every non-parquet file read gets a cache node injected after the parse (so
-  a CSV is parsed once, shared by every entry reading it);
-- if the expression contains an expensive operation — Aggregate, Join, Sort,
-  Window, or a UDF — the whole expression is wrapped in a top-level cache
-  node. Such an entry is **worthy**: its result is materialized once at build
-  (**the baked snapshot**, a parquet under the project's
-  `compute_cache/result_cache/`) and read back ever after.
-- everything else is **cheap**: a projection/filter/rename over columnar
-  sources re-executes in pushdown time comparable to reading a copy, so no
-  copy is kept.
+An entry is **cheap** only if all of these hold: every relation operation is a
+file read, filter, column selection, computed column, rename, cast, column
+drop, drop of null rows or fill of nulls; the plan reads exactly one file; and
+no value operation multiplies rows (`unnest`), depends on the order rows arrive
+in (a window function, which also covers `row_number` and `lag`) or is not pure
+(`random()`, `uuid()`, `now()`, `today()`, or any UDF). Anything else is
+**worthy**: an aggregate, join, sort, limit, union, distinct, a second file, or
+an operation nobody has classified. The list is an allow-list, so an unknown
+operation costs a copy and never unstable paging.
 
-The rewrite happens *before* hashing, so the cache nodes are part of the
-entry's identity and travel inside `xorq_build/` — which is why every loader
-of the build, in any process, reads through the same snapshot key.
+- A **worthy** entry is **materialized**: its result is written once, when the
+  entry is created, to a **snapshot**,
+  `compute_cache/result_cache/<content_hash>.parquet`, and every read after that
+  is a read of that file.
+- A **cheap** entry writes nothing. It is a stored plan over files that exist
+  (a view, in the database sense), which re-runs on every read. Tallyman ran it
+  in full when the entry was created, so an error in it surfaced there.
+
+The canonical sort, described next, is added only to a worthy entry.
+
+## Row order
+
+Every file tallyman writes ends in an `int64` column named `__row_order` holding
+`0..N-1` in the file's physical row order. It is the last column, and it is
+visible in every table. Two writers produce it: ingest (an ordered copy of a
+source) and `materialize` (a snapshot), and each materialization overwrites an
+inherited one with positions in its own file. It is what makes a page of an
+entry a function of `(content_hash, sort, offset, limit)`: with no user sort a
+page is `ORDER BY __row_order`, and with one the user's keys come first and
+`__row_order` is the last key, which breaks every tie.
+
+- A cheap entry has no file of its own, so it inherits the column and must keep
+  it. A cheap recipe whose output lacks it fails to build, and the error names
+  what it reads and shows the corrected select. A worthy entry may drop it,
+  because the writer numbers its rows.
+- A recipe may read the column and copy it under another name
+  (`__row_order_v1`), and may not assign to it. To change the order of rows, sort
+  them: the writer numbers the result in that order.
+- Every `order_by` in a recipe gets `__row_order`, then the remaining sortable
+  columns, as its last keys, so the sort is total wherever the recipe put it. A
+  sort that is not the recipe's last step is kept: the top-level sort leads with
+  its keys, and the build fails, naming the key, if a later step dropped or
+  changed it.
+- A join of two entries leaves the right side's copy under ibis's collision name,
+  `__row_order_right`, and the writer drops it. Joining three entries in one
+  recipe needs `.drop("__row_order")` on the right-hand inputs, and the build
+  says so.
+- A diff carries no row-order column from either side.
+
+## Materialization
+
+`materialize(project, hash)` is the one routine that writes a snapshot. The
+build calls it and so does every heal, so result bytes are manufactured in one
+place. It runs the entry's frozen build on a **single-partition** connection
+(so a float total is merged in one order and is bit-stable on any machine),
+streams the rows through a writer with a pinned layout (zstd, row groups of
+1,048,576 rows, a parquet page index, `__row_order` last), writes to a unique
+temp name and replaces the final file atomically, all under the project's write
+lock, and returns the content digest of the file it wrote, read back. A create
+runs the query twice and compares the digests; if they differ the recipe is not
+reproducible, the entry still builds, and its file is **pinned**: the Cache
+page's delete leaves it alone.
+
+`ensure_materialized(project, hash)` is the one entry point that makes files
+exist, and every consumer that composes or executes an entry goes through it
+(the canonical read below, chaining, the Buckaroo hand-off):
+
+1. A worthy entry whose snapshot exists is done, and no build is loaded.
+2. Otherwise load the build and collect every file its `Read` nodes point at.
+3. Re-create each that is missing by the rule for its class. A snapshot is made
+   again by recursing on the hash in its file name. An ordered copy is made again
+   from its source's clone with the reader options in the manifest, and checked
+   against the digest recorded when it was first written. A clone is copied again
+   from the live source while the live bytes still hash to its name.
+4. If the entry is worthy, materialize it and verify the result against
+   `result_digest`.
+
+A file is cache only if this function can re-create it from files that are not
+cache. Snapshots and ordered copies satisfy that and live under
+`compute_cache/`, which anything may delete. Clones are data: once the live
+source is edited a clone is the only copy of the bytes an entry was built from,
+so nothing deletes one. When nothing can re-create a file (the clone is gone and
+the live source has changed) the error names the source file.
+
+Files are deleted only by an explicit user action, and a file is written only
+because something is about to read it. The startup warm-up, the verify sweep and
+a reset write and delete nothing under `compute_cache/`.
 
 ## Result digest
 
-For worthy entries, the build records `result_digest`: the SHA-256 of the
-baked snapshot file, taken over a canonically-ordered materialization so an
-engine's parallel-scan row reshuffling cannot move it — the worthiness
-rewrite sorts by the author's own `order_by` keys, then `original_row_order`,
-then the remaining sortable columns (ADR D5). It is
-the **output** identity axis, and it has exactly one job: witnessing that a
-later rematerialization reproduced the original bytes. It is never a
-staleness input (an entry whose recompute differs is *nondeterministic*, not
-stale — recomputing cannot make it fresh) and never part of the entry's name.
+For worthy entries, the build records `result_digest`: `arrow-sha256:<hex>`, a
+SHA-256 over the snapshot's ordered Arrow data, computed from the file read
+back. It is independent of the row-group size, the codec, the writer's version,
+whether a text column is `string` or `large_string`, and what a null slot holds;
+it depends on every value, on which slots are null, on the order of the rows
+(fixed by the canonical sort) and on the column names and types. It is the
+**output** identity axis, and it has exactly one job: witnessing that a later
+rematerialization reproduced the original result. It is never a staleness input
+(an entry whose recompute differs is *nondeterministic*, not stale — recomputing
+cannot make it fresh) and never part of the entry's name.
 
 It exists because recipes are LLM-authored: an LLM can write `sample()` or an
 impure UDF, the hash cannot see it (Part 1 §5), and the digest is the runtime
-backstop that catches it.
+backstop that catches it. Running the query twice at create moves the catch to
+the moment the entry is born.
 
 ---
 
@@ -361,25 +441,29 @@ backstop that catches it.
 
 ## The write path (build)
 
-`build_and_persist(project, code)`:
+`build_and_persist(project, code)` holds the project's write lock for the whole
+build (one write at a time per project, so two builds of one entry cannot end with
+the failing one deleting the winner's directory):
 
 1. **Import the recipe** — the single moment of name resolution. During the
-   import, `read_project_file` digests and clones each source (CAS) and
-   records `{rel_path: digest}`; `tracked_expr_from_alias` resolves each
-   alias to its current head, records the parent edge, and returns the
-   parent's expression (loaded from the parent's frozen build — see read
-   path).
-2. **Rewrite** — the worthiness rewrite (cache injection).
+   import, `read_project_file` and `tallyman_read_csv` digest each source, clone
+   it (CAS), write its ordered copy and record `{rel_path: digest}` and the copy's
+   reader options; `tracked_expr_from_alias` resolves each alias to its current
+   head, records the parent edge, and returns the parent's result (below).
+2. **Check and rewrite** — reject what cannot become a sound entry (an in-memory
+   read, a `.cache()` call, a raw parquet read, an assignment to `__row_order`, a
+   cheap entry that drops it), classify the entry once (cheap or worthy), and add
+   the canonical sort to a worthy entry.
 3. **Freeze** — `build_expr` serializes the rewritten expression;
    `content_hash` = the build's name. If an entry with this hash already
    exists, stop: append the prompt, return the existing entry (idempotency).
 4. **Lay down the entry** — copy the build in, make paths portable
    (`${TALLYMAN_PROJECT_ROOT}` placeholders), write `expr.py`.
-5. **Execute once** — load the just-written build against the project's
-   compute cache and run it. Worthy: the top cache node materializes the
-   baked snapshot (canonically ordered), and the build records its digest
-   **and its snapshot key** in the manifest. Cheap: one full streaming pass
-   (honest evaluation, fails fast, keeps nothing).
+5. **Execute once** — a worthy entry is materialized (Part 2, "Materialization"),
+   which writes the snapshot and yields its digest, and the build records the
+   digest, the reproducibility verdict and the schema read from the written file.
+   A cheap entry is streamed once in full and keeps nothing (honest evaluation,
+   fails fast).
 6. **Record** — schema, manifest (written last, atomic).
 7. **Checkpoint** — when the MCP tool returns: recipe zip, tracked pointers,
    one git commit.
@@ -392,42 +476,37 @@ need, because the reader is forbidden from resolving anything.**
 One canonical read, used by every consumer:
 
 ```
-read(project, content_hash, cache_dir=<project compute cache>):
-    expand the entry's xorq_build (placeholders → real paths, stable per-entry dir)
-    expr = load_expr(expanded, cache_dir=cache_dir)   # + tallyman's deep cache-dir rewrite
-    return expr
+read(project, content_hash):
+    ensure_materialized(project, content_hash)     # every file the plan reads exists
+    worthy entry: one bare read of its snapshot
+    cheap entry:  load_expr(expanded build), rebound onto the default backend
 ```
 
-- **Worthy entry:** the loaded graph carries its cache node, so execution
-  reads the baked snapshot by key. If the file is missing (evicted), the
-  cache node re-executes the *frozen* subgraph — whose leaves are CAS clones
-  and inlined parent graphs, all pinned — writes the snapshot, and the result
-  is verified against `result_digest` (below). Single-flighted per entry so
-  concurrent cold readers don't race.
-- **Cheap entry:** execution re-runs the frozen graph in pushdown time,
-  reading CAS clones. Same bytes every time, by construction.
-- The `cache_dir` parameter is the **cold seam**: any entry can be
-  materialized against an empty temp dir, and must produce the same bytes as
-  the warm read. That property is the standing regression test for every
-  read-path change.
+- **Worthy entry:** a bare read of `compute_cache/result_cache/<content_hash>.parquet`,
+  served without loading the entry's build when the file exists. If the file is
+  missing, `ensure_materialized` re-runs the *frozen* build (whose reads are
+  ordered copies and parents' snapshots, all made to exist first), writes the
+  snapshot, and verifies it against `result_digest` before it is served.
+- **Cheap entry:** execution re-runs the frozen graph, reading files that exist.
+  Same rows every time, by construction.
+- **The cold state is an empty `compute_cache/`:** any entry can be read after
+  it is deleted, and must produce the same result as the warm read. That property
+  is the standing regression test for every read-path change.
 
 `cached_result_expr(project, hash)` is the function every in-process consumer
-calls, and it is an optimization over the canonical read, nothing more: it
-performs the read once per `(project, content_hash)` and keeps the loaded
-expression in a bounded in-process LRU, so repeated reads (every pagination
-request, both sides of a diff) skip the load. Removing it must change latency
-and nothing else. That is what makes its key honest: the cached value is a
-pure function of the frozen build the key names. The per-call
-snapshot-existence check and the single-flighted heal stay outside the LRU,
-because file existence is the one input that remains mutable (eviction).
+calls. It is `ensure_materialized` plus the read above, and it memoizes the loaded
+plan (and the bare snapshot read, so a snapshot has one table name in the shared
+backend) per `(project, content_hash)`. Removing the memo must change latency and
+nothing else. The per-call existence check stays outside the memo, because file
+existence is the one input that remains mutable.
 
-**Chaining** (`tracked_expr_from_alias` at build time) uses the same read: the
-parent's frozen build is loaded and its graph — including, for a worthy
-parent, its cache node — is composed into the child. The child's build
-therefore carries its own regeneration knowledge. If the parent's snapshot is
-missing when the child executes, the parent's cache node re-runs its frozen
-subgraph and rewrites the file, the same as any cache miss; nothing outside
-the execution has to arrange for the file to exist.[^preheal]
+**Chaining** (`tracked_expr_from_alias` at build time) uses the same read. A worthy
+parent is a bare read of its snapshot, so the child's build holds the literal path
+of that file, which contains the parent's content hash: the child's identity is a
+function of its parent's. A filter over an aggregate's snapshot is therefore a
+cheap entry. A cheap parent's graph is inlined. The parent's snapshot is made to
+exist before the child is composed, since a child cannot be built over a file
+that is missing.
 
 The recipe-reconstruction machinery survives only as a diagnostic. An entry
 whose build is missing or unloadable is a **hard error** naming the entry and
@@ -440,16 +519,15 @@ invisible (decided in `plans/ADR-006-read-path-loads-builds.md`, D6).[^recon]
 To compose two entries (diff's outer join, a union, any multi-entry
 expression):
 
-1. read each entry (canonical read above) — each load minted fresh backend
-   objects;
+1. read each entry (canonical read above) — each read makes its files exist,
+   and each load minted fresh backend objects;
 2. **rebind onto shared backends, one per distinct content profile** (profile
    identity = profile minus `idx`), using `replace_sources`. For today's
    catalogs every profile is the same embedded engine, so this collapses to
    one shared backend;
-3. compose. The result is a single-backend expression: it executes
-   in-process, and `build_expr` serializes it into a normal single-profile
-   build that Buckaroo's `/load_expr` accepts — the same handoff as an
-   ordinary entry grid.
+3. compose, dropping `__row_order` from both sides first. The result is a
+   single-backend expression: it executes in-process, and `build_expr` serializes
+   it into a normal single-profile build that Buckaroo's `/load_expr` accepts.
 
 Composition of frozen builds was never the problem; backend object identity
 was (#75, rediagnosed in #163). The rebind is cheap graph surgery, no data
@@ -457,7 +535,44 @@ moves.
 
 A **promoted diff** is just an entry whose recipe pins two hashes
 (`build_diff_expr(a_hash, b_hash)`) — name-free, deterministic, and built
-through the ordinary write path.
+through the ordinary write path. It contains a join, so it is worthy and is
+materialized like any other. The live diff grid, which is not an entry, still hands
+Buckaroo an unmaterialized join (`plans/ADR-007-tallyman-owned-materialization.md`
+D10 moved that to a follow-on).
+
+## Handing an entry to Buckaroo
+
+Buckaroo displays: it runs queries only for summary stats, sorting and paging.
+Tallyman finishes the entry's computation first (`ensure_materialized`), so no
+other process runs an entry's expensive computation, writes result files or
+repairs tallyman's cache, and a failure of the computation surfaces in tallyman's
+process and never inside a grid query.
+
+- A **worthy** entry's grid is handed a **view build**: a build whose whole graph
+  is one bare read of the entry's snapshot, written once to a stable per-entry
+  directory (Buckaroo's stat-cache keys include the build directory's path).
+- A **cheap** entry's grid is handed its own expanded build, a stored plan over
+  files that exist.
+- Tallyman keeps no record of Buckaroo's sessions. A session id is
+  `entry-<project>-<content_hash>`, posted on every open: Buckaroo skips the work
+  while it holds that session with the same build directory, and creates the
+  session again if it dropped it (it does after an hour without a browser). A
+  klass reload posts `/reload_expr/<id>` for each entry of the project and treats
+  the 404 for an id Buckaroo does not hold as "not open".
+- Every `/load_expr` names `__row_order` as the row-order column, so Buckaroo can
+  order its pages by it (buckaroo-data/buckaroo#974 is Buckaroo's half of that).
+- After an unfaithful heal, the entry's stat cache is wiped and Buckaroo is told
+  to reload the grid (`force_reload`).
+
+## Reset
+
+`reset_to` returns the catalog to an earlier step. It restores every tracked file
+with `git reset --hard`, and reconciles the untracked entry directories through the
+**bullpen**, the directory a reset moves retired files into so a reset forward can
+bring them back. It leaves `compute_cache/` alone: snapshots and ordered copies are
+named by content, and a file that is missing afterwards is made again and verified
+like any other. It moves the source clones no surviving entry refers to into the
+bullpen and never deletes them.
 
 ## Staleness and recalc (unchanged, stated for completeness)
 
@@ -490,37 +605,33 @@ open entries to their new versions.
 
 ## Verification
 
-`verify_result_faithful(project, hash)` means exactly: *executing this
-entry's frozen build reproduces its recorded `result_digest`.* It runs in
-production, not only in tests:
+`verify_result_faithful(project, hash)` means exactly: *the snapshot on disk
+still has the entry's recorded `result_digest`.* Verification runs in production,
+not only in tests:
 
-- on every self-heal (a healed snapshot is checked before it is served);
-- on demand, corpus-wide, via `catalog_scan_staleness(verify_results=True)`.
+- on every heal (a snapshot `ensure_materialized` writes is checked before it is
+  served);
+- on demand, corpus-wide, via `catalog_scan_staleness(verify_results=True)`, which
+  reads and never writes: a snapshot that is missing is reported as `absent` and
+  checked at the moment it next exists.
 
 A failure is surfaced loudly — a durable `unfaithful_heal` record in
-`errors.jsonl` (the UI badge and ADR D12's non-evictable marking), a stat
-cache wipe, session eviction, an SSE event — never only a log line. Its
-attribution has three classes with three different fixes:
+`errors.jsonl` (the UI badge, and the pin: the Cache page's delete leaves the file
+alone), a stat cache wipe, a forced reload of the open Buckaroo grid, an SSE
+event — never only a log line. Its attribution has four classes with four
+different fixes:
 
 | class | detector | meaning | response |
 |---|---|---|---|
+| engine | the xorq, xorq-datafusion or pyarrow version, or the snapshot format, differs from the one recorded at build | a library upgrade changed the result | rebuild the entry; the recipe is not implicated |
 | structural (#88) | recipe re-derives a different hash, sources unchanged | author-time value baked into the graph (`pd.Timestamp.now()`) | lint; rewrite recipe |
-| execution (#83) | fixed graph, digest moves across runs | `sample()`, `now()`, impure UDF | lint; pin entry to its snapshot, mark non-evictable |
+| execution (#83) | fixed graph, digest moves across runs | `sample()`, `now()`, impure UDF | lint; the file is pinned |
 | lineage (#163) | a read resolved a name post-build | machinery bug | impossible by construction under this contract |
 
-The third row is the point of the whole design: with reads going through the
-build, lineage drift has no mechanism left.
-
-[^preheal]: This replaced a two-layer workaround. Before the #163 fix,
-    chaining stripped the parent's cache node down to a bare file read of its
-    snapshot (the #75 single-backend fix), so the child's build pointed at a
-    parquet without knowing the file was regenerable — evict the snapshot and
-    the child read nothing. To compensate, the companion called
-    `cached_result_expr` on an entry just before handing its build to
-    Buckaroo and discarded the result: the call existed only for its side
-    effect, forcing any missing ancestor snapshots onto disk in time for
-    Buckaroo's replay. The stripping and the pre-heal call were both deleted
-    with the fix.
+Creating a materialized entry runs its query twice, so an execution-class entry
+is known from birth, and a mismatch at a later heal means something changed
+underneath a reproducible entry. The lineage row is the point of the whole
+design: with reads going through the build, lineage drift has no mechanism left.
 
 [^recon]: The subsystem the fix demoted: `_recipe_expr` re-imports an entry's
     `expr.py` to recover its expression, patching over the recipe's
@@ -542,7 +653,7 @@ build, lineage drift has no mechanism left.
 
 # Part 4 — The invariants
 
-Everything above compresses to five statements. Any change that breaks one is
+Everything above compresses to six statements. Any change that breaks one is
 wrong even if every test passes.
 
 - **I1 — A content hash names a fixed result.** Materializing an entry yields
@@ -553,10 +664,11 @@ wrong even if every test passes.
 - **I2 — Caches affect latency, never results.** Every answer must be
   byte-identical with all caches empty. Corollaries: cache keys derive only
   from immutable inputs; cached values are reproducible from the frozen build
-  alone; every read path has a cold seam (`cache_dir`); a self-heal is
-  reproduce-and-verify, never manufacture. Result bytes are manufactured
-  exactly once, at build — a read path that writes bytes the build didn't
-  define has become a second, unaudited build path.
+  alone; every read path has a cold seam (an empty `compute_cache/`); a
+  self-heal is reproduce-and-verify, never manufacture. Result bytes are
+  manufactured by one routine, `materialize`, which the build and every heal
+  call — a read path that writes bytes some other way has become a second,
+  unaudited build path.
 - **I3 — One read semantics.** Every consumer that materializes an entry
   reads the frozen build through the one canonical read. The recipe is never
   re-executed on behalf of an existing entry.
@@ -568,15 +680,24 @@ wrong even if every test passes.
 - **I5 — One question, one path.** Any question answerable two ways (grid vs
   API bytes, manifest row count vs live count) either shares one canonical
   path or carries an explicit check tying the two together; disagreement is
-  surfaced, never averaged over.
+  surfaced, never averaged over. A worthy entry's grid and its `/api/data` pages
+  read the same file.
+- **I6 — A page is a function of its request.** The same `(content_hash, sort,
+  offset, limit)` returns the same rows in any process and any cache state, because
+  every page is ordered by `__row_order`, which has no ties.
 
 ---
 
 # History
 
 This contract began as the proposed design for the #163 fix; the pre-fix
-deviations and the decisions that settled the design (D1–D12) are in
+deviations and the decisions that settled the design (ADR-006 D1–D12) are in
 [`plans/ADR-006-read-path-loads-builds.md`](../plans/ADR-006-read-path-loads-builds.md).
+The redesign that replaced xorq's cache nodes with tallyman's own materialization,
+added `__row_order` and redefined the digest is in
+[`plans/ADR-007-tallyman-owned-materialization.md`](../plans/ADR-007-tallyman-owned-materialization.md),
+[`plans/ADR-008-row-order-of-reads.md`](../plans/ADR-008-row-order-of-reads.md) and
+[`plans/ADR-009-digest-stability.md`](../plans/ADR-009-digest-stability.md).
 The wider audit of the same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes

@@ -502,6 +502,28 @@ def test_a_child_that_inlines_a_cheap_parent_can_make_the_ordered_copy_again(pro
     assert copy.is_file()
 
 
+def test_an_ordered_copy_is_made_again_for_an_entry_whose_manifest_does_not_record_it(
+    project, orders_parquet, monkeypatch
+):
+    """ADR-007 D13: a copy is made again from the record of whichever entry wrote it, so an entry that reaches a cheap
+    entry's graph by a path that records nothing (here ``cached_result_expr`` called from the recipe) still survives
+    the loss of ``compute_cache/``."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    root = _hash(catalog_create("orders", _root_code(project)))
+    code = f"""
+from tallyman_xorq.result_cache import cached_result_expr
+t = cached_result_expr({project!r}, {root!r})
+expr = t.filter(t.qty > 1)
+"""
+    child = build_and_persist(project, code).content_hash
+    assert not read_manifest(entry_dir(project, child)).ordered_copies
+    rows = _rows(project, child)
+    shutil.rmtree(compute_cache_dir(project))
+    cached_result_expr.cache_clear()
+
+    assert _rows(project, child) == rows
+
+
 def test_when_nothing_can_make_a_file_again_the_error_names_the_source(project, orders_parquet, monkeypatch):
     """ADR-007 D13: the clone is gone and the live source has changed, so the built rows are unrecoverable and the
     error names the source file."""

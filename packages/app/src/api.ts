@@ -145,8 +145,12 @@ export const api = {
     get(`/${project}/api/result_cache`),
 
   deleteResultCache: (project: string, hash: string): Promise<{ ok: boolean; hash: string }> =>
-    fetch(`/${project}/api/result_cache/${hash}`, { method: "DELETE" }).then((r) => {
-      if (!r.ok) throw new Error(`delete failed: HTTP ${r.status}`);
+    fetch(`/${project}/api/result_cache/${hash}`, { method: "DELETE" }).then(async (r) => {
+      if (!r.ok) {
+        // A pinned snapshot answers 409 with the reason in `detail`; show it instead of a bare status.
+        const body = await r.json().catch(() => null);
+        throw new Error(body?.detail ?? `delete failed: HTTP ${r.status}`);
+      }
       return r.json() as Promise<{ ok: boolean; hash: string }>;
     }),
 };

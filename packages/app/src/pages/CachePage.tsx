@@ -21,13 +21,13 @@ export function CachePage() {
 
   const handleDelete = async (hash: string) => {
     if (!project) return;
-    if (!confirm(`Delete the cached snapshot for ${hash.slice(0, 12)}?\n\nThe entry, code and alias stay — it re-bakes on next view.`)) return;
+    if (!confirm(`Delete the snapshot for ${hash.slice(0, 12)}?\n\nThe entry, code and alias stay — the snapshot is made again and verified the next time the entry is opened.`)) return;
     setDeleting((s) => new Set(s).add(hash));
     try {
       await api.deleteResultCache(project, hash);
       setEntries((prev) => prev.filter((e) => e.hash !== hash));
-    } catch {
-      alert("delete failed");
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "delete failed");
     } finally {
       setDeleting((s) => { const n = new Set(s); n.delete(hash); return n; });
     }
@@ -45,7 +45,8 @@ export function CachePage() {
             <span>{totalFormatted}</span> on disk
           </span>
           <span className="meta cache-note">
-            Deleting frees the snapshot only — code, build and stat cache stay; the entry re-bakes on next view.
+            Deleting frees the snapshot only — code, build and stat cache stay; the entry is made again and verified on next view.
+            A pinned snapshot cannot be made again faithfully, so it is kept.
           </span>
         </div>
 
@@ -81,14 +82,27 @@ export function CachePage() {
                           <span className="current-tag">current</span>
                         )}
                       </>
+                    ) : e.orphan ? (
+                      <span className="muted" title="Its entry is not in the catalog (a reset retired it)">
+                        (no entry)
+                      </span>
                     ) : (
                       <span className="muted">(scratch)</span>
                     )}
+                    {e.pinned && (
+                      <span className="current-tag" title={e.pinned_reason ?? ""}>
+                        pinned
+                      </span>
+                    )}
                   </td>
                   <td>
-                    <Link className="hash" to={`/${project}/catalog/${e.hash}`}>
-                      {e.hash}
-                    </Link>
+                    {e.orphan ? (
+                      <span className="hash">{e.hash}</span>
+                    ) : (
+                      <Link className="hash" to={`/${project}/catalog/${e.hash}`}>
+                        {e.hash}
+                      </Link>
+                    )}
                   </td>
                   <td className="prompt" title={e.prompt ?? ""}>
                     {e.prompt ?? <span className="muted">—</span>}
@@ -96,7 +110,8 @@ export function CachePage() {
                   <td className="action">
                     <button
                       className="del-btn"
-                      disabled={deleting.has(e.hash)}
+                      disabled={deleting.has(e.hash) || e.pinned}
+                      title={e.pinned ? (e.pinned_reason ?? "pinned") : undefined}
                       onClick={() => handleDelete(e.hash)}
                     >
                       {deleting.has(e.hash) ? "deleting…" : "delete"}

@@ -143,6 +143,11 @@ export interface CacheEntry {
   version: number | null;
   is_current: boolean;
   prompt: string | null;
+  // A snapshot file whose entry is not in the catalog (a reset retired the entry and left its file).
+  orphan?: boolean;
+  // A snapshot that cannot be made again faithfully is kept: delete is refused, and this says why.
+  pinned?: boolean;
+  pinned_reason?: string | null;
 }
 
 export interface ResultCache {

@@ -1,8 +1,11 @@
 """ADR-008 evidence (D10, D11, and the uniqueness note under D5): where a unique sort has to be imposed.
 
-Paddy's rule: when a supplied sort is not deterministic, the natural order is imposed into each ``order_by``. Today
-tallyman extends an author's sort only when it is the TOP node of the expression (``source_cache._canonical_sorted``).
-``original_row_order`` and ``id`` stand in for ``__row_order``, which is not implemented yet.
+Paddy's rule: when a supplied sort is not deterministic, the natural order is imposed into each ``order_by``. The
+figures recorded in ADR-008 were measured before that rule was implemented, when tallyman extended an author's sort
+only when it was the TOP node of the expression. The script now runs against the implemented rules, so questions 1 and
+2 show a sort that is not the last step being kept (``row_order.canonical_sorted``, which
+``source_cache._canonical_sorted`` re-exports). ``__row_order`` is the natural order in the small cases, and ``id``
+stands in for it in the 3,000,000-row cases, where the file position is the ``id``.
 
 Questions, in the order printed:
 
@@ -31,7 +34,8 @@ import pyarrow.parquet as pq  # noqa: E402
 import xorq.api as xo  # noqa: E402
 import xorq.vendor.ibis.expr.operations as ops  # noqa: E402
 
-from tallyman_xorq.source_cache import _canonical_sorted, _is_worthy_expr  # noqa: E402
+from tallyman_xorq.source_cache import _canonical_sorted  # noqa: E402
+from tallyman_xorq.worthiness import classify_expr  # noqa: E402
 
 N = 3_000_000
 RUNS = 5
@@ -53,20 +57,20 @@ def keys_of(expr) -> list[str]:
 
 def nonfinal_sorts() -> None:
     small = HOME / "small.parquet"
-    rows = {"name": list("abcdef"), "amount": [40, 10, 60, 20, 50, 30], "original_row_order": list(range(6))}
+    rows = {"name": list("abcdef"), "amount": [40, 10, 60, 20, 50, 30], "__row_order": list(range(6))}
     pq.write_table(pa.table(rows), small)
     t = xo.deferred_read_parquet(str(small))
     by_amount = t.order_by(t.amount.desc())
     shapes = {
         "order_by last": by_amount,
         "order_by, then mutate": by_amount.mutate(double=t.amount * 2),
-        "order_by, then select": by_amount.select("name", "amount", "original_row_order"),
+        "order_by, then select": by_amount.select("name", "amount", "__row_order"),
         "order_by, then filter": by_amount.filter(t.amount > 15),
     }
     print("1. parent rows are in the order 40, 10, 60, 20, 50, 30; the author asks for amount descending")
     for label, expr in shapes.items():
         written = _canonical_sorted(expr)
-        print(f"   {label:24s} worthy={_is_worthy_expr(expr)!s:5s} sort keys={keys_of(written)}")
+        print(f"   {label:24s} worthy={classify_expr(expr).worthy!s:5s} sort keys={keys_of(written)}")
         print(f"   {'':24s} written as {written.execute()['amount'].tolist()}")
     top3 = _canonical_sorted(by_amount.limit(3)).execute()["amount"].tolist()
     print(f"2. top 3 by amount is written as {top3}; the author asked for [60, 50, 40]")

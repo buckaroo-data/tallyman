@@ -1,21 +1,9 @@
 # ADR: Tallyman owns result materialization (no xorq cache nodes in builds)
 
-- **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session, which added the governing rule, decisions D10 to D12, and the
-  resolution recorded under D5, and again the same day after a review of
-  PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's
-  session-ending clause was dropped, and D12's rule was restated, and a third
-  time that day after a second review of PR #184: two kinds of entry were
-  confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass
-  reload, and D13 and D14 are new). Awaiting
-  Paddy's review; nothing here is implemented. Supersedes two decisions of
-  `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the
-  parent's cache node) and its D8 (the manifest records the snapshot key and
-  reads assert it). Five other ADR-006 decisions keep their intent: D5 (the
-  canonical sort), D6 (a missing build is a hard error), D7 (verification runs
-  in production and is loud), D10 (an unfaithful heal wipes the entry's
-  Buckaroo state) and D12 (unfaithful entries are pinned and badged). The last
-  three attach to `ensure_materialized`, which is this ADR's D5.
+- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
+  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
+  written; the differences between the text and the code are under "Implementation notes" below.
+  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, which added the governing rule, decisions D10 to D12, and the resolution recorded under D5, and again the same day after a review of PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's session-ending clause was dropped, and D12's rule was restated, and a third time that day after a second review of PR #184: two kinds of entry were confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass reload, and D13 and D14 are new). Awaiting Paddy's review; nothing here is implemented. Supersedes two decisions of `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the parent's cache node) and its D8 (the manifest records the snapshot key and reads assert it). Five other ADR-006 decisions keep their intent: D5 (the canonical sort), D6 (a missing build is a hard error), D7 (verification runs in production and is loud), D10 (an unfaithful heal wipes the entry's Buckaroo state) and D12 (unfaithful entries are pinned and badged). The last three attach to `ensure_materialized`, which is this ADR's D5.
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
@@ -834,6 +822,38 @@ with the change. Paddy, 2026-09-20: do normal TDD.
   tab open on an entry whose file the user deletes errors until the entry is
   reopened (D6). The snapshot of an entry that a reset retired stays on disk
   until the user deletes it (D14).
+
+## Implementation notes
+
+What the implementation does that the text above does not say, or says differently:
+
+- **Where the code is.** `src/tallyman_xorq/materialize.py` holds `snapshot_path`, `materialize`,
+  `ensure_materialized`, `single_partition_backend` and `pinned_reason`; `src/tallyman_xorq/ordered_copy.py` holds
+  ingest and the re-creation of ordered copies; `src/tallyman_xorq/result_cache.py` keeps `cached_result_expr` as the
+  canonical read. `cached_result_expr` and the heal both go through one internal `_ensure`, which returns whether the
+  entry is worthy.
+- **Open question 3 (where ordered copies live).** `compute_cache/ordered_sources/<key>.parquet`, where the key is an
+  md5 of the source's content digest and the reader options. It uses the digest and not the clone's path, so a project
+  cloned to another path names the same file. A sidecar `<key>.digest` beside each copy holds its content digest, and
+  is read back from the file if it is missing.
+- **The manifest.** `sources` keeps its shape (`{path: digest}`). The reader options and the copy's content digest are
+  in a new field, `ordered_copies`, keyed by the copy's file stem. A child records its parent's `ordered_copies` only
+  when the parent is cheap, because only then does the child's build read those copies directly.
+- **The view build (D6)** is written to `<entry>/.xorq_view_build/`, and a sibling `.complete` marker records the
+  snapshot path it was made for, so a project that moved regenerates it.
+- **The verify sweep (D5, D12)** reports `absent` (the hashes whose snapshot is missing) next to `results`,
+  `unfaithful` and `errors`, and writes nothing.
+- **Pinned files (D12).** `materialize.pinned_reason` answers whether a snapshot may be deleted: the manifest says
+  `reproducible: false`, or an `unfaithful_heal` record exists for the hash. `/api/result_cache` reports `pinned` and
+  `pinned_reason` per row and lists a file whose entry is gone as `orphan`; the delete route answers 409 with the reason.
+- **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
+  the whole build, including the recipe import, so a chained build waits for its parent's materialization.
+- **Clones (D13, D14).** `ensure_cas_path` clones to a unique temp name, since two builders cloning one source shared
+  one. `gc_cas` moves clones into `<catalog>/bullpen/cas/` when given a bullpen.
+- **Not done here.** The independent bugs listed under D9 step 3 (the chart error loop, eager notebook sessions, the
+  staleness scan re-hashing every source per entry, `tallyman pack` shipping the cache, the primary-key search, the
+  over-broad stat-cache wipes) change no hash and are follow-on work. #185, #186 and #188 are unchanged.
+
 
 ## Open questions
 

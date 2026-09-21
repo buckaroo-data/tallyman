@@ -1,6 +1,9 @@
 # ADR: Result digest as a row-multiset, and canonical snapshot ordering
 
 - **Status:** Proposed (2026-06-25)
+  Amended by `plans/ADR-009-digest-stability.md` (implemented in #189): `result_digest` is a digest of the
+  snapshot's Arrow content read back, `arrow-sha256:<hex>`, and no longer a SHA-256 of the file's bytes, which
+  is what Option A below recommends. The canonical sort it describes is unchanged.
 - **Affected code:** `src/tallyman_xorq/result_cache.py` (`_digest_update`,
   `count_and_result_digest`, `result_digest`, `verify_result_faithful`),
   `src/tallyman_xorq/build.py` (`build_and_persist` execute path,

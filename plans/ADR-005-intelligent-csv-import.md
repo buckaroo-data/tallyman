@@ -4,6 +4,9 @@
   order-stable reader swap), which is merged to `main` (`52afca7`). Resolves the
   CSV-ingest-contract cluster filed during the #137 review: **#141, #143, #144,
   #145**; **#142 is deferred** to the holistic edge-case pass (see below).
+  Amended by `plans/ADR-008-row-order-of-reads.md` (implemented in #189): INV-1's row-index column is named
+  `__row_order` (not `original_row_order`) and INV-2's trailing `order_by` is gone, so `tallyman_read_csv`
+  returns a plain read of an ordered copy that is keyed by the CSV's content.
 - **Affected code:** `src/tallyman_xorq/io.py` (`tallyman_read_csv`,
   `_polars_overrides`, `_IBIS_TO_POLARS`, a new schema-spec normaliser and a
   suggestion engine), `src/tallyman_mcp/server.py` (the `catalog_run` CSV

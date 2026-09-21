@@ -1,19 +1,9 @@
 # ADR: Digest stability (a heal is flagged only when the result changed)
 
-- **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session: D3 gains two format requirements from
-  `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is
-  new; and again the same day after a review of PR #184: D1 and D3 now say
-  what single-partition execution leaves undetermined, and D6's cheap-entry
-  half moved to #185; and a third time that day after a second review: D1 now
-  says how a loaded build gets onto the single-partition connection, and D3's
-  format version covers the ordered copies of sources). Awaiting Paddy's
-  review; nothing here is implemented. Amends
-  `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the
-  snapshot bytes") and decision D5 of
-  `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
-  "`result_digest` keeps its file-hash definition". The canonical sort itself
-  is unchanged and is still required.
+- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
+  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
+  written; the differences between the text and the code are under "Implementation notes" below.
+  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session: D3 gains two format requirements from `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is new; and again the same day after a review of PR #184: D1 and D3 now say what single-partition execution leaves undetermined, and D6's cheap-entry half moved to #185; and a third time that day after a second review: D1 now says how a loaded build gets onto the single-partition connection, and D3's format version covers the ordered copies of sources). Awaiting Paddy's review; nothing here is implemented. Amends `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the snapshot bytes") and decision D5 of `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said "`result_digest` keeps its file-hash definition". The canonical sort itself is unchanged and is still required.
 - **Reading decision labels:** a bare label such as "D2" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
@@ -438,6 +428,25 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - The row-group size and the materialization connection's `batch_size` are
   frozen for the life of the corpus, and so are the settings polars writes an
   ordered copy of a source with. Changing any of them is a rebuild (D3).
+
+## Implementation notes
+
+- **Where the code is.** `src/tallyman_xorq/digest.py` (`content_digest`, `column_digests`, `digests_of_batches`) and
+  `src/tallyman_xorq/materialize.py` (the writer, the single-partition connection, the two runs at create, the format
+  version and the engine versions).
+- **Nested types (open question 1).** Lists (and fixed-size and large lists), structs and maps are hashed recursively:
+  each keeps its own validity, lengths and values streams and one set per child, a map is hashed as a list of
+  `(key, value)` entries, and a type outside these (a union, an extension type) falls back to hashing the Python
+  values, which is slow and correct.
+- **The per-column digests** are what `differing_columns` reports when the two runs at create differ. A recipe with a
+  random column that is also part of the canonical sort key can reorder rows between the runs, so other columns may
+  be reported too.
+- **D3.** `SNAPSHOT_FORMAT_VERSION = 1` stands for the snapshot row-group size (1,048,576), the materialization
+  connection's batch size (8,192) and the ordered-copy row-group size (122,880). It is recorded in the manifest with
+  the xorq, xorq-datafusion and pyarrow versions.
+- **D4.** The heal record says the engine changed, naming the versions, when any recorded version or the format
+  differs from today's, and otherwise keeps the structural (#88) and execution (#83) attribution.
+
 
 ## Open questions
 

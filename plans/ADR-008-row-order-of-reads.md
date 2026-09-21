@@ -1,17 +1,9 @@
 # ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
-- **Status:** Proposed (2026-09-18, revised 2026-09-20 in the grilling
-  session, and again the same day after a review of PR #184, which made the
-  fix for #168 a precondition of D2 and D7, and a third time that day after a
-  second review: D4 and D6 were tightened, and D10 to D12 are new). Awaiting
-  Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy
-  proposed baking a row-order column into every file tallyman writes and
-  sorting every page by it. The measurements below favour that, so it is now
-  the decision and the engine setting is the rejected alternative under D5.
-  Amends `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position
-  of the row-order column) and INV-2 (the trailing `order_by`). Corrects a
-  threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5
-  (the canonical sort) and three other places.
+- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
+  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
+  written; the differences between the text and the code are under "Implementation notes" below.
+  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, and again the same day after a review of PR #184, which made the fix for #168 a precondition of D2 and D7, and a third time that day after a second review: D4 and D6 were tightened, and D10 to D12 are new). Awaiting Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy proposed baking a row-order column into every file tallyman writes and sorting every page by it. The measurements below favour that, so it is now the decision and the engine setting is the rejected alternative under D5. Amends `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position of the row-order column) and INV-2 (the trailing `order_by`). Corrects a threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5 (the canonical sort) and three other places.
 - **Context:** the 2026-09-18 cache audit (tallyman @ `a748ea6`, buckaroo
   0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7).
 - **Tickets:** #168 (CSV sources bypass source identity; D2 and D7 depend on
@@ -687,6 +679,32 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - The grid stays unstable until Buckaroo's half (buckaroo-data/buckaroo#974)
   lands: above 10 MB when unsorted, and at any size when sorted by a column
   with ties.
+
+## Implementation notes
+
+- **Where the code is.** `src/tallyman_xorq/row_order.py` (the reserved name, the tie-break, hoisting, the assignment
+  and join checks, and `page`, the one helper that turns an entry and a sort into a page),
+  `src/tallyman_xorq/worthiness.py` (`classify_expr`, the D4 test) and `src/tallyman_xorq/ordered_copy.py` (D2).
+  `source_cache.rewrite_for_build` is the one place the checks run.
+- **D6, three-way joins.** The second review found that ibis raised `IntegrityError` from the canonical sort. The
+  canonical sort is now built without going through that ibis path, and the same recipe then builds and loses the third
+  entry's `__row_order` silently. So the build checks for it explicitly: a join chain whose first side and two or more
+  right-hand sides carry the column is a build error that shows the `.drop("__row_order")` fix. `translate_collision`
+  still turns the raw ibis message into the same instruction if it appears at execution.
+- **D6, rename.** `t.rename(__row_order="x")` cannot assign to the column: ibis resolves a rename onto an existing name in
+  favour of the existing column, so the graph holds no assignment to detect. `select` and `mutate` assign, and are
+  build errors.
+- **D11, hoisting.** Only the keys the author wrote count. The tie-break appended to a sort (`__row_order` and the
+  other columns) is added again at the top, so a later select may drop those columns.
+- **D5.** `/api/data` pages with `row_order.page`, which orders by the user's keys and then `__row_order`; the route takes no
+  user sort yet. Buckaroo's half is unchanged and waits on buckaroo-data/buckaroo#974 (tallyman sends
+  `row_order_column`, which 0.15.6 ignores).
+- **Open question 1 and 2** were implemented as the uniform rule: every parquet source gets an ordered copy, and the
+  column is `__row_order`. **Open question 5** is answered by ADR-007 D13: the manifest's `ordered_copies` records the
+  copy's content digest, and a re-created copy is checked against it (a mismatch is loud and served).
+- **A CSV that already has a `__row_order` column** has it overwritten, like a parquet source; the previous check that
+  the column was a canonical `0..N-1` sequence is gone, and `original_row_order` is ordinary data.
+
 
 ## Open questions
 

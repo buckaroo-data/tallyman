@@ -61,7 +61,7 @@ Source of truth: `datafusion/common/src/config.rs` and the
 | `datafusion.execution.target_partitions` | `0` → CPU cores | The master knob. `1` → single partition → no round-robin, no file split, no arbitrary coalesce → deterministic file-order output. Also single-threaded. |
 | `datafusion.optimizer.repartition_file_scans` | `true` | When true (+ `target_partitions>1` + file ≥ min size), a single file is byte-range-split across partitions and merged → reorders. `false` keeps one file in one partition, read in order. (alamb's recommended flag.) |
 | `datafusion.optimizer.enable_round_robin_repartition` | `true` | Inserts `RepartitionExec(RoundRobinBatch)` → "arbitrary interleaving (and thus unordered)." Not exposed as a xorq builder method, but reachable via the generic `.set(...)`. |
-| `datafusion.optimizer.repartition_file_min_size` | `1048576` (1 MiB) | Threshold below which a file is never split. Small test files look "deterministic" only because they are under this. |
+| `datafusion.optimizer.repartition_file_min_size` | `10485760` (10 MiB in xorq-datafusion 0.2.7) | Threshold below which a file is never split. Small test files look "deterministic" only because they are under this. |
 | `datafusion.optimizer.prefer_existing_sort` | `false` | Preserves only a *declared* ordering (`preserve_order=true` on `RepartitionExec` + `SortPreservingMergeExec`). No-op for an undeclared scan. |
 
 Not relevant to a plain scan: `repartition_aggregations`, `repartition_windows`,

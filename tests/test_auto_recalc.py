@@ -36,7 +36,7 @@ def _src_code(project: str, src: str = "orders.parquet") -> str:  # a source pro
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file({src!r}, project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
 
 
@@ -44,7 +44,7 @@ def _src_code_v2(project: str, src: str = "orders.parquet") -> str:  # different
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file({src!r}, project={project!r})
-expr = t.select("region", "price").mutate(extra=1)
+expr = t.select("region", "price", "__row_order").mutate(extra=1)
 """
 
 

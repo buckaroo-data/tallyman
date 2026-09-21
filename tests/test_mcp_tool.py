@@ -6,9 +6,10 @@ from tallyman_mcp.server import catalog_list, catalog_load_parquet, catalog_run
 
 
 def _code(parquet: Path) -> str:
+    # The parquet sits in the project's data dir and enters a recipe through read_project_file (ADR-008 D12).
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet.name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -72,9 +73,9 @@ def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_parquet: 
     # advisory lint in the tool reply so the model/user sees it (#88).
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-import xorq.api as xo
 import xorq.vendor.ibis as ibis
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({orders_parquet.name!r})
 expr = t.mutate(built_at=ibis.now())
 """
     out = catalog_run(code, prompt="nondeterministic")

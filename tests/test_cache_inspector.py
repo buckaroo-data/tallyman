@@ -41,7 +41,7 @@ def _cheap_code(project: str) -> str:  # projection → cheap, bakes no snapshot
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
 
 

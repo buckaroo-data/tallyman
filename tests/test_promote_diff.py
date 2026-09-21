@@ -259,7 +259,7 @@ def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: s
     foll = catalog_create(
         "foll",
         "from tallyman_xorq.io import tracked_expr_from_alias\n"
-        "t = tracked_expr_from_alias('mydiff')\nexpr = t.select('region')\n",
+        "t = tracked_expr_from_alias('mydiff')\nexpr = t.select('region', '__row_order')\n",
     )["hash"]
 
     catalog_revise("ss", _agg_code(project))  # v3 → the latest-two diff now differs

@@ -42,7 +42,7 @@ def _current_hash(project: str) -> str:
 
 def test_resolve_detects_and_caches(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    catalog_create("rides", _select(project, '"order_id", "region", "price", "__row_order"'))
     h = _current_hash(project)
     assert resolve_primary_key(project, h) == ["order_id"]  # order_id is unique
     assert (entry_dir(project, h) / "primary_key.json").exists()  # cached
@@ -52,9 +52,9 @@ def test_resolve_detects_and_caches(project, orders_parquet, monkeypatch):
 
 def test_row_preserving_revision_inherits_key(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    catalog_create("rides", _select(project, '"order_id", "region", "price", "__row_order"'))
     base = _current_hash(project)
-    catalog_revise("rides", _select(project, '"price", "region", "order_id"'))  # reorder
+    catalog_revise("rides", _select(project, '"price", "region", "order_id", "__row_order"'))  # reorder
     child = _current_hash(project)
     assert child != base
     assert _parent_hash(project, child) == base
@@ -66,9 +66,9 @@ def test_row_preserving_revision_inherits_key(project, orders_parquet, monkeypat
 
 def test_dropping_key_column_breaks_inheritance(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    catalog_create("rides", _select(project, '"order_id", "region", "price", "__row_order"'))
     base = _current_hash(project)
-    catalog_revise("rides", _select(project, '"region", "price"'))  # drops order_id
+    catalog_revise("rides", _select(project, '"region", "price", "__row_order"'))  # drops order_id
     child = _current_hash(project)
     # order_id no longer present → can't be the join key for the pair
     assert diff_keys(project, base, child) != ["order_id"]
@@ -89,7 +89,7 @@ def test_search_times_out_without_caching(project, orders_parquet, monkeypatch):
 
 def test_search_within_budget_still_finds_key(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    catalog_create("rides", _select(project, '"order_id", "region", "price", "__row_order"'))
     h = _current_hash(project)
     # A unique single column is found in a couple of queries, well inside budget.
     monkeypatch.setattr(pk, "_clock", _ticking_clock(0.3))

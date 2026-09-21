@@ -8,9 +8,10 @@ from tallyman_xorq import build_and_persist, read_prompts
 
 
 def _code(parquet: Path) -> str:
+    # The parquet sits in the project's data dir and enters a recipe through read_project_file (ADR-008 D12).
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet.name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 

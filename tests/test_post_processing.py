@@ -171,7 +171,7 @@ def _cheap_code(project: str) -> str:  # parquet read + projection → cheap, ba
     return (
         "from tallyman_xorq.io import read_project_file\n"
         f"t = read_project_file('orders.parquet', project={project!r})\n"
-        "expr = t.select('region', 'price')\n"
+        "expr = t.select('region', 'price', '__row_order')\n"
     )
 
 

@@ -11,7 +11,7 @@ from tallyman_mcp.server import catalog_create, catalog_revise
 # legal.
 
 
-def _src(project: str, cols: str = '"region", "price"') -> str:
+def _src(project: str, cols: str = '"region", "price", "__row_order"') -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
@@ -58,6 +58,6 @@ def test_revise_allows_pin_by_hash_of_prior_version(project, orders_parquet, mon
 def test_revise_allows_inlined_source(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("parking", _src(project))
-    out = catalog_revise("parking", _src(project, cols='"region"'))  # inline, no alias ref
+    out = catalog_revise("parking", _src(project, cols='"region", "__row_order"'))  # inline, no alias ref
     assert "error" not in out, out
     assert out.get("version") == 2

@@ -45,7 +45,7 @@ def _parent_code(project: str) -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "category", "price")
+expr = t.select("region", "category", "price", "__row_order")
 """
 
 
@@ -53,7 +53,7 @@ def _parent_v2_code(project: str) -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.filter(t.category == "boots").select("region", "category", "price")
+expr = t.filter(t.category == "boots").select("region", "category", "price", "__row_order")
 """
 
 

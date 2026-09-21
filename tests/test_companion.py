@@ -9,9 +9,10 @@ from tallyman_xorq import build_and_persist
 
 
 def _build_one(project: str, parquet: Path) -> str:
+    # The parquet sits in the project's data dir and enters a recipe through read_project_file (ADR-008 D12).
     code = f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet.name!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
     return build_and_persist(project, code, prompt="by region").content_hash
@@ -89,7 +90,7 @@ def test_api_data_cheap_entry_serves_page_without_materialising(
     code = f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
     rp = entry_dir(project, h) / "result.parquet"
@@ -101,7 +102,7 @@ expr = t.select("region", "price")
     body = r.json()
     assert body["total"] == 200  # from the manifest's row_count, not a parquet
     assert len(body["data"]) == 10
-    assert set(body["data"][0]) == {"region", "price"}
+    assert set(body["data"][0]) == {"region", "price", "__row_order"}
 
     assert not rp.exists()  # #90: serving a page wrote no per-entry result.parquet
 
@@ -154,7 +155,7 @@ def test_api_data_cheap_entry_paginates_consistently_across_pages(
     code = f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("order_id", "region", "price")
+expr = t.select("order_id", "region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cheap").content_hash
     assert not (entry_dir(project, h) / "result.parquet").exists()  # cheap: no snapshot
@@ -186,7 +187,7 @@ def test_api_data_missing_manifest_serves_page_without_500(
     code = f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
     (entry_dir(project, h) / "manifest.json").unlink()  # half-built / pruned entry
@@ -196,7 +197,7 @@ expr = t.select("region", "price")
     assert r.status_code == 200  # served off the expression, not the manifest
     body = r.json()
     assert len(body["data"]) == 10
-    assert set(body["data"][0]) == {"region", "price"}
+    assert set(body["data"][0]) == {"region", "price", "__row_order"}
     assert body["total"] == 0  # no manifest → best-effort total, not a crash
 
 

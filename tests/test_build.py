@@ -11,17 +11,17 @@ from tallyman_xorq import BuildError, build_and_persist, list_entries
 
 def _agg_code(parquet_path: Path) -> str:
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet_path.name!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _cheap_code(parquet_path: Path) -> str:  # parquet read + projection → cheap, bakes nothing
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
-expr = t.select("region", "price")
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet_path.name!r})
+expr = t.select("region", "price", "__row_order")
 """
 
 
@@ -132,8 +132,8 @@ def test_cheap_build_validates_row_projection(project: str):
 
     def _cast_code(parquet: Path) -> str:
         return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet.name!r})
 expr = t.mutate(dd=t.d.cast("date"))
 """
 
@@ -161,8 +161,8 @@ def test_build_idempotent_same_code(project: str, orders_parquet: Path):
 def test_build_distinct_code_distinct_hash(project: str, orders_parquet: Path):
     code_a = _agg_code(orders_parquet)
     code_b = f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({orders_parquet.name!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
@@ -193,9 +193,9 @@ def test_build_hints_bare_ibis_import(project: str, orders_parquet: Path):
     # the real ibis package doesn't expose all the methods xorq does. The
     # BuildError should include a hint pointing at xorq.vendor.ibis.
     code = f"""
-import xorq.api as xo
 import ibis
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({orders_parquet.name!r})
 expr = t.mutate(flag=ibis.case().when(t.price > 50, "hi").else_("lo").end())
 """
     with pytest.raises(BuildError, match="import xorq.vendor.ibis as ibis"):
@@ -204,9 +204,9 @@ expr = t.mutate(flag=ibis.case().when(t.price > 50, "hi").else_("lo").end())
 
 def test_build_no_hint_on_unrelated_error(project: str, orders_parquet: Path):
     code = f"""
-import xorq.api as xo
 import xorq.vendor.ibis as ibis
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({orders_parquet.name!r})
 expr = t.nonexistent_column.sum()
 """
     with pytest.raises(BuildError) as excinfo:
@@ -280,9 +280,9 @@ expr = t.group_by("region").aggregate(n=t.count())
 
 def _nondeterministic_code(parquet_path: Path) -> str:
     return f"""
-import xorq.api as xo
 import xorq.vendor.ibis as ibis
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet_path.name!r})
 expr = t.mutate(built_at=ibis.now())
 """
 

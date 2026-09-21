@@ -27,17 +27,18 @@ from tallyman_xorq import build_and_persist
 
 
 def _agg_code(parquet_path: Path) -> str:
+    # A parquet file enters a recipe through read_project_file (ADR-008 D12); the file sits in the project's data dir.
     return (
-        "import xorq.api as xo\n"
-        f"t = xo.deferred_read_parquet({str(parquet_path)!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file({parquet_path.name!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
     )
 
 
 def _agg_code_n(parquet_path: Path, agg: str) -> str:
     return (
-        "import xorq.api as xo\n"
-        f"t = xo.deferred_read_parquet({str(parquet_path)!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file({parquet_path.name!r})\n"
         f"expr = t.group_by('region').aggregate({agg})\n"
     )
 
@@ -321,37 +322,42 @@ def test_back_then_forward_restores_recipe(project, orders_parquet):
 
 def test_connect_shim_matches_xorq_api_connect(project, orders_parquet, monkeypatch):
     """The catalog-free connect shim is equivalent to xorq.api.connect(): it
-    builds the same datafusion backend, so a ParquetSnapshotCache(source=shim)
-    derives the SAME content-addressed snapshot key and bakes the SAME result
-    data. A naive swap to xorq.expr.api.connect (ibis's connect(resource,
-    **kwargs)) would resolve the symbol then build the wrong backend or fail at
-    call time (Risk #3) — this is the central Cut-B correctness claim.
+    builds the same datafusion backend, so a materialization run through the
+    shim (``single_partition_backend`` connects through it) writes the SAME
+    result data as one run through ``xorq.api.connect``. A naive swap to
+    xorq.expr.api.connect (ibis's connect(resource, **kwargs)) would resolve the
+    symbol then build the wrong backend or fail at call time (Risk #3) — this is
+    the central Cut-B correctness claim.
 
-    Not raw-byte equality: datafusion's group-by output order (and parquet
-    metadata) isn't deterministic, so even one backend re-baking the same expr
-    yields different bytes. The content-addressed *key* and the *data* are what
-    must match.
+    The claim used to include "and derives the same snapshot key" for a
+    ``ParquetSnapshotCache(source=shim)``; no build carries a xorq cache node any
+    more (ADR-007 D1) and a snapshot's name is its content hash (ADR-007 D2), so
+    what is left is the backend's identity and the data.
+
+    Not raw-byte equality: parquet metadata isn't part of the claim. The
+    *backend* (kind and idx-stripped profile) and the *data* are what must match.
     """
     import pandas as pd
     import xorq.api as xo
 
-    from tallyman_xorq.result_cache import _cached_node_path, _recipe_expr
-    from tallyman_xorq.source_cache import rewrite_for_build
+    from tallyman_xorq.backend import connect
+    from tallyman_xorq.materialize import materialize, snapshot_path
+    from tallyman_xorq.result_cache import _profile_content_token
 
-    res = build_and_persist(project, _agg_code(orders_parquet))  # bakes via the shim
-    raw = _recipe_expr(project, res.content_hash)
-    shim_path = _cached_node_path(rewrite_for_build(raw, project))
-    assert shim_path is not None and shim_path.exists(), "the shim must bake a real snapshot"
-    shim_df = pd.read_parquet(shim_path).sort_values("region").reset_index(drop=True)
+    shim, api = connect(), xo.connect()
+    assert type(shim) is type(api)
+    assert _profile_content_token(shim) == _profile_content_token(api), "the shim must build the same kind of backend"
 
-    # rewrite_for_build does `from tallyman_xorq.backend import connect` at call
-    # time, so patching the shim's source reroutes the next derive/bake.
+    res = build_and_persist(project, _agg_code(orders_parquet))  # materialized through the shim
+    snap = snapshot_path(project, res.content_hash)
+    assert snap.exists(), "the shim must write a real snapshot"
+    shim_df = pd.read_parquet(snap).sort_values("region").reset_index(drop=True)
+
+    # single_partition_backend does `from tallyman_xorq.backend import connect` at call time, so patching the shim's
+    # source reroutes the next materialization through xorq.api.connect.
     monkeypatch.setattr("tallyman_xorq.backend.connect", xo.connect)
-    api_expr = rewrite_for_build(raw, project)
-    assert _cached_node_path(api_expr) == shim_path, "shim and xorq.api.connect must share the snapshot key"
-    shim_path.unlink()  # evict, then re-bake via xorq.api.connect
-    api_expr.count().execute()
-    api_df = pd.read_parquet(shim_path).sort_values("region").reset_index(drop=True)
+    materialize(project, res.content_hash)  # re-materialize (a create always runs the query and replaces the file)
+    api_df = pd.read_parquet(snap).sort_values("region").reset_index(drop=True)
     pd.testing.assert_frame_equal(shim_df, api_df)
 
 
@@ -425,8 +431,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
         ".gitignore",
         "aliases.jsonl",
         "notebook.jsonl",
-        "entries.jsonl",
-        "compute_cache.jsonl",
+        "entries.jsonl",  # no compute_cache.jsonl: a reset leaves compute_cache/ alone (ADR-007 D14)
         f"entries/{h}.zip",
         f"chart_specs/{h}.vl.json",
         f"display_configs/{h}.json",

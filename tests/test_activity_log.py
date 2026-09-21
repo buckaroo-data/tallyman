@@ -16,7 +16,7 @@ from tallyman_mcp.server import catalog_create, catalog_revise, catalog_run
 _BAD = "x = 5  # never binds `expr` → BuildError"
 
 
-def _ok_code(project: str, cols: str = '"region", "price"') -> str:
+def _ok_code(project: str, cols: str = '"region", "price", "__row_order"') -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
@@ -43,7 +43,7 @@ def test_build_error_records_event_with_traceback(project, orders_parquet, monke
 def test_alias_create_and_revise_record_alias_events(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoes", _ok_code(project))
-    catalog_revise("shoes", _ok_code(project, cols='"region"'))  # different projection → V2
+    catalog_revise("shoes", _ok_code(project, cols='"region", "__row_order"'))  # different projection → V2
 
     aliases = [e for e in read_events(project, categories=["alias"]) if e["alias"] == "shoes"]
     assert len(aliases) >= 2

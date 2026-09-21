@@ -141,8 +141,8 @@ def segfault_git_repo(tmp_path: Path, monkeypatch) -> Path:
 
 def _agg_code(parquet_path: Path) -> str:
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import read_project_file
+t = read_project_file({parquet_path.name!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 

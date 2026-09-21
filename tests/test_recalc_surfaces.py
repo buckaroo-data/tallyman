@@ -20,7 +20,7 @@ def _base_code(project: str) -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+expr = t.select("region", "price", "__row_order")
 """
 
 
@@ -28,7 +28,7 @@ def _base_code_v2(project: str) -> str:
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price").mutate(extra=1)
+expr = t.select("region", "price", "__row_order").mutate(extra=1)
 """
 
 

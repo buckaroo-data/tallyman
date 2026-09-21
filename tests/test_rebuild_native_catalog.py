@@ -40,8 +40,8 @@ def _load_rebuild():
 def _agg(parquet: Path, *, avg: bool = False) -> str:
     extra = ", avg=t.price.mean()" if avg else ""
     return (
-        "import xorq.api as xo\n"
-        f"t = xo.deferred_read_parquet({str(parquet)!r})\n"
+        "from tallyman_xorq.io import read_project_file\n"
+        f"t = read_project_file({parquet.name!r})\n"
         f"expr = t.group_by('region').aggregate(n=t.count(){extra})\n"
     )
 

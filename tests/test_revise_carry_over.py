@@ -25,7 +25,7 @@ def test_revise_carries_chart_and_display_config(project, orders_parquet, monkey
     new version's fresh hash would otherwise orphan them ("chart didn't carry
     over")."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("rides", _select(project, '"order_id", "region", "price"'))
+    catalog_create("rides", _select(project, '"order_id", "region", "price", "__row_order"'))
     base = _current_hash(project)
 
     chart = {"mark": "bar", "encoding": {"x": {"field": "region"}, "y": {"field": "price"}}}
@@ -33,7 +33,7 @@ def test_revise_carries_chart_and_display_config(project, orders_parquet, monkey
     set_chart(project, base, chart)
     set_display_config(project, base, display)
 
-    catalog_revise("rides", _select(project, '"price", "region", "order_id"'))  # reorder
+    catalog_revise("rides", _select(project, '"price", "region", "order_id", "__row_order"'))  # reorder
     child = _current_hash(project)
     assert child != base
 

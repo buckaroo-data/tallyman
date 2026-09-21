@@ -93,16 +93,20 @@ When the expression is added, it is also executed and cached, along with summary
 - **Content-addressed entries.** An entry's identity is a hash of its
   expression structure plus its source-file digests. Same code + same inputs →
   same hash → same directory on disk. Resubmitting identical work is free.
-- **Two-axis caching.** A source axis caches reads of input files; a result axis
-  bakes a snapshot for entries judged expensive (aggregates, joins, sorts,
-  windows, UDFs). Cheap row-preserving entries recompute rather than pay for
+- **Materialize what is expensive.** Each input file is read once into an
+  ordered copy that numbers its rows, and an entry judged expensive (aggregates,
+  joins, sorts, windows, UDFs) has its result written to a snapshot file when it
+  is created. Cheap row-preserving entries recompute rather than pay for
   storage.
-- **Snapshots self-heal.** An evicted snapshot rematerializes transparently on
-  the next read.
-- **Result digest.** Baked entries record a hash of their executed bytes as a
-  row multiset. If a rebuild disagrees with the recorded digest, the expression
-  is nondeterministic (sampling, `now()`, an impure UDF, source drift) and
-  tallyman says so instead of silently serving different numbers.
+- **Snapshots self-heal.** A deleted snapshot is rewritten, and checked against
+  the digest recorded when it was first written, before anything reads it.
+- **Result digest.** Materialized entries record a digest of their result,
+  computed from the contents of the file and not its bytes, so a different
+  parquet writer or row-group size does not change it. A new entry's query is
+  also run twice when it is created. If the two runs, or a later rebuild,
+  disagree with the recorded digest, the expression is nondeterministic
+  (sampling, `now()`, an impure UDF, source drift) and tallyman says so instead
+  of silently serving different numbers.
 - **Nothing lives in a kernel.** All catalog state is on disk. The MCP server
   holds no in-memory state at all.
 
@@ -376,19 +380,25 @@ rebuild so parents finish before children, and each entry is rebuilt exactly
 once no matter how many paths reach it. Pre-existing staleness elsewhere in the
 catalog is left alone and logged rather than swept into the walk.
 
-**Caching runs on two axes with a worthiness rubric.** Reads of source files are
-cached on one axis. On the other, results are baked to a snapshot only for
-entries judged expensive — those whose plan contains an aggregate, join, sort,
-window, or UDF. A cheap row-preserving projection recomputes on read instead of
-paying storage, because recomputing it is cheaper than storing it. Evicted
-snapshots self-heal: a cold read rematerializes transparently.
+**Materialization follows a worthiness rubric.** Each input file is read once
+into an ordered copy, which numbers the rows in file order so that every page of
+every entry is the same page on every request. A result is written to a snapshot
+only for entries judged expensive — those whose plan contains an aggregate,
+join, sort, window, or UDF, or that cannot inherit a row order. A cheap
+row-preserving projection recomputes on read instead of paying storage, because
+recomputing it is cheaper than storing it. Tallyman writes these files itself
+and runs an entry's query when the entry is created, so a failure shows up in
+the tool call that made the entry. A deleted snapshot is rewritten, and checked,
+the next time something reads it.
 
-**Determinism is audited, not assumed.** Baked entries record a digest of their
-executed bytes, computed as a row *multiset* so that scan-order nondeterminism
-doesn't produce false alarms. If a rebuild disagrees with the recorded digest,
-something in the expression is nondeterministic — sampling, `now()`, an impure
-UDF, or source drift — and tallyman reports it rather than silently serving
-different numbers under the same hash.
+**Determinism is audited, not assumed.** Materialized entries record a digest of
+their result, computed from the contents of the file and in a fixed row order,
+so scan-order nondeterminism and writer details don't produce false alarms. A
+new entry's query is run twice when it is created. If the runs, or a later
+rebuild, disagree with the recorded digest, something in the expression is
+nondeterministic — sampling, `now()`, an impure UDF, or source drift — and
+tallyman reports it rather than silently serving different numbers under the
+same hash.
 
 **State lives on disk; there is no kernel.** The MCP server holds no in-memory
 state at all, and the companion holds only its list of SSE subscribers. This is

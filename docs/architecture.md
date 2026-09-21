@@ -39,7 +39,7 @@ in-memory catalog state, and the companion holds only its SSE subscriber list.
   React SPA (packages/app) in the browser
       │  embeds grids
       ▼
-  Buckaroo subprocess (:8700) ◄─── companion POSTs xorq_build/ dirs
+  Buckaroo subprocess (:8700) ◄─── companion POSTs build dirs
    (interactive dataframe grids, sort/search push down to xorq)
 ```
 
@@ -70,8 +70,8 @@ aliases with version history, the notebook cell list, chart specs, display
 configs, project-global post-processing and summary-stat functions, and the
 prompt/error/event logs. It manages the git-backed checkpoint transaction
 (capture pointers, zip recipes, stage, commit, tag) and the reset-to-revision
-operation that rewinds the catalog and reconciles untracked build artifacts
-through a holding area called the bullpen. A key invariant lives here:
+operation that rewinds the catalog and reconciles untracked entry directories
+and source clones through a holding area called the bullpen. A key invariant lives here:
 `assert_catalog_consistent` enforces an allow-listed tracked surface and
 verifies that every hash referenced by an alias, chart, or display config has a
 durable recipe zip. The call direction is one-way: `catalog_state` calls
@@ -79,10 +79,11 @@ durable recipe zip. The call direction is one-way: `catalog_state` calls
 
 **tallyman_xorq** (`src/tallyman_xorq/`) is the xorq integration layer. It
 compiles a xorq expression into a content-addressed entry, computes the content
-hash from the expression structure (and, in some source-identity modes, the
-source file digests), decides whether the entry is expensive enough to bake a
-result snapshot, and writes a portable build directory whose absolute paths are
-rewritten to `${TALLYMAN_PROJECT_ROOT}` placeholders. It also implements
+hash from the expression structure (which covers each source's content, because
+a recipe reads an ordered copy named by the source's digest), decides once
+whether the entry is worthy of a materialized result file, writes that file
+itself (`materialize`), and writes a portable build directory whose absolute
+paths are rewritten to `${TALLYMAN_PROJECT_ROOT}` placeholders. It also implements
 reactive staleness detection (comparing recorded manifest fields against the
 current world) and the recalc cone that recomputes dependents in dependency
 order. Reconstruction of an entry's expression from its persisted `expr.py`
@@ -121,7 +122,7 @@ runs the companion and the MCP service, and owns the Buckaroo subprocess via
 `BuckarooManager`, which spawns `python -m buckaroo.server` on port 8700 (or a
 random free port) and exits when its stdin closes. It also provides `serve`
 (read-only companion against a project directory anywhere on disk), `pack`
-(portable tarball excluding cache and session state), `reset-to` / `revisions`,
+(portable tarball of the project directory), `reset-to` / `revisions`,
 and storyboard `replay` for deterministic rehearsal. See [installing.md](installing.md).
 
 **Frontend** (`packages/app/`) is the React 18 + Vite SPA. It builds to `dist/`
@@ -142,7 +143,6 @@ itself is a git repository at `<project>/artifacts/catalog/`.
 ```
 ~/.tallyman-notebooks/
   active_project                     # one line: the active project name
-  buckaroo_sessions.json             # global session map {hash: {session_id, project, started_at}}
   projects/<project>/
     artifacts/
       catalog/                       # git repo — the tracked catalog
@@ -151,15 +151,16 @@ itself is a git repository at `<project>/artifacts/catalog/`.
         entries.jsonl                # pointer list, one {hash} per line
         aliases.jsonl                # one {alias, latest, history:[V1,V2,...]} per line
         notebook.jsonl               # one {cell_id, alias, markdown} per cell
-        compute_cache.jsonl          # pointer list of warm cache files
         config.json                  # project settings, e.g. {auto_recalc: bool}
         chart_specs/<hash>.vl.json   # Vega-Lite specs, keyed by content hash
         display_configs/<hash>.json  # {column_config_overrides, diff_provenance}
         post_processing/<name>.py    # process(expr) functions (_disabled/ = soft-deleted)
         stats/<name>.py              # compute(col) functions (_disabled/ = soft-deleted)
         prompts/<hash>.jsonl         # append-only per-entry prompt history
-        bullpen/                     # untracked holding area for evicted entries/caches
-        compute_cache/               # untracked baked result snapshots (xorq)
+        bullpen/                     # untracked holding area (entries/, cas/) a reset retires files to
+        compute_cache/               # untracked cache files tallyman writes:
+          result_cache/<hash>.parquet         # snapshots of worthy entries
+          ordered_sources/<key>.parquet       # ordered copies of sources
         diff_stat_cache/             # untracked Buckaroo diff-stat caches per entry pair
         .gitignore                   # deny-by-default (entries/*/, bullpen/, caches, *.tmp)
       display/<name>.py              # display klass files (ColAnalysis subclasses)
@@ -179,23 +180,27 @@ Key formats and what's tracked vs untracked:
   The zip writer only runs inside a checkpoint.
 - **Entry build dir** (`entries/<hash>/`) is ephemeral and gitignored. It holds
   `manifest.json` (the build-completeness sentinel), the load-time-expanded
-  `.xorq_build_expanded/`, and per-entry caches (`.buckaroo_stat_cache/`). A
+  `.xorq_build_expanded/`, the `.xorq_view_build/` handed to Buckaroo for a
+  worthy entry, and per-entry caches (`.buckaroo_stat_cache/`). A
   directory without a `manifest.json` is treated as partial/crashed and is not
   zipped.
 - **Manifest** (`manifest.json`) carries entry metadata: `content_hash`,
-  `result_digest`, `sources` (`{rel_path: digest}`), `parents` (DAG edges),
-  `row_count`, `compile_seconds`, `execute_seconds`, `cache_worthy`,
-  `cache_bytes`. Written atomically (temp file + `os.replace`).
-- **JSONL pointer files** (`entries.jsonl`, `compute_cache.jsonl`) and the
-  structured logs (`prompts/`, `errors.jsonl`, `events.jsonl`) are
-  append-oriented and line-delimited. They replaced the single `catalog.yaml`
-  that older docs reference.
+  `result_digest`, `sources` (`{rel_path: digest}`), `ordered_copies` (how each
+  ordered copy of a source was made), `parents` (DAG edges), `row_count`,
+  `compile_seconds`, `execute_seconds`, `cache_worthy` and `cache_worthy_why`,
+  `cache_bytes`, `reproducible`, `snapshot_format` and `engine_versions`.
+  Written atomically (temp file + `os.replace`).
+- **JSONL pointer file** (`entries.jsonl`) and the structured logs
+  (`prompts/`, `errors.jsonl`, `events.jsonl`) are append-oriented and
+  line-delimited. They replaced the single `catalog.yaml` that older docs
+  reference.
 - **Activity logs** (`events.jsonl`, `errors.jsonl`) live in `artifacts/`,
   outside the catalog git repo, so they survive reset-to-revision and have no
   size cap. The UI filters them on read.
-- **No per-entry `result.parquet`.** That layer was removed (#104); an expensive
-  entry's rows live in the baked `.cache()` snapshot under `compute_cache/`, a
-  cheap entry keeps no copy and recomputes on read.
+- **No per-entry `result.parquet`.** That layer was removed (#104). A worthy
+  entry's rows live in its snapshot, `compute_cache/result_cache/<hash>.parquet`,
+  which tallyman writes when the entry is created; a cheap entry keeps no copy
+  and recomputes on read.
 
 All catalog writers use atomic writes, so a crash mid-write or a checkpoint
 firing during a write window leaves a whole file, not a torn one.
@@ -207,21 +212,28 @@ its expression structure (xorq's tokenization) and, depending on the
 source-identity mode, its source file digests. Identity is structural: two
 entries with the same expression and inputs collapse to the same hash, which is
 what makes builds idempotent. Because hashes are content-addressed and globally
-unique by construction, Buckaroo sessions are keyed globally by content hash,
-not per project. The source-identity mode (`off` / `cas` / `salt`, default
+unique by construction, a Buckaroo session's id is derived from the project and
+the content hash (`entry-<project>-<hash>`), and tallyman keeps no record of
+sessions. The source-identity mode (`off` / `cas` / `salt`, default
 `cas`) is decided in [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md).
 
-**Result digest.** A second identity axis, recorded for *worthy* (snapshot-baking)
+**Result digest.** A second identity axis, recorded for *worthy* (materialized)
 entries only. The content hash keys the expression graph; the `result_digest`
-keys the executed *bytes* as a row **multiset**, not a sequence. It is the
-SHA-256 of the entry's baked snapshot parquet (`snapshot_file_digest`), which the
-bake writes after sorting on a synthetic `original_row_order` and pinning the
-parquet write settings, so the bytes are reproducible run-to-run and the file
-hash is order-insensitive. Cheap, row-preserving entries record no digest — they
-have no snapshot to hash and recompute live. A mismatch when an evicted snapshot
-self-heals points at execution nondeterminism (sampling, `now()`, an impure UDF,
-source drift), not the unordered-scan row reshuffling the canonical ordering now
-absorbs. Design: [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md).
+keys the executed *result*. It is `arrow-sha256:<hex>`, a SHA-256 over the
+Arrow data of the entry's snapshot parquet read back (`snapshot_file_digest`),
+so it does not depend on how the writer batched or grouped the rows, on the
+codec, or on the writer's version. It does depend on every value and on the
+order of the rows: the snapshot is written in a canonical total order (the
+author's sort keys, then `__row_order`, then the remaining sortable columns) on
+a single-partition connection, so the same build gives the same digest run to
+run. Cheap, row-preserving entries record no digest: they have no snapshot to
+digest and recompute live. A mismatch when a deleted snapshot is re-created
+points at execution nondeterminism (sampling, `now()`, an impure UDF, source
+drift) or at an engine change, which the manifest's `engine_versions` lets the
+error record say. A worthy entry's query is also run twice when it is created,
+so a recipe that is not reproducible is known from the start. Design:
+[ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md)
+and [ADR-009-digest-stability.md](../plans/ADR-009-digest-stability.md).
 
 **Alias and V_n versions.** An alias is a named, mutable pointer (for example
 `sales`) to the latest content hash of a logical entry. Each alias carries an
@@ -253,28 +265,38 @@ classified against the recorded error store rather than treated as an
 unexplained invariant break. See [reactive-recalc.md](reactive-recalc.md) and
 [recalc-mechanism.md](../plans/recalc-mechanism.md).
 
-**Result cache vs source cache (two-axis caching).** Tallyman caches along two
-axes. The source axis caches reads of input files. The result axis bakes a
-result snapshot for entries judged expensive (those whose expression contains
-aggregates, joins, sorts, windows, or UDFs); cheap, row-preserving entries
-recompute on every read even when an ancestor is expensive. Baked snapshots
-self-heal on read, so a cold read transparently rematerializes. See
-[caching.md](caching.md).
+**Worthy and cheap entries (materialization).** At build, tallyman decides once
+whether an entry is *worthy* (it does expensive work, or work that cannot
+inherit a row order: an aggregate, join, sort, limit, window function, union,
+distinct, unnest, a second file, a non-pure operation or a UDF) or *cheap*
+(row-preserving over one file). A worthy entry is materialized: tallyman runs
+its query when the entry is created and writes the result to a **snapshot**
+parquet file, which every read after that uses. A cheap entry writes nothing
+and re-runs its small plan on every read. Tallyman owns the files and xorq's own
+cache is not involved. `ensure_materialized` makes every file an entry reads
+exist before anything runs, re-creating a missing snapshot, ordered copy or
+source clone and checking what it made, so a deleted file heals on the next
+read. Sources enter through **ordered copies**: a parquet copy of each source,
+in file order, with a last column `__row_order`. See [caching.md](caching.md).
 
 **Portability.** A build directory embeds absolute filesystem paths in
 `expr.yaml`. On write these are rewritten to `${TALLYMAN_PROJECT_ROOT}`
 placeholders; on load they are expanded into a stable per-entry directory marked
 complete by a sentinel, so a project can be copied or packed and run from
 anywhere on disk, and the expanded path stays consistent so Buckaroo's
-snapshot-cache keys match across restarts.
+stat-cache keys match across restarts.
 
 **Checkpoint and reset-to-revision.** A checkpoint is an atomic git transaction
 under a per-project file lock: it captures pointers, zips pending recipes,
 stages all tracked files, commits once, and tags the step. Reset-to-revision
-does a hard git reset to a commit and then reconciles untracked build artifacts
-back to the recorded pointers, evicting to or restoring from the bullpen without
-recompute (a forward reset copies back from the bullpen). Live operations never
-read the bullpen.
+does a hard git reset to a commit and then reconciles untracked entry directories
+back to the recorded pointers, retiring to or restoring from the bullpen without
+recompute (a forward reset copies back from the bullpen). It also moves the
+source clones no surviving entry refers to into the bullpen instead of deleting
+them. It leaves `compute_cache/` alone: those files are named by content hash and
+can be made again. Live operations never read the bullpen.
+Every write to a project (a build, a materialization, a checkpoint) takes the
+same re-entrant project lock, so there is one writer at a time.
 
 **Live updates over SSE.** The companion pushes changes to the browser with
 Server-Sent Events (SSE): the SPA opens one long-lived HTTP stream to
@@ -304,8 +326,9 @@ route and the `/internal/notify` fan-out in `app.py` on the server side.
 2. `tallyman_xorq` compiles the expression, computes the content hash, and runs
    the build, writing the entry build dir: `expr.py`, `xorq_build/`,
    `schema.json`, and finally `manifest.json` (written last, atomically, as the
-   completeness sentinel). `cache_worthy` entries bake a result snapshot into
-   `compute_cache/`.
+   completeness sentinel). A `cache_worthy` entry is materialized during the
+   build: its query runs twice and its snapshot is written to
+   `compute_cache/result_cache/`.
 3. The MCP dispatch boundary fires a checkpoint: `tallyman_core` zips the recipe,
    stages the tracked surface, commits one git revision, and tags it.
 4. The MCP server best-effort POSTs a notification to the companion.
@@ -333,20 +356,25 @@ route and the `/internal/notify` fan-out in `app.py` on the server side.
 ### Viewing an entry grid
 
 1. The SPA entry-detail pane mounts `LazyBuckarooEmbed`, which waits for the grid
-   to scroll near the viewport (IntersectionObserver) and polls for session
-   startup.
-2. The companion POSTs the entry's `xorq_build/` directory to the Buckaroo
-   subprocess's `/load_expr`. First the build dir is expanded into a stable
-   per-entry path with `${TALLYMAN_PROJECT_ROOT}` resolved, so Buckaroo's
-   snapshot-cache key matches and a cold read of an expensive entry self-heals
-   its baked snapshot rather than recomputing.
-3. Buckaroo creates a session keyed by content hash and streams the grid over
-   WebSocket; sort and search push down to the xorq backend rather than paging a
-   materialized parquet.
+   to scroll near the viewport (IntersectionObserver) and then polls the
+   companion for the entry's session (`GET /{project}/api/session/{hash}`) until
+   it returns a WebSocket URL.
+2. The companion first runs `ensure_materialized`, so every file the entry reads
+   exists and anything it had to re-create is verified. Only then does it POST to
+   the Buckaroo subprocess's `/load_expr`, with a session id derived from the
+   project and the hash. A worthy entry is handed a *view build*, a build whose
+   whole graph is one read of its snapshot (`<entry>/.xorq_view_build/`); a cheap
+   entry is handed its own build, expanded into a stable per-entry path with
+   `${TALLYMAN_PROJECT_ROOT}` resolved. The payload names `__row_order` as the
+   row-order column. Buckaroo runs queries only for summary stats, sorting and
+   paging; it never executes an aggregate or join on tallyman's behalf.
+3. Buckaroo creates the session and streams the grid over WebSocket; sort and
+   search push down to the xorq backend rather than paging a materialized
+   parquet.
 4. The data tab stays mounted (hidden) across tab switches to keep the WS session
-   alive. Sessions live only in Buckaroo's RAM; a Buckaroo restart (detected via
-   a `started_at` timestamp on `/health`) clears the session maps and the next
-   view re-POSTs.
+   alive. Tallyman keeps no session record. Opening the entry again POSTs the same
+   id, which Buckaroo answers from the session it holds or rebuilds if it has
+   dropped it (it does after an idle hour, and after a restart).
 
 ### Diffing versions
 
@@ -359,8 +387,11 @@ route and the `/internal/notify` fan-out in `app.py` on the server side.
    are immutable.
 3. Buckaroo column-config overrides color the diff: categorical coloring for
    key/equality columns, numeric coloring for the delta columns.
-4. The diff grid loads through the same `/load_expr` path as a normal entry view,
-   with diff stats cached per entry pair under `diff_stat_cache/`.
+4. The diff grid loads through `/load_expr` with a compare build, with diff stats
+   cached per entry pair under `diff_stat_cache/`. Both sides are read through
+   `cached_result_expr` with `__row_order` dropped, so the files exist before the
+   join is built. The join itself is not materialized first; that is tracked in
+   #188.
 
 ## Related documentation
 
@@ -396,10 +427,20 @@ when in doubt, the code wins.
   structural `cache_worthy` admission test it proposes to remove is still the
   live gatekeeper, and `ensure_result` it names was removed (#73).
 - [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md)
-  — `result_digest` as a row multiset via a canonically-ordered snapshot hash,
-  replacing the per-row Python digest (#137). **Current** (implemented: the
-  digest is now `snapshot_file_digest`, and `tallyman_read_csv` injects
-  `original_row_order`).
+  — a canonically-ordered snapshot and a digest of it, replacing the per-row
+  Python digest (#137). **Partially superseded:** the canonical sort stays; the
+  digest is now a content digest of the file read back (ADR-009), and the CSV
+  row-index column is `__row_order` (ADR-008).
+- [ADR-006-read-path-loads-builds.md](../plans/ADR-006-read-path-loads-builds.md)
+  — reads load the frozen build (#163). **Partially superseded** by ADR-007: the
+  parent's cache node no longer travels in a child's build, and the
+  snapshot-key tripwire is gone.
+- [ADR-007-tallyman-owned-materialization.md](../plans/ADR-007-tallyman-owned-materialization.md),
+  [ADR-008-row-order-of-reads.md](../plans/ADR-008-row-order-of-reads.md) and
+  [ADR-009-digest-stability.md](../plans/ADR-009-digest-stability.md) — the cache
+  redesign this doc and [caching.md](caching.md) describe: tallyman writes its
+  own result files, every file carries `__row_order`, and a rewritten file is
+  flagged only when the result changed.
 
 ### Plans (`plans/`)
 

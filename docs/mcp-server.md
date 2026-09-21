@@ -148,9 +148,22 @@ Data sourcing inside `code` uses four helpers from `tallyman_xorq.io`:
 `pinned_expr_from_alias` (a catalog entry by hash or `"name-vN"` version
 reference, no following — a bare alias is rejected, #166),
 `read_project_file` (a raw parquet under `data/`), and `tallyman_read_csv` (CSV
-ingest — injects an `original_row_order` column so the baked snapshot is
-byte-stable across builds; use it for all CSV reads instead of
-`xo.deferred_read_csv`, #137).
+ingest; use it for all CSV reads instead of `xo.deferred_read_csv`, #137). Both
+read the file through an **ordered copy** (the source's rows in file order, plus a
+last column `__row_order` holding `0..N-1`), so editing a source and re-running
+the same recipe creates a new entry and the old one keeps its rows. Reading a
+parquet file any other way (`xo.deferred_read_parquet`) is a build error.
+
+Every entry's result ends in `__row_order`, and pages are ordered by it. A recipe
+that only filters, selects or adds columns is *cheap* and must keep the column:
+`t.select("region", "price")` fails the build, and the error shows the fix,
+`t.select("region", "price", "__row_order")`. A recipe that aggregates, joins,
+sorts, uses a window function, union, distinct, unnest or UDF is *worthy*: the
+server writes its result to a snapshot file when the entry is created and
+renumbers the column to match. Assigning to `__row_order` is an error, an
+`order_by` that is followed by more steps is kept if its key columns survive, and
+joining three entries in one recipe needs `.drop("__row_order")` on the
+right-hand inputs. `catalog_run`'s docstring has the details.
 
 ### `catalog_run(code, prompt="") -> dict`
 Execute an expression and persist it as an **unnamed (scratch)** entry. Claude's
@@ -158,10 +171,14 @@ default authoring tool for a one-off run.
 - **Params:** `code` (required) — script binding `expr`; `prompt` — optional
   intent string, recorded on the entry.
 - **Returns:** `{hash, row_count, execute_seconds, schema, entry_path, url}`,
-  plus `lint_warnings` when the nondeterminism lint fired. `{error, error_id}`
-  on a `BuildError`.
-- **Writes:** the entry build dir under `catalog/entries/<hash>/`; a `build_ok`
-  or `build_error` event to `events.jsonl`.
+  plus `lint_warnings` when the nondeterminism lint fired, and `reproducible:
+  false` with `nonreproducible_columns` when a worthy entry's query gave
+  different results on its two runs at create time. `{error, error_id}` on a
+  `BuildError`.
+- **Writes:** the entry build dir under `catalog/entries/<hash>/`; the ordered
+  copy of each source and, for a worthy entry, its snapshot under
+  `catalog/compute_cache/`; a `build_ok` or `build_error` event to
+  `events.jsonl`.
 - **Promote** a scratch entry to a name afterward with `catalog_alias`.
 
 ### `catalog_load_parquet(rel_path, prompt="", name="") -> dict`
@@ -265,8 +282,8 @@ hash).
 
 ### `catalog_diff(name, va=-2, vb=-1) -> dict`
 **Read-only** diff of two versions of an alias (default previous vs latest).
-Each side's expression comes from `cached_result_expr`, so it does not depend on
-a materialized result existing.
+Each side's expression comes from `cached_result_expr`, which makes any missing
+file exist first, and the diff drops `__row_order` from both sides.
 - **Params:** `name` (required); `va`, `vb` — version indices, 1-based or
   negative-from-end (`-1` latest, `-2` penultimate).
 - **Returns:** `{alias, before:{version,hash}, after:{version,hash}, schema,
@@ -295,13 +312,19 @@ marimo-exportable.
 
 ## Staleness and recalc tools
 
-### `catalog_scan_staleness() -> dict`
+### `catalog_scan_staleness(verify_results=False) -> dict`
 **Read-only** scan of every live entry for staleness against its recorded inputs.
 Purely diagnostic — never rebuilds, repoints, or checkpoints. Call it first to
 see what is stale.
+- **Params:** `verify_results` — also check that each snapshot on disk still has
+  its recorded `result_digest`. It reads the files that exist and writes nothing,
+  so a snapshot that was deleted is reported and stays deleted.
 - **Returns:** `{stale, transitively_stale, entries, orphan_stale}`. `stale` is
   the default root set `catalog_recalc` uses. `orphan_stale` populates only under
-  auto-recalc mode.
+  auto-recalc mode. With `verify_results`, also `verify: {results, unfaithful,
+  absent, errors}`: `results` maps each hash that recorded a digest to `true`,
+  `false` or `null` (no file to check), `unfaithful` lists the `false` ones, and
+  `absent` lists the entries whose snapshot file is missing.
 
 ### `catalog_recalc(roots=None, dry_run=True) -> dict`
 Recompute stale entries and their dependents in dependency order. Defaults to a
@@ -414,9 +437,9 @@ anything — the iterate-before-commit tool. Note the arg is `code` here, not
 - **Returns:** `{entry, row_count, columns, preview}` (first 20 rows). `{error}`
   on any run failure.
 - Reads the entry's actual result via `cached_result_expr` (a cheap entry
-  recomputes; an expensive one reads its baked snapshot, self-healing if
-  evicted), so the preview reflects real data — wider than `add`'s `{a, b}`
-  dry-run. Persists nothing; on the opt-out list, no notify.
+  recomputes; a worthy one reads its snapshot, re-creating and verifying it if
+  it was deleted), so the preview reflects real data — wider than `add`'s
+  `{a, b}` dry-run. Persists nothing; on the opt-out list, no notify.
 
 ## Export and listing tools
 

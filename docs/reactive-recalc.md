@@ -228,13 +228,15 @@ Each entry has a `manifest.json` with two fields that carry the graph:
   `{hash, ref, follow}`. `hash` is the parent's build-time content hash, `ref` the
   original argument (alias or hash), `follow` its read-intent. Empty for a root (an
   entry that reads no other entry).
-- **`manifest.sources`** — the raw-file leaves, `{rel_path: digest}`: the project
-  files the recipe read via `read_project_file`, each with the content digest it
-  was built against. `None` when the entry was built under `off` identity mode (so
-  the source axis can't be evaluated); `{}` when the recipe read no raw files.
+- **`manifest.sources`** — the raw-file leaves, `{rel_path: digest}`: the files the
+  recipe read via `read_project_file` or `tallyman_read_csv`, each with the content
+  digest it was built against, plus every source its parents recorded. `None` when
+  the entry was built under `off` identity mode (so the source axis can't be
+  evaluated); `{}` when the recipe read no raw files.
 
-`tracked_`/`pinned_expr_from_alias` write `parents`; `read_project_file` writes
-`sources`. Together they are the only record of the graph.
+`tracked_`/`pinned_expr_from_alias` write `parents`; `read_project_file` and
+`tallyman_read_csv` write `sources`. Together they are the only record of the
+graph.
 
 ### Roots, leaves, and direction
 
@@ -250,41 +252,47 @@ A recalc starts at the changed roots and flows down to the leaves. (Build-system
 tools — Make, Bazel — point the arrows the other way and swap these names, which is
 the usual source of confusion.)
 
-### Cheap vs expensive parents — and what lands in `manifest.sources`
+### Cheap vs worthy parents — and what lands in `manifest.sources`
 
 When a recipe reads a parent with `tracked_expr_from_alias`, what comes back
-depends on whether the parent was classified **expensive** or **cheap** at build.
+depends on whether the parent was classified **worthy** or **cheap** at build.
 This is the materialized-vs-not distinction:
 
-- An **expensive** parent (an Aggregate, Join, Sort, or UDF) bakes a result
-  snapshot when built (materialized). A child reading it gets a *read of that baked
-  snapshot* — the parent's work is computed once and shared, and the child does not
-  re-run it.
-- A **cheap** parent (row-wise: select, filter, mutate) bakes nothing
-  (non-materialized). A child reading it gets the parent's *recipe re-run inline* —
-  pushdown makes that ~free — so the parent's expression, down to its own
-  `read_project_file` reads, is composed into the child.
+- A **worthy** parent (an aggregate, join, sort, window function, union, distinct,
+  unnest, a second file, a non-pure operation, or a UDF) is materialized: its
+  result was written to a snapshot file when it was built. A child reading it gets
+  a *bare read of that snapshot* — the parent's work is computed once and shared,
+  and the child does not re-run it. The snapshot's path contains the parent's
+  content hash, so the child's own hash changes when the parent it was built on
+  changes.
+- A **cheap** parent (row-preserving over one file: select, filter, mutate) has no
+  file of its own. A child reading it gets the parent's *frozen graph inlined* —
+  pushdown makes re-running it ~free — so the parent's expression, down to the
+  ordered copy of its source, is composed into the child.
 
-That second case is why a cheap parent's sources show up in the **child's**
-`manifest.sources`: the inlined recipe re-runs the parent's `read_project_file`
-calls during the child's build, and those reads get collected into the child's own
-source set. So editing that raw file makes the child **directly** stale on the
-source axis, not merely transitively stale. A child reading an *expensive* parent
-reads the snapshot instead, so the parent's raw sources never enter the child's
-sources — there the source edit makes the *parent* directly stale, and the child
-follows only when the parent's alias advances.
+Either way, building the child folds the parent's recorded `sources` into the
+child's own `manifest.sources`, so the source digests a child depends on are
+recorded on the child and its clones stay referenced as long as it survives. When
+the parent is cheap the child also records the parent's `ordered_copies`, since
+the child's build reads those copies itself. Editing a raw file that anywhere up
+the chain feeds the child therefore makes the child **directly** stale on the
+source axis, not merely transitively stale.
 
 Which work is materialized is otherwise an implementation detail you don't see:
 `tracked_expr_from_alias` returns an expression either way, and the child never
-depends on the parent having a `result.parquet` on disk.
+depends on the parent having a `result.parquet` on disk. It does depend on the
+parent's snapshot existing when the child is built, so building a child first makes
+the parent's files exist (`ensure_materialized`), re-creating a deleted snapshot if
+it has to.
 
 ### Build-time capture, not live introspection
 
 The edges are captured the moment a recipe runs, not by walking the built
 expression afterward. While `build_and_persist` imports the recipe, two collectors
 are armed, and each loader announces itself as it executes: `read_project_file`
-notes the source digest, `tracked_`/`pinned_expr_from_alias` notes the resolved
-parent hash. After the import those bags are written into the manifest. The capture
+and `tallyman_read_csv` note the source digest, `tracked_`/`pinned_expr_from_alias`
+notes the resolved parent hash. After the import those bags are written into the
+manifest. The capture
 happens once, at build; nothing re-derives it later.
 
 This is a **tallyman** mechanism, not an xorq one. xorq's unit is a single
@@ -296,12 +304,16 @@ loaders announced, and writes the manifest beside xorq's artifact.
 The capture is a side-channel because the parent edge is **not recoverable from
 xorq's output**. Since the expression-composition change (#73/#74),
 `tracked_expr_from_alias` composes the parent's *expression* into the child (cheap:
-the inlined recipe; expensive: a read of the baked snapshot) rather than reading
-the parent's `result.parquet` by a path that named it. The result is one flattened
-graph with no node that says "this subtree was entry `<parent_hash>`." Before the
-change a child read `entries/<parent_hash>/result.parquet` — a leaf path naming the
-parent — and the edge was readable straight out of the expression. After it, the
-only place the edge survives is the manifest tallyman wrote.
+the parent's frozen graph inlined; worthy: a read of the parent's snapshot) rather
+than reading the parent's `result.parquet` by a path that named it. For a cheap
+parent the result is one flattened graph with no node that says "this subtree was
+entry `<parent_hash>`." Before the change a child read
+`entries/<parent_hash>/result.parquet` — a leaf path naming the parent — and the
+edge was readable straight out of the expression. After it, the only place the
+edge survives for a cheap parent is the manifest tallyman wrote. A worthy parent's
+snapshot path, `compute_cache/result_cache/<parent_hash>.parquet`, does carry the
+parent's hash, but not the alias the recipe named or whether the edge follows or
+pins, and those live only in the manifest too.
 
 ### Reading it back: one seam
 
@@ -319,11 +331,11 @@ Both `staleness` and `recalc` go through this module rather than touching manife
 fields directly, so it is the single seam over the recorded graph: swapping the
 implementation (a persistent index, say) is a change to `dependents` alone.
 
-A consequence worth noting (and a candidate future check): because the parent edge
-is gone from xorq's flattened expression, you can't reconcile tallyman's recorded
-parents against xorq's graph. What you *can* reconcile is the source leaves — a
-child's inlined raw-file reads should equal the union of `sources` over its
-transitive cheap parents. That invariant is checkable; the parent edges are only as
+One consequence, and a candidate future check: because a cheap parent's
+edge is gone from xorq's flattened expression, you can't fully reconcile tallyman's
+recorded parents against xorq's graph. What you *can* reconcile is the source leaves — a
+child's `sources` should equal its own raw-file reads plus the union of `sources`
+over its parents. That invariant is checkable; the parent edges are only as
 good as what the side-channel captured at build.
 
 ## The two staleness axes
@@ -346,11 +358,10 @@ An entry is judged on two independent axes, each tied to a kind of recorded inpu
   you don't expect this to fire; it covers the case where a raw parquet under
   `data/` is replaced.
 
-A note on cheap chains: when a child reads a *cheap* (non-materialized) parent,
-that parent's recipe is inlined into the child, so the parent's source files land
-in the child's own `manifest.sources` (see *Cheap vs expensive parents* above).
-Editing such a source makes the child **directly** stale on the source axis, not
-merely transitively stale. This is expected.
+A note on chains: a child's `manifest.sources` carries the source files its parents
+recorded, whether each parent is cheap or worthy (see *Cheap vs worthy parents*
+above). Editing such a source makes the child **directly** stale on the source
+axis, not merely transitively stale. This is expected.
 
 `result_digest` is deliberately not a staleness input. An entry that recomputes to
 the same `content_hash` but a different result is *nondeterministic*, not stale,
@@ -361,12 +372,13 @@ this system.
 
 Source-axis staleness only works under content-addressed source identity, which is
 the default. `source_identity.mode()` reads `TALLYMAN_SOURCE_IDENTITY` and falls
-back to `"cas"` (`source_identity.py:59`). In `cas` mode, `read_project_file` reads each
-source through a copy-on-write clone at `data/.cas/<digest><suffix>`, so the path
-xorq hashes is the content identity: editing a source in place yields a different
-digest, the manifest records that digest at build time, and a later scan can tell
-the file moved. The clone also means an old entry's recompute still reads the bytes
-it was built from after you edit the source.
+back to `"cas"`. In `cas` mode, `read_project_file` and `tallyman_read_csv` take
+the source's content digest, clone it copy-on-write to `data/.cas/<digest><suffix>`,
+and read an ordered copy of the clone whose file name is a function of the digest.
+The path xorq hashes is therefore the content identity: editing a source in place
+yields a different digest, the manifest records that digest at build time, and a
+later scan can tell the file moved. The clone also means an old entry's copy can be
+made again from the bytes it was built from after you edit the source.
 
 Under the legacy `off` mode the manifest records no source digests, so the source
 axis cannot be evaluated. A scan reports it as `unknown` rather than silently

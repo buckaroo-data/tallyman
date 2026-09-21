@@ -83,16 +83,19 @@ What's working:
   - `/internal/notify` — the MCP server's notification hook; fans out to SSE.
 - **Buckaroo subprocess** — `tallyman run` spawns `python -m buckaroo.server`
   on `:8700` (falls back to a random port if busy), watches for the
-  `BUCKAROO_PORT=...` handshake, and lazily creates per-entry sessions on
-  first view by POSTing the entry's `xorq_build/` dir to Buckaroo's
-  `/load_expr` endpoint (PR 776) — sort/search push down to the xorq
-  backend rather than paging over a materialised parquet. The build dir is
-  expanded into a stable per-entry path (`.xorq_build_expanded/`, gated by a
-  `.complete` marker) so `${TALLYMAN_PROJECT_ROOT}` placeholders are resolved
-  before xorq's loader sees them. Sessions are persisted in a global
-  `~/.tallyman-notebooks/buckaroo_sessions.json` (keyed by content hash, shared
-  across projects) and invalidated by start-time when Buckaroo restarts.
-  Tear-down rides along with the companion. Disable with `--no-buckaroo`.
+  `BUCKAROO_PORT=...` handshake, and lazily opens per-entry sessions on
+  first view by POSTing a build dir to Buckaroo's `/load_expr` endpoint
+  (PR 776), after making sure every file the entry reads exists — sort/search
+  push down to the xorq backend. A *worthy* entry (one whose query tallyman
+  materialized to a result file when the entry was created) is handed a view
+  build, a build that is one read of that file (`.xorq_view_build/`). A *cheap*
+  entry (a filter, selection or computed column over one file, which keeps no
+  file of its own) is handed its own build, expanded into a stable per-entry
+  path (`.xorq_build_expanded/`, gated by a `.complete` marker) so
+  `${TALLYMAN_PROJECT_ROOT}` placeholders are resolved before xorq's loader sees
+  them. A session's id is derived from the project and the content hash, so
+  tallyman keeps no session file. Tear-down rides along with the companion.
+  Disable with `--no-buckaroo`.
 - **Build artifacts are portable.** xorq's absolute filesystem paths are
   rewritten to `${TALLYMAN_PROJECT_ROOT}` on write and expanded back on load.
 - **`tallyman serve <project_dir>`** — read-only companion against a project
@@ -152,8 +155,12 @@ affordances. Mutation routes return 403.
 
 ## Conventions worth knowing
 
-- xorq 0.3.x reads use `xo.deferred_read_parquet` (NOT `xo.read_parquet` — that
-  resolves through ibis's backend loader and fails). Use
+- Recipes read data with `read_project_file` (parquet under `data/`),
+  `tallyman_read_csv` (CSV) and `tracked_expr_from_alias` /
+  `pinned_expr_from_alias` (catalog entries). `xo.deferred_read_parquet` on a
+  file outside the project's `compute_cache/` is a build error, since the file
+  would get no content digest and no `__row_order` column, and `xo.read_parquet`
+  resolves through ibis's backend loader and fails. Use
   `import xorq.api as xo` and `import xorq.vendor.ibis as ibis`. Do NOT
   `import ibis` directly.
 - Prefer `from tallyman_xorq.io import read_project_file; t = read_project_file("name.parquet")`

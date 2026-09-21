@@ -21,7 +21,8 @@
 - **Cheap / worthy:** the classifier's verdict on an entry. Cheap means a row-preserving view over one file (ADR-008
   D4, the allow-list of row-preserving operations); worthy means everything else. Until now cheap entries got no file
   of their own.
-- **Store:** the untracked directory of files tallyman writes and reads data from, introduced by D5.
+- **Store:** the untracked directory `store/` in the project home, holding every data file tallyman writes and reads
+  (D5). It replaces `compute_cache/`.
 - **Store object:** one file in the store. There are three kinds: a source clone, a CSV intermediate, and a result.
 - **Source clone:** a copy of a raw source file, named by the digest of its content (ADR-002, source identity).
 - **CSV intermediate:** the parquet file `tallyman_read_csv` writes from a CSV (ADR-005), named by the CSV's digest
@@ -86,10 +87,24 @@ What follows:
 
 - Paging is repeatable within one result file (D4), not across rebuilds. After a rebuild, row 5 may be a different
   row. ADR-008 D1's contract becomes: a page is a function of `(result file, sort, offset, limit)`.
-- `result_digest` is order-insensitive: a multiset hash of per-row hashes, where each row is hashed with ADR-009 D2's
-  per-column normalisation (null slots zeroed, logical types in the seed). Floats are hashed exactly, so a digest
-  can differ where the rows are equal within tolerance. The digest is a fast equality check. When two digests
-  differ, the comparison that decides is D3's.
+- `result_digest` is order-insensitive, algorithm `arrow-multiset-v1`, defined in
+  `scripts/spike_multiset_digest.py`:
+  - Each value gets a 64-bit hash computed from its Arrow buffers with numpy's wrapping uint64 arithmetic and
+    murmur3's 64-bit finaliser, with every constant defined in tallyman. No library's hash function is involved, so
+    no version bump can change a digest. (`polars.DataFrame.hash_rows` was rejected because polars documents it as
+    not stable across versions.)
+  - ADR-009 D2's normalisation stands: logical types, not physical spellings, and null slots ignored whatever they
+    hold. Two float rules are added: -0.0 hashes as 0.0, and every NaN as one NaN.
+  - A row's hash folds its column hashes in column order. The file digest is SHA-256 over the schema, the row count
+    and two wrapping sums of the row hashes (the second over a re-mixed copy). `__row_order` is left out.
+  - Measured on 18,000,000 rows, 9 columns (ints, floats with nulls, strings, dates, timestamps, booleans,
+    decimals, lists), 520 MB: 4.3 s, streaming 65,536-row batches, against 1.5 s for ADR-009 D2's ordered
+    digest. The spike's checks pass: row order, batching and `string` vs `large_string` leave it unchanged; one
+    changed value, a swap within a column, values moved between rows, a duplicated row, null vs 0.0, and moved
+    string or list boundaries all change it.
+
+  Floats are hashed exactly, so two digests can differ where the rows are equal within tolerance. The digest is a
+  fast equality check. When two digests differ, the comparison that decides is D3's.
 - Materialization runs with the engine's default partitioning. ADR-009 D1 (single-partition execution) is retired,
   since its only purpose was stable order and stable float totals.
 
@@ -131,7 +146,8 @@ digest sidecar). Removes most of `row_order.py`: `canonical_sorted`'s natural-or
 
 ### D5. An immutable, content-addressed store
 
-All data files tallyman writes live in one untracked store under the project home. Each store object is named by what
+All data files tallyman writes live in one untracked directory, `store/`, in the project home. It replaces
+`compute_cache/`; the rename is free because the rebuild of D11 empties it anyway. Each store object is named by what
 determines its content:
 
 | Kind | Name | Re-created from |
@@ -190,8 +206,8 @@ entries wipe Buckaroo state and are pinned).
 
 `tallyman gc [--apply]` lists, and with `--apply` deletes, the store objects not reachable from its roots. Roots:
 
-- every entry an alias points at in the current catalog step and the last N steps (N from the project config,
-  default 20), and their ancestors;
+- every entry an alias points at in the current catalog step and the last 30 steps (a project config setting), and
+  their ancestors;
 - every result of an entry recorded `reproducible: false`, and every source clone whose live source has changed,
   regardless of reachability, because neither can be re-created. These go only when named explicitly.
 
@@ -203,9 +219,17 @@ Closes #207's "no way to see it" for every kind, and #35 (manifest-less leftover
 
 ### D9. Buckaroo is handed result files only
 
-Every grid, chart and diff operand is given to Buckaroo as the path of a result file. Buckaroo never receives an xorq
-expression or a build. Its session is keyed by `(project, content hash)`, and the owner (D10) runs at most one load per
-key at a time.
+Every grid, chart and diff operand is given to Buckaroo as a bare read of one result file, posted to `/load_expr`
+with `row_order_column="__row_order"`. Buckaroo never receives an entry's recipe or build. Its session is keyed by
+`(project, content hash)`, and the owner (D10) runs at most one load per key at a time.
+
+Why `/load_expr` and not Buckaroo's file route: in buckaroo 0.15.6, `/load` takes a path, but neither of its modes
+fits. `mode="lazy"` scans the parquet with polars and pages it in file order, but it sends no summary stats and shows
+every column with the `obj` displayer (`get_display_state_lazy`, and buckaroo#965 for the widget). `mode="buckaroo"`
+has stats but reads the whole file into memory (`pd.read_parquet` or `pl.read_parquet`). `/load_expr` over a bare
+read has stats and reads out of core. Its paging is not repeatable until buckaroo#974 lands: with no sort it applies
+no order, and with a sort it uses one key with no tie-break. #974 asks for exactly the `row_order_column` hint above,
+so no further Buckaroo issue is needed.
 
 Closes #210 (reads no longer load builds, so there is no LRU of them), #172 (sessions keyed by hash across projects),
 #177 (a klass reload no longer needs to wipe stat caches keyed on a file that did not change). Narrows #202 (the
@@ -318,14 +342,8 @@ Failing tests first, in one commit, per the project's TDD rule:
 
 ## Open questions
 
-1. **The row hash.** D2 needs a per-row hash that is stable across library versions. `polars.DataFrame.hash_rows`
-   is documented as not stable across versions. The likely answer is xxhash-64 or SHA-256 over digest.py's
-   normalised column values, row by row. Needs a measurement at 18M rows.
-2. **Buckaroo's paging over a file.** D9 assumes Buckaroo has a load route that takes a parquet path and pages it in
-   file order when no sort is set. That route and its order must be checked in buckaroo 0.15.6 before D9 is
-   implemented; if it does not page in file order, buckaroo#974 is still needed.
-3. **The store's location and name.** `compute_cache/` could become `store/`. A rename is free with the rebuild.
-4. **Whether the MCP server should start the owner** when none is running, instead of failing. Starting it ties the
-   companion's lifetime to a Claude Code session, which is why D10 fails instead.
-5. **N in D8.** Whether 20 steps is the right default for GC roots, or whether the roots should be every step in the
-   catalog's history until disk use says otherwise.
+Resolved on 2026-09-21: the row hash (D2, `arrow-multiset-v1`), Buckaroo's route (D9, `/load_expr` plus buckaroo#974),
+the store's name (`store/`, D5) and the number of GC steps (30, D8).
+
+1. **Whether the MCP server should start the owner** when none is running, instead of failing. Starting it would tie
+   the companion's lifetime to a Claude Code session, which is why D10 fails instead.

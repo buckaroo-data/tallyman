@@ -205,22 +205,25 @@ def entry_view_build_dir(project: str, content_hash: str) -> Path:
 
 
 def compute_cache_dir(project: str) -> Path:
-    """Per-project xorq compute cache, redirected off the global ``~/.cache/xorq``.
+    """Per-project directory of files tallyman can make again: snapshots and ordered copies of sources.
 
-    Lives inside the catalog dir so it travels with the project. ``reset-to``
-    prunes it to the revision's recorded warm-set, so a baseline expression
-    stays warm while a freshly added one computes cold — the honest cold add
-    the demo is built to show. Untracked by git (content-addressed parquet).
+    ``result_cache/<content_hash>.parquet`` holds each worthy entry's snapshot and
+    ``ordered_sources/<key>.parquet`` each source's ordered copy (ADR-007 D2, D13).
+    Lives inside the catalog dir so it travels with the project, and is untracked by git
+    (content-addressed parquet). Everything in it is cache, so anything may delete it:
+    ``ensure_materialized`` makes a missing file again and checks it. A reset leaves it
+    alone (ADR-007 D14).
     """
     return catalog_dir(project) / "compute_cache"
 
 
 def bullpen_dir(project: str) -> Path:
-    """Holding area for artifacts a reset evicts (untracked, content-addressed).
+    """Holding area for artifacts a reset retires (untracked, content-addressed).
 
-    A backward reset moves pruned entries/caches here instead of deleting
-    them; a forward reset copies the step's recorded set back. Live
-    operations never read it, so an evicted entry still re-adds cold.
+    A backward reset moves entry dirs, and the source clones (``data/.cas``) no surviving
+    entry refers to, here instead of deleting them; a forward reset copies the step's
+    recorded set back. Live operations never read it. ``compute_cache/`` is not managed
+    by a reset (ADR-007 D14).
     """
     return catalog_dir(project) / "bullpen"
 

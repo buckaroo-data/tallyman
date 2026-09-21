@@ -1836,7 +1836,7 @@ def create_app(
             if payload.kind in ("project_reset", "recalc"):
                 # project_reset: out-of-process CLI `reset-to` ran reset_to in the
                 # CLI process, so this long-lived companion's result/compare LRUs
-                # are still warm and may point at snapshots the prune deleted.
+                # are still warm and may name entries the reset retired.
                 # recalc: an MCP-driven catalog_recalc (arriving here via _notify,
                 # not the in-process /api/recalc route) re-pointed aliases and
                 # rebuilt entries. Either way, clear the LRUs and reload sessions —

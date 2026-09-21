@@ -271,8 +271,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     THREE NAMESPACES — mixing these up is the #1 build failure:
 
-        import xorq.api as xo            # backends + deferred reads:
-                                         # xo.memtable, xo.deferred_read_parquet, xo.connect
+        import xorq.api as xo            # backends: xo.memtable, xo.connect
         import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
                                          # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
         from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, tallyman_read_csv   # reading data
@@ -283,7 +282,8 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
         #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
         # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
-        # Read data only via read_project_file / tracked_expr_from_alias (no xo.read_parquet / ibis.read_parquet).
+        # Read data only via read_project_file / tracked_expr_from_alias / tallyman_read_csv (no
+        #   xo.read_parquet / xo.deferred_read_parquet / ibis.read_parquet: a raw read is a build error).
 
     ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
@@ -294,9 +294,12 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         as a parent in the lineage DAG. Use this for normal recipe chaining — the
         standard way to build on top of another catalog entry.
       - `read_project_file("file.parquet")` reads raw files under `<project>/data/`.
-        Use this only for raw files visible on disk (not catalog aliases).
-      - `tallyman_read_csv("/abs/path/to/file.csv", schema=...)` reads a CSV and
-        injects ``original_row_order`` so the snapshot is byte-stable across builds.
+        Use this only for raw files visible on disk (not catalog aliases). The file
+        is ingested once into a copy in file order with a last column, `__row_order`
+        (see ROW ORDER below).
+      - `tallyman_read_csv("/abs/path/to/file.csv", schema=...)` reads a CSV, in file
+        order, with a last column ``__row_order`` (see ROW ORDER below). Editing the CSV
+        and re-running the recipe creates a NEW entry; the old one keeps its rows.
         Use this for ALL CSV ingests instead of ``xo.deferred_read_csv``.
       - `pinned_expr_from_alias(<hash or "name-vN">)` reads a catalog entry by
         content hash or explicit version reference (e.g. "shoe_sales-v2") and
@@ -307,6 +310,27 @@ def catalog_run(code: str, prompt: str = "") -> dict:
       - When in doubt, call `catalog_list` first. A name that looks like a file
         is often actually an alias — `read_project_file` on an alias raises
         `ProjectDataNotFound`.
+
+    ROW ORDER — every entry carries a last column, `__row_order`:
+
+        `__row_order` is each row's position in the entry's file (0..N-1, int64, always
+        the LAST column, visible in the grid). Pages of every entry are ordered by it,
+        so paging is repeatable. Rules:
+        - A filter / select / computed column keeps it. A `select` that lists columns
+          and leaves it out is a BUILD ERROR (the error shows the fix), because such an
+          entry has no file of its own and pages by its parent's column:
+              t.select("region", "price", "__row_order")     # not t.select("region", "price")
+        - An aggregate, join, sort, window function, union, distinct, unnest or UDF
+          makes the entry materialized: its file is written when it is created, and
+          `__row_order` is renumbered to match the order of the result.
+        - To change the order rows are shown in, sort them (`order_by`): the column is
+          renumbered in that order. Never assign to `__row_order` (build error). To keep
+          the parent's positions, copy them: `t.mutate(__row_order_v1=t["__row_order"])`.
+        - Joining three entries in ONE recipe: drop the column from the right-hand
+          inputs, `a.join(b.drop("__row_order"), k).join(c.drop("__row_order"), k)`.
+          Joining a join entry to another entry needs nothing.
+        - An `order_by` that is followed by more steps is kept, if its key columns are
+          still there (a build error names the key otherwise).
 
     COLUMN NAMES — do not guess. The source step returns a `schema`, and
     `catalog_list` shows each entry's columns as a compact `name:type, ...`
@@ -334,8 +358,8 @@ def catalog_run(code: str, prompt: str = "") -> dict:
     LOADING RAW CSV FILES — always inspect first:
 
         Use ``tallyman_read_csv`` (not ``xo.deferred_read_csv``) for all CSV
-        ingests. It adds an ``original_row_order`` column that makes the
-        snapshot byte-stable across builds:
+        ingests. It adds a last ``__row_order`` column holding each row's
+        position in the file (0..N-1):
 
             from tallyman_xorq.io import tallyman_read_csv
             import xorq.vendor.ibis as ibis
@@ -591,6 +615,9 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
     }
     if result.lint_warnings:
         reply["lint_warnings"] = result.lint_warnings
+    if result.reproducible is False:
+        reply["reproducible"] = False
+        reply["nonreproducible_columns"] = result.nonreproducible_columns
     return reply
 
 

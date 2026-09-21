@@ -4,7 +4,10 @@ Buckaroo is the in-table recon surface (column distributions, null counts,
 sort/filter/search) and is what beat 2 of the talk's storyboard relies on.
 Buckaroo runs as its own Tornado server on a separate port; the companion
 mounts the React embed (``static/buckaroo-embed.js``) into the entry-detail
-page and pre-warms a WS session per catalog entry.
+page and opens a WS session per catalog entry.
+
+Buckaroo is a displayer (ADR-007, governing rule): it runs queries only for summary stats, sorting and paging.
+Tallyman runs an entry's computation to completion first, and hands Buckaroo something that already exists.
 
 Lifecycle:
 
@@ -16,21 +19,17 @@ Lifecycle:
    `BUCKAROO_PORT=<n>` so we recover the bound port (useful when
    port=0).
 3. Poll `/health` until Buckaroo reports ready (~200ms typical).
-4. When the entry-detail route is hit for the first time on a content
-   hash, POST `/load_expr` with the entry's `xorq_build/` dir and store
-   the returned `session` in `catalog/buckaroo_sessions.json` for later
-   retrieval. Buckaroo serves the entry via the xorq backend with
-   push-down sort/search (paging over a materialised parquet is the
-   `/load` flow, which we no longer use).
+4. When the entry-detail route is hit on a content hash, make sure every file the entry reads exists
+   (``ensure_materialized``), then POST `/load_expr` with a build dir and a session id derived from the project and
+   the hash. A worthy entry is handed a *view build*, a build whose whole graph is one read of its snapshot; a cheap
+   entry is handed its own build, a small plan over files that exist.
 5. On shutdown (uvicorn lifespan or `atexit`), close the subprocess's
    stdin and wait briefly; if it doesn't go, SIGTERM.
 
-The session map is persisted so that across companion restarts we don't
-re-call /load redundantly on the same hash. Buckaroo itself is fresh on
-each start, though, so the cached session_ids only act as a *naming*
-convention — Buckaroo's own state is rebuilt on first hit either way.
-This means: a `tallyman serve` restart re-loads parquets lazily as entries
-are viewed; that's correct.
+Tallyman keeps no record of Buckaroo's sessions (ADR-007 D6). The session id is a function of the project and the
+content hash, so it is never stale: a repeat POST is a no-op in Buckaroo while it holds the session (same id, same
+build dir, none of the config-bearing fields), and re-creates it if Buckaroo has dropped it, as Buckaroo does after an
+idle hour.
 """
 
 from __future__ import annotations
@@ -42,6 +41,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -52,22 +52,56 @@ from tallyman_core import (
     entry_build_dir,
     entry_expanded_build_dir,
     entry_stat_cache_dir,
+    entry_view_build_dir,
 )
 from tallyman_core.manifest import read_manifest
 from tallyman_core.paths import artifacts_dir, entry_manifest_path, project_dir
-
-
-def _entry_exists(project: str, content_hash: str) -> bool:
-    """True if the project's catalog has a built entry for *content_hash*.
-
-    The build dir is the entry's existence proof now (there is no on-demand
-    ``result.parquet``). Used by ``_load_session_file`` to prune stale session
-    entries whose project / hash combination no longer maps to a build on disk.
-    """
-    return entry_build_dir(project, content_hash).is_dir()
-
+from tallyman_xorq.row_order import ROW_ORDER
 
 log = logging.getLogger("tallyman.buckaroo")
+
+# One view build is written per entry directory at a time (a per-path lock, like ``ensure_expanded_build``'s).
+_view_locks_guard = threading.Lock()
+_view_locks: dict[str, threading.Lock] = {}
+
+
+def ensure_view_build(project: str, content_hash: str) -> Path:
+    """The stable per-entry directory holding the *view build* of a worthy entry's snapshot (ADR-007 D6).
+
+    A view build is a xorq build whose whole graph is one step, "read this parquet file". Buckaroo's stat-cache keys
+    include the build directory's path, so the directory is stable, written once and reused. A sibling marker records
+    the snapshot path the build was made for, so a project that moved (a clone at another path) regenerates it instead
+    of pointing Buckaroo at a path that is gone. The snapshot must exist (``ensure_materialized`` has run).
+    """
+    from xorq.expr.api import deferred_read_parquet
+    from xorq.ibis_yaml.compiler import build_expr
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    dest = entry_view_build_dir(project, content_hash)
+    snap = str(snapshot_path(project, content_hash))
+    marker = dest.with_name(dest.name + ".complete")
+
+    def _fresh() -> bool:
+        try:
+            return (dest / "expr.yaml").is_file() and marker.read_text() == snap
+        except OSError:
+            return False
+
+    if _fresh():
+        return dest
+    with _view_locks_guard:
+        lock = _view_locks.setdefault(str(dest), threading.Lock())
+    with lock:
+        if _fresh():
+            return dest
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".xorq_view_build.", dir=dest.parent) as tmp:
+            built = Path(build_expr(deferred_read_parquet(snap), builds_dir=Path(tmp)))
+            shutil.rmtree(dest, ignore_errors=True)
+            shutil.move(str(built), str(dest))
+        marker.write_text(snap)
+    return dest
 
 
 def _port_in_use(port: int) -> bool:
@@ -97,19 +131,11 @@ class BuckarooUnavailable(RuntimeError):
 
 
 class BuckarooManager:
-    """Owns a Buckaroo server subprocess and a multi-project session cache.
+    """Owns a Buckaroo server subprocess and opens sessions on it.
 
-    Sessions are keyed by content hash (globally unique by construction), so
-    one subprocess can serve sessions backed by xorq builds from any project.
-    The owning project travels per-call via ``ensure_session(hash, project)``
-    and is recorded alongside the session id so a restart-reload knows which
-    project's parquet to find.
-
-    Session state persists in a single global file at
-    ``~/.tallyman/buckaroo_sessions.json``. The per-project location used
-    by V0.5 (``<project>/artifacts/catalog/buckaroo_sessions.json``) is gone.
-    Will be replaced wholesale by a session-enumeration endpoint when
-    buckaroo-data/buckaroo#860 lands; until then the file is the bookkeeping.
+    A session's id is a function of the project and the entry's content hash (``session_id_for``), so one subprocess
+    serves sessions for entries of any project and tallyman needs no record of which are open: Buckaroo is the only
+    process that knows, and it answers a repeat ``/load_expr`` for a session it holds without redoing the work.
     """
 
     def __init__(
@@ -132,13 +158,10 @@ class BuckarooManager:
         self.companion_base_url = companion_base_url.rstrip("/") if companion_base_url else None
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
-        # Schema: {<content_hash>: {"session_id": str, "project": str}}.
-        self._sessions: dict[str, dict] = {}
         # Diff-compare session_ids (``diff-<a>-<b>``) Buckaroo has loaded this
-        # lifetime. Reset on a Buckaroo restart, same as ``_sessions`` — these
-        # sessions live only in the subprocess's RAM.
+        # lifetime. Reset on a Buckaroo restart: these sessions live only in the
+        # subprocess's RAM. (The live diff still posts an unmaterialized join, ADR-007 D10, #188.)
         self._loaded_diff_sessions: set[str] = set()
-        self._session_lock = threading.Lock()
         self._buckaroo_started_at: float | None = None
         # Tmp dirs we created by expanding ${TALLYMAN_PROJECT_ROOT} placeholders
         # before POSTing /load_expr. Buckaroo holds the loaded xorq expression
@@ -151,7 +174,15 @@ class BuckarooManager:
         # ``_restart_cooldown`` seconds.
         self._last_restart_attempt: float = 0.0
         self._restart_cooldown: float = 30.0
-        self._load_session_file()
+
+    @staticmethod
+    def session_id_for(project: str, content_hash: str) -> str:
+        """The Buckaroo session id of an entry: ``entry-<project>-<content_hash>``.
+
+        A function of the two and nothing else (ADR-007 D6), so it is never stale and there is nothing to remember. The
+        project is in it so that one project's session is never served to another on a hash collision (#172).
+        """
+        return f"entry-{project}-{content_hash}"
 
     # ------------------------------------------------------------------
     # lifecycle
@@ -308,150 +339,82 @@ class BuckarooManager:
         self._loaded_diff_sessions.add(session_id)
 
     def _reset_session_bookkeeping_if_restarted(self, started_at) -> None:
-        """Drop in-RAM session bookkeeping when a fresh Buckaroo is detected.
+        """Drop in-RAM diff-session bookkeeping when a fresh Buckaroo is detected.
 
-        Buckaroo's ``/load_expr`` sessions — entry (``_sessions``) and
-        diff-compare (``_loaded_diff_sessions``) alike — live only in the
-        subprocess's memory, so a restart (a new ``started_at`` from ``/health``)
-        invalidates every session_id we've handed out. Clearing both forces a
-        re-POST on next access; that reload is cheap because the on-disk
-        stat/result cache survives the restart. Keeping a stale entry instead
-        would hand a client a dead session.
+        The diff-compare sessions live only in the subprocess's memory, so a restart (a new ``started_at`` from
+        ``/health``) invalidates every one we've handed out. Clearing forces a re-POST on next access; that reload is
+        cheap because the on-disk stat cache survives the restart. Entry sessions need no such record (ADR-007 D6):
+        their ids are derived and every open re-posts.
         """
         if started_at == self._buckaroo_started_at:
             return
-        if self._sessions:
-            log.info(
-                "buckaroo restart detected; invalidating %d cached sessions",
-                len(self._sessions),
-            )
-        self._sessions = {}
         self._loaded_diff_sessions.clear()
         self._buckaroo_started_at = started_at
-        self._persist_sessions()
 
     # ------------------------------------------------------------------
-    # session map (persisted to disk)
+    # klass reload and forced reload (no session record needed)
     # ------------------------------------------------------------------
-
-    def _session_file_path(self) -> Path:
-        from tallyman_core.paths import buckaroo_sessions_path
-
-        return buckaroo_sessions_path()
-
-    def _load_session_file(self) -> None:
-        """Load the global session map, dropping entries whose parquet has
-        disappeared since the last persist.
-
-        Schema: ``{"sessions": {hash: {session_id, project}}, "buckaroo_started_at": float}``.
-        Each entry's ``project`` is treated as a hint — if that project has
-        no entry for the hash, the session is stale and gets dropped.
-        """
-        p = self._session_file_path()
-        if not p.exists():
-            return
-        try:
-            data = json.loads(p.read_text())
-        except json.JSONDecodeError:
-            return
-        self._buckaroo_started_at = data.get("buckaroo_started_at")
-        sessions = data.get("sessions", {})
-        # Defensive: silently drop entries that aren't the new shape.
-        kept: dict[str, dict] = {}
-        for h, info in sessions.items():
-            if not isinstance(info, dict):
-                continue
-            project = info.get("project")
-            if not project:
-                continue
-            if not _entry_exists(project, h):
-                continue
-            kept[h] = {"session_id": info["session_id"], "project": project}
-        self._sessions = kept
-
-    def _persist_sessions(self) -> None:
-        p = self._session_file_path()
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(
-            json.dumps(
-                {
-                    "buckaroo_started_at": self._buckaroo_started_at,
-                    "sessions": self._sessions,
-                },
-                indent=2,
-                sort_keys=True,
-            )
-        )
 
     def reload_project_sessions(self, project: str) -> int:
-        """Hot-reload klasses for all live sessions belonging to *project*.
+        """Hot-reload klasses for every open grid of *project*.
 
-        Calls POST /reload_expr/<session_id> (buckaroo 0.14.9+) on each
-        cached session for *project*. The session stays alive and its
-        analysis/post-processing klasses are updated in place — no eviction
-        or page-load round-trip to /load_expr is needed.
+        A klass is a project-authored stat, post-processing or display class. Buckaroo 0.15.6 has no route that lists
+        its sessions and tallyman keeps no record of them, so this posts ``/reload_expr/<session id>`` (buckaroo
+        0.14.9+) for each entry of the project and treats the 404 (or 400) Buckaroo answers for an id it does not hold
+        as "not open" (ADR-007 D6). That is one request per entry per klass change. The session stays alive and its
+        klasses are updated in place — no page-load round-trip to /load_expr is needed.
 
-        After a successful reload the on-disk parquet stat cache for that
-        entry is cleared so the next widget request recomputes all stats
-        (including any newly added ones) from scratch. Without this, a stat
-        added after the session was first loaded would be absent from the
-        cache and silently omitted from the display.
+        After a successful reload the on-disk stat cache for that entry is cleared so the next widget request
+        recomputes all stats (including any newly added ones) from scratch. Without this, a stat added after the
+        session was first loaded would be absent from the cache and silently omitted from the display.
 
-        Returns the number of sessions reloaded. Falls back to 0 (with a
-        warning) if buckaroo isn't running or a reload call fails.
+        Returns the number of sessions reloaded. Falls back to 0 (with a warning) if buckaroo isn't running or a
+        reload call fails.
         """
         if not self.is_running or self.bound_port is None:
             return 0
-        with self._session_lock:
-            targets = {h: info["session_id"] for h, info in self._sessions.items() if info.get("project") == project}
+        from tallyman_xorq.build import list_entries
+
         reloaded = 0
-        to_evict: list[str] = []
-        for content_hash, session_id in targets.items():
+        for entry in list_entries(project):
+            content_hash = entry["content_hash"]
+            session_id = self.session_id_for(project, content_hash)
             try:
-                resp = self._client.post(
-                    f"{self.base_url}/reload_expr/{session_id}",
-                    timeout=5.0,
-                )
+                resp = self._client.post(f"{self.base_url}/reload_expr/{session_id}", timeout=5.0)
                 if resp.status_code in (404, 400):
-                    # Session is gone or is no longer an xorq session — evict
-                    # so the next ensure_session call re-creates it cleanly.
-                    log.warning(
-                        "buckaroo session %s (hash %s) is stale (%d); evicting",
-                        session_id,
-                        content_hash,
-                        resp.status_code,
-                    )
-                    to_evict.append(content_hash)
-                    continue
+                    continue  # Buckaroo does not hold this session (never opened, or idle-evicted)
                 resp.raise_for_status()
                 self._clear_stat_cache(project, content_hash)
                 reloaded += 1
                 log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
             except httpx.HTTPError as exc:
                 log.warning("buckaroo /reload_expr failed for session %s: %s", session_id, exc)
-        if to_evict:
-            with self._session_lock:
-                for h in to_evict:
-                    self._sessions.pop(h, None)
-            self._persist_sessions()
         return reloaded
 
-    def evict_session(self, content_hash: str) -> bool:
-        """Drop the cached session for one entry so its next view reloads fresh.
+    def force_reload_session(self, project: str, content_hash: str) -> bool:
+        """Re-run Buckaroo's pipeline for an entry's grid (``force_reload``), for an unfaithful heal (ADR-007 D6).
 
-        Used after an unfaithful self-heal (ADR D10): the entry's snapshot bytes
-        changed under a stable path, so an open session's row cache would show
-        the old rows beside freshly computed stats. Returns whether a session
-        was actually evicted. The Buckaroo-side session object is left to its
-        own idle reaping — only the hash→session mapping is dropped here, which
-        is what makes the next ``load_session`` create a new one.
+        The snapshot's path now holds different rows and an open grid holds stats computed from the old ones. The
+        caller has already wiped the entry's stat cache; Buckaroo then recomputes for that session. Returns whether
+        Buckaroo accepted the load. Never raises: a heal must not fail because a grid could not be refreshed.
         """
-        with self._session_lock:
-            removed = self._sessions.pop(content_hash, None) is not None
-        if removed:
-            self._persist_sessions()
-            log.info("evicted buckaroo session for %s (unfaithful heal)", content_hash)
-        return removed
+        if not self.is_running or self.bound_port is None:
+            return False
+        try:
+            body = self._load_body(project, content_hash, None)
+        except Exception as exc:
+            log.warning("could not build a forced reload for %s: %s", content_hash, exc)
+            return False
+        body["force_reload"] = True
+        try:
+            timeout = self._load_timeout(project, content_hash)
+            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=timeout)
+            resp.raise_for_status()
+        except httpx.HTTPError as exc:
+            log.warning("buckaroo forced reload failed for %s: %s", content_hash, exc)
+            return False
+        log.info("forced a reload of the grid for %s (unfaithful heal)", content_hash)
+        return True
 
     def _clear_stat_cache(self, project: str, content_hash: str) -> None:
         """Delete cached stat parquet files for one entry.
@@ -516,35 +479,88 @@ class BuckarooManager:
         """
         return self.load_session(content_hash, project, column_config_overrides)["session_id"]
 
+    def _load_timeout(self, project: str, content_hash: str) -> float:
+        row_count = 0
+        mpath = entry_manifest_path(project, content_hash)
+        if mpath.exists():
+            try:
+                row_count = read_manifest(mpath.parent).row_count or 0
+            except Exception:
+                pass
+        return 10.0 + row_count / 1_000_000
+
+    def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None) -> dict:
+        """The ``/load_expr`` body for an entry whose files all exist.
+
+        A worthy entry is handed a view build of its snapshot, so Buckaroo never executes an aggregate, join or sort on
+        tallyman's behalf and never writes a snapshot (ADR-007 D6). A cheap entry is handed its own expanded build, a
+        stored definition over files that exist, which tallyman already executed in full when it was created.
+        """
+        from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+        from tallyman_xorq.result_cache import cache_worthy  # noqa: PLC0415
+
+        if cache_worthy(project, content_hash):
+            build_dir = ensure_view_build(project, content_hash)
+        else:
+            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable per-entry dir (not a random tmp dir) so
+            # the expanded path is identical across server restarts: Buckaroo's stat keys include the build
+            # directory's path, so a random tmp path makes every stat-cache lookup a miss even when the cache is fully
+            # populated on disk. Marker-gated for crash safety.
+            build_dir = ensure_expanded_build(
+                entry_build_dir(project, content_hash),
+                project_dir(project),
+                entry_expanded_build_dir(project, content_hash),
+            )
+        stat_cache = entry_stat_cache_dir(project, content_hash)
+        stat_cache.mkdir(parents=True, exist_ok=True)
+        payload: dict = {
+            "session": self.session_id_for(project, content_hash),
+            "build_dir": str(build_dir),
+            "no_browser": True,
+            # Buckaroo scans <project_root>/stats/*.py and <project_root>/post_processing/*.py for project-authored
+            # klasses. tallyman stores both under artifacts/, so pass artifacts_dir, not project_dir. Older buckaroo
+            # builds ignore this field, so it's safe to always send.
+            "project_root": str(artifacts_dir(project)),
+            # Buckaroo 0.14.9+: persist computed summary stats to disk so they survive a Buckaroo restart without full
+            # recomputation on next /load_expr.
+            "cache_storage_path": str(stat_cache),
+            # ADR-008 D8: the column with no ties that pages sort by (buckaroo-data/buckaroo#974). A page is
+            # ORDER BY __row_order, or the user's keys and then __row_order, so the same request returns the same rows.
+            # Buckaroo builds that predate the hint ignore it.
+            "row_order_column": ROW_ORDER,
+        }
+        if column_config_overrides is not None:
+            payload["column_config_overrides"] = column_config_overrides
+        if self.companion_base_url is not None:
+            # buckaroo#943: the server fire-and-forget POSTs one record per firstpull.* perf span (expr load, stats
+            # pipeline + cache hit/miss, WS first payload) to this URL, keyed by the session id. Per-project so the
+            # receiver knows which telemetry.jsonl to append to. Older buckaroo ignores the field.
+            payload["telemetry_url"] = f"{self.companion_base_url}/{project}/api/telemetry"
+        return payload
+
     def load_session(
         self,
         content_hash: str,
         project: str,
         column_config_overrides: dict | None = None,
     ) -> dict:
-        """Load (or reuse) a Buckaroo session, returning a typed status.
+        """Open (or reuse) a Buckaroo session, returning a typed status.
 
         ``{"status", "session_id", "detail"}`` where ``status`` is one of
         ``ok`` (``session_id`` set), ``unavailable`` (Buckaroo not running),
         ``no_build`` (entry has no xorq build), ``timeout`` (the ``/load_expr``
-        POST timed out), or ``error`` (Buckaroo rejected the load). The companion
-        surfaces this so the detail page shows a spinner, a precise error, and a
-        retry instead of a bare "not available" fallback (#133) — never raising,
-        so a Buckaroo hiccup can't take down the page.
+        POST timed out), or ``error`` (a file the entry needs could not be made, or Buckaroo rejected the load). The
+        companion surfaces this so the detail page shows a spinner, a precise error, and a retry instead of a bare "not
+        available" fallback (#133) — never raising, so a Buckaroo hiccup can't take down the page.
 
-        Posts an expanded xorq build dir to Buckaroo's ``/load_expr`` endpoint so
-        the session is backed by an xorq expression (push-down sort/search
-        against the underlying backend). The posted build is always the entry's
-        expanded recipe (``xorq_build/``): a cheap entry recomputes on read
-        (push-down over a columnar source), and a cache-worthy entry's recipe
-        replays onto its baked ``.cache()`` snapshot — a read of the snapshot, not
-        a re-run of the Aggregate/Join/Sort. No per-entry ``result.parquet`` is
-        read any more; the #71 result-read build that served one was removed.
+        Tallyman finishes its own work first (ADR-007 D6, the governing rule): ``ensure_materialized`` makes every file
+        the entry's plan reads, and its own snapshot, exist and verifies what it writes. Only then is Buckaroo asked to
+        display anything, so a failure of the computation surfaces here, in tallyman's process, and never inside a grid
+        query. The session id is derived from the project and the hash and posted every time: Buckaroo skips the work
+        when it already holds that session with the same build dir (and the post carries none of the config-bearing
+        fields), and creates the session again if it has dropped it.
 
-        ``project`` names the project that owns the entry. Sessions cache
-        across projects via content hash (globally unique), so a second call
-        for the same hash from a different project returns the existing
-        session — the bytes are the same by definition.
+        ``project`` names the project that owns the entry.
 
         ``column_config_overrides`` is passed to ``/load_expr`` when provided
         (e.g. for promoted diff entries that carry Buckaroo coloring state).
@@ -560,107 +576,54 @@ class BuckarooManager:
                 "session_id": None,
                 "detail": "Buckaroo is not running — start tallyman with --buckaroo.",
             }
-        build_dir = entry_build_dir(project, content_hash)
-        if not build_dir.is_dir():
+        if not entry_build_dir(project, content_hash).is_dir():
             return {
                 "status": "no_build",
                 "session_id": None,
                 "detail": "This entry has no xorq build to load.",
             }
-        # No pre-heal here (ADR D4): entry builds are self-contained — a chained
-        # child's build carries its ancestors' cache nodes — so Buckaroo's replay
-        # of the build regenerates any evicted snapshot through ordinary cache
-        # mechanics on first query. The discarded-result cached_result_expr call
-        # that used to force ancestor snapshots onto disk before the replay is
-        # retired with the #75 stripping that made it necessary.
-        with self._session_lock:
-            cached = self._sessions.get(content_hash)
-            if cached:
-                # Within one Buckaroo lifetime cached sessions are valid by
-                # construction; start() resets the map on restart.
-                return {"status": "ok", "session_id": cached["session_id"], "detail": ""}
-            # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable
-            # per-entry dir (not a random tmp dir) so the expanded path is
-            # identical across server restarts — xorq embeds the build_dir path
-            # in the expression hash used by ParquetSnapshotCache, so a random
-            # tmp path makes every stat-cache lookup a miss even when the cache
-            # is fully populated on disk. Marker-gated for crash safety.
-            from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
+        try:
+            from tallyman_xorq.materialize import ensure_materialized  # noqa: PLC0415
 
-            expanded = ensure_expanded_build(
-                build_dir,
-                project_dir(project),
-                entry_expanded_build_dir(project, content_hash),
-            )
-            stat_cache = entry_stat_cache_dir(project, content_hash)
-            stat_cache.mkdir(parents=True, exist_ok=True)
-            payload: dict = {
-                "build_dir": str(expanded),
-                "no_browser": True,
-                # Buckaroo scans <project_root>/stats/*.py and
-                # <project_root>/post_processing/*.py for project-authored
-                # klasses. tallyman stores both under artifacts/, so pass
-                # artifacts_dir, not project_dir. Older buckaroo builds
-                # ignore this field, so it's safe to always send.
-                "project_root": str(artifacts_dir(project)),
-                # Buckaroo 0.14.9+: persist computed summary stats to
-                # disk so they survive a Buckaroo restart without full
-                # recomputation on next /load_expr.
-                "cache_storage_path": str(stat_cache),
-            }
-            if column_config_overrides is not None:
-                payload["column_config_overrides"] = column_config_overrides
-            if self.companion_base_url is not None:
-                # buckaroo#943: the server fire-and-forget POSTs one record per
-                # firstpull.* perf span (expr load, stats pipeline + cache
-                # hit/miss, WS first payload) to this URL, keyed by the session
-                # id it mints below. Per-project so the receiver knows which
-                # telemetry.jsonl to append to. Older buckaroo ignores the field.
-                payload["telemetry_url"] = f"{self.companion_base_url}/{project}/api/telemetry"
-            _row_count = 0
-            _mpath = entry_manifest_path(project, content_hash)
-            if _mpath.exists():
-                try:
-                    _row_count = read_manifest(_mpath.parent).row_count or 0
-                except Exception:
-                    pass
-            _load_timeout = 10.0 + _row_count / 1_000_000
-            _t_post = time.perf_counter()
-            try:
-                resp = self._client.post(
-                    f"{self.base_url}/load_expr",
-                    json=payload,
-                    timeout=_load_timeout,
-                )
-                resp.raise_for_status()
-                session_id = resp.json()["session"]
-            except httpx.TimeoutException as exc:
-                log.warning("buckaroo /load_expr timed out for %s: %s", content_hash, exc)
-                return {
-                    "status": "timeout",
-                    "session_id": None,
-                    "detail": (
-                        f"Buckaroo timed out loading this entry ({_load_timeout:.1f}s) — it may be slow to materialise."
-                    ),
-                }
-            except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
-                log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)
-                return {
-                    "status": "error",
-                    "session_id": None,
-                    "detail": f"Buckaroo could not load this entry: {type(exc).__name__}: {exc}",
-                }
-            self._sessions[content_hash] = {"session_id": session_id, "project": project}
-            self._persist_sessions()
-            # load_expr_ms: the companion-visible slice of the grid load — the POST
-            # to buckaroo only. The in-buckaroo timing (stats, row requests) needs
-            # buckaroo-side telemetry (buckaroo-data/buckaroo#943).
+            ensure_materialized(project, content_hash)
+            payload = self._load_body(project, content_hash, column_config_overrides)
+        except Exception as exc:
+            log.warning("could not prepare %s for Buckaroo: %s", content_hash, exc)
             return {
-                "status": "ok",
-                "session_id": session_id,
-                "detail": "",
-                "load_expr_ms": round((time.perf_counter() - _t_post) * 1000, 1),
+                "status": "error",
+                "session_id": None,
+                "detail": f"Tallyman could not prepare this entry: {type(exc).__name__}: {exc}",
             }
+        _load_timeout = self._load_timeout(project, content_hash)
+        _t_post = time.perf_counter()
+        try:
+            resp = self._client.post(f"{self.base_url}/load_expr", json=payload, timeout=_load_timeout)
+            resp.raise_for_status()
+            session_id = resp.json()["session"]
+        except httpx.TimeoutException as exc:
+            log.warning("buckaroo /load_expr timed out for %s: %s", content_hash, exc)
+            return {
+                "status": "timeout",
+                "session_id": None,
+                "detail": (
+                    f"Buckaroo timed out loading this entry ({_load_timeout:.1f}s) — it may be slow to materialise."
+                ),
+            }
+        except (httpx.HTTPError, KeyError, json.JSONDecodeError) as exc:
+            log.warning("buckaroo /load_expr failed for %s: %s", content_hash, exc)
+            return {
+                "status": "error",
+                "session_id": None,
+                "detail": f"Buckaroo could not load this entry: {type(exc).__name__}: {exc}",
+            }
+        # load_expr_ms: the companion-visible slice of the grid load — the POST to buckaroo only. The in-buckaroo
+        # timing (stats, row requests) needs buckaroo-side telemetry (buckaroo-data/buckaroo#943).
+        return {
+            "status": "ok",
+            "session_id": session_id,
+            "detail": "",
+            "load_expr_ms": round((time.perf_counter() - _t_post) * 1000, 1),
+        }
 
     # ------------------------------------------------------------------
     # introspection
@@ -670,7 +633,6 @@ class BuckarooManager:
         return {
             "running": self.is_running,
             "port": self.bound_port,
-            "session_count": len(self._sessions),
         }
 
 

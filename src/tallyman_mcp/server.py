@@ -1111,11 +1111,14 @@ def catalog_scan_staleness(verify_results: bool = False) -> dict:
     ``catalog_recalc`` to act.
 
     ``verify_results=True`` additionally sweeps result faithfulness: every entry
-    with a recorded ``result_digest`` has its baked snapshot re-hashed and
-    compared. Adds a ``verify`` key — ``{results: {hash: bool|null}, unfaithful:
-    [hashes], errors: {hash: message}}`` — where ``false`` means the snapshot's
-    bytes are not what the build recorded (a nondeterministic recompute healed it
-    to different bytes). Hashes every snapshot file, so opt-in.
+    with a recorded ``result_digest`` has its snapshot's content digest compared
+    with it. Adds a ``verify`` key — ``{results: {hash: bool|null}, unfaithful:
+    [hashes], absent: [hashes], errors: {hash: message}}`` — where ``false`` means
+    the snapshot's rows are not what the build recorded (a nondeterministic
+    recompute healed it to different rows), and ``absent`` lists entries whose
+    snapshot file is missing. The sweep reads and never writes: a missing snapshot
+    stays missing and is checked when it is next made. Reads every snapshot file,
+    so opt-in.
 
     Returns:
         stale: hashes that are directly stale (the natural recalc roots).

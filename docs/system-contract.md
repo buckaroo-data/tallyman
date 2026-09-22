@@ -193,8 +193,9 @@ input forever; the live file is merely where the *next* build will look.
 
 A recipe never reads the source or its clone directly. Ingest writes an
 **ordered copy** of the clone under the project's `compute_cache/ordered_sources/`:
-polars reads the clone in file order and writes a parquet file with the same
-columns and one more at the end, `__row_order`, `0..N-1`. The copy is named by
+pyarrow (a parquet source, whose types it keeps) or polars (a CSV) reads the
+clone in file order and writes a parquet file with the same columns and one more
+at the end, `__row_order`, `0..N-1`. The copy is named by
 the source's digest and the reader options (the schema and `scan_csv` options
 of a CSV), and the recipe reads that file. So a recipe's reads are all files
 tallyman wrote, each carrying the column that pages sort by (Part 2, "Row

@@ -169,7 +169,8 @@ A recipe never reads a source file directly. `read_project_file` and
 `tallyman_read_csv` take the source's content digest (md5, memoized on the
 file's stat). In the default `cas` mode they also clone the source
 copy-on-write to `<project>/data/.cas/<digest><suffix>`, the **clone**. Then
-polars writes an **ordered copy**: `<compute_cache>/ordered_sources/<key>.parquet`,
+pyarrow (a parquet source, whose types it keeps) or polars (a CSV, which it
+parses) writes an **ordered copy**: `<compute_cache>/ordered_sources/<key>.parquet`,
 holding the source's rows in file order plus a last column `__row_order`, in
 row groups of 122,880 rows. The recipe reads the copy. `<key>` is an md5 of the
 digest and the reader options (for a CSV, the schema and the `scan_csv`
@@ -223,7 +224,7 @@ its own snapshot, is on disk before anything executes:
 | File | Written by | If it is missing |
 |---|---|---|
 | Snapshot, `compute_cache/result_cache/<hash>.parquet` | `materialize` | re-run the entry's build, and verify the digest |
-| Ordered copy, `compute_cache/ordered_sources/<key>.parquet` | polars, at ingest | re-run ingest on the clone with the recorded reader options, and check it |
+| Ordered copy, `compute_cache/ordered_sources/<key>.parquet` | pyarrow or polars, at ingest | re-run ingest on the clone with the recorded reader options, and check it |
 | Clone, `data/.cas/<digest><suffix>` | `ensure_cas_path` | copy the live source again, but only while its bytes still hash to the digest |
 
 A healed snapshot is checked against the recorded `result_digest`. A mismatch

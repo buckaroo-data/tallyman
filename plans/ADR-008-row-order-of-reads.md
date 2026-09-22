@@ -702,6 +702,11 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - **Open question 1 and 2** were implemented as the uniform rule: every parquet source gets an ordered copy, and the
   column is `__row_order`. **Open question 5** is answered by ADR-007 D13: the manifest's `ordered_copies` records the
   copy's content digest, and a re-created copy is checked against it (a mismatch is loud and served).
+- **D2, who writes the copy.** pyarrow copies a parquet source (#197): it streams the source in file order and writes
+  the copy in the snapshot's parquet settings with 122,880-row groups, so the copy's schema is the source's plus
+  `__row_order`. polars wrote it at first and did not keep every type: a `date64` came back as a timestamp, a map as
+  a list of structs, `time32` and `time64` as `time64[ns]`, and a `decimal256` made it panic. polars still parses a
+  CSV.
 - **A CSV that already has a `__row_order` column** has it overwritten, like a parquet source; the previous check that
   the column was a canonical `0..N-1` sequence is gone, and `original_row_order` is ordinary data.
 

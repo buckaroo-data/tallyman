@@ -1,8 +1,9 @@
 """Ordered copies of sources (ADR-008 D2, ADR-007 D13): the one way a file enters a recipe.
 
 A source (a parquet file or a CSV under the project) is read through its content-addressed clone (``data/.cas``), and
-polars writes a parquet copy of it, in file order, with one more column at the end: ``__row_order``, ``0..N-1``. That
-copy is what a recipe reads. Nothing reads the source or the clone directly, so:
+a parquet copy of it is written, in file order, with one more column at the end: ``__row_order``, ``0..N-1``. pyarrow
+copies a parquet source, so the copy keeps the source's types (#197); polars parses a CSV. That copy is what a recipe
+reads. Nothing reads the source or the clone directly, so:
 
 - every file tallyman reads carries the column that pages sort by;
 - the copy is keyed by the source's content digest and the reader options, so editing a source and running the same
@@ -25,12 +26,18 @@ import os
 import uuid
 from pathlib import Path
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from tallyman_xorq.row_order import ROW_ORDER
 
 perf_log = logging.getLogger("tallyman.perf")
 
-# Pinned polars parquet-write settings for an ordered copy. Held constant so the layout, and therefore any float total
-# computed straight from a source, is reproducible. Changing one is a corpus rebuild (SNAPSHOT_FORMAT_VERSION).
+# The row-group size of an ordered copy. Held constant so the layout, and therefore any float total computed straight
+# from a source, is reproducible. Changing it is a corpus rebuild (SNAPSHOT_FORMAT_VERSION). A parquet source's copy is
+# otherwise written in the snapshot's parquet settings (``materialize._PARQUET_OPTIONS``); polars writes a CSV's with
+# the settings below.
 ORDERED_COPY_ROW_GROUP_ROWS = 122_880
 _WRITE = {
     "compression": "zstd",
@@ -142,14 +149,47 @@ def end_collect(token: contextvars.Token) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _write_parquet_copy(src: Path, dest: Path) -> None:
-    import polars as pl
+def _row_groups(batches, rows: int):
+    """The rows of *batches*, in order, as tables of *rows* rows each; the last one may be shorter."""
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    for batch in batches:
+        if not batch.num_rows:
+            continue
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        while pending_rows >= rows:
+            table = pa.Table.from_batches(pending)
+            yield table.slice(0, rows)
+            tail = table.slice(rows)
+            pending, pending_rows = tail.to_batches(), tail.num_rows
+    if pending_rows:
+        yield pa.Table.from_batches(pending)
 
-    lf = pl.scan_parquet(str(src))
-    columns = [c for c in lf.collect_schema().names() if c != ROW_ORDER]  # an existing __row_order is overwritten
-    lf.select(columns).with_row_index(ROW_ORDER).select([*columns, pl.col(ROW_ORDER).cast(pl.Int64)]).sink_parquet(
-        str(dest), **_WRITE
-    )
+
+def _write_parquet_copy(src: Path, dest: Path) -> None:
+    """Copy the parquet file *src* to *dest* with pyarrow, in file order, numbering the rows in a last ``__row_order``.
+
+    pyarrow reads and writes every type a parquet file can hold, so the copy's schema is the source's plus
+    ``__row_order``, and a recipe sees the types a direct read of the source gives. polars, which wrote the copy
+    before, turned a ``date64`` into a timestamp and a map into a list of structs, and panicked on a ``decimal256``
+    (#197). An existing ``__row_order`` is dropped and written again, last. The rows are regrouped into row groups of
+    ``ORDERED_COPY_ROW_GROUP_ROWS``, whatever the source's row groups are, and each is combined into contiguous arrays,
+    as the snapshot writer does (``materialize._stream_to_parquet``). Memory is bounded by one row group.
+    """
+    from tallyman_xorq.materialize import _PARQUET_OPTIONS
+
+    with pq.ParquetFile(src) as source:
+        kept = [f for f in source.schema_arrow if f.name != ROW_ORDER]
+        schema = pa.schema([*kept, pa.field(ROW_ORDER, pa.int64())])
+        written = 0
+        with pq.ParquetWriter(dest, schema, **_PARQUET_OPTIONS) as writer:
+            batches = source.iter_batches(columns=[f.name for f in kept])
+            for table in _row_groups(batches, ORDERED_COPY_ROW_GROUP_ROWS):
+                numbers = pa.array(np.arange(written, written + table.num_rows, dtype=np.int64))
+                numbered = table.append_column(schema.field(ROW_ORDER), numbers)
+                writer.write_table(numbered.combine_chunks(), row_group_size=ORDERED_COPY_ROW_GROUP_ROWS)
+                written += table.num_rows
 
 
 def _write_copy(src: Path, reader: dict, dest: Path) -> None:
@@ -318,8 +358,8 @@ def recreate_ordered_copy(project: str, owner_hash: str, path: Path) -> None:
     if digest != record["content_digest"]:
         message = (
             f"the ordered copy of {record['source']!r} was made again with content digest {digest}, not the "
-            f"{record['content_digest']} recorded when it was first written (a change in polars, or a source that is "
-            "not what it was)"
+            f"{record['content_digest']} recorded when it was first written (a change in pyarrow or polars, which "
+            "write the copies, or a source that is not what it was)"
         )
         perf_log.warning("recreate_ordered_copy %s: %s", key, message)
         try:

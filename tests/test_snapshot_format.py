@@ -53,7 +53,7 @@ from tests.big_parquet import write_big_parquet
 
 PREFIX = "arrow-sha256:"
 SNAPSHOT_ROW_GROUP = 1_048_576  # ADR-009 D3
-ORDERED_COPY_ROW_GROUP = 122_880  # ADR-009 D3, io._CSV_PARQUET_WRITE
+ORDERED_COPY_ROW_GROUP = 122_880  # ADR-009 D3, ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS
 BIG_ROWS = 1_500_000  # tests/big_parquet.py default
 
 
@@ -365,7 +365,8 @@ def test_snapshot_ends_in_row_order_numbered_from_zero_in_file_order(big_built):
 
 
 def test_ordered_copy_of_a_source_has_row_groups_of_122880_rows(big_built):
-    """ADR-009 D3 (the format version covers the ordered copies): polars writes them, in pinned 122,880-row groups.
+    """ADR-009 D3 (the format version covers the ordered copies): pinned 122,880-row groups, from pyarrow for a parquet
+    source like this one (#197) and from polars for a CSV.
 
     An ungrouped float total over a source reads that layout (#187), so it is as pinned as the snapshot's.
     """

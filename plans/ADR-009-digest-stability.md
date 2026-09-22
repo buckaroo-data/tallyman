@@ -444,6 +444,13 @@ that does not exist yet fails on import, and that counts as red. Paddy,
 - **D3.** `SNAPSHOT_FORMAT_VERSION = 1` stands for the snapshot row-group size (1,048,576), the materialization
   connection's batch size (8,192) and the ordered-copy row-group size (122,880). It is recorded in the manifest with
   the xorq, xorq-datafusion and pyarrow versions.
+- **D3, the ordered copies.** Since #197 pyarrow writes the copy of a parquet source, in this writer's parquet
+  settings with 122,880-row groups; polars writes only a CSV's. The format version stayed at 1: the row groups are
+  where they were, and polars also wrote a page index. On the 1.5M-row test source the pyarrow copy has the same
+  content digest as the polars one, and on the single-partition connection the `SUM` and `AVG` of its float column
+  come out bit for bit the same, ungrouped, filtered on the float, and over four ranges of the sorted `id` that the
+  page index prunes. What changed is the columns polars did not keep (`date64`, maps, `time32`, `time64`), and a
+  copy of those made again is reported by its recorded content digest (`unfaithful_ordered_copy`).
 - **D4.** The heal record says the engine changed, naming the versions, when any recorded version or the format
   differs from today's, and otherwise keeps the structural (#88) and execution (#83) attribution.
 

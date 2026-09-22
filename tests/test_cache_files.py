@@ -214,3 +214,60 @@ def test_a_normal_snapshot_can_still_be_deleted_and_the_next_read_re_creates_and
     assert snapshot_file_digest(snap) == read_manifest(entry_dir(project, h)).result_digest
     assert not [e for e in list_errors(project) if e.get("code") == "unfaithful_heal"]
     assert _cache_rows(client, project)[h].get("pinned") is False
+
+
+def test_a_source_snapshot_can_be_deleted_and_the_next_read_re_creates_it_from_the_clone(project, tmp_path):
+    """ADR-011 D1, revised: a source version's snapshot is cache too.
+
+    The clone of the imported bytes under ``data/.cas`` and the reader options on the entry are everything
+    ``ensure_materialized`` needs to write the file again, which is ADR-007 D13's test for whether a file is cache.
+    So the Cache page lists a source row as unpinned, the delete takes it, and the next read makes it again.
+    """
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import snapshot_path
+
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pq.write_table(pa.table({"region": ["e", "w", "e"], "price": [1.0, 2.0, 3.0]}), src)
+    out = source_import.update_and_depend(str(src), "orders", project=project)
+    snap = snapshot_path(project, out["hash"])
+    assert snap.exists()
+    client = TestClient(create_app(project))
+
+    assert _cache_rows(client, project)[out["hash"]].get("pinned") is False
+
+    response = client.delete(f"/{project}/api/result_cache/{out['hash']}")
+    assert response.status_code == 200, response.text
+    assert not snap.exists()
+
+    cached_result_expr.cache_clear()
+    assert len(cached_result_expr(project, out["hash"]).execute()) == 3
+    assert snap.exists()
+    assert snapshot_file_digest(snap) == read_manifest(entry_dir(project, out["hash"])).result_digest
+    assert not [e for e in list_errors(project) if e.get("code") == "unfaithful_heal"]
+
+
+def test_a_source_snapshot_whose_clone_is_gone_is_pinned_and_its_delete_is_refused(project, tmp_path):
+    """The one case where a source snapshot cannot be made again: the clone of the imported bytes is gone too."""
+    from tallyman_core.paths import data_dir
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import snapshot_path
+
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pq.write_table(pa.table({"region": ["e", "w", "e"], "price": [1.0, 2.0, 3.0]}), src)
+    out = source_import.update_and_depend(str(src), "orders", project=project)
+    (data_dir(project) / ".cas" / f"{out['digest']}.parquet").unlink()
+    client = TestClient(create_app(project))
+
+    row = _cache_rows(client, project)[out["hash"]]
+    assert row.get("pinned") is True, row
+    assert "orders-v1" in row.get("pinned_reason", ""), row
+    assert ".cas" in row.get("pinned_reason", ""), row  # pinned by the lost clone, not by being a source
+
+    response = client.delete(f"/{project}/api/result_cache/{out['hash']}")
+
+    assert response.status_code == 409, response.text
+    assert snapshot_path(project, out["hash"]).exists()

@@ -14,6 +14,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pandas as pd
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from tallyman_core import data_dir, entry_dir, get_alias, history_for, read_manifest
@@ -424,11 +426,210 @@ def test_a_source_entry_reports_no_source_axis(project: str, tmp_path: Path, mon
 
 
 # ---------------------------------------------------------------------------
-# D1 / ADR-007 D13 — the snapshot is DATA, not cache
+# D1 — pyarrow writes the snapshot, in the pinned layout
 # ---------------------------------------------------------------------------
+#
+# ``compute_cache/result_cache/`` holds one shape of parquet file. polars cannot write it — it has no option for the
+# parquet format version and none for the page index (pola-rs/polars#12752, open against 1.44.2) — so polars stays
+# where it is genuinely needed, parsing a CSV in file order under the schema DSL of ADR-005, and its Arrow data goes
+# to the writer every computed snapshot already uses.
 
 
-def test_ensure_materialized_does_not_rebuild_a_source_snapshot(project: str, tmp_path: Path, monkeypatch):
+def _layout(project: str, content_hash: str) -> dict:
+    md = pq.ParquetFile(snapshot_path(project, content_hash)).metadata
+    return {
+        "format_version": md.format_version,
+        "created_by": md.created_by,
+        "row_group_rows": [md.row_group(i).num_rows for i in range(md.num_row_groups)],
+        "page_index": all(
+            md.row_group(i).column(c).has_offset_index and md.row_group(i).column(c).has_column_index
+            for i in range(md.num_row_groups)
+            for c in range(md.row_group(i).num_columns)
+        ),
+    }
+
+
+def test_a_source_snapshot_is_written_by_pyarrow_in_the_pinned_layout(project: str, tmp_path: Path, monkeypatch):
+    """The parquet format version, the page index and the row-group size of every other file in ``result_cache/``."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.ordered_copy import ORDERED_COPY_ROW_GROUP_ROWS
+
+    rows = ORDERED_COPY_ROW_GROUP_ROWS + 5_000
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", rows)
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    layout = _layout(project, out["hash"])
+    assert layout["format_version"] == "2.6", layout
+    assert layout["created_by"].startswith("parquet-cpp-arrow"), layout
+    assert layout["page_index"] is True, layout
+    assert layout["row_group_rows"] == [ORDERED_COPY_ROW_GROUP_ROWS, 5_000], layout
+
+
+def test_a_csv_source_snapshot_is_written_by_pyarrow_too(project: str, tmp_path: Path, monkeypatch):
+    """polars parses the CSV; the bytes on disk are written by the same writer as a parquet source's."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1), ("west", 2), ("east", 3)])
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    layout = _layout(project, out["hash"])
+    assert layout["format_version"] == "2.6", layout
+    assert layout["created_by"].startswith("parquet-cpp-arrow"), layout
+    assert layout["page_index"] is True, layout
+    frame = _snapshot_frame(project, out["hash"])
+    assert frame["region"].to_list() == ["east", "west", "east"]
+    assert frame[ROW_ORDER].to_list() == [0, 1, 2]
+
+
+def test_a_source_snapshot_has_the_layout_of_a_computed_one(project: str, tmp_path: Path, monkeypatch):
+    """Two files in one directory, written by one writer: the format version and the page index agree."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
+    from tallyman_mcp.server import catalog_create
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 20)
+    out = source_import.update_and_depend(str(src), "orders")
+    assert "error" not in catalog_create("totals", _child_code("orders", project))
+
+    source = _layout(project, out["hash"])
+    computed = _layout(project, get_alias(project, "totals"))
+    assert source["format_version"] == computed["format_version"]
+    assert source["created_by"] == computed["created_by"]
+    assert source["page_index"] == computed["page_index"] is True
+
+
+def test_importing_a_parquet_needs_no_polars(project: str, tmp_path: Path, monkeypatch):
+    """A parquet source has its rows and its types in the file, so pyarrow reads it and nothing else is involved."""
+    import polars as pl
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+
+    def boom(*a, **k):
+        raise AssertionError("a parquet import read the file with polars")
+
+    monkeypatch.setattr(pl, "scan_parquet", boom)
+    monkeypatch.setattr(pl, "read_parquet", boom)
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    assert _snapshot_frame(project, out["hash"])[ROW_ORDER].to_list() == list(range(10))
+
+
+def test_a_parquet_source_keeps_the_types_the_file_has(project: str, tmp_path: Path, monkeypatch):
+    """polars rewrote a date as a timestamp, a time32 as a time64 and a map as a list of structs (#197)."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "typed.parquet"
+    table = pa.table(
+        {
+            "d": pa.array([19_723, 19_724], type=pa.date32()),
+            "tm": pa.array([1_000, 2_000], type=pa.time32("ms")),
+            "m": pa.array([[("a", 1)], [("b", 2)]], type=pa.map_(pa.string(), pa.int64())),
+            "x": pa.array([1.5, 2.5], type=pa.float64()),
+        }
+    )
+    pq.write_table(table, src)
+
+    out = source_import.update_and_depend(str(src), "typed")
+
+    written = pq.read_schema(snapshot_path(project, out["hash"]))
+    assert [(f.name, str(f.type)) for f in written] == [
+        *[(f.name, str(f.type)) for f in pq.read_schema(src)],
+        (ROW_ORDER, "int64"),
+    ]
+
+
+def test_a_csv_import_never_collects_the_whole_frame(project: str, tmp_path: Path, monkeypatch):
+    """A big source is the point of the row-group size, so the CSV is streamed into the writer, not collected."""
+    import polars as pl
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [(f"r{i % 3}", i) for i in range(500)])
+
+    def boom(*a, **k):
+        raise AssertionError("the CSV import collected the whole frame into memory")
+
+    monkeypatch.setattr(pl.LazyFrame, "collect", boom)
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    assert _snapshot_frame(project, out["hash"])[ROW_ORDER].to_list() == list(range(500))
+
+
+# ---------------------------------------------------------------------------
+# D1 / ADR-007 D13 — the snapshot is CACHE, re-created from the clone
+# ---------------------------------------------------------------------------
+#
+# The clone under ``data/.cas`` holds the bytes as imported and the entry records the reader options, so
+# ``ensure_materialized`` CAN make the snapshot again — which is ADR-007 D13's whole test for whether a file is
+# cache. Only when the clone is gone too is the version unrecoverable.
+
+
+def _clone_of(project: str, out: dict) -> Path:
+    return data_dir(project) / ".cas" / f"{out['digest']}{Path(out['path']).suffix}"
+
+
+def test_ensure_materialized_recreates_a_source_snapshot_from_the_clone(project: str, tmp_path: Path, monkeypatch):
+    """A deleted source snapshot comes back from the clone, with the rows it had."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.errors import list_errors
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "orders")
+    before = snapshot_path(project, out["hash"]).read_bytes()
+    src.unlink()  # the outside file is gone: the clone is what re-creates the snapshot
+    snapshot_path(project, out["hash"]).unlink()
+
+    ensure_materialized(project, out["hash"])
+
+    assert snapshot_path(project, out["hash"]).is_file()
+    assert snapshot_path(project, out["hash"]).read_bytes() == before
+    frame = _snapshot_frame(project, out["hash"])
+    assert frame[ROW_ORDER].to_list() == list(range(10))
+    assert [r for r in list_errors(project, limit=1000) if r.get("hash") == out["hash"]] == []
+
+
+def test_a_recreated_source_snapshot_is_verified_against_its_recorded_digest(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """Verified exactly as any other re-created snapshot is: a digest that is not the recorded one is recorded."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.errors import list_errors
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "orders")
+    # The clone is overwritten with other rows under the same digest name, so the re-creation cannot be faithful.
+    other = _write_parquet(_outside(tmp_path) / "other.parquet", 4)
+    _clone_of(project, out).write_bytes(other.read_bytes())
+    snapshot_path(project, out["hash"]).unlink()
+
+    ensure_materialized(project, out["hash"])
+
+    codes = [r.get("code") for r in list_errors(project, limit=1000) if r.get("hash") == out["hash"]]
+    assert "unfaithful_heal" in codes, codes
+
+
+def test_a_source_snapshot_whose_clone_is_gone_names_the_re_import(project: str, tmp_path: Path, monkeypatch):
+    """Only when the bytes are gone from the arena as well is a source version unrecoverable, and it says so."""
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -438,15 +639,46 @@ def test_ensure_materialized_does_not_rebuild_a_source_snapshot(project: str, tm
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
     out = source_import.update_and_depend(str(src), "orders")
     snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
 
     with pytest.raises(BuildError) as exc:
         ensure_materialized(project, out["hash"])
 
-    assert "orders" in str(exc.value)
-    assert not snapshot_path(project, out["hash"]).exists(), "a source snapshot is data; nothing re-creates it"
+    message = str(exc.value)
+    assert "orders-v1" in message
+    assert "catalog_import_source" in message
+    # It has to say WHICH file is missing: the snapshot alone is a cache miss, the clone as well is the loss.
+    assert ".cas" in message, message
+    assert out["digest"] in message, message
+    assert not snapshot_path(project, out["hash"]).exists()
 
 
-def test_the_cache_page_does_not_offer_to_delete_a_source_snapshot(project: str, tmp_path: Path, monkeypatch):
+def test_a_child_reads_after_its_sources_snapshot_is_deleted(project: str, tmp_path: Path, monkeypatch):
+    """The payoff: deleting ``result_cache/`` no longer leaves a source entry unreadable with the data right there."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
+    from tallyman_mcp.server import catalog_create
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    out = source_import.update_and_depend(str(src), "orders")
+    child = catalog_create("totals", _child_code("orders", project))
+    assert "error" not in child, child
+    child_hash = get_alias(project, "totals")
+    expected = cached_result_expr(project, child_hash).execute()
+
+    for snap in snapshot_path(project, out["hash"]).parent.glob("*.parquet"):
+        snap.unlink()
+    cached_result_expr.cache_clear()
+
+    assert len(cached_result_expr(project, child_hash).execute()) == len(expected)
+    assert snapshot_path(project, out["hash"]).is_file()
+
+
+def test_the_cache_page_offers_to_delete_a_source_snapshot(project: str, tmp_path: Path, monkeypatch):
+    """A source snapshot is an ordinary deletable snapshot while its clone is on disk to make it again from."""
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -455,9 +687,24 @@ def test_the_cache_page_does_not_offer_to_delete_a_source_snapshot(project: str,
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
     out = source_import.update_and_depend(str(src), "orders")
 
+    assert pinned_reason(project, out["hash"]) is None
+
+
+def test_a_source_snapshot_whose_clone_is_gone_is_pinned(project: str, tmp_path: Path, monkeypatch):
+    """Without the clone the snapshot is the last copy of those rows, so the delete leaves it alone and says why."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.materialize import pinned_reason
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "orders")
+    _clone_of(project, out).unlink()
+
     reason = pinned_reason(project, out["hash"])
     assert reason is not None
-    assert "source" in reason.lower()
+    assert "orders-v1" in reason
+    assert ".cas" in reason, reason  # the pin is the missing clone, not the fact that this is a source
 
 
 def test_a_reset_keeps_the_clone_of_an_imported_source_alive(project: str, tmp_path: Path, monkeypatch):

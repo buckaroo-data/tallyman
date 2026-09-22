@@ -522,7 +522,9 @@ def test_importing_a_parquet_needs_no_polars(project: str, tmp_path: Path, monke
 
     out = source_import.update_and_depend(str(src), "orders")
 
-    assert _snapshot_frame(project, out["hash"])[ROW_ORDER].to_list() == list(range(10))
+    # Read back with pyarrow: polars is still patched out, and the point of the test is that it is not needed.
+    written = pq.read_table(snapshot_path(project, out["hash"]))
+    assert written[ROW_ORDER].to_pylist() == list(range(10))
 
 
 def test_a_parquet_source_keeps_the_types_the_file_has(project: str, tmp_path: Path, monkeypatch):
@@ -550,8 +552,12 @@ def test_a_parquet_source_keeps_the_types_the_file_has(project: str, tmp_path: P
     ]
 
 
-def test_a_csv_import_never_collects_the_whole_frame(project: str, tmp_path: Path, monkeypatch):
-    """A big source is the point of the row-group size, so the CSV is streamed into the writer, not collected."""
+def test_a_csv_import_streams_into_the_pyarrow_writer(project: str, tmp_path: Path, monkeypatch):
+    """A big source is the point of the row-group size, so the CSV goes batch by batch into pyarrow's writer.
+
+    polars never collects the frame — patching ``collect`` out proves the rows arrive through ``collect_batches``,
+    and the layout of the file proves they arrive at the writer this branch introduces rather than at polars' sink.
+    """
     import polars as pl
 
     from tallyman_xorq import source_import
@@ -566,7 +572,10 @@ def test_a_csv_import_never_collects_the_whole_frame(project: str, tmp_path: Pat
 
     out = source_import.update_and_depend(str(src), "orders")
 
-    assert _snapshot_frame(project, out["hash"])[ROW_ORDER].to_list() == list(range(500))
+    # Read back with pyarrow: polars' own reader collects, and the test has just patched that out.
+    written = pq.read_table(snapshot_path(project, out["hash"]))
+    assert written[ROW_ORDER].to_pylist() == list(range(500))
+    assert _layout(project, out["hash"])["created_by"].startswith("parquet-cpp-arrow")
 
 
 # ---------------------------------------------------------------------------

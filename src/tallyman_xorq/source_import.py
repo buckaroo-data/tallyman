@@ -8,7 +8,8 @@ One import does four things:
 
 1. digests the outside file and clones its bytes to ``data/.cas/<digest><suffix>``, verified after the write
    (ADR-011 D9). The clone is the imported file as it was, kept so a CSV read with the wrong schema can be imported
-   again without the outside file (ADR-005's suggestion-and-retry contract);
+   again without the outside file (ADR-005's suggestion-and-retry contract), and so the snapshot below can be
+   written again from it;
 2. writes ONE parquet snapshot of it, in file order plus a last ``__row_order`` column, at
    ``compute_cache/result_cache/<content_hash>.parquet``. A source entry is worthy and **its snapshot is the ordered
    copy** — ``compute_cache/ordered_sources/`` and the copy key of ADR-008 D2 do not exist for an import, because the
@@ -20,9 +21,11 @@ One import does four things:
 The **content hash of a source entry is a function of its bytes and its reader options**, and of nothing else, so two
 imports of identical bytes under two aliases mint one entry and share one file.
 
-That snapshot is **data, not cache** in the sense of ADR-007 D13: ``ensure_materialized`` never re-creates it and the
-Cache page never offers to delete it. The bytes it holds were manufactured from a file tallyman does not control, so
-losing it is a loss, not a cache miss.
+That snapshot is **cache** in the sense of ADR-007 D13 — a file is cache if ``ensure_materialized`` can re-create it
+— because the clone holds the bytes and the entry holds the reader options. A deleted one is written again from the
+clone and verified against the recorded ``result_digest``, like any other snapshot; the Cache page offers to delete
+it like any other. Only when the clone is gone as well are the rows unrecoverable, and then the snapshot is pinned
+and the error names the re-import (``materialize._heal_a_source``).
 
 After the import the outside path is **provenance**: recorded on the entry and never read again. Deleting, moving or
 editing the original file has no effect on any build.
@@ -305,6 +308,30 @@ def _write_snapshot(clone: Path, reader: dict, dest: Path) -> str:
     return content_digest(dest)
 
 
+def source_clone_path(project: str, provenance) -> Path:
+    """The clone of a source version's imported bytes: ``data/.cas/<digest><suffix>``.
+
+    The bytes as they arrived, kept beside the snapshot (ADR-011, open question 1). They are what re-creates the
+    snapshot when it is deleted, and what ADR-005's suggestion-and-retry contract re-reads when a CSV was imported
+    under the wrong schema, so the entry survives the outside file going away.
+    """
+    from tallyman_core.paths import data_dir
+
+    return data_dir(project) / ".cas" / f"{provenance.digest}{provenance.suffix}"
+
+
+def rewrite_source_snapshot(project: str, content_hash: str, provenance) -> str:
+    """Write the snapshot of the source entry *content_hash* again, from its clone; return the digest written.
+
+    ``ensure_materialized`` calls this for a source version whose file was deleted (ADR-011 D1). The reader options
+    are the ones recorded at import (D12), so the rows are parsed exactly as they were the first time.
+    """
+    from tallyman_xorq.materialize import snapshot_path
+
+    clone = source_clone_path(project, provenance)
+    return _write_snapshot(clone, provenance.reader, snapshot_path(project, content_hash))
+
+
 def _recipe(outside_path: Path, alias: str, version: int, digest: str, reader: dict) -> str:
     """The generated recipe of a source entry: what the Code tab shows, and what its frozen build is made from.
 
@@ -359,8 +386,8 @@ def _mint(
     # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
     clone = si.ensure_cas_path(project, outside_path, digest)
 
-    # 2. The one snapshot, named by the entry hash. Nothing re-creates it, so it is written before anything else that
-    #    could fail, and an existing one (a second alias over the same bytes) is kept.
+    # 2. The one snapshot, named by the entry hash. An existing one (a second alias over the same bytes) is kept:
+    #    the hash is a function of the bytes and the reader, so it already holds exactly these rows.
     snapshot = snapshot_path(project, content_hash)
     if snapshot.exists():
         from tallyman_xorq.digest import content_digest
@@ -538,8 +565,8 @@ def update_and_depend(
         from tallyman_core.paths import entry_dir
         from tallyman_xorq.materialize import snapshot_path
 
-        # A no-op whose entry or snapshot is gone is repaired here: the snapshot is data that nothing re-creates
-        # (ADR-007 D13), and an explicit import is the one act that hands tallyman the bytes again.
+        # A no-op whose entry is gone is repaired here, and so is a missing snapshot: the caller has handed us the
+        # bytes, which is cheaper than going through the clone, and an entry directory is not cache at all.
         if mint or not (entry_dir(proj, content_hash).is_dir() and snapshot_path(proj, content_hash).exists()):
             written = _mint(
                 proj,

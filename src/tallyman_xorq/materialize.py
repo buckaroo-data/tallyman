@@ -266,29 +266,54 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
         raise BuildError(f"entry {owner_hash} in {project!r}: {path} is still missing after it was made again")
 
 
-def _refuse_to_rebuild_a_source(project: str, content_hash: str) -> None:
-    """A source version's snapshot is data, not cache (ADR-007 D13, ADR-011 D1), so nothing re-creates it.
-
-    Its rows were manufactured from a file tallyman does not control, and re-running the entry's build would read
-    the very snapshot that is missing. The error names the alias and the version, because importing the bytes again
-    is the only repair.
-    """
+def _source_provenance(project: str, content_hash: str):
+    """The import recorded on the entry, or None when it is not a source version."""
     from tallyman_core import read_manifest
     from tallyman_core.paths import entry_dir
-    from tallyman_xorq.build import BuildError
 
     try:
-        provenance = read_manifest(entry_dir(project, content_hash)).provenance
+        return read_manifest(entry_dir(project, content_hash)).provenance
     except (OSError, ValueError):
-        return
+        return None
+
+
+def _heal_a_source(project: str, content_hash: str) -> bool:
+    """Re-create a source version's snapshot from the clone of the bytes it was imported from (ADR-011 D1).
+
+    A source snapshot is cache in the sense of ADR-007 D13 — ``ensure_materialized`` can re-create it — because the
+    clone under ``data/.cas`` holds the imported bytes and the entry records the reader options that read them. It
+    cannot go through ``materialize``: the entry's build reads the very snapshot that is missing, so the rows come
+    from the clone instead. What is written is then verified against the recorded ``result_digest`` like any other
+    re-created snapshot.
+
+    Only a clone that is gone as well makes the version unrecoverable, and then the error names the file that is
+    missing and the re-import that repairs it. Returns whether this entry is a source version, so the general path
+    can stop.
+    """
+    from tallyman_core.catalog_state import project_lock
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.result_cache import _verify_self_heal
+    from tallyman_xorq.source_import import rewrite_source_snapshot, source_clone_path
+
+    provenance = _source_provenance(project, content_hash)
     if provenance is None:
-        return
-    raise BuildError(
-        f"the data of {provenance.alias}-v{provenance.version} (entry {content_hash}) is missing: "
-        f"{snapshot_path(project, content_hash)} is not on disk. A source version is data, not cache — nothing "
-        f"re-creates it, because its rows came from a file outside the catalog. Import it again with "
-        f"catalog_import_source({provenance.path!r}, {provenance.alias!r}, pinned_version={provenance.version})."
-    )
+        return False
+    with project_lock(project):
+        if snapshot_path(project, content_hash).exists():  # a peer healed it while we waited
+            return True
+        clone = source_clone_path(project, provenance)
+        if not clone.is_file():
+            raise BuildError(
+                f"the data of {provenance.alias}-v{provenance.version} (entry {content_hash}) cannot be made "
+                f"again: {snapshot_path(project, content_hash)} is not on disk and neither is the clone of the "
+                f"imported bytes, {clone}. Import them again with "
+                f"catalog_import_source({provenance.path!r}, {provenance.alias!r}, "
+                f"pinned_version={provenance.version})."
+            )
+        digest = rewrite_source_snapshot(project, content_hash, provenance)
+        perf_log.debug("ensure_materialized re-imported %s from %s", content_hash, clone.name)
+        _verify_self_heal(project, content_hash, digest)
+    return True
 
 
 def _ensure(project: str, content_hash: str) -> bool:
@@ -298,7 +323,8 @@ def _ensure(project: str, content_hash: str) -> bool:
     worthy = cache_worthy(project, content_hash)
     if worthy and snapshot_path(project, content_hash).exists():
         return True
-    _refuse_to_rebuild_a_source(project, content_hash)
+    if _heal_a_source(project, content_hash):
+        return worthy
     plan = _resolve_result_plan(project, content_hash)
     for path in plan.reads:
         if not path.exists():
@@ -327,25 +353,29 @@ def ensure_materialized(project: str, content_hash: str) -> None:
 def pinned_reason(project: str, content_hash: str) -> str | None:
     """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
 
-    A snapshot is pinned when it cannot be made again faithfully: it is a source version's imported data
-    (ADR-011 D1), the recipe is not reproducible (two runs at create time gave different digests), or a heal already
-    produced different rows than were built. The Cache page's delete leaves such a file alone and says why.
-    ``compute_cache/`` as a whole is still deletable by definition.
+    A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
+    time gave different digests), a heal already produced different rows than were built, or it is a source
+    version whose clone of the imported bytes is gone (ADR-011 D1 — with the clone it is ordinary cache, made again
+    from those bytes). The Cache page's delete leaves such a file alone and says why. ``compute_cache/`` as a whole
+    is still deletable by definition.
     """
     from tallyman_core import read_manifest
     from tallyman_core.errors import list_errors
     from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import source_clone_path
 
     try:
         manifest = read_manifest(entry_dir(project, content_hash))
     except (OSError, ValueError):
         manifest = None
     if manifest is not None and manifest.provenance is not None:
-        return (
-            f"this file is the data of the source version {manifest.provenance.alias}-v"
-            f"{manifest.provenance.version}, imported from {manifest.provenance.path} — nothing can make it "
-            "again, so it is kept"
-        )
+        clone = source_clone_path(project, manifest.provenance)
+        if not clone.is_file():
+            return (
+                f"this file is the last copy of the source version {manifest.provenance.alias}-v"
+                f"{manifest.provenance.version}: the clone of the bytes imported from "
+                f"{manifest.provenance.path} is gone from {clone}, so nothing can make it again and it is kept"
+            )
     if manifest is not None and manifest.reproducible is False:
         columns = ", ".join(manifest.nonreproducible_columns or [])
         return (

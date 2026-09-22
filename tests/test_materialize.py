@@ -360,9 +360,10 @@ def test_a_failed_first_create_leaves_no_snapshot_and_no_temp_file(project, orde
 
 
 def test_a_failed_retry_of_a_half_built_entry_keeps_its_snapshot(project, orders_parquet, monkeypatch):
-    """ADR-007 D4, #193. A build killed between writing the snapshot and writing the manifest leaves an entry
-    directory with no manifest, and its snapshot is still served (``cache_worthy`` falls back to the file). A retry is
-    a create, and one that fails removes the half-built directory and leaves the snapshot as it was."""
+    """ADR-007 D4, #193. A build killed after it made the entry directory and before it wrote the manifest leaves a
+    directory with no manifest. A snapshot already at the path, such as one a reset left, is still served
+    (``cache_worthy`` falls back to the file). A retry is a create, and one that fails removes the half-built directory
+    and leaves the snapshot as it was."""
     from tallyman_xorq.materialize import snapshot_path
 
     code = _agg_code(project)

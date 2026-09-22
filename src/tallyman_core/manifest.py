@@ -55,6 +55,13 @@ class Manifest(BaseModel):
     # None for a cheap entry, which is not run twice.
     reproducible: bool | None = None
     nonreproducible_columns: list[str] | None = None
+    # The content digest of the file the last unfaithful heal wrote: a heal whose rows differ from the recorded
+    # ``result_digest`` (ADR-006 D12, unfaithful entries are pinned and badged). Set, it pins the snapshot as
+    # ``reproducible: false`` does. It is the one field written after create, by ``_verify_self_heal``, and it lives
+    # here so the pin moves with the entry through a reset and survives the error banner's dismiss, which deletes
+    # errors.jsonl (#196). The recipe zip is written once, at the first checkpoint after create, so its copy of the
+    # manifest does not follow this field.
+    unfaithful_heal_digest: str | None = None
     # The version of the snapshot format (row-group size and materialization batch size, ADR-009 D3) this entry's
     # snapshot and ordered copies were written with, and the engine versions at build (ADR-009 D4), so a mismatch at a
     # heal can say the engine changed instead of blaming the recipe.

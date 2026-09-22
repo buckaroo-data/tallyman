@@ -680,7 +680,7 @@ def test_an_entry_whose_heal_was_unfaithful_is_pinned_against_an_explicit_delete
     h = build_and_persist(project, _agg_code(project)).content_hash
     _edit_manifest(project, h, lambda doc: doc.update(result_digest=PREFIX + "0" * 64))
     _evict(project, h)
-    cached_result_expr(project, h)  # an unfaithful heal: the durable record is the pin
+    cached_result_expr(project, h)  # an unfaithful heal: the manifest records the pin, errors.jsonl the banner's record
     assert len(_unfaithful(project)) == 1
     snap = baked_snapshot_path(project, h)
     assert snap is not None and snap.exists()

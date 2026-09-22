@@ -294,6 +294,7 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 | `cache_worthy`, `cache_worthy_why`, `cache_bytes` | whether the entry is materialized, decided once at build, and the evidence |
 | `result_digest` | `arrow-sha256:` digest of the snapshot's content (worthy entries) — the output identity |
 | `reproducible`, `nonreproducible_columns` | whether two runs at create gave the same digest, and the columns that differed |
+| `unfaithful_heal_digest` | the digest the last unfaithful heal wrote; set, it pins the snapshot. The one field written after create |
 | `snapshot_format`, `engine_versions` | the format version and the xorq, xorq-datafusion and pyarrow versions at build |
 | `row_count`, `execute_seconds`, `compile_seconds`, timings | build measurements |
 
@@ -615,10 +616,10 @@ not only in tests:
   reads and never writes: a snapshot that is missing is reported as `absent` and
   checked at the moment it next exists.
 
-A failure is surfaced loudly — a durable `unfaithful_heal` record in
-`errors.jsonl` (the UI badge, and the pin: the Cache page's delete leaves the file
-alone), a stat cache wipe, a forced reload of the open Buckaroo grid, an SSE
-event — never only a log line. Its attribution has four classes with four
+A failure is surfaced loudly — the pin, `unfaithful_heal_digest` in the manifest
+(the Cache page's delete leaves the file alone), a durable `unfaithful_heal`
+record in `errors.jsonl` (the UI badge), a stat cache wipe, a forced reload of
+the open Buckaroo grid, an SSE event — never only a log line. Its attribution has four classes with four
 different fixes:
 
 | class | detector | meaning | response |

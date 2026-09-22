@@ -284,10 +284,10 @@ through the same writer, and verifies the result against the `result_digest`
 recorded at build. Missing files it reads are made first: a parent's snapshot by
 recursing on the hash in its name, an ordered copy from its clone with the reader
 options in the manifest, a clone from the live source while the bytes still match.
-A mismatch is still served, but never silently: `_verify_self_heal` records a
-durable `unfaithful_heal` error (which also pins the file), wipes the entry's
-stat cache, and fires the hooks, which in the companion force Buckaroo to reload
-the open grid and push an SSE event.
+A mismatch is still served, but never silently: `_verify_self_heal` pins the file
+(`unfaithful_heal_digest` in the manifest), records a durable `unfaithful_heal`
+error for the banner, wipes the entry's stat cache, and fires the hooks, which in
+the companion force Buckaroo to reload the open grid and push an SSE event.
 
 Every reader takes this path: the paginated viewer (`api_data` pages the entry
 with `row_order.page`, `ORDER BY __row_order` and then `LIMIT/OFFSET`, so the same

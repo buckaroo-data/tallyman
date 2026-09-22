@@ -402,7 +402,8 @@ def recipe_is_structurally_nondeterministic(project: str, content_hash: str) -> 
 
 # Called (project, content_hash) after an UNFAITHFUL self-heal, best-effort.
 # The companion registers a hook that forces Buckaroo to reload the entry's grid and pushes the SSE badge event
-# (ADR-007 D6); processes without an SSE bus (the MCP server) still get the durable errors.jsonl record written below.
+# (ADR-007 D6); processes without an SSE bus (the MCP server) still get the pin in the manifest and the errors.jsonl
+# record written below.
 UNFAITHFUL_HEAL_HOOKS: list = []
 
 
@@ -427,6 +428,18 @@ def _engine_change(project: str, content_hash: str) -> str | None:
     return ", ".join(changes) or None
 
 
+def _record_unfaithful_heal(project: str, content_hash: str, actual: str) -> None:
+    """Pin the entry's snapshot by recording the digest an unfaithful heal wrote in its manifest (#196).
+
+    The heal holds the project's write lock, and ``write_manifest`` replaces the file atomically.
+    """
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_core.paths import entry_dir
+
+    path = entry_dir(project, content_hash)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": actual}))
+
+
 def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
     """Verify a just-repopulated snapshot's content digest against the build-time digest (ADR-007 D5, ADR-006 D7).
 
@@ -437,8 +450,10 @@ def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
 
       * a ``tallyman.perf`` UNFAITHFUL warning, attributing the change (ADR-009 D4): the engine (a version recorded
         at build differs from today's), the recipe's graph moving (#88), or a fixed graph that runs differently (#83);
-      * a durable ``errors.jsonl`` record (``code="unfaithful_heal"``) — the UI badge's source, and the pin (the entry's
-        bytes are not regenerable, so the Cache page's delete leaves its file alone);
+      * the pin: ``manifest.unfaithful_heal_digest`` records the digest the heal wrote. The entry's bytes are not
+        regenerable, so the Cache page's delete leaves its file alone. It is a fact of the entry, kept in the manifest
+        so it moves with the entry through a reset and outlasts the error banner's dismiss (#196);
+      * a durable ``errors.jsonl`` record (``code="unfaithful_heal"``) — the UI badge's source;
       * the entry's ``.buckaroo_stat_cache`` is wiped (ADR-006 D10): Buckaroo's summary stats key on expression
         structure and stable paths (buckaroo#955), so stale stats would render beside the fresh rows;
       * registered hooks fire (companion: a forced reload of the open grid, and the SSE event).
@@ -465,6 +480,10 @@ def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
         actual,
         recorded,
     )
+    try:
+        _record_unfaithful_heal(project, content_hash, actual)
+    except Exception:
+        perf_log.warning("recording the unfaithful-heal pin in %s's manifest failed", content_hash, exc_info=True)
     import shutil
 
     from tallyman_core.paths import entry_stat_cache_dir

@@ -27,6 +27,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tallyman_core.manifest import Manifest
 from tallyman_xorq.row_order import ROW_ORDER, ROW_ORDER_RIGHT
 
 perf_log = logging.getLogger("tallyman.perf")
@@ -278,29 +279,51 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     _ensure(project, content_hash)
 
 
-def pinned_reason(project: str, content_hash: str) -> str | None:
-    """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
+def snapshot_manifest(project: str, content_hash: str) -> tuple[Manifest | None, bool]:
+    """The manifest that speaks for the snapshot named *content_hash*, and whether a reset has retired its entry.
 
-    A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
-    time gave different digests), or a heal already produced different rows than were built. The Cache page's delete
-    leaves such a file alone and says why. ``compute_cache/`` as a whole is still deletable by definition.
+    The live entry's manifest when it can be read. Otherwise the copy a reset parked in the bullpen: a reset leaves a
+    retired entry's snapshot on disk (ADR-007 D14), and the parked manifest still records whether that file can be
+    made again (#195). ``(None, False)`` for an orphan, a file that no entry names.
     """
     from tallyman_core import read_manifest
-    from tallyman_core.errors import list_errors
+    from tallyman_core.catalog_state import parked_entry_dir
     from tallyman_core.paths import entry_dir
 
-    try:
-        manifest = read_manifest(entry_dir(project, content_hash))
-    except (OSError, ValueError):
-        manifest = None
-    if manifest is not None and manifest.reproducible is False:
+    for where, retired in ((entry_dir(project, content_hash), False), (parked_entry_dir(project, content_hash), True)):
+        try:
+            return read_manifest(where), retired
+        except (OSError, ValueError):
+            continue
+    return None, False
+
+
+def pinned_reason_of(manifest: Manifest) -> str | None:
+    """Why the snapshot of the entry *manifest* describes must not be deleted, or None when it may be.
+
+    A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
+    time gave different digests, ADR-009 D6), or a heal already produced different rows than were built (ADR-006 D12,
+    unfaithful entries are pinned and badged). Both are facts of the manifest, so the pin holds wherever the manifest
+    goes, and dismissing the error banner does not lift it (#196).
+    """
+    if manifest.reproducible is False:
         columns = ", ".join(manifest.nonreproducible_columns or [])
         return (
             "this entry's query is not reproducible (two runs at create time gave different results"
             + (f" in {columns}" if columns else "")
             + "), so its snapshot cannot be re-created faithfully and is kept"
         )
-    for record in list_errors(project, limit=1_000_000_000):
-        if record.get("code") == "unfaithful_heal" and record.get("hash") == content_hash:
-            return "a heal of this snapshot produced different rows than were built, so it is kept"
+    if manifest.unfaithful_heal_digest is not None:
+        return "a heal of this snapshot produced different rows than were built, so it is kept"
     return None
+
+
+def pinned_reason(project: str, content_hash: str) -> str | None:
+    """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
+
+    The rules of ``pinned_reason_of``, applied to the manifest that speaks for the file (``snapshot_manifest``: the
+    live entry's, or the one a reset parked). The Cache page's delete leaves a pinned file alone and says why.
+    ``compute_cache/`` as a whole is still deletable by definition.
+    """
+    manifest, _ = snapshot_manifest(project, content_hash)
+    return pinned_reason_of(manifest) if manifest is not None else None

@@ -230,9 +230,10 @@ def test_the_pin_of_an_unfaithful_heal_survives_a_reset_back_and_forward(project
 
 
 def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_deleted(project, orders_parquet):
-    """ADR-007 D14: a reset no longer prunes ``compute_cache/``, so the snapshot of an entry that a reset retired stays
-    on disk until the user deletes it. The Cache page lists files by entry, so it needs a row for a file whose entry is
-    not in the catalog, and the delete has to accept it."""
+    """ADR-007 D14: a reset no longer prunes ``compute_cache/``, so files outlive their entries until the user deletes
+    them. The Cache page lists files by entry, so it needs a row for a file that no entry names, live or retired by a
+    reset (an orphan), and the delete has to accept it. A retired entry's file is listed from its parked manifest
+    (#195, tested below)."""
     h = build_and_persist(project, _agg_code(project)).content_hash
     snapshots = compute_cache_dir(project) / "result_cache"
     snapshots.mkdir(parents=True, exist_ok=True)
@@ -244,8 +245,10 @@ def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_delet
 
     assert "deadbeef0123" in rows, f"the file of an entry that is not in the catalog is not listed: {sorted(rows)}"
     assert rows["deadbeef0123"].get("orphan") is True
+    assert not rows["deadbeef0123"].get("retired")
     assert rows["deadbeef0123"].get("alias") is None
     assert not rows[h].get("orphan")
+    assert not rows[h].get("retired")
 
     response = client.delete(f"/{project}/api/result_cache/deadbeef0123")
 

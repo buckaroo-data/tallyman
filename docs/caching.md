@@ -231,10 +231,11 @@ is still served, since the rows are the honest output of the frozen build, but
 never silently (`_verify_self_heal`). It logs a warning that attributes the
 change: an engine version that differs from the manifest's `engine_versions`, a
 recipe that re-derives a different graph hash (#88), or a fixed graph that runs
-differently each time (#83). It records a durable `unfaithful_heal` error,
-which also pins the file, wipes the entry's Buckaroo stat cache, and fires the
-registered hooks. In the companion the hooks force Buckaroo to reload the open
-grid and push an SSE event. A re-created ordered copy is checked the same way
+differently each time (#83). It records the digest it wrote in the manifest's
+`unfaithful_heal_digest`, which pins the file, records a durable
+`unfaithful_heal` error for the banner, wipes the entry's Buckaroo stat cache,
+and fires the registered hooks. In the companion the hooks force Buckaroo to
+reload the open grid and push an SSE event. A re-created ordered copy is checked the same way
 against its recorded content digest, and a mismatch records an
 `unfaithful_ordered_copy` error.
 
@@ -293,9 +294,10 @@ Files are deleted only by an explicit user action, and written only because
 something is about to read them. The startup warm-up writes nothing, the verify
 sweep (`catalog_scan_staleness(verify_results=True)`) reads and never writes,
 and a reset leaves the directory alone. The Cache page's delete is the one
-deleter. It answers 409 with the reason for a pinned snapshot, and it lists a
-snapshot whose entry is no longer in the catalog as an orphan row so that it
-can be deleted.
+deleter. It answers 409 with the reason for a pinned snapshot. It lists a
+snapshot whose entry a reset retired as a retired row, whose pin comes from the
+manifest parked in the bullpen, and one that no entry names as an orphan row,
+so that the user can delete them.
 
 Every write takes the project's write lock (`catalog_state.project_lock`): a
 build, a materialization, a heal and a checkpoint. It is a file lock on
@@ -396,7 +398,9 @@ Not caches in the eviction sense — immutable build outputs, valid forever
 because the entry they describe never changes. `paths.py` draws the line
 explicitly: `ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `manifest.json`,
 `schema.json`) are the immutable artifacts; the write-isolated perf overlay
-symlinks them read-only — safe because nothing ever rewrites them — and omits
+symlinks them read-only — safe because the one later write, an unfaithful heal
+recording `unfaithful_heal_digest` in `manifest.json`, is an atomic replace that
+swaps the link for a file — and omits
 `ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`, `.xorq_build_expanded`,
 `.xorq_view_build`) so a benchmark starts honestly cold.
 

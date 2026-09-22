@@ -294,7 +294,8 @@ back to the recorded pointers, retiring to or restoring from the bullpen without
 recompute (a forward reset copies back from the bullpen). It also moves the
 source clones no surviving entry refers to into the bullpen instead of deleting
 them. It leaves `compute_cache/` alone: those files are named by content hash and
-can be made again. Live operations never read the bullpen.
+can be made again. The one live reader of the bullpen is the Cache page, which
+reads a retired entry's parked manifest to keep its snapshot's pin.
 Every write to a project (a build, a materialization, a checkpoint) takes the
 same re-entrant project lock, so there is one writer at a time.
 

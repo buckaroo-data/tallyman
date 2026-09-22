@@ -223,35 +223,57 @@ def _digest_sidecar(path: Path) -> Path:
     return path.with_suffix(".digest")
 
 
+def _write_sidecar(path: Path, digest: str) -> None:
+    """Write the digest sidecar of the copy *path* to a unique temp name and replace, so no reader sees it half done."""
+    sidecar = _digest_sidecar(path)
+    tmp = sidecar.with_name(f"{sidecar.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        tmp.write_text(digest)
+        os.replace(tmp, sidecar)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def _content_digest_of(path: Path) -> str:
-    """The copy's content digest: the sidecar written with it, or a read-back when the sidecar is gone."""
+    """The copy's content digest: the sidecar written with it, or a read-back when the sidecar is missing or empty.
+
+    An empty sidecar is what an in-place write cut off between its truncate and its write leaves behind, and taking it
+    would record an empty digest (#211).
+    """
     from tallyman_xorq.digest import content_digest
 
-    sidecar = _digest_sidecar(path)
     try:
-        return sidecar.read_text().strip()
+        recorded = _digest_sidecar(path).read_text().strip()
     except OSError:
-        digest = content_digest(path)
-        try:
-            sidecar.write_text(digest)
-        except OSError:
-            pass
-        return digest
+        recorded = ""
+    if recorded:
+        return recorded
+    digest = content_digest(path)
+    try:
+        _write_sidecar(path, digest)
+    except OSError:
+        pass
+    return digest
 
 
 def _write_atomically(src: Path, reader: dict, target: Path, *, rel: str, csv_args: tuple | None = None) -> str:
-    """Write the copy to a unique temp name beside its destination, replace, and return its content digest."""
+    """Write the copy to a unique temp name beside its destination, then its digest sidecar, then replace the copy into
+    place; return the content digest.
+
+    Both files arrive by an atomic replace, the sidecar first, so a reader that finds the copy finds its whole digest
+    beside it, never an empty one or one left by an earlier copy (#211).
+    """
     from tallyman_xorq.digest import content_digest
 
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.stem}.{uuid.uuid4().hex}.tmp")
     try:
         _write_copy(src, reader, tmp, rel=rel, csv_args=csv_args)
+        digest = content_digest(tmp)
+        _write_sidecar(target, digest)
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
-    digest = content_digest(target)
-    _digest_sidecar(target).write_text(digest)
     return digest
 
 

@@ -2,12 +2,17 @@
 
 - **Status:** Normative, implemented. Describes the system as built; where
   code or the descriptive docs disagree with it, the disagreement is a bug.
+  The known disagreements, each with its open issue, are listed under
+  [Known deviations](#known-deviations) at the end.
   Design decisions and history: `plans/ADR-006-read-path-loads-builds.md`
   (the read path, still in force for what the later ADRs did not change) and
   `plans/ADR-007-tallyman-owned-materialization.md`,
   `plans/ADR-008-row-order-of-reads.md` and
   `plans/ADR-009-digest-stability.md` (tallyman writes its own result files,
-  every file carries `__row_order`, and the digest is a content digest).
+  every file carries `__row_order`, and the digest is a content digest),
+  accepted on 2026-09-22 and implemented in #189.
+  `plans/ADR-010-immutable-store-one-owner.md`, a later proposal to replace
+  those three, was rejected the same day.
 - **Audience:** no prior xorq knowledge assumed. The xorq section below covers
   exactly as much of xorq as the rest of the doc needs, and no more.
 
@@ -73,7 +78,8 @@ it: the build forbids the authoring patterns that create such nodes
 (in-memory reads are a build error), so every leaf is a file read and the
 refusal is a loud assertion that the build gate failed, never a live copy
 path. Beside it, rebinding fails loudly if a build ever spans more than one
-distinct backend content profile (ADR D3).
+distinct backend content profile (ADR-006 D3, rebind composition onto the
+default backend with a one-group guard).
 
 ## 3. Builds: freezing an expression to disk
 
@@ -181,31 +187,37 @@ user can overwrite `trips.parquet` any time — so tallyman never lets an entry
 depend on a live source path. At build time each source is:
 
 1. digested (md5, memoized on stat so unchanged files hash once),
-2. cloned copy-on-write to `data/.cas/<digest><suffix>`,
+2. cloned copy-on-write to `data/.cas/<digest><suffix>` (the **clone**),
 3. read through the clone.
 
-This is **CAS** (content-addressed sources), and it is the answer to xorq's
-path-only hashing: the path *is* the digest, so every xorq-level key (the
-expression hash, and the name of every file tallyman writes) becomes
-content-honest for free. Edit a source and rebuild: the digest changes, the path
-changes, the hash changes, a new entry forks. The clone is the entry's immutable
-input forever; the live file is merely where the *next* build will look.
+This is **CAS** (content-addressed sources, the default `cas` identity mode),
+and it is the answer to xorq's path-only hashing: the path *is* the digest, so
+every xorq-level key (the expression hash, and the name of every file tallyman
+writes) becomes content-honest for free. Edit a source and rebuild: the digest
+changes, the path changes, the hash changes, a new entry forks. The clone is the
+entry's immutable input forever; the live file is merely where the *next* build
+will look. The other identity modes, `salt` and `off`, skip the clone and read
+the live file at build time.
 
 A recipe never reads the source or its clone directly. Ingest writes an
 **ordered copy** of the clone under the project's `compute_cache/ordered_sources/`:
 polars reads the clone in file order and writes a parquet file with the same
 columns and one more at the end, `__row_order`, `0..N-1`. The copy is named by
 the source's digest and the reader options (the schema and `scan_csv` options
-of a CSV), and the recipe reads that file. So a recipe's reads are all files
-tallyman wrote, each carrying the column that pages sort by (Part 2, "Row
-order").
+of a CSV), in every identity mode, and the recipe reads that file. So a
+recipe's reads are all files tallyman wrote, each carrying the column that
+pages sort by (Part 2, "Row order"). The copy should have the source's column
+types; for a few Arrow types it does not yet (#197).
 
 ## Recipe
 
 A **recipe** (`expr.py`) is the LLM-authored Python that defines a
 computation. It must bind a variable `expr`, built from:
 
-- `read_project_file("trips.parquet")` — read a source (through CAS);
+- `read_project_file("trips.parquet")` — read a parquet source under `data/`
+  (through CAS and an ordered copy);
+- `tallyman_read_csv("/path/to/trips.csv", schema=...)` — read a CSV source
+  the same way; the only CSV reader a recipe may use;
 - `tracked_expr_from_alias("trips")` — build on another entry, named by alias,
   recording a `follow=True` parent edge: this expression depends on the parent
   alias, and when that alias advances, recalc mints a new version of this
@@ -241,7 +253,7 @@ authority**:
 
 | | `expr.py` (recipe) | `xorq_build/` (build) |
 |---|---|---|
-| binds inputs by | name (aliases, live paths) | value (parent graphs inlined, CAS paths) |
+| binds inputs by | name (aliases, live paths) | value (ordered copies named by source digest, a worthy parent's snapshot path, a cheap parent's graph inlined) |
 | meaning over time | drifts as names move | fixed forever |
 | authoritative for | authoring: revise, display, the *next* build | semantics: every read, forever |
 
@@ -289,8 +301,8 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 |---|---|
 | `content_hash` | the entry's identity |
 | `parents` | `[{hash, ref, follow}]` — each alias reference, **resolved to the exact hash it meant at build time** |
-| `sources` | `{rel_path: digest}` — each source, pinned to the bytes read |
-| `ordered_copies` | `{key: {source, digest, reader, content_digest}}` — each ordered copy the plan reads, with the reader options and the digest that let it be made again |
+| `sources` | `{rel_path: digest}` — each source, pinned to the bytes read, including every source its parents recorded (a CSV outside `data/` is keyed by its absolute path); `null` under the `off` identity mode, and whenever nothing was recorded (a promoted diff, which reads its two entries without recording them) |
+| `ordered_copies` | `{key: {source, digest, suffix, reader, content_digest}}` — each ordered copy the plan reads, with the reader options and the digest that let it be made again |
 | `cache_worthy`, `cache_worthy_why`, `cache_bytes` | whether the entry is materialized, decided once at build, and the evidence |
 | `result_digest` | `arrow-sha256:` digest of the snapshot's content (worthy entries) — the output identity |
 | `reproducible`, `nonreproducible_columns` | whether two runs at create gave the same digest, and the columns that differed |
@@ -298,7 +310,10 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 | `row_count`, `execute_seconds`, `compile_seconds`, timings | build measurements |
 
 The manifest is written last, atomically: its presence is the "this entry is
-complete" sentinel. An entry directory without one is treated as absent.
+complete" sentinel. An entry directory without one is treated as absent by the
+entry list, the checkpoint, recalc and the build, which builds it again. A page
+read still serves such a directory, with the snapshot's existence standing in
+for the missing `cache_worthy` (#90, #204).
 
 ## Alias
 
@@ -369,20 +384,27 @@ page is `ORDER BY __row_order`, and with one the user's keys come first and
   them: the writer numbers the result in that order.
 - Every `order_by` in a recipe gets `__row_order`, then the remaining sortable
   columns, as its last keys, so the sort is total wherever the recipe put it. A
-  sort that is not the recipe's last step is kept: the top-level sort leads with
+  sort followed only by steps that keep row order (filters, limits, selections,
+  column drops, drops or fills of nulls) is kept: the top-level sort leads with
   its keys, and the build fails, naming the key, if a later step dropped or
-  changed it.
+  changed it or if the sort was by an expression rather than a column. Above an
+  aggregate, a join or a union the order of rows is gone, and the top-level sort
+  is the tie-break alone.
 - A join of two entries leaves the right side's copy under ibis's collision name,
   `__row_order_right`, and the writer drops it. Joining three entries in one
   recipe needs `.drop("__row_order")` on the right-hand inputs, and the build
-  says so.
-- A diff carries no row-order column from either side.
+  says so. (Today the writer drops any column of that name, including an
+  author's, #206, and the check also refuses semi and anti join chains, which
+  cannot collide, #199.)
+- A diff carries no row-order column from either side. The compare grid and a
+  promoted diff drop it; `full_diff`, behind the diff page's summaries and
+  `catalog_diff`, does not yet (#200).
 
 ## Materialization
 
 `materialize(project, hash)` is the one routine that writes a snapshot. The
-build calls it and so does every heal, so result bytes are manufactured in one
-place. It runs the entry's frozen build on a **single-partition** connection
+build calls it and so does every **heal** (the re-creation of a snapshot that is
+missing from disk), so result bytes are manufactured in one place. It runs the entry's frozen build on a **single-partition** connection
 (so a float total is merged in one order and is bit-stable on any machine),
 streams the rows through a writer with a pinned layout (zstd, row groups of
 1,048,576 rows, a parquet page index, `__row_order` last), writes to a unique
@@ -390,7 +412,9 @@ temp name and replaces the final file atomically, all under the project's write
 lock, and returns the content digest of the file it wrote, read back. A create
 runs the query twice and compares the digests; if they differ the recipe is not
 reproducible, the entry still builds, and its file is **pinned**: the Cache
-page's delete leaves it alone.
+page's delete leaves it alone. A snapshot changes only by an atomic replace of
+a complete file; a failed build that deletes the file already at its path breaks
+that today (#193).
 
 `ensure_materialized(project, hash)` is the one entry point that makes files
 exist, and every consumer that composes or executes an entry goes through it
@@ -405,6 +429,10 @@ exist, and every consumer that composes or executes an entry goes through it
    from the live source while the live bytes still hash to its name.
 4. If the entry is worthy, materialize it and verify the result against
    `result_digest`.
+
+Whether the entry is worthy is read from the manifest, never derived again.
+(With the manifest missing, the code guesses from whether a snapshot exists,
+#204.)
 
 A file is cache only if this function can re-create it from files that are not
 cache. Snapshots and ordered copies satisfy that and live under
@@ -442,28 +470,31 @@ the moment the entry is born.
 ## The write path (build)
 
 `build_and_persist(project, code)` holds the project's write lock for the whole
-build (one write at a time per project, so two builds of one entry cannot end with
-the failing one deleting the winner's directory):
+build (one build at a time per project, so two builds of one entry cannot end
+with the failing one deleting the winner's directory):
 
 1. **Import the recipe** — the single moment of name resolution. During the
    import, `read_project_file` and `tallyman_read_csv` digest each source, clone
    it (CAS), write its ordered copy and record `{rel_path: digest}` and the copy's
    reader options; `tracked_expr_from_alias` resolves each alias to its current
-   head, records the parent edge, and returns the parent's result (below).
+   head, records the parent edge, and returns the parent's result (below), and
+   `pinned_expr_from_alias` does the same for a hash or version reference.
 2. **Check and rewrite** — reject what cannot become a sound entry (an in-memory
-   read, a `.cache()` call, a raw parquet read, an assignment to `__row_order`, a
-   cheap entry that drops it), classify the entry once (cheap or worthy), and add
-   the canonical sort to a worthy entry.
+   read, a `.cache()` call, a raw parquet or CSV read, an assignment to
+   `__row_order`, a cheap entry that drops it, a join chain over three entries
+   that all carry it), classify the entry once (cheap or worthy), add the
+   canonical sort to a worthy entry, and move `__row_order` to the last column
+   of a cheap one.
 3. **Freeze** — `build_expr` serializes the rewritten expression;
    `content_hash` = the build's name. If an entry with this hash already
    exists, stop: append the prompt, return the existing entry (idempotency).
 4. **Lay down the entry** — copy the build in, make paths portable
    (`${TALLYMAN_PROJECT_ROOT}` placeholders), write `expr.py`.
-5. **Execute once** — a worthy entry is materialized (Part 2, "Materialization"),
-   which writes the snapshot and yields its digest, and the build records the
-   digest, the reproducibility verdict and the schema read from the written file.
-   A cheap entry is streamed once in full and keeps nothing (honest evaluation,
-   fails fast).
+5. **Execute** — a worthy entry is materialized (Part 2, "Materialization"),
+   which runs its query twice, writes the snapshot and yields its digest, and
+   the build records the digest, the reproducibility verdict and the schema
+   read from the written file. A cheap entry is streamed once in full and keeps
+   nothing (honest evaluation, fails fast).
 6. **Record** — schema, manifest (written last, atomic).
 7. **Checkpoint** — when the MCP tool returns: recipe zip, tracked pointers,
    one git commit.
@@ -491,7 +522,10 @@ read(project, content_hash):
   Same rows every time, by construction.
 - **The cold state is an empty `compute_cache/`:** any entry can be read after
   it is deleted, and must produce the same result as the warm read. That property
-  is the standing regression test for every read-path change.
+  is the standing regression test for every read-path change. The known
+  exception is an entry recorded as not reproducible, whose snapshot is pinned
+  because it cannot be made again faithfully, and the entries built on it
+  (#185, #208).
 
 `cached_result_expr(project, hash)` is the function every in-process consumer
 calls. It is `ensure_materialized` plus the read above, and it memoizes the loaded
@@ -512,7 +546,8 @@ The recipe-reconstruction machinery survives only as a diagnostic. An entry
 whose build is missing or unloadable is a **hard error** naming the entry and
 the remedy (rebuild) — there is no automatic recipe fallback, because a
 warning on a background read is exactly how #163-class behavior stays
-invisible (decided in `plans/ADR-006-read-path-loads-builds.md`, D6).[^recon]
+invisible (ADR-006 D6, a missing or unloadable build is a hard error, in
+`plans/ADR-006-read-path-loads-builds.md`).[^recon]
 
 ## Composition: diff and beyond
 
@@ -521,13 +556,14 @@ expression):
 
 1. read each entry (canonical read above) — each read makes its files exist,
    and each load minted fresh backend objects;
-2. **rebind onto shared backends, one per distinct content profile** (profile
-   identity = profile minus `idx`), using `replace_sources`. For today's
-   catalogs every profile is the same embedded engine, so this collapses to
-   one shared backend;
-3. compose, dropping `__row_order` from both sides first. The result is a
-   single-backend expression: it executes in-process, and `build_expr` serializes
-   it into a normal single-profile build that Buckaroo's `/load_expr` accepts.
+2. **rebind onto the process's default backend**, using `replace_sources`.
+   Every profile in a tallyman build is the same embedded engine (profile
+   identity = profile minus `idx`), and a build that spans more than one
+   distinct content profile fails loudly instead of being rebound;
+3. compose, dropping `__row_order` from both sides first (`full_diff` does not
+   yet, #200). The result is a single-backend expression: it executes
+   in-process, and `build_expr` serializes it into a normal single-profile build
+   that Buckaroo's `/load_expr` accepts.
 
 Composition of frozen builds was never the problem; backend object identity
 was (#75, rediagnosed in #163). The rebind is cheap graph surgery, no data
@@ -536,9 +572,10 @@ moves.
 A **promoted diff** is just an entry whose recipe pins two hashes
 (`build_diff_expr(a_hash, b_hash)`) — name-free, deterministic, and built
 through the ordinary write path. It contains a join, so it is worthy and is
-materialized like any other. The live diff grid, which is not an entry, still hands
-Buckaroo an unmaterialized join (`plans/ADR-007-tallyman-owned-materialization.md`
-D10 moved that to a follow-on).
+materialized like any other. The live diff grid, which is not an entry, still
+hands Buckaroo an unmaterialized join: ADR-007 D10, which would have built
+every diff as an entry before showing it, was moved out of
+`plans/ADR-007-tallyman-owned-materialization.md` to #188.
 
 ## Handing an entry to Buckaroo
 
@@ -550,17 +587,20 @@ process and never inside a grid query.
 
 - A **worthy** entry's grid is handed a **view build**: a build whose whole graph
   is one bare read of the entry's snapshot, written once to a stable per-entry
-  directory (Buckaroo's stat-cache keys include the build directory's path).
+  directory, so Buckaroo is handed the same build after a restart.
 - A **cheap** entry's grid is handed its own expanded build, a stored plan over
   files that exist.
-- Tallyman keeps no record of Buckaroo's sessions. A session id is
-  `entry-<project>-<content_hash>`, posted on every open: Buckaroo skips the work
-  while it holds that session with the same build directory, and creates the
-  session again if it dropped it (it does after an hour without a browser). A
-  klass reload posts `/reload_expr/<id>` for each entry of the project and treats
-  the 404 for an id Buckaroo does not hold as "not open".
+- Tallyman keeps no record of Buckaroo's sessions. A **session** (one grid's
+  state in the Buckaroo process) has the id `entry-<project>-<content_hash>`,
+  posted on every open: Buckaroo skips the work while it holds that session with
+  the same build directory and the post carries no configuration, and creates
+  the session again if it dropped it (it does after an hour without a browser).
+  A klass (a project-authored stat, post-processing or display class) reload
+  posts `/reload_expr/<id>` for each entry of the project and treats the 404 for
+  an id Buckaroo does not hold as "not open".
 - Every `/load_expr` names `__row_order` as the row-order column, so Buckaroo can
-  order its pages by it (buckaroo-data/buckaroo#974 is Buckaroo's half of that).
+  order its pages by it. Buckaroo 0.15.6, the pinned version, ignores the hint;
+  buckaroo-data/buckaroo#974 is Buckaroo's half of that.
 - After an unfaithful heal, the entry's stat cache is wiped and Buckaroo is told
   to reload the grid (`force_reload`).
 
@@ -572,29 +612,40 @@ with `git reset --hard`, and reconciles the untracked entry directories through 
 bring them back. It leaves `compute_cache/` alone: snapshots and ordered copies are
 named by content, and a file that is missing afterwards is made again and verified
 like any other. It moves the source clones no surviving entry refers to into the
-bullpen and never deletes them.
+bullpen and never deletes them, and a reset forward copies back the clones a
+restored entry refers to. Two cases involving an entry that is not reproducible
+do not hold yet: the bullpen can hand back an older manifest beside a newer
+snapshot (#194), and a retired entry's snapshot loses its pin (#195).
 
 ## Staleness and recalc (unchanged, stated for completeness)
 
 **Staleness** is a read-only judgment: an entry is stale on the alias axis
 when a `follow=True` parent's recorded hash no longer equals that alias's
 head, and on the source axis when a recorded digest no longer matches the
-live file's digest. Computing staleness executes nothing and mutates nothing.
+live file's digest. Computing staleness executes nothing and changes no
+catalog state. (Today it rewrites the source-digest memo; see Known
+deviations.)
+Only an entry that is the current head of an alias is actionably stale; a
+superseded version is reported with `live=False` (#154). The source axis is
+`unknown` for an entry built under the `off` identity mode, and today for a
+CSV recorded outside `data/`, which the scan cannot resolve (#191).
 
 **Recalc** is the one sanctioned re-execution of recipes. When an alias head
-advances (a revise), the entries that may be affected form its **cone**:
-every entry reachable by walking `follow=True` parent edges backwards from
-that alias — its followers, their followers, and so on. Pinned
-(`follow=False`) edges are not in the cone. It runs automatically after a
-revise when the project enables auto-recalc, or on demand.
+advances (a revise), the entries that followed it by name are directly stale;
+they are the roots, and the entries that may be affected form their **cone**:
+the roots and every current alias head reachable from them through recorded
+parent edges, followers of followers and so on. It runs automatically after a
+revise when the project enables auto-recalc (the default), or on demand.
 
 Recalc rebuilds the cone in topological order, parents before children. For
 each member it re-imports the member's *recipe* — the one situation where
 name resolution is the point, since the goal is a new version against the
 new heads — builds the result as an ordinary new entry, and advances the
 member's alias before any of its children replay, so each child chains off
-its parent's fresh head. Old entries are untouched; every member gains a
-version, none loses one.
+its parent's fresh head. A member whose inputs did not move, such as a child
+that pins its parent by hash (`follow=False`), replays to the same hash and is
+left alone. Old entries are untouched; a member that rebuilds gains a version,
+and none loses one.
 
 Two disciplines keep it predictable. **Scope:** recalc touches only followers
 of the alias that moved; pre-existing staleness elsewhere is reported, not
@@ -611,14 +662,18 @@ not only in tests:
 
 - on every heal (a snapshot `ensure_materialized` writes is checked before it is
   served);
-- on demand, corpus-wide, via `catalog_scan_staleness(verify_results=True)`, which
-  reads and never writes: a snapshot that is missing is reported as `absent` and
-  checked at the moment it next exists.
+- on demand, corpus-wide, via `catalog_scan_staleness(verify_results=True)`, whose
+  verify sweep reads and never writes: a snapshot that is missing is reported as
+  `absent` and checked at the moment it next exists.
 
-A failure is surfaced loudly — a durable `unfaithful_heal` record in
-`errors.jsonl` (the UI badge, and the pin: the Cache page's delete leaves the file
-alone), a stat cache wipe, a forced reload of the open Buckaroo grid, an SSE
-event — never only a log line. Its attribution has four classes with four
+A failure is surfaced loudly, never only as a log line: a durable
+`unfaithful_heal` record in `errors.jsonl` (shown in the catalog page's error
+banner, and the pin: the Cache page's delete leaves the file alone), a stat
+cache wipe, and in the companion a forced reload of the entry's Buckaroo grid
+and an `unfaithful_heal` SSE event. Today the SPA has no listener for that event,
+the pin lasts only until the error log is cleared (#196), the forced reload is
+sent even when no grid is open (#203), and cheap entries that read the healed
+snapshot are not flagged (#208). Its attribution has four classes with four
 different fixes:
 
 | class | detector | meaning | response |
@@ -688,6 +743,71 @@ wrong even if every test passes.
 
 ---
 
+# Known deviations
+
+Where the code breaks a rule above today. Each is an open issue; none is a
+change of the rule.
+
+- **Materialization and deletion.** A failed build deletes the snapshot already
+  at its entry's path, so a snapshot changes other than by an atomic replace,
+  and a file is deleted without a user action (#193).
+- **Pins.** The pin of a non-reproducible entry is lost across a reset back
+  (#195), the pin from an unfaithful heal is lost when the error log is cleared
+  (#196), and a reset after re-adding a non-reproducible entry can restore an
+  older manifest over a newer snapshot, which breaks I1 without any record
+  (#194).
+- **Worthiness from the manifest.** With the manifest missing, the snapshot's
+  existence stands in for the verdict, so a worthy entry that has lost both is
+  read as cheap (#204).
+- **Verification reaches one entry.** An unfaithful heal of a worthy parent
+  changes its cheap children's rows under their hashes without a record
+  (#208), and the purity of an entry is not passed on to entries built on it,
+  so a child of a non-reproducible parent is recorded as reproducible (#185).
+  Both are gaps in I1 and I2.
+- **Ordered copies.** The copy of a parquet source can change column types
+  (#197), a CSV's reader options are rewritten before the first ingest (#198),
+  a build can record an empty content digest for a copy (#211), and copies no
+  entry reads any more are never listed or removed (#207).
+- **Row order.** The canonical sort's tie-break leaves out nested columns
+  (#205); the snapshot writer drops any column named `__row_order_right` (#206);
+  the three-way join check refuses semi and anti joins (#199); `full_diff` keeps
+  `__row_order` as data (#200); and Buckaroo's grid does not yet order pages by
+  `__row_order` (buckaroo-data/buckaroo#974), so I6 holds for `/api/data` and
+  not yet for the grid.
+- **Handing an entry to Buckaroo.** Concurrent opens both post `/load_expr`, and
+  a promoted diff re-runs Buckaroo's statistics on every open (#202); the
+  forced reload after an unfaithful heal runs under the project lock and opens a
+  session nobody asked for (#203); a klass reload posts once per entry from the
+  companion's event loop (#201); Buckaroo is pointed at `artifacts/` and does
+  not find the project's stats and post-processing functions (#170); the live
+  diff grid is an unmaterialized join (#188).
+- **One writer at a time.** The project lock blocks with no timeout (#186), two
+  companion routes build on the event loop and freeze the UI while they wait
+  (#190), two servers on one project are not detected (#183), and concurrent
+  reads on the shared backend can fail (#118). The lock covers builds,
+  materializations, checkpoints and resets only: alias, notebook, chart,
+  display-config and `config.json` writes replace their file atomically without
+  it, so an MCP edit and a browser edit of the same file at the same moment can
+  lose one of the two (no issue filed yet).
+- **Staleness writes.** The scan forces a re-hash of every recorded source, and
+  each forced re-hash rewrites `artifacts/source_digests.json` holding only that
+  one file, so a scan wipes the digest memo (no issue filed yet). A child that
+  pins its parent by hash inherits the parent's sources, so after an upstream
+  source edit it is stale on the source axis and its replay gives the same hash,
+  which leaves it stale for good (no issue filed yet).
+- **Names resolve once, in the right project.** A recipe's `read_project_file`
+  and alias readers resolve the project from the `active_project` file, while
+  the MCP tool builds into the session's own project; after another session
+  switches projects the two differ and the build fails with a misleading
+  raw-read error (related to #39).
+- **Portability.** An expanded build does not record the project path it was
+  filled in with, so a copied project reads the old location (#209).
+- **Float totals.** An ungrouped float `SUM` depends on the row-group layout of
+  the file it reads; the snapshot format version pins that layout, and a change
+  of it is a corpus rebuild (#187).
+
+---
+
 # History
 
 This contract began as the proposed design for the #163 fix; the pre-fix
@@ -697,8 +817,10 @@ The redesign that replaced xorq's cache nodes with tallyman's own materializatio
 added `__row_order` and redefined the digest is in
 [`plans/ADR-007-tallyman-owned-materialization.md`](../plans/ADR-007-tallyman-owned-materialization.md),
 [`plans/ADR-008-row-order-of-reads.md`](../plans/ADR-008-row-order-of-reads.md) and
-[`plans/ADR-009-digest-stability.md`](../plans/ADR-009-digest-stability.md).
-The wider audit of the same bug class is
+[`plans/ADR-009-digest-stability.md`](../plans/ADR-009-digest-stability.md),
+accepted on 2026-09-22 and implemented in #189.
+[`plans/ADR-010-immutable-store-one-owner.md`](../plans/ADR-010-immutable-store-one-owner.md)
+proposed replacing them and was rejected. The wider audit of the same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes
 too.

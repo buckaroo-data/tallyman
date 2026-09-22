@@ -72,8 +72,8 @@ When the expression is added, it is also executed and cached, along with summary
 
 ## Authoring — the LLM writes expressions, over MCP
 - Every analysis step is a **xorq expression** submitted through an MCP tool
-  call, not code typed into a cell. Claude Code (or any MCP client) is the
-  editor.
+  call. Claude Code (or any MCP client) is the editor, and the browser's Code
+  tab can submit a revision too.
 - **Named aliases** (`orders`, `by_region`) are the unit of work. An alias is a
   mutable pointer to the latest content hash of a logical step.
 - **Expressions depend on other expressions by name.** A child either *follows*
@@ -83,9 +83,9 @@ When the expression is added, it is also executed and cached, along with summary
   produced an expression is stored alongside it, versioned with it. No "write
   docs for this" round-trip, and the doc can't drift from the code because they
   were minted together.
-- **Intelligent CSV/parquet import** with a deterministic reader and an error
+- **Intelligent CSV import** with a deterministic reader and an error
   contract designed to hand the LLM a usable suggestion when a file doesn't
-  parse cleanly.
+  parse cleanly. Parquet and CSV sources alike are read once, in file order.
 - **Projects** — multiple independent catalogs, with `project_new`,
   `project_list`, `project_switch`.
 
@@ -102,18 +102,20 @@ When the expression is added, it is also executed and cached, along with summary
   the digest recorded when it was first written, before anything reads it.
 - **Result digest.** Materialized entries record a digest of their result,
   computed from the contents of the file and not its bytes, so a different
-  parquet writer or row-group size does not change it. A new entry's query is
-  also run twice when it is created. If the two runs, or a later rebuild,
-  disagree with the recorded digest, the expression is nondeterministic
-  (sampling, `now()`, an impure UDF, source drift) and tallyman says so instead
-  of silently serving different numbers.
+  parquet writer or row-group size does not change it. A new materialized
+  entry's query is also run twice when it is created. If the two runs disagree,
+  or a deleted snapshot comes back different from the recorded digest, the
+  expression is nondeterministic (sampling, `now()`, an impure UDF, source
+  drift) or the engine changed, and tallyman says so instead of silently serving
+  different numbers.
 - **Nothing lives in a kernel.** All catalog state is on disk. The MCP server
-  holds no in-memory state at all.
+  keeps nothing in memory but caches of things that never change and the
+  project its session is working on.
 
 ## Reactivity — revise one alias, the graph catches up
 - **Staleness on two axes**: an alias axis (a followed parent advanced) and a
-  source axis (an input file's content digest changed). Computing staleness is
-  read-only; it executes nothing and reports reasons.
+  source axis (an input file's content digest changed). Computing staleness
+  runs no query and changes no catalog state; it reports reasons.
 - **Recalc cone.** When an alias head moves, its dependents are recomputed in
   topological order, parents before children.
 - **Auto-recalc on revise**, with preview-then-commit for explicit recalcs. Only
@@ -127,34 +129,42 @@ When the expression is added, it is also executed and cached, along with summary
   stays on disk as forensic lineage, each with its own prompt and code.
 - **Diff two versions** across five surfaces: code diff, schema diff, per-column
   summary stats, key-joined row-level side-by-side, and `head()` side-by-side.
-- **Promote a diff** to accept a version.
+- **Promote a diff** to a catalog entry of its own, which can be charted,
+  post-processed and exported like any other.
 - **Git-backed checkpoints.** Each mutation (and each whole recalc walk) is one
   atomic commit under a per-project lock.
 - **Reset to any revision**, with build artifacts reconciled back to the
-  recorded pointers — restored from the bullpen instead of recomputed.
+  recorded pointers — restored from the bullpen instead of recomputed. Result
+  files are named by content, so a reset leaves them where they are.
 
 ## Viewing — a grid over data that was never in memory
-- **Buckaroo grid per entry.** The viewer is handed the entry's xorq *build
-  directory*, so sort, search, and summary-stat computation push down into the
-  xorq backend. Millions of rows without materializing them in the browser or
-  in a kernel.
+- **Buckaroo grid per entry.** The viewer is handed a xorq *build directory*:
+  for a materialized entry, one read of its result file; for a cheap entry, the
+  entry's own small plan. Sort, search, and summary-stat computation run as
+  queries on it in the xorq backend. Millions of rows without loading them into
+  the browser or a kernel.
 - **Automatic per-column summary stats and histograms** on every entry.
 - **Charts.** Vega-Lite specs attached to an entry and rendered above its grid.
 - **Live updates over SSE.** The browser reflects each tool call as it lands.
   You and the model watch the same screen.
 - **Log tab** — a linear, filterable activity view, including build failures.
-- **Cache tab** — per-entry disk footprint.
+- **Cache tab** — the result snapshots on disk, with a delete button; each
+  entry's own disk footprint is on its metadata tab.
 
 ## The LLM extends the analysis UI, not just the data
-- **Project-authored summary stats.** The LLM writes a `compute(col)` function;
-  it then appears as a pinned row in *every* grid in the project. Validated by a
-  dry run at tool-call time, so a bad stat fails at the MCP call rather than in
-  a subprocess log.
-- **Post-processing functions** — a `process(expr)` per file, surfaced as an
-  option in the grid's post-processing dropdown.
+- **Project-authored summary stats.** The LLM writes a `compute(col)` function,
+  meant to appear in the statistics of *every* grid in the project (a display
+  klass can pin it as a row of the main table). Validated by a dry run at
+  tool-call time, so a bad stat fails at the MCP call rather than in a
+  subprocess log. Today the grid does not show it: tallyman points Buckaroo one
+  directory above where it writes the file (#170).
+- **Post-processing functions** — a `process(expr)` per file, meant to appear
+  as an option in the grid's post-processing dropdown (same gap, #170).
 - **Display klasses** — project-specific styling and formatting rules for the
   main and summary views.
-- All three are soft-deletable and versioned with the project.
+- All three are soft-deletable. Summary stats and post-processing functions are
+  committed with the catalog; display klasses live outside the catalog
+  repository, so a reset does not rewind them.
 
 ## Narrative and export
 - **Catalog vs. notebook are different views.** The catalog is everything ever
@@ -166,10 +176,12 @@ When the expression is added, it is also executed and cached, along with summary
 ## Sharing
 - **Portable builds.** Absolute paths in build artifacts are rewritten to
   `${TALLYMAN_PROJECT_ROOT}` on write and expanded on load, so a project runs
-  from anywhere on disk.
+  from anywhere on disk. (A copy that carries the expanded builds along keeps
+  reading the old location, #209.)
 - **`tallyman pack` → `.tgz` → `tallyman serve`.** A colleague gets the whole
-  catalog, history, and grids as a read-only companion with no environment to
-  reproduce and no kernel to start.
+  catalog, history, prompts and charts as a read-only companion with no
+  environment to reproduce and no kernel to start. `serve` does not start
+  Buckaroo, so there are no grids.
 
 # Introduction to Tallyman — a walkthrough
 
@@ -209,8 +221,9 @@ you shouldn't have to wait while a model writes that code for you
 > Group these by violation code and count them, sorted descending.
 
 A new entry appears at the top of the catalog, named `by_code`. Above the grid
-is the sentence you just typed. Below it is the expression the agent wrote. You
-read both, in that order, and decide whether they agree.
+is the sentence you just typed, and the Code tab beside the grid holds the
+expression the agent wrote. You read both, in that order, and decide whether
+they agree.
 
 That pairing is the second change. In a notebook you'd have a code cell and,
 if you were disciplined, a markdown cell above it explaining why. Here the
@@ -253,8 +266,8 @@ enough that nobody would trust it.
 
 Tallyman can only hold one kind of thing. Every entry is a xorq expression that
 evaluates to a table, so the system knows the shape of every object it stores.
-Diff isn't a heuristic bolted on top of arbitrary Python; it's a well-defined
-operation on two tables with known schemas, and it can be specific: which
+Diff is a well-defined operation on two tables with known schemas, with no
+guessing about arbitrary Python involved, and it can be specific: which
 columns appeared, which types changed, how each column's distribution moved,
 which rows differ when joined on a key.
 
@@ -296,11 +309,13 @@ expression itself.
 
 > Add a summary stat for the percent of nulls in each column.
 
-The agent writes one small function. It appears as a new row in the statistics
-block on *every* grid in the project, including the ones you built an hour ago.
-The same works for formatting rules and for post-processing views. The agent
-isn't just producing tables; it's customizing the tool you're reviewing them
-with.
+The agent writes one small function. It is meant to appear as a new row in the
+statistics block on *every* grid in the project, including the ones you built an
+hour ago, and the same goes for formatting rules and post-processing views. So
+the agent also customizes the tool you review its tables with. (Today
+formatting rules reach the grid, but project statistics and
+post-processing views do not, because tallyman points Buckaroo at the wrong
+directory for them: #170.)
 
 ## You do a review pass
 
@@ -325,8 +340,9 @@ presentation you're about to give.
 When you're ready, export that ordering to a Marimo notebook (Jupyter is
 coming) and use their presentation ecosystem, or pack the project into a `.tgz`
 and hand it to a colleague. They run one command and get the whole thing
-read-only — catalog, history, grids, prompts — with no environment to reproduce
-and no kernel to start.
+read-only (catalog, history, prompts, charts) with no environment to reproduce
+and no kernel to start. The read-only server does not start Buckaroo, so the
+grids are the one thing they do not get.
 
 ## What you never did
 
@@ -338,10 +354,10 @@ read every line the agent wrote, which is the part that actually needed you.
 # For the CS-minded — what is actually happening
 
 The user-facing behavior above comes out of a small number of design decisions.
-None of them are novel on their own; the leverage is in constraining the
-problem space enough that they can all hold at once.
+None of them is novel on its own. They work together because the problem space
+is constrained enough that they can all hold at once.
 
-**The unit is an expression, not a cell.** Every step is a xorq expression — a
+**The unit of work is an expression.** Every step is a xorq expression — a
 method-chained relational transformation that compiles to a query plan (xorq is
 built on Ibis and DataFusion). Constraining the language to tabular
 transformations is what makes everything downstream tractable. You cannot
@@ -354,7 +370,7 @@ over the same inputs produces the same hash and lands in the same directory.
 Resubmitting identical work is a no-op, which makes builds idempotent and makes
 "did this change?" a pointer comparison rather than a diff.
 
-**The graph is recorded, not inferred.** At build time each entry writes down
+**The graph is recorded at build time.** At build time each entry writes down
 its direct parents as edges. An edge is either *following* (it names an alias
 and tracks whatever that alias currently points at) or *pinned* (it names an
 exact hash and never moves). Marimo infers its DAG by static analysis of Python
@@ -367,12 +383,13 @@ Revising mints a new hash, advances the head, and appends to the history. Old
 versions are never garbage; they're the lineage, and they're what makes diff
 possible.
 
-**Staleness is a read-only computation on two axes.** An entry is stale on the
+**Staleness is computed on two axes, without running a query.** An entry is stale on the
 alias axis when a following parent's head no longer matches the recorded hash,
 and on the source axis when an input file's content digest no longer matches
-what was recorded. Detecting staleness executes nothing — it compares the
-manifest against the world and returns reasons. This is why the scan is instant
-even on a large catalog.
+what was recorded. Detecting staleness runs no query: it compares the manifest
+against the world and returns reasons. Its cost is reading the manifests and
+re-hashing each recorded source file, which it does in full so that an in-place
+edit cannot hide behind a cached digest.
 
 **Recalc walks a cone in topological order.** When an alias head advances, its
 dependents form a cone. Kahn's algorithm over the intra-cone edges orders the
@@ -381,8 +398,10 @@ once no matter how many paths reach it. Pre-existing staleness elsewhere in the
 catalog is left alone and logged rather than swept into the walk.
 
 **Materialization follows a worthiness rubric.** Each input file is read once
-into an ordered copy, which numbers the rows in file order so that every page of
-every entry is the same page on every request. A result is written to a snapshot
+into an ordered copy, which numbers the rows in file order so that a page of an
+entry read through tallyman's API is the same page on every request (the grid
+will do the same once Buckaroo uses the column, buckaroo-data/buckaroo#974). A
+result is written to a snapshot
 only for entries judged expensive — those whose plan contains an aggregate,
 join, sort, window, or UDF, or that cannot inherit a row order. A cheap
 row-preserving projection recomputes on read instead of paying storage, because
@@ -391,27 +410,31 @@ and runs an entry's query when the entry is created, so a failure shows up in
 the tool call that made the entry. A deleted snapshot is rewritten, and checked,
 the next time something reads it.
 
-**Determinism is audited, not assumed.** Materialized entries record a digest of
+**Determinism is checked.** Materialized entries record a digest of
 their result, computed from the contents of the file and in a fixed row order,
 so scan-order nondeterminism and writer details don't produce false alarms. A
-new entry's query is run twice when it is created. If the runs, or a later
-rebuild, disagree with the recorded digest, something in the expression is
-nondeterministic — sampling, `now()`, an impure UDF, or source drift — and
-tallyman reports it rather than silently serving different numbers under the
-same hash.
+new materialized entry's query is run twice when it is created, on a
+single-partition connection so that float sums add up in one order. If the runs
+disagree, or a deleted snapshot comes back different from the recorded digest,
+something in the expression is nondeterministic — sampling, `now()`, an impure
+UDF, or source drift — or the engine version changed, and tallyman reports it
+rather than silently serving different numbers under the same hash.
 
-**State lives on disk; there is no kernel.** The MCP server holds no in-memory
-state at all, and the companion holds only its list of SSE subscribers. This is
-the design decision the whole system rests on, and the reason it suits agents:
+**State lives on disk; there is no kernel.** The MCP server and the companion
+keep only caches of things that never change, keyed by content hash, plus a few
+facts about the session: which project the MCP session is on, and the
+companion's open SSE streams and diff sessions. This is the design decision the
+whole system rests on, and the reason it suits agents:
 an agent working in a live Jupyter kernel has to reason about invisible state it
 cannot inspect — what's in memory, what's stale, what ran in what order. Here
 there is nothing invisible to reason about. Every fact is a file, addressed by
 content.
 
-**The grid pushes computation down.** The viewer (Buckaroo) is handed the
-entry's compiled build directory rather than a materialized dataframe, so sort,
-search, and summary-statistic computation execute in the query engine against
-the data on disk. Nothing needs to fit in browser memory, and nothing needs to
+**The grid pushes computation down.** The viewer (Buckaroo) is handed a
+compiled build directory rather than a dataframe: for a materialized entry, one
+read of its result file; for a cheap entry, its own small plan. Sort, search,
+and summary-statistic computation execute in the query engine against the data
+on disk. Nothing needs to fit in browser memory, and nothing needs to
 fit in a Python process either. This is why 4 million rows opens like 4
 thousand.
 
@@ -424,7 +447,9 @@ the analysis is a real history you can walk backwards.
 **Builds are relocatable.** Compiled artifacts embed absolute paths; on write
 these are rewritten to a `${TALLYMAN_PROJECT_ROOT}` placeholder and expanded on
 load into a stable per-entry directory. That's what makes `pack` and `serve`
-work: a project is a directory you can move to another machine and open.
+work: a project is a directory you can move to another machine and open. (The
+expanded directories do not record which path they were expanded for, so a copy
+that carries them keeps reading the old location until #209 is fixed.)
 
 **The browser is push-driven.** The companion holds one long-lived SSE stream
 per client. Each MCP mutation notifies the companion, which fans out a named

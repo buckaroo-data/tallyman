@@ -13,11 +13,18 @@ results are tallyman's own. The xorq section is here because Buckaroo's stat
 cache (the summary statistics Buckaroo computes for each column of a grid) is
 built on it, and because it explains what the design replaced.
 
+Terms follow [architecture.md](architecture.md#terms). An **entry** is one
+catalog computation, stored under its **content hash**, xorq's hash of the
+entry's expression. Because every file the expression reads is named by what
+decides its content (a source's digest, or a parent entry's content hash), the
+hash also covers the bytes of every source and the identity of every parent.
+
 The dominant pattern everywhere is content-addressing: keys are derived
 from immutable inputs (an expression's structure, an entry's content
 hash, a source file's digest), so entries never go stale and "invalidation"
 is usually a space decision, not a correctness one. The exceptions are
-called out as they appear and collected at the end.
+called out as they appear and collected at the end. Where an open issue says
+tallyman does not yet behave as described, the paragraph says so and cites it.
 
 ## xorq: the expression cache
 
@@ -114,9 +121,9 @@ An entry is cheap only if all of these hold:
 
 Everything else is worthy: an aggregate, join, sort, limit, union, distinct,
 sample, and any operation nobody has considered yet. The test is an allow-list
-because a cheap entry pages by its parent's `__row_order` (see Row order
-below), so a wrong "cheap" gives unstable paging and a wrong "worthy" costs a
-copy. A UDF is matched by its base class, so a scalar UDF makes an entry
+because a cheap entry pages by the `__row_order` of the one file it reads (see
+Row order below), so a wrong "cheap" gives unstable paging and a wrong "worthy"
+costs a copy. A UDF is matched by its base class, so a scalar UDF makes an entry
 worthy without any other expensive operation (#81).
 
 ### Snapshots (`src/tallyman_xorq/materialize.py`)
@@ -148,9 +155,16 @@ differed. The file is then **pinned**: the Cache page will not delete it, since
 it cannot be re-created faithfully. A heal runs the query once and checks the
 result against the recorded digest.
 
+Two defects weaken this. A worthy entry's build that fails once its query has
+started removes the file at the snapshot's path, whoever wrote it, so a failed
+re-add deletes a snapshot a reset left behind (#193). And a pin holds only as long as its
+evidence can be found: `pinned_reason` reads the live entry's manifest, which a
+reset back moves to the bullpen (#195), and the log record of an unfaithful
+heal, which clearing the error banner deletes (#196).
+
 The row-group size and the batch size decide the batch boundaries that an
-entry built on the file sees, and an ungrouped float total depends on them, so
-they are part of the reproducibility contract. `SNAPSHOT_FORMAT_VERSION`
+entry built on the file sees, and an ungrouped float total depends on them
+(#187), so they are part of the reproducibility contract. `SNAPSHOT_FORMAT_VERSION`
 stands for both, and for the layout of ordered copies; the manifest records it
 as `snapshot_format`, next to the xorq, xorq-datafusion and pyarrow versions in
 `engine_versions`. Changing any of them is a corpus rebuild.
@@ -168,7 +182,8 @@ between two runs.
 A recipe never reads a source file directly. `read_project_file` and
 `tallyman_read_csv` take the source's content digest (md5, memoized on the
 file's stat). In the default `cas` mode they also clone the source
-copy-on-write to `<project>/data/.cas/<digest><suffix>`, the **clone**. Then
+copy-on-write where the filesystem supports it (a plain copy elsewhere) to
+`<project>/data/.cas/<digest><suffix>`, the **clone**. Then
 polars writes an **ordered copy**: `<compute_cache>/ordered_sources/<key>.parquet`,
 holding the source's rows in file order plus a last column `__row_order`, in
 row groups of 122,880 rows. The recipe reads the copy. `<key>` is an md5 of the
@@ -178,10 +193,23 @@ the source's content in every identity mode. Editing a source and running the
 same recipe forks a new entry, and the old entry keeps the rows it was built
 from (#168).
 
+The copy does not always keep the source's column types. Polars turns a
+`date64` column into a timestamp and a map into a list of structs, and a
+`decimal256` column makes it panic with an exception the build does not catch
+(#197). A CSV's reader options are stored in a JSON-safe form, and the first
+ingest already uses that form, so an option that is a function fails (#198).
+
 The manifest records each copy under `ordered_copies`: the source path, its
-digest, the reader options, and the content digest of the copy when it was
-first written. That record is what lets `ensure_materialized` make a deleted
-copy again. A `<key>.digest` file next to a copy caches its content digest.
+digest, the file suffix, the reader options, and the content digest of the copy
+when it was first written. That record is what lets `ensure_materialized` make
+a deleted copy again. It is looked up in the reading entry's manifest first and
+then in any manifest in the catalog, since a copy's key depends only on the
+source digest and the reader options. A `<key>.digest` file next to a copy
+caches its content digest. It is rewritten in place (truncated, then written),
+and a build reads it without the lock, so a build that reads it in the middle of
+that write can record an empty digest (#211).
+Nothing lists or removes an ordered copy that no entry reads any more, so each
+edit of a large source leaves another full copy on disk (#207).
 
 `TALLYMAN_SOURCE_IDENTITY` (default `cas`) now decides what else is recorded.
 `cas` keeps the clone and records `manifest.sources`. `salt` records
@@ -196,12 +224,15 @@ no digest, no clone and no ordered copy.
 
 ### Reads (`cached_result_expr` and `ensure_materialized`)
 
-Every consumer reads an entry's result through one function,
-`cached_result_expr`, whose internals are the canonical read of
-`docs/system-contract.md` (#163): the entry's frozen `xorq_build/` is expanded
-and loaded, and reads never re-import `expr.py`. A missing or unloadable build
-is a hard error naming the entry. `cached_result_expr` calls
-`ensure_materialized(project, content_hash)` and then returns:
+Every in-process consumer (page reads, charts, diffs, post-processing, a child
+recipe) reads an entry's result through one function, `cached_result_expr`,
+whose internals are the canonical read of `docs/system-contract.md` (#163): the
+entry's frozen `xorq_build/` is expanded and loaded, and a read never re-imports
+`expr.py`. (Only the attribution of an unfaithful heal re-imports it, as a
+diagnostic.) Buckaroo's grid is handed a build instead; see "Buckaroo
+integration caches" below. A missing or unloadable build is a hard error naming
+the entry. `cached_result_expr` calls `ensure_materialized(project,
+content_hash)` and then returns:
 
 - for a worthy entry, one bare `deferred_read_parquet` of the snapshot on the
   default backend, memoized per `(project, content_hash)`. When the file exists
@@ -215,16 +246,24 @@ its own snapshot, is on disk before anything executes:
 2. Otherwise it loads the frozen build and collects the file each `Read` node
    points at.
 3. It re-creates each missing file by the rule for its class (table below).
-   When nothing can, the error names the source file.
+   No plan reads a clone directly, so a missing clone is made again only when
+   an ordered copy that needs it is re-created. When nothing can re-create a
+   file, the error names the source file.
 4. For a worthy entry it then heals the entry's own snapshot, under the
    project lock and after re-checking that the file is still missing, and
    verifies it.
+
+Whether an entry is worthy comes from its manifest. When the manifest is
+missing (a half-built entry), a snapshot on disk stands in for the verdict, so a
+worthy entry that has lost both is read as cheap: its whole build re-runs on
+every read, and a child built earlier, whose build reads that snapshot, can no
+longer be read (#204).
 
 | File | Written by | If it is missing |
 |---|---|---|
 | Snapshot, `compute_cache/result_cache/<hash>.parquet` | `materialize` | re-run the entry's build, and verify the digest |
 | Ordered copy, `compute_cache/ordered_sources/<key>.parquet` | polars, at ingest | re-run ingest on the clone with the recorded reader options, and check it |
-| Clone, `data/.cas/<digest><suffix>` | `ensure_cas_path` | copy the live source again, but only while its bytes still hash to the digest |
+| Clone, `data/.cas/<digest><suffix>` | `ensure_cas_path` | when an ordered copy made from it is re-created: copy the live source again, but only while its bytes still hash to the digest |
 
 A healed snapshot is checked against the recorded `result_digest`. A mismatch
 is still served, since the rows are the honest output of the frozen build, but
@@ -233,10 +272,17 @@ change: an engine version that differs from the manifest's `engine_versions`, a
 recipe that re-derives a different graph hash (#88), or a fixed graph that runs
 differently each time (#83). It records a durable `unfaithful_heal` error,
 which also pins the file, wipes the entry's Buckaroo stat cache, and fires the
-registered hooks. In the companion the hooks force Buckaroo to reload the open
-grid and push an SSE event. A re-created ordered copy is checked the same way
-against its recorded content digest, and a mismatch records an
-`unfaithful_ordered_copy` error.
+registered hooks. In the companion the hook posts a forced reload of the
+entry's grid to Buckaroo and publishes an `unfaithful_heal` SSE event. The SPA
+has no listener for that event; the error appears in the catalog page's error
+banner the next time the page refetches. All of this runs while the heal still
+holds the project lock, and the forced reload is posted whether or not a grid
+is open, without a promoted diff's colouring (#203). Only the healed entry is
+flagged: a cheap child of it reads the same snapshot, so the child's rows change
+under its hash with no record and no reload (#208). The MCP server registers no
+hook, so a heal that runs there records the error and wipes the stat cache
+only. A re-created ordered copy is checked the same way against its recorded
+content digest, and a mismatch records an `unfaithful_ordered_copy` error.
 
 Both shapes are single-backend expressions, so two entries compose (`union`,
 `join`, a diff) without tripping xorq's "multiple backends" guard. Chaining
@@ -258,9 +304,11 @@ Every file tallyman writes ends in an int64 `__row_order` column holding
 `0..N-1` in the file's physical row order, and every page request sorts by it:
 `ORDER BY __row_order`, or the user's sort keys and then `__row_order`, so the
 same request returns the same rows in any process and any cache state
-(`row_order.page`, which `/api/data` uses). Buckaroo pages in its own process,
-and is told the column's name with `row_order_column` in the `/load_expr`
-payload. The build enforces what makes that safe:
+(`row_order.page`, which `/api/data` uses; that route takes no user sort yet).
+Buckaroo pages the grid in its own process. Tallyman tells it the column's name
+with `row_order_column` in the `/load_expr` payload, but Buckaroo 0.15.6, the
+pinned version, ignores the hint, so the grid's pages are not yet ordered by it
+(buckaroo-data/buckaroo#974). The build enforces what makes the rule safe:
 
 - A cheap entry has no file of its own and pages by its parent's column, so it
   must keep it. A select that omits it fails the build with the corrected
@@ -273,12 +321,20 @@ payload. The build enforces what makes that safe:
   sortable columns, appended as tie-breakers, so a sort that feeds a `limit`
   decides the same rows on any connection. A sort that is not the last step is
   hoisted: the top-level sort leads with its keys. If a key was dropped or
-  overwritten, the build fails and names it.
+  overwritten, the build fails and names it. Nested columns (lists, structs,
+  maps) are left out of the tie-break, so two rows that tie on every other
+  column can still come out in either order (#205).
 - Every entry carries the column, and ibis names a join's right-hand copy
   `__row_order_right`, so joining three entries in one recipe needs
-  `.drop("__row_order")` on the right-hand inputs. The snapshot writer drops
-  `__row_order_right`, so a join entry can be joined again. A diff drops the
-  column from both sides, and the primary-key search skips it.
+  `.drop("__row_order")` on the right-hand inputs. The check counts right-hand
+  inputs without looking at the join kind, so a chain of semi or anti joins,
+  which adds no right-hand columns, is refused too (#199). The snapshot writer
+  drops `__row_order_right`, so a join entry can be joined again; it drops any
+  column of that name, including one the author made, and a join with a
+  non-default `rname` leaves its own collision column behind (#206).
+- The diff grid's compare expression drops the column from both sides, but
+  `full_diff`, which computes the diff page's summaries and `catalog_diff`'s
+  reply, keeps it as a data column (#200). The primary-key search skips it.
 
 ### Compute cache (`compute_cache_dir` in `src/tallyman_core/paths.py`)
 
@@ -287,40 +343,57 @@ that tallyman writes: `result_cache/` (snapshots) and `ordered_sources/`
 (ordered copies and their `.digest` files). By rule everything in it is cache:
 a file lives here only if `ensure_materialized` can re-create it and check what
 it made, so the cold state is an empty `compute_cache/`, and reading any entry
-then re-creates every file it needs.
+then re-creates every file it needs. The exception is the snapshot of an entry
+recorded as not reproducible, which cannot be made again faithfully; its pin
+protects it from the Cache page and from nothing else (#185).
 
 Files are deleted only by an explicit user action, and written only because
-something is about to read them. The startup warm-up writes nothing, the verify
-sweep (`catalog_scan_staleness(verify_results=True)`) reads and never writes,
-and a reset leaves the directory alone. The Cache page's delete is the one
-deleter. It answers 409 with the reason for a pinned snapshot, and it lists a
-snapshot whose entry is no longer in the catalog as an orphan row so that it
-can be deleted.
+something is about to read them. The startup warm-up writes nothing here, the
+verify sweep (`catalog_scan_staleness(verify_results=True)`) reads and never
+writes, and a reset leaves the directory alone. The Cache page's delete is meant
+to be the one deleter; a failed build is the other (#193). The page answers 409 with
+the reason for a pinned snapshot, and it lists a snapshot whose entry is no
+longer in the catalog as an orphan row, so that it can be deleted. It lists
+only snapshots: ordered copies cannot be seen or deleted there (#207).
 
-Every write takes the project's write lock (`catalog_state.project_lock`): a
-build, a materialization, a heal and a checkpoint. It is a file lock on
-`.checkpoint.lock`, so it holds between the MCP server and the companion, and
-it is re-entrant within a thread. It covers writes only. Concurrent reads on
-the shared default backend can still raise `Already borrowed` (#118).
+The project's write lock (`catalog_state.project_lock`) is taken by a build
+(for its whole length), a materialization or heal, an ordered-copy write, a
+checkpoint and a reset. Other writes take no lock: alias and notebook updates,
+chart and display configs and `config.json` each replace a whole file
+atomically, the logs append a line, and the Cache page's delete unlinks the
+file. The lock is a file
+lock on `.checkpoint.lock`, so it holds between the MCP server and the
+companion, and it is re-entrant within a thread. It blocks with no timeout: a
+page read whose entry needs a heal waits behind any build in the other process
+(#186), and the companion's `PUT /code` and `POST /promote_diff` routes build on
+the event loop, so the whole UI stops answering while they wait or build (#190).
+It covers no reads. Concurrent reads on the shared default backend can still
+raise `Already borrowed` (#118).
 
 `reset_to` (`src/tallyman_core/catalog_state.py`) returns the catalog with
 `git reset --hard` and reconciles entry directories through the bullpen (the
 directory a reset moves retired files into, so that a later reset forward can
-bring them back), but it does not manage `compute_cache/` (ADR-007 D14, a reset
-leaves `compute_cache/` alone). Snapshots are named by content hash, so one left behind by a retired
-entry cannot be served for another entry: it is unreferenced disk until that
-entry comes back or the user deletes it. A clone is data, the only frozen copy
-of the bytes an entry was built from once the live file is edited, and
-`<project>/data/.cas` lives outside the catalog git repo. So `reset_to` moves
-the clones no surviving entry's `manifest.sources` refers to into
-`<catalog>/bullpen/cas/` and never deletes one (`source_identity.gc_cas` with a
-bullpen), and a reset forward copies them back. `compute_cache.jsonl` no
-longer exists.
+bring them back), but it does not manage `compute_cache/` (ADR-007 D14, a
+reset leaves `compute_cache/` alone). Snapshots are named by content hash, so
+one left behind by a retired entry cannot be served for another entry: it is
+unreferenced disk until that entry comes back or the user deletes it. A clone
+is data, the only frozen copy of the bytes an entry was built from once the
+live file is edited, and `<project>/data/.cas` lives outside the catalog git
+repo. So `reset_to` moves the clones no surviving entry's `manifest.sources`
+refers to into `<catalog>/bullpen/cas/` and never deletes one
+(`source_identity.gc_cas` with a bullpen), and a reset forward copies them
+back. `compute_cache.jsonl` no longer exists.
+
+Two defects affect entries that are not reproducible. The bullpen keeps the
+first copy of an entry directory it receives, so a reset after re-adding such
+an entry can bring back its older manifest beside its newer snapshot (#194).
+And while the entry is retired, its snapshot shows on the Cache page as an
+unpinned orphan, which the page lets you delete (#195).
 
 ### In-memory caches in the companion
 
-All bounded LRUs over immutable keys, so eviction means a cheap rebuild
-and staleness is impossible:
+The first two are bounded LRUs over immutable keys, so eviction means a cheap
+rebuild and staleness is impossible; the third is a short TTL:
 
 - `cached_result_expr` — two memos. `_resolve_result_plan` is
   `lru_cache(256)` keyed `(project, content_hash)`: it holds a loaded build,
@@ -329,7 +402,9 @@ and staleness is impossible:
   snapshot, so one read has one table name in the shared backend.
   `cached_result_expr.cache_clear()` clears both. Whether each file exists is
   checked on every call, inside `ensure_materialized`, since existence is the
-  one input that stays mutable.
+  one input that stays mutable. The plan memo also keeps the build as it was
+  loaded, which nothing reads again, so up to 256 unused DataFusion backends
+  stay in memory (#210). The MCP server has the same two memos.
 - `_build_compare_expr` — `lru_cache(128)` keyed
   `(project, a_hash, b_hash, keys)`; saves rebuilding diff outer-join
   expressions. Build dirs land under `$TMPDIR/tallyman_diff_builds/`.
@@ -338,10 +413,11 @@ and staleness is impossible:
   time-based cache in tallyman; it coalesces filesystem walks during SSE
   bursts.
 
-On companion startup a 3-second warmup budget loads the frozen builds of cheap
-entries into the plan memo, so the first page request does not pay for the
-load. A worthy entry is skipped, since reading it does not load its build, and
-the warmup writes no file.
+On companion startup a 3-second warmup budget loads the frozen builds of the
+active project's cheap entries into the plan memo, so the first page request
+does not pay for the load. A worthy entry is skipped, since reading it does not
+load its build. The warmup writes nothing under `compute_cache/`; loading a
+cheap entry's build can write its `.xorq_build_expanded/`.
 
 ### Buckaroo integration caches (`src/tallyman_companion/buckaroo_lifecycle.py`)
 
@@ -351,43 +427,60 @@ Buckaroo process, and its id is `entry-<project>-<content_hash>`
 (`BuckarooManager.session_id_for`), a function of the two and nothing else, so
 it is never stale. There is no session file.
 
-- **Opening a grid** — `load_session` calls `ensure_materialized` first, so a
+- **Opening a grid**: `load_session` calls `ensure_materialized` first, so a
   failure of the computation surfaces in tallyman and never inside a grid
   query, then POSTs `/load_expr` with the derived id every time. Buckaroo
   skips the work when it already holds a session with that id and the same
   build directory and the post carries none of `component_config`,
   `column_config_overrides`, `extra_grid_config`, `init_sd` or
   `skip_stat_columns`. It creates the session again if it has dropped it, as it
-  does after a session has been idle for an hour. A promoted diff entry sends
-  `column_config_overrides`, so it reloads on every open.
-- **What Buckaroo is handed** — for a worthy entry, a **view build**: a build
+  does after a session has been idle for an hour. Nothing coalesces two opens
+  of one entry, so opens that overlap both post and both run Buckaroo's
+  pipeline; a promoted diff entry sends `column_config_overrides`, so it
+  re-runs the pipeline on every open; and the notebook page's data route posts
+  for every cell on every page load (#202).
+- **What Buckaroo is handed**: for a worthy entry, a **view build**, a build
   whose whole graph is one read of the entry's snapshot, written once to
   `<entry>/.xorq_view_build/` and rebuilt if the snapshot's path changes (a
   sibling `.xorq_view_build.complete` file records the path it was made for).
   Buckaroo never executes an aggregate, join or sort on tallyman's behalf and
   never writes a snapshot. For a cheap entry, the entry's own expanded build,
-  a small plan over files that exist. Both directories are stable, because
-  Buckaroo's stat-cache keys include the build directory's path. The body also
-  carries `row_order_column`, the name `__row_order`.
-- **After an unfaithful heal** — the companion's hook wipes the entry's stat
-  cache and POSTs `/load_expr` for the entry's id with `force_reload: true`, so
-  an open grid does not keep stats computed from the old rows.
-- **After a klass change** — a klass is a summary stat, post-processing or
+  a small plan over files that exist. Both directories are stable per-entry
+  paths, so Buckaroo is handed the same build after a restart, which is what its
+  on-disk stat cache relies on. The body also
+  carries `row_order_column`, the name `__row_order`, which Buckaroo 0.15.6
+  ignores, and `project_root`, where Buckaroo looks for the project's `stats/`,
+  `post_processing/` and `display/` klasses. Tallyman sends `artifacts/`,
+  which holds `display/`, but it writes stats and post-processing functions
+  under `artifacts/catalog/`, so Buckaroo does not find them (#170).
+- **After an unfaithful heal**: `_verify_self_heal` wipes the entry's stat
+  cache, and the companion's hook POSTs `/load_expr` for the entry's id with
+  `force_reload: true`, so an open grid does not keep stats computed from the
+  old rows. The post goes out whether or not a grid is open, which opens a
+  session nobody asked for, and it carries no column colouring (#203).
+- **After a klass change**: a klass is a summary stat, post-processing or
   display class written for the project. `reload_project_sessions` POSTs
-  `/reload_expr/<id>` for every entry of the project, treats the 404 that
-  Buckaroo answers for an unknown session as "not open", and clears the stat
-  cache of each grid it reloaded. That is one request per entry per change.
-- **Per-entry stat cache** — `<entry>/.buckaroo_stat_cache/parquet/`, a
+  `/reload_expr/<id>` for every entry of the project, treats the 404 (or 400)
+  that Buckaroo answers for an unknown session as "not open", and clears the
+  stat cache of each grid it reloaded. That is one request per entry per
+  change, sent one after another from the companion's event loop (#201), and
+  the stat-cache wipe after each reload is more than a klass change needs
+  (#177). A reset or a recalc that moved an alias reloads sessions the same way.
+- **Per-entry stat cache**: `<entry>/.buckaroo_stat_cache/parquet/`, a
   `ParquetSnapshotCache` Buckaroo writes its summary stats into (the
   companion passes the path at `/load_expr` time). Deleted wholesale on
   stat reload so Buckaroo recomputes. Always on, orthogonal to whether an entry
-  is worthy or cheap.
-- **Diff stat cache** — `<project>/artifacts/catalog/diff_stat_cache/`
+  is worthy or cheap. In practice a first load after a Buckaroo restart has not
+  been seen to hit it (#157).
+- **Diff stat cache**: `<project>/artifacts/catalog/diff_stat_cache/`
   `{a_hash[:12]}-{b_hash[:12]}/`, the same idea for a comparison session,
   keyed by the entry pair. Re-opening the same diff reuses the per-column
-  stats instead of recomputing over the full join. The live diff still posts an
-  unmaterialized join to Buckaroo (ADR-007 D10, tracked in #188), and its
-  session ids are remembered in memory and cleared when `/health` reports a new
+  stats instead of recomputing over the full join. A reset or a recalc that
+  moved an alias deletes the whole directory. The live diff still posts an
+  unmaterialized join to Buckaroo (ADR-007 D10, which would have built every
+  diff as an entry first, was moved to #188). Its session ids,
+  `diff-<a[:12]>-<b[:12]>`, are remembered in the companion's memory and
+  forgotten when the companion starts a Buckaroo whose `/health` reports a new
   `started` timestamp.
 
 ### Per-entry immutable records
@@ -416,11 +509,16 @@ catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
 - **Portable build expansion** (`src/tallyman_xorq/portable.py`) —
   `<entry>/.xorq_build_expanded/` plus a `.complete` marker, written
   last, gates reuse; a crashed expansion redoes on next access. The
-  expansion must live at a stable path, because Buckaroo's stat-cache keys
-  include the build directory's path and a random tmp dir would miss them on
-  every process restart. (Content-addressed but regenerable, so it is an
+  expansion lives at a stable path so that Buckaroo is handed the same build
+  directory after every process restart, which its on-disk stat cache was
+  meant to rely on (#157). (Content-addressed but regenerable, so it is an
   `ENTRY_CACHE_NAME`, not an artifact — the overlay omits it rather than
-  symlinking it.)
+  symlinking it.) The marker does not record which project path the build was
+  expanded with, so a project copied together with these directories keeps
+  reading the old location, and fails once that is gone (#209). A worthy
+  entry's build is first expanded at create, when `materialize` loads it; a
+  cheap entry's the first time something loads it (a read, the grid, a child's
+  build, the companion's startup warm-up).
 - **Manifest / schema** — `<entry>/manifest.json`, `<entry>/schema.json`:
   row counts, timings (including #87's cache-admission fields:
   `compile_seconds`, `cache_worthy`, `cache_worthy_why`, `cache_bytes`), the
@@ -502,25 +600,29 @@ Most of the stack never invalidates because it never can be stale: tallyman
 entry hashes, snapshot paths (named by content hash), ordered copies (named by
 a source's digest and its reader options), primary-key files, and manifests all
 rely on "same key, same rows, forever". Cleanup for those is a space concern.
-Only the user deletes a file, and a deleted file is made again and verified the
-next time something reads it.
+Only the user deletes a file (apart from a failed build, #193), and a deleted
+file is made again and verified the next time something reads it.
 
 One documented hole breaks "never stale": execution nondeterminism. An entry
 whose recipe calls `now()` / `random()` / an unseeded `sample()` or an impure
 UDF produces different rows each run under one content hash, so a cold
-recompute can disagree with what was built (#88). The build flags these as
-advisory lint warnings (`_nondeterminism_warnings`, `build.py`), and a worthy
-entry is also run twice when it is created, so a recipe that is not
+recompute can disagree with what was built (#88). The build flags `now()`,
+`today()`, `random()`, `uuid()` and an unseeded `sample()` as advisory lint
+warnings (`_nondeterminism_warnings`, `build.py`); an impure UDF is not flagged,
+since purity cannot be read off the graph. A worthy entry is also run twice when
+it is created, so a recipe that is not
 reproducible is known from the start: the manifest records
 `reproducible: false`, the build result names the columns that differed, and the
 snapshot is pinned. That check cannot see `today()`, since both runs agree (the
 lint does), or what an entry inherits from a non-reproducible parent, since both
-runs read the same parent file. The runtime backstop is `result_digest`: every
-heal verifies the repopulated snapshot against it before serving
+runs read the same parent file (#185). The runtime backstop is `result_digest`:
+every heal verifies the repopulated snapshot against it before serving
 (`_verify_self_heal`), and an unfaithful heal wipes the entry's stat cache,
-records a durable error, pins the file, and forces Buckaroo to reload the open
-grid. An engine or writer upgrade that changes results is attributed to the
-versions in `engine_versions`, and the remedy is a corpus rebuild. The second
+records a durable error, pins the file, and, in the companion, forces Buckaroo
+to reload the entry's grid. It does not reach the cheap entries that read the
+healed snapshot, whose rows change with it (#208). An engine or writer upgrade
+that changes results is attributed to the versions in `engine_versions`, and
+the remedy is a corpus rebuild. The second
 hole this section used to document — cold reads re-running `expr.py` and
 re-digesting live sources, serving edited bytes under the original hash
 (#115/#163) — is closed: reads load the frozen build, whose leaves are ordered
@@ -533,14 +635,16 @@ Where staleness is actually possible, it is handled explicitly:
   source file changes, and tallyman's source-digest memo
   (`source_identity.digest_for`) skips re-hashing a file whose mtime, size and
   inode are unchanged. Content stays the truth: the staleness scan forces a
-  re-hash.
-- **TTL** — xorq's `ParquetTTLStorage` (default one day) and the
-  companion's 3-second disk-usage cache are the only clocks in the
-  system.
+  re-hash. (Each forced re-hash also rewrites the memo holding only the file it
+  just hashed, so after a scan the next build hashes every source again.)
+- **TTL** — xorq's `ParquetTTLStorage` (default one day), the
+  companion's 3-second disk-usage cache, and Buckaroo's eviction of a session
+  idle for an hour are the only clocks in the system.
 - **State-change purges** — Buckaroo's op-chain key change, the JS
   `purgeInfiniteCache` on sort/ops change, the diff-session bookkeeping
-  clearing on Buckaroo restart, and the stat-cache deletion on a klass reload
-  or an unfaithful heal.
+  clearing on Buckaroo restart, the stat-cache deletion on a klass reload
+  or an unfaithful heal, and the deletion of `diff_stat_cache/` on a reset or
+  a recalc.
 
 The one rule to remember: a cache keyed on a path does not notice upstream data
 changes, so tallyman puts the content in the path. In every identity mode the

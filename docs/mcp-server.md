@@ -2,10 +2,12 @@
 
 The MCP server (`src/tallyman_mcp/server.py`) is the surface Claude Code drives.
 It is a [FastMCP](https://github.com/jlowin/fastmcp) server that exposes the
-catalog as **30 tools and one prompt** over stdio. Claude Code is the only
-caller; a human never invokes these directly. Each tool compiles or mutates the
-on-disk catalog through `tallyman_core` / `tallyman_xorq`, commits a git
-revision, and best-effort notifies the running companion so the browser updates.
+catalog as **31 tools and one prompt** over stdio. Claude Code is the only
+caller; a human never invokes these directly. Most tools compile or change the
+on-disk catalog through `tallyman_core` / `tallyman_xorq`, commit a git
+revision (a checkpoint), and best-effort notify the running companion so the
+browser updates. Terms (entry, alias, worthy and cheap entries, snapshot, klass)
+follow [architecture.md](architecture.md#terms).
 
 This doc lists every tool, its parameters, its return shape, and — the part that
 matters most when reasoning about a session — its **side effects**: whether it
@@ -40,7 +42,7 @@ not be up; notifications that fail are logged and dropped.
 
 ## Cross-cutting behavior
 
-Four mechanisms apply to (almost) every tool, so they are documented once here
+Five mechanisms apply to (almost) every tool, so they are documented once here
 rather than repeated per tool.
 
 **Auto-checkpoint (opt-out).** `mcp.tool` is monkeypatched to
@@ -73,8 +75,14 @@ tagging.
 **Notifications.** `_notify(kind, hash, **extra)` is a 2-second best-effort POST
 to the companion's `/internal/notify`, which re-publishes it as an SSE event of
 that `kind`. It never raises. Pass extra data as flat kwargs (`remap=...`), not
-`extra={...}`, or it nests and is silently dropped. The "Notifies" line per tool
-lists the kinds it emits.
+`extra={...}`, or it nests and is silently dropped. The "SSE notify" column
+below lists the kinds each tool emits. The SPA listens for `new_entry`,
+`build_failed`, `notebook_changed`, `chart_attached`,
+`post_processing_changed`, `summary_stat_changed`, `recalc` and
+`project_switched`; `alias_changed`, `alias_renamed`, `display_changed` and
+`entry_added` reach the browser but trigger no refetch. For
+`summary_stat_changed`, `post_processing_changed`, `display_changed` and
+`recalc` the companion also reloads the project's Buckaroo sessions.
 
 **Sticky active project.** `_resolve_active_project()` returns the in-process
 `_mcp_active_project` (set by `project_switch` / `project_new`) ahead of the
@@ -87,7 +95,7 @@ alias head, which can make followers stale. Both route through
 `_auto_recalc_after_head_advance` (when the project's `auto_recalc` switch is on):
 a checkpoint-free cascade rebuilds the followers in dependency order and leaves
 them in the working tree, so the head advance and the whole cascade land as one
-git revision. A non-empty cascade emits a `recalc` SSE event.
+git revision. A cascade whose remap is non-empty emits a `recalc` SSE event.
 
 ## Side-effect matrix
 
@@ -104,6 +112,7 @@ git revision. A non-empty cascade emits a `recalc` SSE event.
 | `notebook_remove` | yes | `notebook_changed` | no |
 | `notebook_edit_markdown` | yes | `notebook_changed` | no |
 | `catalog_chart` | yes | `chart_attached` | no |
+| `catalog_chart_errors` | yes ⚠ | — | no |
 | `catalog_diff` | no | — | no |
 | `catalog_promote_diff` | self³ | `entry_added`, `recalc`⁴ | yes |
 | `catalog_scan_staleness` | no | — | no |
@@ -125,15 +134,17 @@ git revision. A non-empty cascade emits a `recalc` SSE event.
 | `project_new` | no | — ⁵ | no |
 
 ¹ `notebook_changed` only when `name` is supplied. ² only when a cell was
-actually removed. ³ self-checkpoints exactly one revision; on the opt-out list so
-the dispatch boundary does not double-commit. ⁴ only on a committing run that
+actually removed. ³ self-checkpoints one revision (for `catalog_recalc`, only a
+committing run whose remap is non-empty); on the opt-out list so the dispatch
+boundary does not double-commit. ⁴ only on a committing run that
 produced a non-empty remap. ⁵ the *companion* broadcasts `project_switched`; the
 MCP tool itself sends no `_notify`. ⚠ see [Known quirks](#known-quirks).
 
 Any tool whose result carries an `error` key skips its checkpoint and sends no
-notify; failures come back inline in the response (most as `{error, error_id}`
-for build failures, `{error}` for validation/precondition failures), not as
-raised exceptions.
+success notify (a failed build in the authoring tools still sends
+`build_failed`; `catalog_promote_diff` sends nothing on failure); failures come
+back inline in the response (most as `{error, error_id}` for build failures,
+`{error}` for validation/precondition failures), not as raised exceptions.
 
 ---
 
@@ -152,18 +163,22 @@ ingest; use it for all CSV reads instead of `xo.deferred_read_csv`, #137). Both
 read the file through an **ordered copy** (the source's rows in file order, plus a
 last column `__row_order` holding `0..N-1`), so editing a source and re-running
 the same recipe creates a new entry and the old one keeps its rows. Reading a
-parquet file any other way (`xo.deferred_read_parquet`) is a build error.
+parquet file any other way (`xo.deferred_read_parquet`) is a build error. The
+copy of a parquet source can change a few column types, such as `date64` to a
+timestamp (#197).
 
 Every entry's result ends in `__row_order`, and pages are ordered by it. A recipe
 that only filters, selects or adds columns is *cheap* and must keep the column:
 `t.select("region", "price")` fails the build, and the error shows the fix,
 `t.select("region", "price", "__row_order")`. A recipe that aggregates, joins,
-sorts, uses a window function, union, distinct, unnest or UDF is *worthy*: the
-server writes its result to a snapshot file when the entry is created and
-renumbers the column to match. Assigning to `__row_order` is an error, an
-`order_by` that is followed by more steps is kept if its key columns survive, and
-joining three entries in one recipe needs `.drop("__row_order")` on the
-right-hand inputs. `catalog_run`'s docstring has the details.
+sorts, uses a window function, union, distinct, unnest, `random()`, `now()` or a
+UDF, or reads a second file, is *worthy*: the server writes its result to a
+snapshot file when the entry is created (running the query twice) and renumbers
+the column to match. Assigning to `__row_order` is an error, an `order_by` that
+is followed by more steps is kept if its key columns survive, and joining three
+entries in one recipe needs `.drop("__row_order")` on the right-hand inputs
+(chains of semi or anti joins are refused too, #199). `catalog_run`'s docstring
+has the details.
 
 ### `catalog_run(code, prompt="") -> dict`
 Execute an expression and persist it as an **unnamed (scratch)** entry. Claude's
@@ -298,12 +313,25 @@ hash).
   but-JSON spec only fails in the browser).
 - **Returns:** `{hash, spec_path}`. `{error}` for an unknown target or invalid
   JSON.
-- **Writes:** `catalog/chart_specs/<hash>.vl.json`.
+- **Writes:** `catalog/chart_specs/<hash>.vl.json`. The browser fetches the
+  chart's data from `/{project}/api/data/<hash>?limit=100000`.
+
+### `catalog_chart_errors(hash_or_alias) -> list`
+Chart render failures the browser reported for an entry, most recent first. The
+page posts one to `/{project}/api/chart_error` when vega-embed fails, and it is
+stored in `errors.jsonl` with `tool="chart_render"`. Use it after attaching or
+editing a chart, once someone has viewed the page.
+- **Params:** `hash_or_alias` (required); resolved like `catalog_chart`.
+- **Returns:** a list of error records (up to the 500 most recent errors are
+  searched), empty if none were reported; `[{error}]` for an unknown target.
+- It is read-only but not on the opt-out list, so it checkpoints on every call
+  (see [Known quirks](#known-quirks)).
 
 ### `catalog_diff(name, va=-2, vb=-1) -> dict`
 **Read-only** diff of two versions of an alias (default previous vs latest).
 Each side's expression comes from `cached_result_expr`, which makes any missing
-file exist first, and the diff drops `__row_order` from both sides.
+file exist first. The diff (`full_diff`) keeps `__row_order` as a data column, so
+after an inserted row the stats diff reports it as changed (#200).
 - **Params:** `name` (required); `va`, `vb` — version indices, 1-based or
   negative-from-end (`-1` latest, `-2` penultimate).
 - **Returns:** `{alias, before:{version,hash}, after:{version,hash}, schema,
@@ -333,9 +361,12 @@ marimo-exportable.
 ## Staleness and recalc tools
 
 ### `catalog_scan_staleness(verify_results=False) -> dict`
-**Read-only** scan of every live entry for staleness against its recorded inputs.
-Purely diagnostic — never rebuilds, repoints, or checkpoints. Call it first to
-see what is stale.
+**Read-only** scan of every complete entry (current alias heads and superseded
+versions alike; only heads can be directly stale) for staleness against its
+recorded inputs. Purely diagnostic — never rebuilds, repoints, or checkpoints.
+It does rewrite the source-digest memo, `artifacts/source_digests.json`, and
+today leaves it holding only the last file it hashed. Call it first to see what
+is stale.
 - **Params:** `verify_results` — also check that each snapshot on disk still has
   its recorded `result_digest`. It reads the files that exist and writes nothing,
   so a snapshot that was deleted is reported and stays deleted.
@@ -350,16 +381,19 @@ see what is stale.
 Recompute stale entries and their dependents in dependency order. Defaults to a
 non-committing **dry-run preview**; call again with `dry_run=False` to commit.
 - **Params:** `roots` — content hashes to recompute with their descendant cone;
-  `None` defaults to every directly-stale entry. Roots naming no live entry are
-  silently dropped. `dry_run` — preview when `True` (default).
+  `None` defaults to every directly-stale entry. Roots that name no complete
+  entry (no `manifest.json`) are silently dropped; a named root that is a
+  superseded version is kept and replayed. `dry_run` — preview when `True`
+  (default).
 - **Returns:** the `RecalcReport` (`project, roots, cone, entries, dry_run,
   status, remap, checkpoint_step, error`). Action vocabulary differs by mode
   (`rebuild`/`cascade`/`unchanged` on dry-run; `rebuilt`/`noop`/`failed`/
   `skipped` on a real run). A nothing-stale fast path returns a short
   `{status:'ok', ..., note:'nothing stale to recompute'}`.
 - **Self-checkpoints arg-aware:** a dry-run takes no checkpoint; a committing run
-  takes exactly one for the whole walk, so the recompute is a single revision
-  `reset-to` can undo atomically. A committing run with a non-empty remap emits
+  that changed something (a non-empty remap) takes exactly one for the whole
+  walk, so the recompute is a single revision `reset-to` can undo atomically,
+  and one that changed nothing takes none. A committing run with a non-empty remap emits
   `recalc`. Build failures are encoded in `status`/`error`/per-entry `error`
   (the walk halts, the rebuilt prefix stays committed); a dependency cycle yields
   `status=='cycle'` rather than raising.
@@ -370,9 +404,18 @@ Project-authored per-column statistics. Source runs in a restricted-globals
 sandbox; errors come back inline rather than later in the Buckaroo log. There is
 no separate update tool — re-adding the same `name` overwrites.
 
+Buckaroo looks for project stats in `<project_root>/stats/`, and tallyman sends
+`project_root` as `<project>/artifacts/`, while it writes stats to
+`<project>/artifacts/catalog/stats/`. So a stat added here is validated,
+committed and reloaded, but Buckaroo does not find it and the grid does not show
+it (#170). Post-processing functions have the same problem; display klasses,
+which live in `artifacts/display/`, do not.
+
 ### `catalog_add_summary_stat(name, source) -> dict`
-Validate a `compute(col)` function against a 1-row ibis memtable, write it to
-`<project>/stats/<name>.py`, and hot-reload it into open Buckaroo sessions.
+Validate a `compute(col)` function against a 3-row, one-column ibis memtable,
+write it to `<project>/artifacts/catalog/stats/<name>.py` (tracked in the
+catalog repository), and ask the companion to reload the project's open Buckaroo
+sessions.
 - **Params:** `name` (required) — a valid Python identifier; `source` (required)
   — must define `compute(col)` taking one ibis column and returning an ibis
   scalar.
@@ -400,8 +443,10 @@ styling base classes already in scope; validated in a restricted sandbox before
 the file lands.
 
 ### `catalog_add_display_klass(name, source) -> dict`
-Validate and persist a display klass to `display/<name>.py`, then hot-reload it
-into open sessions (`display_changed`). The primary use is extending
+Validate and persist a display klass to `<project>/artifacts/display/<name>.py`,
+then hot-reload it into open sessions (`display_changed`). That directory is
+outside the catalog repository, so the checkpoint this tool takes commits
+nothing for it, and a reset does not undo it. The primary use is extending
 `DefaultMainStyling` (`df_display_name='main'`) or `DefaultSummaryStatsStyling`
 (`'summary'`) with a `pinned_rows` entry so a stat shows as a frozen row.
 - **Params:** `name` (required) — valid identifier; `source` (required) — must
@@ -428,7 +473,8 @@ sandbox as summary stats (third-party imports like numpy/sklearn raise
 
 ### `catalog_add_post_processing(name, source) -> dict`
 Validate a `process(expr)` function and write it to
-`<project>/post_processing/<name>.py`.
+`<project>/artifacts/catalog/post_processing/<name>.py` (tracked in the catalog
+repository). Buckaroo does not find it there yet (#170, above).
 - **Params:** `name` (required) — valid identifier, becomes the dropdown label;
   `source` (required) — defines `process(expr)` returning an ibis expression or a
   pandas DataFrame.
@@ -436,8 +482,9 @@ Validate a `process(expr)` function and write it to
 - **Validator gotcha:** the dry-run table has only columns `{a, b}`, so a
   `process` that references real column names is rejected here even when
   `catalog_run_post_processing` previewed it fine — guard with
-  `if 'col' not in expr.columns: return expr`. The new option appears only on the
-  next session load (V1 does not hot-swap loaded sessions).
+  `if 'col' not in expr.columns: return expr`. The tool's docstring says the new
+  option appears on the next session load; the companion also posts
+  `/reload_expr` for each of the project's entries, as for any klass change.
 
 ### `catalog_remove_post_processing(name) -> dict`
 Soft-delete to `post_processing/_disabled/`. Still shows in the list with
@@ -485,11 +532,13 @@ it references exact column names rather than guessing.
 
 ## Project-lifecycle tools
 
-These require the companion (`tallyman run`) to be active: the **companion** is
-the sole writer of the `active_project` file and the genesis baseline, reached
-via `_companion_post`. All three are on the opt-out list. On success the
-companion broadcasts a `project_switched` SSE event itself (the MCP tool sends no
-`_notify`). Each updates the in-process sticky `_mcp_active_project`.
+`project_switch` and `project_new` require the companion (`tallyman run`) to be
+active: for these tools the **companion** writes the `active_project` file and
+the genesis baseline, reached via `_companion_post`, so that it can publish the
+SSE event. All three are on the opt-out
+list. On success the companion broadcasts a `project_switched` SSE event itself
+(the MCP tool sends no `_notify`), and the tool updates the in-process sticky
+`_mcp_active_project`.
 
 ### `project_list() -> dict`
 List projects on disk and report the active one. **Safe even when the companion
@@ -536,11 +585,18 @@ checkpoint or tagging wrappers.
 
 ## Known quirks
 
-- **`catalog_list_display_klasses` checkpoints.** It is the one read-only `*_list*`
-  tool missing from the `_NO_CHECKPOINT` set (`server.py`), so `_with_checkpoint`
-  runs `checkpoint_catalog`, which commits with `--allow-empty` and advances the
-  step tag. Each call therefore appends an **empty** catalog revision — harmless
-  to correctness but it inflates the git history and the step count. Adding it to
-  `_NO_CHECKPOINT` (next to `catalog_list_summary_stats` /
-  `catalog_list_post_processings`) would bring it in line with the other list
-  tools.
+- **`catalog_list_display_klasses` and `catalog_chart_errors` checkpoint.** They
+  are read-only but missing from the `_NO_CHECKPOINT` set (`server.py`), so
+  `_with_checkpoint` runs `checkpoint_catalog`, which commits with
+  `--allow-empty` and advances the step tag. Each call therefore appends an
+  **empty** catalog revision — harmless to correctness but it inflates the git
+  history and the step count. Adding them to `_NO_CHECKPOINT` (next to
+  `catalog_list_summary_stats` / `catalog_list_post_processings`) would bring
+  them in line with the other read-only tools.
+- **Display klasses are outside the catalog repository.** `catalog_add_display_klass`
+  and `catalog_remove_display_klass` checkpoint, but `artifacts/display/` is not
+  in the repository, so the revision records nothing about them and a reset does
+  not undo them.
+- **A build holds the project lock for its whole length.** Parallel tool calls
+  that build queue behind each other, and behind any build or heal the companion
+  is running (#186).

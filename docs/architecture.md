@@ -1,479 +1,834 @@
 # Tallyman architecture overview
 
-This is the top-level map of the tallyman codebase. Read it first, then follow
-the cross-references into the per-subsystem docs. For a document index with a
-currency note on each file, see [Related documentation](#related-documentation)
-at the end.
+This is the top-level map of tallyman: how the system works from end to end,
+and where each part is documented in more depth. Read it first. The
+[Related documentation](#related-documentation) section at the end lists every
+doc, with a note on how current each one is.
 
 ## What tallyman is
 
-Tallyman is a deconstructed notebook platform. Instead of a notebook file with
-inline cells and outputs, the unit of work is a **catalog entry**: a single
-xorq expression, compiled and stored on disk under a content hash. Claude Code
-is the author — it drives tallyman through an MCP server, creating and revising
-entries as xorq expressions. The entries accumulate in an on-disk,
-content-addressed, git-backed catalog. A FastAPI companion server plus a React
-SPA visualize that catalog in a browser, and a Buckaroo subprocess provides
-interactive data grids over each entry's result.
+Tallyman is a notebook without cells. Its unit of work is a **catalog entry**:
+one xorq expression (a deferred dataframe computation, which runs only when
+asked), compiled and stored on disk under its **content hash**. Claude Code is
+the author. It drives tallyman through an MCP server, sending Python that
+builds an expression, and each successful call becomes an entry in a
+git-backed catalog on disk. A FastAPI companion server and a React single-page
+app (SPA) show the catalog in a browser, and a Buckaroo subprocess draws the
+interactive data grid for each entry.
 
-Nothing in tallyman is a long-lived application server holding state in memory.
-The catalog on disk is the source of truth. The running processes (companion,
-Buckaroo, MCP server) are views and editors over it; the MCP server holds no
-in-memory catalog state, and the companion holds only its SSE subscriber list.
+The catalog on disk is the source of truth, and the running processes are
+views of it and editors of it. Each process keeps in-memory caches keyed by
+content hash, which change how fast an answer comes back and never what the
+answer is. Beyond those caches, the MCP server remembers which project its
+session is working on, and the companion holds its open SSE streams and the
+diff sessions it has opened in Buckaroo. Running two tallyman servers against
+one project is unsupported, and nothing detects it yet (#183).
+
+### Terms
+
+These are the project's own terms. The other docs use them with the same
+meaning.
+
+- **Catalog:** a project's entries, aliases and notebook, kept in a git
+  repository at `<project>/artifacts/catalog/`.
+- **Entry:** one catalog computation, stored in `entries/<content_hash>/` and
+  committed as `entries/<content_hash>.zip`.
+- **Content hash:** an entry's identity, xorq's 12-character hash of the
+  entry's expression after tallyman's rewrite (under the `salt` identity mode,
+  mixed with the source digests). Every file the expression reads is named by
+  what decides its content (a source's digest, or a parent entry's content
+  hash), so the hash covers the inputs as well as the structure.
+- **Recipe:** the Python the author submitted, kept as the entry's `expr.py`.
+  It names its inputs (a file name, an alias), so run again later it can mean
+  something else.
+- **Build:** the entry's `xorq_build/` directory, the expression frozen to disk
+  with every input fixed. A read of a cheap entry and every heal load the build;
+  a worthy entry whose snapshot exists is read from the snapshot alone. The
+  recipe is run again only to make a new entry (a revise or a recalc), and by
+  one diagnostic after a heal that went wrong.
+- **Manifest:** the entry's `manifest.json`, which records what the build does
+  not say: parent hashes, source digests, the cheap-or-worthy verdict, the
+  result digest.
+- **Alias:** a mutable name, such as `sales`, that points at the latest content
+  hash of a logical entry and keeps every hash it has pointed at, as versions
+  V1, V2 and so on.
+- **Source:** a data file the user provides: a parquet file under the project's
+  `data/`, or a CSV anywhere.
+- **Clone:** a copy-on-write copy of a source under `data/.cas/`, named by the
+  md5 digest of its bytes, so that an entry can still be re-read from the bytes
+  it was built from after the source is edited.
+- **Ordered copy:** a parquet copy of a source, in the source's row order, with
+  one extra column at the end, `__row_order`. Recipes read ordered copies, never
+  the sources themselves.
+- **`__row_order`:** an int64 column holding `0..N-1` in a file's physical row
+  order. It is the last column of every file tallyman writes, and pages of an
+  entry are sorted by it.
+- **Worthy and cheap entries:** a **worthy** entry is one tallyman
+  materializes, because its plan does work that is expensive or that cannot
+  keep its input's row order (an aggregate, a join, a sort, a window function,
+  among others). A **cheap** entry is row-preserving over one file (filters,
+  column selections, computed columns) and has no file of its own; its small
+  plan re-runs on every read.
+- **Snapshot:** the parquet file that holds a worthy entry's result,
+  `compute_cache/result_cache/<content_hash>.parquet`.
+- **Materialize:** run an entry's build to completion and write the result to
+  its snapshot.
+- **Heal:** make a missing file that an entry reads (a snapshot, an ordered
+  copy or a clone) again, and check it against what was recorded.
+- **Result digest:** a content digest of a snapshot, recorded in the manifest
+  when the snapshot is first written; every heal is checked against it.
+- **Pinned snapshot:** one the Cache page refuses to delete, because it cannot
+  be made again faithfully.
+- **Checkpoint:** one git commit of the catalog repository, tagged `step-NNN`.
+  Each operation that changes the catalog lands as one checkpoint.
+- **Reset:** `reset_to`, which returns the catalog to an earlier checkpoint.
+- **Bullpen:** the directory a reset moves retired entry directories and
+  clones into, so that a later reset forward can bring them back.
+- **Project lock:** a file lock on the project that builds, materializations,
+  checkpoints and resets take, so that they happen one at a time.
+- **Session:** one grid's state inside the Buckaroo process.
+- **View build:** a build whose whole graph is one read of a worthy entry's
+  snapshot. It is what Buckaroo is handed for a worthy entry.
+- **Klass:** a summary statistic, post-processing function or display class
+  written for the project, for Buckaroo's grids to use.
 
 ### Big-picture flow
 
 ```
   Claude Code
-      │  (MCP tool calls over stdio)
+      │  MCP tool calls over stdio
       ▼
-  tallyman MCP server ──────────────► on-disk catalog
-   (compiles xorq exprs,              ~/.tallyman-notebooks/projects/<project>/
-    checkpoints to git)               (content-addressed entries, aliases,
+  tallyman MCP server ──────────────► on-disk project
+   (builds entries,                   ~/.tallyman-notebooks/projects/<project>/
+    checkpoints to git)               (entries, snapshots, aliases,
       │                                notebook, git history)
       │  best-effort HTTP notify             ▲
-      ▼                                      │ reads/writes
+      ▼                                      │ reads and writes
   tallyman companion (FastAPI :7860) ────────┘
       │  REST + SSE
       ▼
   React SPA (packages/app) in the browser
       │  embeds grids
       ▼
-  Buckaroo subprocess (:8700) ◄─── companion POSTs build dirs
-   (interactive dataframe grids, sort/search push down to xorq)
+  Buckaroo subprocess (:8700) ◄─── companion posts a build to display
+   (grids: paging, sorting, search, summary statistics)
 ```
 
-The typical loop: Claude Code calls an MCP tool to create or revise an entry,
-the MCP server compiles the xorq expression and writes a content-addressed
-entry plus a git checkpoint, then notifies the companion. The companion emits a
-Server-Sent Event (SSE, a push message over an HTTP stream the browser holds
-open; see [Live updates over SSE](#live-updates-over-sse)), the SPA refetches
-the affected data, and when the user opens
-an entry the companion warms a Buckaroo session so the grid loads. See
-[expression-lifecycle.md](expression-lifecycle.md) for the full
-create-to-view path.
+The typical loop: Claude Code calls an MCP tool to create or revise an entry.
+The MCP server imports the code and builds the entry. It checks the
+expression, decides whether the entry is worthy, freezes it, runs its query to
+completion (writing the snapshot of a worthy entry), and writes the entry
+directory. It then notifies the companion, best effort, and commits a
+checkpoint as the tool returns. The companion publishes a Server-Sent Event
+(SSE, a message on an HTTP stream the browser keeps open; see
+[Live updates over SSE](#live-updates-over-sse)), and the SPA refetches what
+changed. When the user opens the entry, the companion first makes sure every
+file the entry reads exists, then asks Buckaroo to open a session for it, and
+the grid connects to that session over a WebSocket.
+[expression-lifecycle.md](expression-lifecycle.md) follows one entry through
+all of this.
 
-Three processes run on one machine: `tallyman_mcp` (spawned by Claude Code over
-stdio), `tallyman_companion` (the FastAPI app, started with `tallyman run`), and
-a `buckaroo` server subprocess that the CLI/companion supervises.
+Three processes run on one machine: `tallyman_mcp`, which Claude Code spawns
+over stdio (one per Claude Code session); `tallyman_companion`, the FastAPI app
+that `tallyman run` starts; and the Buckaroo server, which `tallyman run`
+spawns and stops. The MCP server and the companion both write to the catalog.
+The project lock makes their builds, materializations, checkpoints and resets
+happen one at a time; smaller writes (an alias, a notebook cell, a chart) are
+atomic file replacements that take no lock.
 
 ## Component map
 
-Tallyman is six subsystems: five Python packages under `src/` and one frontend
-workspace under `packages/`. The dependency direction runs core ← xorq ← {mcp,
-companion} ← cli; nothing in `tallyman_core` imports the web, MCP, or compute
-layers.
+Tallyman is six parts: five Python packages under `src/` and one frontend
+workspace under `packages/`. Imports mostly run one way, core ← xorq ←
+{companion, mcp} ← cli. The exceptions: `tallyman_core` imports `tallyman_xorq`
+lazily inside three functions (`reset_to` clears the read memo and retires
+clones, and `run_post_processing` reads an entry's result), the MCP server
+imports the companion's diff helpers for `catalog_promote_diff`, and the
+companion imports the CLI's fixture writer for `/api/projects/new`.
 
-**tallyman_core** (`src/tallyman_core/`) is the native catalog model. It owns
-the on-disk representation: versioned entries keyed by content hash, mutable
-aliases with version history, the notebook cell list, chart specs, display
-configs, project-global post-processing and summary-stat functions, and the
-prompt/error/event logs. It manages the git-backed checkpoint transaction
-(capture pointers, zip recipes, stage, commit, tag) and the reset-to-revision
-operation that rewinds the catalog and reconciles untracked entry directories
-and source clones through a holding area called the bullpen. A key invariant lives here:
-`assert_catalog_consistent` enforces an allow-listed tracked surface and
-verifies that every hash referenced by an alias, chart, or display config has a
-durable recipe zip. The call direction is one-way: `catalog_state` calls
-`catalog`, never the reverse. Design: [native-catalog-store.md](../plans/native-catalog-store.md).
+**tallyman_core** (`src/tallyman_core/`) is the catalog model and store. It
+owns the on-disk representation: entries keyed by content hash, aliases and
+their version history, the notebook's cell list, chart specs, display configs,
+the project's post-processing and summary-stat functions, per-project settings
+(`config.json`), and the prompt, error and event logs. It runs the checkpoint
+(record the entry pointers, zip new recipes, `git add -A`, commit once, tag the
+step) and `reset_to`, which rewinds the catalog to a step and reconciles the
+files git does not track through the bullpen. It holds the project lock
+(`catalog_state.project_lock`). `assert_catalog_consistent` enforces an
+allow-listed set of tracked paths and checks that every hash an alias, chart or
+display config names has a committed recipe zip. The call direction is one
+way: `catalog_state` calls `catalog`, never the reverse. Design:
+[native-catalog-store.md](../plans/native-catalog-store.md).
 
-**tallyman_xorq** (`src/tallyman_xorq/`) is the xorq integration layer. It
-compiles a xorq expression into a content-addressed entry, computes the content
-hash from the expression structure (which covers each source's content, because
-a recipe reads an ordered copy named by the source's digest), decides once
-whether the entry is worthy of a materialized result file, writes that file
-itself (`materialize`), and writes a portable build directory whose absolute
-paths are rewritten to `${TALLYMAN_PROJECT_ROOT}` placeholders. It also implements
-reactive staleness detection (comparing recorded manifest fields against the
-current world) and the recalc cone that recomputes dependents in dependency
-order. Reconstruction of an entry's expression from its persisted `expr.py`
-happens here, using context variables that pin the entry's recorded source
-digests. See [caching.md](caching.md) and [reactive-recalc.md](reactive-recalc.md).
+**tallyman_xorq** (`src/tallyman_xorq/`) turns recipes into entries and serves
+their results. `build.py` imports a recipe and builds the entry. `io.py` holds
+what recipes read data with. `source_identity.py` digests and clones sources,
+and `ordered_copy.py` writes and re-creates their ordered copies.
+`worthiness.py` decides cheap or worthy. `source_cache.py` and `row_order.py`
+check and rewrite the expression before it is frozen. `materialize.py` writes
+snapshots and makes sure the files an entry reads exist. `digest.py` computes
+content digests. `result_cache.py` is the one read of an entry's result.
+`portable.py` makes builds relocatable. `staleness.py`, `dependents.py` and
+`recalc.py` are the reactive system, and `primary_key.py` and `diff.py` serve
+version diffs. See [caching.md](caching.md) and
+[reactive-recalc.md](reactive-recalc.md).
 
-**tallyman_companion** (`src/tallyman_companion/`) is the FastAPI web server on
-port 7860. It surfaces catalog views over REST, pushes live updates over SSE,
-manages the Buckaroo subprocess lifecycle, and handles browser-initiated
-mutations (code revision, diff promotion, resets). There are no server-side
-HTML templates — it serves the compiled React SPA (`packages/app/dist`) as a
-catch-all and mounts `/assets` and `/static`. A checkpoint middleware wraps
-mutating routes so each authored change lands as one git revision, with an
-opt-out denylist for routes that self-checkpoint or should not checkpoint at
-all. It builds diff expressions (outer join with membership and per-column
-delta/equality sentinel columns) and computes the Buckaroo column-config
-overrides that color them. No dedicated subsystem doc yet — the route table is
-in `app.py`; the create-to-view path is in [expression-lifecycle.md](expression-lifecycle.md).
+**tallyman_companion** (`src/tallyman_companion/`) is the FastAPI web server
+on port 7860. It serves the catalog over REST, pushes live updates over SSE,
+handles edits made in the browser (a code revision, a diff promotion, notebook
+edits, a recalc, deleting a snapshot, project switching), and talks to Buckaroo
+through `BuckarooManager` (`buckaroo_lifecycle.py`), which spawns the
+subprocess, opens sessions and reloads them when klasses change. It has no
+server-side HTML templates: it serves the built SPA (`packages/app/dist`) for
+every GET that no route matches (an unmatched `/api` path gets a JSON 404), and
+mounts the SPA's `/assets`. A checkpoint middleware commits one git revision
+after each successful mutating request, except on an explicit list of exempt
+routes (`/internal/*` and the project routes, cache and log clears, telemetry,
+reset, and the routes that checkpoint themselves). `diff.py` builds the diff
+comparison, an outer join with a membership column and per-column delta and
+equality columns, and the Buckaroo column settings that colour it. No
+dedicated doc covers the route table yet; it is in `app.py`, and the
+create-to-view path is in [expression-lifecycle.md](expression-lifecycle.md).
 
-**tallyman_mcp** (`src/tallyman_mcp/`) is the FastMCP server that Claude Code
-talks to over stdio. It exposes the catalog, notebook, and project tools
-(`catalog_run`, `catalog_create`, `catalog_revise`, `catalog_alias`,
-`catalog_diff`, `catalog_recalc`, the chart/display/stat/post-processing tools,
-`notebook_*`, and `project_*`). Checkpointing is opt-out: every tool
-auto-checkpoints at the dispatch boundary unless it is on the no-checkpoint
-list. The active project is session-sticky (seeded on first tool call, surviving
-disk changes within the session), and project lifecycle changes are POSTed to
-the companion rather than written directly so SSE stays honest. Notifications to
-the companion are best-effort and never raise. Every tool, its parameters, and
-its side effects (checkpoint, SSE notify, auto-recalc) are documented in
-[mcp-server.md](mcp-server.md).
+**tallyman_mcp** (`src/tallyman_mcp/server.py`) is the FastMCP server that
+Claude Code talks to over stdio: 31 tools and one prompt. Every tool
+checkpoints after it succeeds unless it is on the `_NO_CHECKPOINT` list. The
+active project is sticky for the session: seeded on the first call, then
+changed only by `project_switch` or `project_new`, which go through the
+companion so that its SSE stream stays honest. Notifications to the companion
+are best effort and never raise. [mcp-server.md](mcp-server.md) documents every
+tool, its parameters and its side effects.
 
-**tallyman_cli** (`src/tallyman_cli/`) is the Click command-line interface
-(entry point `tallyman`). It initializes projects (with synthetic fixture data),
-runs the companion and the MCP service, and owns the Buckaroo subprocess via
-`BuckarooManager`, which spawns `python -m buckaroo.server` on port 8700 (or a
-random free port) and exits when its stdin closes. It also provides `serve`
-(read-only companion against a project directory anywhere on disk), `pack`
-(portable tarball of the project directory), `reset-to` / `revisions`,
-and storyboard `replay` for deterministic rehearsal. See [installing.md](installing.md).
+**tallyman_cli** (`src/tallyman_cli/main.py`) is the Click command line,
+`tallyman`. `init` creates a project, with a synthetic `orders.parquet` unless
+given `--no-fixture`, and records its step-000 checkpoint. `run` starts the
+companion and, unless given `--no-buckaroo`, the Buckaroo subprocess
+(`python -m buckaroo.server --stdio-control`, which exits when its stdin
+closes) on port 8700, or on a random port if 8700 is taken. `mcp` starts the
+MCP server. `serve` runs a read-only companion, without Buckaroo, against a
+project directory anywhere on disk. `pack` tars a project directory. `reset-to`,
+`revisions` and `revisions label` move through and name checkpoints. `replay`
+runs a storyboard of MCP tool calls. See [installing.md](installing.md).
 
-**Frontend** (`packages/app/`) is the React 18 + Vite SPA. It builds to `dist/`
-and is served by FastAPI as a catch-all; it drives refetches off an SSE version
-counter rather than polling, defers grid loads until scroll via
-`LazyBuckarooEmbed`, and remaps views to new hashes when a recalc event arrives.
-Its `BuckarooEmbed` component mounts `BuckarooServerView` from `buckaroo-js-core`
-directly and connects over WebSocket. No dedicated frontend doc yet.
+**Frontend** (`packages/app/`) is a React 18 and Vite SPA with pages for the
+catalog, the notebook, diffs, the Cache page, the activity log and the project
+list. It refetches when an SSE event arrives instead of polling. The catalog
+page's data tab asks for the entry's Buckaroo session as soon as the entry
+opens, and shows a spinner, then the grid, or the reason it failed with a retry
+button (#133). The notebook page's data route opens a Buckaroo session for every
+cell each time the page loads (#202), and each cell's grid connects only when
+the cell scrolls near the viewport (`LazyBuckarooEmbed`). The grid itself is
+`BuckarooServerView` from `buckaroo-js-core`, connected to the Buckaroo process
+over a WebSocket. No dedicated frontend doc yet.
 
-## On-disk catalog layout
+## On-disk layout
 
-A project lives at `~/.tallyman-notebooks/projects/<project>/`. The home root is
-`~/.tallyman-notebooks/` by default and is overridable with the `TALLYMAN_HOME`
-environment variable (`paths.py:tallyman_home`). The single active project name
-is recorded in `~/.tallyman-notebooks/active_project` (one line). The catalog
-itself is a git repository at `<project>/artifacts/catalog/`.
+A project lives at `~/.tallyman-notebooks/projects/<project>/`. The home root
+is `~/.tallyman-notebooks/` by default and can be moved with the
+`TALLYMAN_HOME` environment variable (`paths.tallyman_home`). The active
+project's name is the one line of `~/.tallyman-notebooks/active_project`.
 
 ```
 ~/.tallyman-notebooks/
-  active_project                     # one line: the active project name
+  active_project                       # one line: the active project's name
   projects/<project>/
     artifacts/
-      catalog/                       # git repo — the tracked catalog
-        entries/<hash>.zip           # tracked recipe zip (expr.py, schema.json, xorq_build/)
-        entries/<hash>/              # untracked build dir (gitignored, reconciled on reset)
-        entries.jsonl                # pointer list, one {hash} per line
-        aliases.jsonl                # one {alias, latest, history:[V1,V2,...]} per line
-        notebook.jsonl               # one {cell_id, alias, markdown} per cell
-        config.json                  # project settings, e.g. {auto_recalc: bool}
-        chart_specs/<hash>.vl.json   # Vega-Lite specs, keyed by content hash
-        display_configs/<hash>.json  # {column_config_overrides, diff_provenance}
-        post_processing/<name>.py    # process(expr) functions (_disabled/ = soft-deleted)
-        stats/<name>.py              # compute(col) functions (_disabled/ = soft-deleted)
-        prompts/<hash>.jsonl         # append-only per-entry prompt history
-        bullpen/                     # untracked holding area (entries/, cas/) a reset retires files to
-        compute_cache/               # untracked cache files tallyman writes:
-          result_cache/<hash>.parquet         # snapshots of worthy entries
-          ordered_sources/<key>.parquet       # ordered copies of sources
-        diff_stat_cache/             # untracked Buckaroo diff-stat caches per entry pair
-        .gitignore                   # deny-by-default (entries/*/, bullpen/, caches, *.tmp)
-      display/<name>.py              # display klass files (ColAnalysis subclasses)
-      errors.jsonl                   # append-only error log (outside catalog repo)
-      events.jsonl                   # append-only activity log (outside catalog repo)
-      exports/                       # marimo .py, screenshots, CSVs
-    data/                            # user input parquets (fixtures)
-    data/.cas/<digest><suffix>       # content-addressed source clones (CoW), cas mode only
+      catalog/                         # git repo: the catalog
+        entries/<hash>.zip             # tracked recipe zip (expr.py, schema.json, manifest.json, xorq_build/)
+        entries/<hash>/                # untracked entry directory (below)
+        entries.jsonl                  # the entries a checkpoint recorded, one {hash} per line
+        aliases.jsonl                  # one {alias, latest, history} per line
+        notebook.jsonl                 # one {cell_id, alias, markdown} per cell
+        config.json                    # project settings, e.g. {"auto_recalc": true}
+        chart_specs/<hash>.vl.json     # Vega-Lite specs, by content hash
+        display_configs/<hash>.json    # {column_config_overrides, diff_provenance}
+        post_processing/<name>.py      # process(expr) functions (_disabled/ holds removed ones)
+        stats/<name>.py                # compute(col) functions (_disabled/ holds removed ones)
+        prompts/<hash>.jsonl           # the prompts each entry was built from
+        .gitignore                     # keeps the untracked paths below out of git add -A
+        .checkpoint.lock               # the project lock (untracked)
+        compute_cache/                 # untracked; files tallyman can make again
+          result_cache/<hash>.parquet    # snapshots of worthy entries
+          ordered_sources/<key>.parquet  # ordered copies of sources, each with a <key>.digest
+        bullpen/                       # untracked; entries/ and cas/ that a reset retired
+        diff_stat_cache/<a>-<b>/       # untracked; Buckaroo statistics per diffed pair
+      display/<name>.py                # display klasses (outside the catalog repo)
+      errors.jsonl                     # error log (outside the catalog repo)
+      events.jsonl                     # activity log (outside the catalog repo)
+      telemetry.jsonl                  # Buckaroo grid-load timings (outside the catalog repo)
+      source_digests.json              # md5 of each source, memoized on its stat
+      exports/
+    data/                              # the user's source files
+    data/.cas/<digest><suffix>         # clones of sources (cas identity mode)
+    buckaroo.log                       # the Buckaroo subprocess's stderr (tallyman run)
+    notebook_marimo.py                 # written by catalog_export_marimo
 ```
 
-Key formats and what's tracked vs untracked:
+An entry directory, `entries/<hash>/`, holds the four recipe members
+(`expr.py`, `schema.json`, `manifest.json`, `xorq_build/`) and the per-entry
+caches, which are made again on demand: `.xorq_build_expanded/` (the build with
+the project path filled back in), `.xorq_view_build/` (a worthy entry's view
+build), `.buckaroo_stat_cache/` (Buckaroo's summary statistics) and
+`primary_key.json` (the key a diff joins on). `.xorq_build_expanded/` and
+`.xorq_view_build/` each have a sibling `.complete` marker, written last.
 
-- **Recipe zip** (`entries/<hash>.zip`) is the durable, deterministic,
-  content-addressed entry. It contains `expr.py` (the author's literal source,
-  with portable placeholders), `schema.json` (field names and types), and
-  `xorq_build/` (the portable expression directory with `expr.yaml` plus deps).
-  The zip writer only runs inside a checkpoint.
-- **Entry build dir** (`entries/<hash>/`) is ephemeral and gitignored. It holds
-  `manifest.json` (the build-completeness sentinel), the load-time-expanded
-  `.xorq_build_expanded/`, the `.xorq_view_build/` handed to Buckaroo for a
-  worthy entry, and per-entry caches (`.buckaroo_stat_cache/`). A
-  directory without a `manifest.json` is treated as partial/crashed and is not
-  zipped.
-- **Manifest** (`manifest.json`) carries entry metadata: `content_hash`,
-  `result_digest`, `sources` (`{rel_path: digest}`), `ordered_copies` (how each
-  ordered copy of a source was made), `parents` (DAG edges), `row_count`,
-  `compile_seconds`, `execute_seconds`, `cache_worthy` and `cache_worthy_why`,
-  `cache_bytes`, `reproducible`, `snapshot_format` and `engine_versions`.
-  Written atomically (temp file + `os.replace`).
-- **JSONL pointer file** (`entries.jsonl`) and the structured logs
-  (`prompts/`, `errors.jsonl`, `events.jsonl`) are append-oriented and
-  line-delimited. They replaced the single `catalog.yaml` that older docs
-  reference.
-- **Activity logs** (`events.jsonl`, `errors.jsonl`) live in `artifacts/`,
-  outside the catalog git repo, so they survive reset-to-revision and have no
-  size cap. The UI filters them on read.
-- **No per-entry `result.parquet`.** That layer was removed (#104). A worthy
-  entry's rows live in its snapshot, `compute_cache/result_cache/<hash>.parquet`,
-  which tallyman writes when the entry is created; a cheap entry keeps no copy
-  and recomputes on read.
+Key formats, and what is tracked:
 
-All catalog writers use atomic writes, so a crash mid-write or a checkpoint
-firing during a write window leaves a whole file, not a torn one.
+- **Recipe zip** (`entries/<hash>.zip`) is the committed, durable form of an
+  entry. The checkpoint writes it, deterministically, and nothing else does.
+- **Manifest** (`manifest.json`) records `content_hash`, `project`,
+  `created_at`, `prompt`, `row_count`, `execute_seconds`, `compile_seconds`,
+  `cache_worthy` and `cache_worthy_why` (the cheap-or-worthy verdict and its
+  reason), `cache_bytes` (the snapshot's size), `result_digest`, `reproducible`
+  and `nonreproducible_columns`, `snapshot_format` and `engine_versions`,
+  `ordered_copies` (how each ordered copy the plan reads was made), `sources`
+  (`{path: digest}`) and `parents` (`[{hash, ref, follow}]`). It is written
+  last and atomically, and its presence means the entry is complete: the entry
+  list, the checkpoint, recalc and the build skip or rebuild a directory that
+  has none. A page read still serves such a directory, and #204 describes
+  what that means for a worthy entry.
+- **`compute_cache/`** holds the files tallyman writes and can make again:
+  snapshots and ordered copies. It is untracked, a reset leaves it alone, and
+  anything may delete it: the next read makes what it needs again.
+- **Logs** (`errors.jsonl`, `events.jsonl`, `telemetry.jsonl`) live in
+  `artifacts/`, outside the catalog repository, so a reset does not rewind
+  them and a recorded failure survives it.
+- **Display klasses** (`artifacts/display/`) are also outside the catalog
+  repository, so no checkpoint commits them and no reset rewinds them.
+  Summary stats and post-processing functions are inside it.
+- **No per-entry `result.parquet`.** That layer was removed in #104; the
+  companion still sweeps any old one away once per project at startup.
+
+Tracked catalog files are written to a temporary file and renamed into place,
+so a checkpoint that fires during a write commits a whole file.
+`entries.jsonl` is written only inside the checkpoint, under the project lock.
 
 ## Core domain concepts
 
-**Content hash (identity).** Every entry is identified by a hash derived from
-its expression structure (xorq's tokenization) and, depending on the
-source-identity mode, its source file digests. Identity is structural: two
-entries with the same expression and inputs collapse to the same hash, which is
-what makes builds idempotent. Because hashes are content-addressed and globally
-unique by construction, a Buckaroo session's id is derived from the project and
-the content hash (`entry-<project>-<hash>`), and tallyman keeps no record of
-sessions. The source-identity mode (`off` / `cas` / `salt`, default
-`cas`) is decided in [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md).
+### Identity: the content hash
 
-**Result digest.** A second identity axis, recorded for *worthy* (materialized)
-entries only. The content hash keys the expression graph; the `result_digest`
-keys the executed *result*. It is `arrow-sha256:<hex>`, a SHA-256 over the
-Arrow data of the entry's snapshot parquet read back (`snapshot_file_digest`),
-so it does not depend on how the writer batched or grouped the rows, on the
-codec, or on the writer's version. It does depend on every value and on the
-order of the rows: the snapshot is written in a canonical total order (the
-author's sort keys, then `__row_order`, then the remaining sortable columns) on
-a single-partition connection, so the same build gives the same digest run to
-run. Cheap, row-preserving entries record no digest: they have no snapshot to
-digest and recompute live. A mismatch when a deleted snapshot is re-created
-points at execution nondeterminism (sampling, `now()`, an impure UDF, source
-drift) or at an engine change, which the manifest's `engine_versions` lets the
-error record say. A worthy entry's query is also run twice when it is created,
-so a recipe that is not reproducible is known from the start. Design:
-[ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md)
-and [ADR-009-digest-stability.md](../plans/ADR-009-digest-stability.md).
+An entry's content hash is the name xorq gives the build directory of the
+entry's rewritten expression. xorq hashes a file read by its path alone, so
+tallyman puts the content in the path: every file a
+recipe's expression reads is one tallyman wrote under a content name, either an
+ordered copy named by its source's digest and reader options, or a worthy
+parent's snapshot named by the parent's content hash. The hash therefore covers
+the bytes of every source, and a child's hash is a function of its parent's. Two entries
+with the same expression over the same inputs collapse to one hash, which makes
+building idempotent. `TALLYMAN_SOURCE_IDENTITY` (`cas` by default, or `salt` or
+`off`) decides whether sources are cloned (`cas`), whether their digests are
+recorded in the manifest (`cas` and `salt`) and whether the digests are also
+mixed into the hash (`salt`); design in
+[ADR-002](../plans/ADR-002-source-identity-content-hash.md). The absolute path
+of the project is part of the hash, so the same recipe in a project at another
+path gets another hash.
 
-**Alias and V_n versions.** An alias is a named, mutable pointer (for example
-`sales`) to the latest content hash of a logical entry. Each alias carries an
-ordered `history` list of every hash it has pointed at (V1, V2, …, oldest
-first). Revising an alias mints a new content hash, advances `latest`, and
-appends to `history`; the old versions remain as forensic lineage.
-`catalog_diff` resolves version indices (-1 latest, -2 previous) through this
-history.
+### Aliases and versions
 
-**Parent edges and following.** At build time each entry records its direct DAG
-parents as `{hash, ref, follow}`. `tracked_expr_from_alias('name')` records
-`follow=True`: the edge names an alias, and the child goes stale as that alias
-advances. `pinned_expr_from_alias('hash')` records `follow=False`: the edge pins
-an exact hash and is never disturbed by recalc. Aliases are resolved to hashes
-at read time, not baked into the edge.
+An alias is a line `{alias, latest, history}` in `aliases.jsonl`. Revising an
+alias builds a new entry, moves `latest` to its
+hash and appends that hash to `history`; the old versions stay as they were.
+`catalog_diff` and the diff page pick versions from this history (`-1` is the
+latest, `-2` the one before). A Buckaroo session id is derived from the project
+and the content hash, `entry-<project>-<hash>`, so tallyman keeps no record of
+sessions.
 
-**Staleness.** Read-only and side-effect-free. An entry is stale on the alias
-axis when a `follow=True` parent's alias head no longer equals the recorded
-hash, or on the source axis when a recorded source digest no longer matches the
-file's current digest. Computing staleness never executes anything; it only
-compares the manifest against the current world and returns reasons.
+### Parent edges
 
-**Recalc cone.** When an alias head advances, its dependents form a cone of
-entries that may now be stale. The cone is recomputed in topological order
-(Kahn's algorithm over intra-cone parent edges) so parents rebuild before
-children. Auto-recalc only recomputes the followers of the alias that just
-moved; pre-existing ("orphan") staleness is left in place, logged, and
-classified against the recorded error store rather than treated as an
-unexplained invariant break. See [reactive-recalc.md](reactive-recalc.md) and
-[recalc-mechanism.md](../plans/recalc-mechanism.md).
+At build time each entry records the entries its recipe read, as
+`{hash, ref, follow}` in `manifest.parents`.
+`tracked_expr_from_alias("sales")` records `follow=True`: the child follows the
+alias and goes stale when the alias moves. `pinned_expr_from_alias` takes a
+content hash or a version reference such as `"sales-v2"` (a bare alias is
+refused, #166) and records `follow=False`: the child stays on that entry. The
+edge stores the hash the alias pointed at when the child was built, and the
+staleness scan looks the alias up again to compare.
 
-**Worthy and cheap entries (materialization).** At build, tallyman decides once
-whether an entry is *worthy* (it does expensive work, or work that cannot
-inherit a row order: an aggregate, join, sort, limit, window function, union,
-distinct, unnest, a second file, a non-pure operation or a UDF) or *cheap*
-(row-preserving over one file). A worthy entry is materialized: tallyman runs
-its query when the entry is created and writes the result to a **snapshot**
-parquet file, which every read after that uses. A cheap entry writes nothing
-and re-runs its small plan on every read. Tallyman owns the files and xorq's own
-cache is not involved. `ensure_materialized` makes every file an entry reads
-exist before anything runs, re-creating a missing snapshot, ordered copy or
-source clone and checking what it made, so a deleted file heals on the next
-read. Sources enter through **ordered copies**: a parquet copy of each source,
-in file order, with a last column `__row_order`. See [caching.md](caching.md).
+### Worthy and cheap entries
 
-**Portability.** A build directory embeds absolute filesystem paths in
-`expr.yaml`. On write these are rewritten to `${TALLYMAN_PROJECT_ROOT}`
-placeholders; on load they are expanded into a stable per-entry directory marked
-complete by a sentinel, so a project can be copied or packed and run from
-anywhere on disk, and the expanded path stays consistent so Buckaroo's
-stat-cache keys match across restarts.
+Tallyman decides once, when an entry is built, whether it is worthy, and
+records the verdict in the manifest as `cache_worthy`, with a short reason in
+`cache_worthy_why`
+(`worthiness.classify_expr`). An entry is cheap only if every relation
+operation in it is a file read, a filter, a column selection or computed
+column, a column drop, a drop of null rows or a fill of nulls; it reads exactly
+one file; and no value in it multiplies rows (`unnest`), depends on the order
+rows arrive in (a window function) or is not pure (`random()`, `uuid()`,
+`now()`, `today()`, any UDF). Everything else is worthy. The test is an
+allow-list, so an operation nobody has classified costs a copy instead of
+unstable paging. A cheap entry must keep `__row_order`, because it pages by the
+column of the file it reads: a select that drops the column fails the build,
+and the error shows the corrected select.
 
-**Checkpoint and reset-to-revision.** A checkpoint is an atomic git transaction
-under a per-project file lock: it captures pointers, zips pending recipes,
-stages all tracked files, commits once, and tags the step. Reset-to-revision
-does a hard git reset to a commit and then reconciles untracked entry directories
-back to the recorded pointers, retiring to or restoring from the bullpen without
-recompute (a forward reset copies back from the bullpen). It also moves the
-source clones no surviving entry refers to into the bullpen instead of deleting
-them. It leaves `compute_cache/` alone: those files are named by content hash and
-can be made again. Live operations never read the bullpen.
-Every write to a project (a build, a materialization, a checkpoint) takes the
-same re-entrant project lock, so there is one writer at a time.
+### Materialization
 
-**Live updates over SSE.** The companion pushes changes to the browser with
-Server-Sent Events (SSE): the SPA opens one long-lived HTTP stream to
-`GET /{project}/api/sse` through the browser's native `EventSource`, and the
-server writes named event messages down it. This is the inverse of polling. The
-browser never asks "anything new?" on a timer; it holds the stream open and the
-server speaks when something changes. The SPA registers listeners for these
-kinds: `new_entry`, `build_failed`, `notebook_changed`, `chart_attached`,
-`post_processing_changed`, `summary_stat_changed`, `recalc`, and
-`project_switched` (plus `hello` and `ping`, which open and keep the connection
-alive). An event is a signal, not a data payload: every one increments a
-monotonic `version` counter held in a React context (`SSEContext.tsx`), and
-components key their effects on that counter, so a bump triggers exactly one
-refetch of the affected REST resource. That is what "refetches off an SSE
-version counter rather than polling" means. Two events also carry state the
-refetch cannot derive: `recalc` ships the `{oldHash: newHash}` remap so an open
-entry view can follow its entry to the new hash, and `project_switched` ships
-the project name to navigate to. If the stream drops, the context flips to
-`offline`. Sources: `SSEContext.tsx` on the browser side, the `/{project}/api/sse`
-route and the `/internal/notify` fan-out in `app.py` on the server side.
+A worthy entry is materialized when it is created, by one routine,
+`materialize`, which every heal also uses. It runs the entry's build
+on a single-partition connection (so a float total is merged in one order),
+streams the rows through a writer with a pinned layout (zstd, row groups of
+1,048,576 rows, a page index), numbers them in a last `__row_order` column,
+writes a temporary file and renames it over the snapshot, all under the
+project lock, and returns the content digest of the file it wrote. At create it
+runs the query twice and compares the two digests. If they differ, the entry
+still builds, the manifest records `reproducible: false` with the columns that
+differed, and the snapshot is pinned. A cheap entry writes nothing: its plan is
+streamed once in full at create, so an error in it fails the tool call. Every
+file that holds a result is tallyman's; no build contains a xorq cache node,
+and xorq's own cache is not used. [caching.md](caching.md) has the details.
+
+### Reads: `cached_result_expr` and `ensure_materialized`
+
+Every consumer reads an entry's result through `cached_result_expr`:
+`/api/data` pages, charts, diffs, post-processing, and a child recipe chaining
+off the entry. It
+first calls `ensure_materialized`, which makes every file the entry's plan
+reads exist before anything runs: a missing snapshot is made again by running
+its entry's build, and a missing ordered copy from its source's clone. No plan
+reads a clone directly, so a missing clone is made again (from the live source,
+while the live bytes still hash to the recorded digest) only when an ordered
+copy that needs it is re-created. The Buckaroo hand-off calls
+`ensure_materialized` too. A
+worthy entry then reads as one bare read of its snapshot, without loading its
+build when the file exists, and a cheap entry as its frozen plan, re-run over
+files that exist. A healed snapshot is checked against the recorded
+`result_digest`. A mismatch is still served, since the rows are the honest
+output of the frozen build, but it is recorded as an `unfaithful_heal` error
+(which also pins the file) and the entry's Buckaroo statistics are wiped; when
+the heal runs in the companion, Buckaroo is also told to reload the entry's
+grid.
+
+### Ordered copies and row order
+
+Recipes read sources only through `read_project_file` (a parquet file under
+`data/`) and `tallyman_read_csv` (a CSV). Each takes the source's md5 digest,
+clones the source in the default
+`cas` mode, and has polars write the ordered copy to
+`compute_cache/ordered_sources/<key>.parquet`, where the key is an md5 of the
+digest and the reader options. Editing a source and running the same recipe
+therefore makes a new entry, and the old entry keeps the rows it was built
+from. Reading a file any other way (`xo.deferred_read_parquet` on a file
+outside `compute_cache/`, or `xo.deferred_read_csv`) is a build error. Because
+every file tallyman writes ends in `__row_order`, a page served by `/api/data` is
+sorted by `__row_order`, and the same request returns the same rows in any
+process. (The paging helper also takes user sort keys and puts `__row_order`
+after them; no route passes any yet, and Buckaroo's grid does not use the
+column yet, buckaroo-data/buckaroo#974.) Every `order_by` in a recipe also gets
+`__row_order` and then the remaining columns appended as tie-breakers, and a
+sort followed only by steps that keep row order (filters, selections, limits)
+still decides the order that is written.
+[system-contract.md](system-contract.md) states the rules.
+
+### Result digest
+
+`result_digest` is `arrow-sha256:<hex>`, a SHA-256 over the Arrow data of a
+snapshot as read back (`digest.py`). It does not change with how
+the rows were batched, the codec, the row-group size or the writer's version,
+and it does change with any value, any null, the order of the rows, and the
+column names and types. Worthy entries record it; a cheap entry has no snapshot
+and records none. Its one job is to show whether a re-created snapshot
+reproduced the original. A mismatch is attributed to an engine change (the
+manifest records the xorq, xorq-datafusion and pyarrow versions and the
+snapshot format version), to a recipe that bakes a changing value into its
+graph (#88), or to a graph that runs differently each time (#83). Running each
+new worthy entry twice finds most such recipes at create; what it cannot find,
+such as `today()` or a non-pure parent, is #185. Design:
+[ADR-004](../plans/ADR-004-result-digest-canonical-ordering.md) and
+[ADR-009](../plans/ADR-009-digest-stability.md).
+
+### Staleness
+
+Staleness is a judgment that runs no query and changes no catalog state. (It
+does rewrite the source-digest memo, `artifacts/source_digests.json`, and today
+each re-hash leaves the memo holding only that one file, so the next build
+hashes every source again.) An entry is stale on the alias axis when a
+`follow=True` parent's alias now points at a
+different hash than the one recorded, and on the source axis when a recorded
+source digest no longer matches the file on disk. Only an entry that is the
+current head of an alias counts as directly stale (#154); a superseded version
+is reported with `live=False`. The source axis is reported `unknown` for an
+entry built under the `off` identity mode, and for a CSV recorded by its
+absolute path outside `data/`, which the scan cannot resolve (#191).
+
+### Recalc cone
+
+When an alias head advances, the entries that followed it become directly
+stale. They and every current head built on them form the
+cone. Recalc replays each member's recipe in topological order (Kahn's
+algorithm over the edges inside the cone), so a parent rebuilds and its alias
+moves before its children replay. A member whose inputs did not move, such as
+a child that pins its parent by hash, replays to the same hash and is left
+alone. Auto-recalc, on by default for each project, runs this for the followers
+of the alias a revise just moved; staleness from any other cause is left in
+place, logged, and classified against the recorded errors. See
+[reactive-recalc.md](reactive-recalc.md).
+
+### Portability
+
+A build contains absolute paths in its `expr.yaml`. The build step rewrites the
+project's path to a `${TALLYMAN_PROJECT_ROOT}` placeholder,
+and a read fills it back in, into the stable per-entry directory
+`.xorq_build_expanded/`. A project can therefore be packed, copied or cloned to
+another path, and the expanded build keeps one path across restarts. The
+expanded directory's marker
+does not record which project path it was filled in with, so a copy that
+carries the expanded directories along keeps reading the old location (#209).
+
+### Checkpoint and reset
+
+A checkpoint takes the project lock, records the complete entry directories in
+`entries.jsonl`, zips any entry that has no
+recipe zip yet, runs `git add -A`, commits once and tags `step-NNN`. The MCP
+server checkpoints after each tool, and the companion after each mutating
+request; a recalc and a diff promotion checkpoint themselves, once each.
+`reset_to` takes the lock, runs `git reset --hard` to the step, and reconciles
+the files git does not track. Entry directories the step does not list move to
+the bullpen; listed ones that are missing are copied back from it. Source clones
+that no surviving entry refers to move to `bullpen/cas/`, never deleted, and
+clones a restored entry needs are copied back. A reset leaves `compute_cache/`
+alone: its files are named by content hash, a leftover cannot be served for
+another entry, and a file that is missing afterwards is healed like any other.
+Live operations never read the bullpen. A reset after re-adding a
+non-reproducible entry can pair its older manifest with its newer snapshot
+(#194), and after a reset back, such an entry's snapshot shows on the Cache
+page as an unpinned orphan (#195).
+
+### The project lock
+
+One re-entrant file lock, `catalog_state.project_lock` (a `flock` on
+`artifacts/catalog/.checkpoint.lock`), is taken by a build (for its whole
+length, recipe import included), a materialization or heal, an ordered-copy
+write, a checkpoint and a reset. It holds between the MCP server and the
+companion, and it is re-entrant within a thread, since a build writes ordered
+copies and materializes while it holds the lock. It blocks with no timeout, so a
+page request whose entry needs a heal waits behind any build in the other
+process (#186), and the two companion routes that build on the event loop,
+`PUT /code` and `POST /promote_diff`, freeze the whole UI while they wait or
+build (#190). Smaller writes to tracked files (aliases, notebook cells, charts,
+display configs, `config.json`) take no lock: each replaces its whole file
+atomically, so two processes editing the same file at the same moment can lose
+one of the edits. The lock covers no reads either: concurrent reads on the shared
+DataFusion backend can fail with `Already borrowed` (#118).
+
+### Live updates over SSE
+
+The companion pushes changes to the browser with Server-Sent Events: the SPA
+opens one long-lived HTTP stream to
+`GET /{project}/api/sse` through the browser's `EventSource`, and the server
+writes named events down it. The browser never polls. The SPA listens for
+`new_entry`, `build_failed`, `notebook_changed`, `chart_attached`,
+`post_processing_changed`, `summary_stat_changed`, `recalc` and
+`project_switched`, plus `hello` and `ping`, which open and keep the stream
+alive. Each listened event except `project_switched` increments a `version`
+counter in a React context (`SSEContext.tsx`), and components refetch their
+REST resource when it changes. Two events carry state a refetch cannot derive:
+`recalc` carries the `{oldHash: newHash}` remap, so that an entry view open in a
+background tab moves to the entry's new hash (a focused tab stays put), and
+`project_switched` carries the project to navigate to. The server also
+publishes `entry_added`, `alias_changed`, `alias_renamed`, `display_changed`,
+`project_reset` and `unfaithful_heal`, which the SPA has no listener for, so
+they cause no refetch. If the stream drops, the context reports `offline`.
+Sources: `SSEContext.tsx` in the browser; the `/{project}/api/sse` route and the
+`/internal/notify` fan-out in `app.py` on the server.
 
 ## Request and data-flow paths
 
-### catalog_run / catalog_create — author a new entry
+### catalog_run / catalog_create: author a new entry
 
-1. Claude Code calls the MCP tool with xorq source.
-2. `tallyman_xorq` compiles the expression, computes the content hash, and runs
-   the build, writing the entry build dir: `expr.py`, `xorq_build/`,
-   `schema.json`, and finally `manifest.json` (written last, atomically, as the
-   completeness sentinel). A `cache_worthy` entry is materialized during the
-   build: its query runs twice and its snapshot is written to
-   `compute_cache/result_cache/`.
-3. The MCP dispatch boundary fires a checkpoint: `tallyman_core` zips the recipe,
-   stages the tracked surface, commits one git revision, and tags it.
-4. The MCP server best-effort POSTs a notification to the companion.
-5. The companion emits an SSE `new_entry` event; the SPA bumps its version
-   counter and refetches the entry list. See [expression-lifecycle.md](expression-lifecycle.md).
+1. Claude Code calls the tool with Python that binds `expr`.
+2. `build_and_persist` takes the project lock and imports the code. While it
+   runs, `read_project_file` and `tallyman_read_csv` digest and clone each
+   source and write its ordered copy if that is not on disk yet, and
+   `tracked_expr_from_alias` records each parent edge and makes the parent's
+   files exist.
+3. The build refuses what cannot become a sound entry: a raw file read, an
+   in-memory table, a `.cache()` call, an assignment to `__row_order`, a cheap
+   entry that drops it, and a join chain over three entries that all carry it.
+   It classifies the entry, adds the canonical sort to a worthy entry, and
+   freezes the expression with xorq's `build_expr`, whose directory name is the
+   content hash. If a complete entry with that hash is already on disk, the
+   build stops and returns it.
+4. It writes the entry directory (`xorq_build/` with portable paths,
+   `expr.py`) and runs the query: a worthy entry is materialized, twice, and its
+   snapshot written; a cheap entry is streamed once and nothing is kept.
+5. It writes `schema.json` (read from the snapshot for a worthy entry) and then
+   `manifest.json`, last and atomically.
+6. `catalog_create` sets the alias and adds a notebook cell. The tool notifies
+   the companion, and as it returns the dispatch wrapper commits a checkpoint,
+   which zips the recipe.
+7. The companion publishes `new_entry`, and the SPA refetches the entry list.
 
-### catalog_revise + auto-recalc — revise an entry and cascade
+If the build fails after it has created the entry directory, the directory is
+removed. For a worthy entry whose query had started, so is the snapshot file at
+the entry's path, even one that was there before the build started (#193).
 
-1. A revision arrives from `catalog_revise` (MCP) or `PUT /code` (companion). It
-   mints a new content hash, advances the alias `latest`, and appends the old
-   hash to `history`. Charts and display configs carry forward from the old hash
-   to the new one only where the new hash does not already define them.
-   Self-alias references are rejected — an entry following its own alias would be
-   permanently stale by design.
-2. Auto-recalc, if enabled for the project, walks the recalc cone of the alias's
-   followers in topological order and rebuilds each, re-pointing aliases before
-   replaying children. This walk is checkpoint-free.
-3. The whole thing lands as one checkpoint, so head advance plus cascade is a
-   single git revision that reset-to-revision undoes atomically.
-4. The companion emits an SSE `recalc` event carrying `{oldHash: newHash}` for
-   each remapped entry; backgrounded SPA views navigate to the new hash, focused
-   views stay put. See [reactive-recalc.md](reactive-recalc.md) and
-   [auto-recalc-on-revise.md](../plans/auto-recalc-on-revise.md).
+### catalog_revise + auto-recalc: revise an entry and cascade
+
+1. A revision arrives from `catalog_revise` (MCP) or `PUT /code` (companion).
+   It builds a new entry, moves the alias's `latest` to the new hash and appends
+   it to `history`. Charts and display configs carry forward from the old hash
+   to the new one where the new hash has none of its own. A revision that reads
+   its own alias by name is rejected: it would follow its own head and be stale
+   forever.
+2. If auto-recalc is on for the project (it is by default), the followers the
+   revise made stale, and every current head built on them, are rebuilt in
+   topological order, each alias re-pointed before its children replay. The
+   walk takes no checkpoint of its own.
+3. The revise and the cascade land as one checkpoint, so a reset to the step
+   before undoes both.
+4. A cascade that changed anything publishes a `recalc` SSE event with the
+   remap, and the companion reloads the project's Buckaroo sessions. See
+   [reactive-recalc.md](reactive-recalc.md).
 
 ### Viewing an entry grid
 
-1. The SPA entry-detail pane mounts `LazyBuckarooEmbed`, which waits for the grid
-   to scroll near the viewport (IntersectionObserver) and then polls the
-   companion for the entry's session (`GET /{project}/api/session/{hash}`) until
-   it returns a WebSocket URL.
-2. The companion first runs `ensure_materialized`, so every file the entry reads
-   exists and anything it had to re-create is verified. Only then does it POST to
-   the Buckaroo subprocess's `/load_expr`, with a session id derived from the
-   project and the hash. A worthy entry is handed a *view build*, a build whose
-   whole graph is one read of its snapshot (`<entry>/.xorq_view_build/`); a cheap
-   entry is handed its own build, expanded into a stable per-entry path with
-   `${TALLYMAN_PROJECT_ROOT}` resolved. The payload names `__row_order` as the
-   row-order column. Buckaroo runs queries only for summary stats, sorting and
-   paging; it never executes an aggregate or join on tallyman's behalf.
-3. Buckaroo creates the session and streams the grid over WebSocket; sort and
-   search push down to the xorq backend rather than paging a materialized
-   parquet.
-4. The data tab stays mounted (hidden) across tab switches to keep the WS session
-   alive. Tallyman keeps no session record. Opening the entry again POSTs the same
-   id, which Buckaroo answers from the session it holds or rebuilds if it has
-   dropped it (it does after an idle hour, and after a restart).
+1. The catalog page's data tab requests `GET /{project}/api/session/{hash}` as
+   soon as it opens. On the notebook page, the data route (`/api/notebook_full`)
+   opens a session for every cell each time the page loads or refetches (on any
+   SSE event), and each cell's grid asks `/api/session` for its WebSocket URL
+   once the cell scrolls near the viewport (#202).
+2. The companion calls `load_session`, which runs `ensure_materialized` first,
+   so a missing file is made again and checked before Buckaroo is involved. A
+   failure there shows in the page with its reason and a retry button.
+3. It posts `/load_expr` to Buckaroo with the session id
+   `entry-<project>-<hash>`. A worthy entry is handed its view build
+   (`<entry>/.xorq_view_build/`, written once); a cheap entry its own build,
+   expanded into `<entry>/.xorq_build_expanded/`. The body also names the entry's
+   statistics cache directory, `__row_order` as the `row_order_column`, and the
+   `project_root` Buckaroo searches for klasses. That root is `artifacts/`, so
+   Buckaroo finds the display klasses there but not the stats and
+   post-processing functions, which tallyman writes under `artifacts/catalog/`
+   (#170).
+4. Buckaroo creates the session, or answers from the one it holds, and the grid
+   connects over a WebSocket. Paging, sorting, search and summary statistics are
+   Buckaroo's queries over the build it was handed, which for a worthy entry is a
+   read of the snapshot. Buckaroo 0.15.6, the pinned version, ignores
+   `row_order_column`, so the grid's pages are not yet ordered by `__row_order`
+   (buckaroo-data/buckaroo#974); `/api/data` pages are.
+5. Tallyman keeps no record of sessions. Every open posts `/load_expr` again
+   with the same id. Buckaroo skips the work while it holds that session with
+   the same build directory, and creates it again after dropping it (it drops a
+   session idle for an hour, and loses them all on a restart). Two opens at once
+   both post, and a promoted diff entry, which sends its column colouring,
+   re-runs Buckaroo's statistics on every open (#202).
 
 ### Diffing versions
 
-1. The SPA diff page resolves the version pair (defaulting to V_{n-1} vs V_n via
-   the alias history) and requests the diff from the companion.
-2. The companion builds a compare expression: an outer join of the two versions
-   with a membership column (a-only / b-only / both) plus per-column `{col}_eq`,
-   `{col}_pct_delta`, and `{col}_abs_delta` sentinel columns. The compare
-   expression is memoized for the process lifetime because the two entry hashes
-   are immutable.
-3. Buckaroo column-config overrides color the diff: categorical coloring for
-   key/equality columns, numeric coloring for the delta columns.
-4. The diff grid loads through `/load_expr` with a compare build, with diff stats
-   cached per entry pair under `diff_stat_cache/`. Both sides are read through
-   `cached_result_expr` with `__row_order` dropped, so the files exist before the
-   join is built. The join itself is not materialized first; that is tracked in
-   #188.
+1. The diff page resolves the version pair (by default V_{n-1} against V_n) and
+   requests `/{project}/api/diff_data/{alias}/{va}/{vb}`.
+2. The companion reads both sides through `cached_result_expr`, so both sides'
+   files exist first, and computes the code, schema, statistics, head and keyed
+   diffs (`full_diff`). Those summaries still include `__row_order` as a data
+   column (#200).
+3. For the grid it builds a compare expression: an outer join of the two
+   versions on the diff key, with `__row_order` dropped from both sides, a
+   membership column (a only, b only, both), and per-column `{col}_eq`,
+   `{col}_pct_delta` and `{col}_abs_delta` columns. The expression is memoized
+   per pair and key (an LRU of 128, cleared on a reset or recalc).
+4. The compare build is posted to Buckaroo as session `diff-<a>-<b>` (the first
+   12 characters of each hash), with statistics cached per pair under
+   `diff_stat_cache/`. The join is not materialized first, so Buckaroo runs it
+   for every query of the diff grid (#188).
+
+`catalog_promote_diff` and the diff page's promote button turn a diff into an
+entry of its own, whose recipe calls `build_diff_expr(a_hash, b_hash, keys)`.
+It contains a join, so it is worthy and materialized like any other entry.
+
+### Resetting to a revision
+
+`tallyman reset-to <step>` (CLI) and `POST /{project}/api/reset` (companion)
+call `reset_to`, described under [Checkpoint and reset](#checkpoint-and-reset).
+The companion then clears its in-memory result and compare memos and the
+`diff_stat_cache/` directory, reloads the project's Buckaroo sessions, and
+publishes `project_reset`. The CLI posts `project_reset` to the companion's
+`/internal/notify`, which does the same clean-up. `tallyman revisions` lists the
+steps, and `tallyman revisions label <step> <name>` names one.
+
+## Known defects
+
+These open issues describe places where the system does not yet do what the
+rest of the docs say it should. The docs describe the current behaviour and cite
+the issue where it matters.
+
+Writes, the lock and processes:
+
+- #193: a failed build deletes the snapshot already on disk for its hash, for
+  example one a reset left behind.
+- #186: the project lock is one blocking lock with no timeout, so slow work in
+  one process blocks page reads in the other.
+- #190: `PUT /code` and `POST /promote_diff` build on the companion's event
+  loop, which freezes the UI while they wait for the lock or build.
+- #183: two tallyman servers on one project are unsupported, and nothing
+  detects it.
+
+Pins and resets:
+
+- #194: a reset after re-adding a non-reproducible entry can restore its older
+  manifest over its newer snapshot.
+- #195: after a reset back, a non-reproducible entry's snapshot is listed as an
+  unpinned orphan and can be deleted.
+- #196: the pin from an unfaithful heal lives in `errors.jsonl`, so clearing the
+  error banner unpins the snapshot.
+
+Ordered copies:
+
+- #197: the polars-written copy of a parquet source changes some column types
+  (a `date64` becomes a timestamp, a map becomes a list of structs), and a
+  `decimal256` column makes polars panic.
+- #198: `tallyman_read_csv` hands polars JSON-rewritten reader options even on
+  the first ingest, so a callable option fails.
+- #211: a build can record an empty content digest for an ordered copy.
+- #207: ordered copies left behind by source edits are never listed or removed.
+
+Row order and diffs:
+
+- #199: the three-way join check also refuses chains of semi and anti joins.
+- #200: `full_diff` keeps `__row_order` as a data column.
+- #205: the canonical sort leaves nested columns out of its tie-break.
+- #206: the snapshot writer drops any column named `__row_order_right`,
+  including one the author made.
+- #188: the live diff grid hands Buckaroo an unmaterialized join.
+
+Heals and Buckaroo:
+
+- #202: every grid open posts `/load_expr`; concurrent opens load twice, and a
+  promoted diff re-runs Buckaroo's statistics on every open.
+- #201: a klass reload posts `/reload_expr` once per catalog entry, one after
+  another, on the event loop.
+- #203: an unfaithful heal runs its checks and the forced Buckaroo reload while
+  holding the project lock, and the reload opens a session for an entry nobody
+  has open.
+- #204: with its manifest gone, an entry's worthiness is guessed from whether a
+  snapshot exists, so a worthy entry that has lost both is served as cheap.
+- #208: an unfaithful heal of a worthy parent changes its cheap children's rows
+  under their hashes; only the parent is flagged.
+- #209: a copied project keeps reading the old path through its expanded
+  builds.
+- #210: the plan memo keeps each loaded build and its backend objects alive.
+
+Design questions still open: #185 (a non-pure recipe's verdict is not recorded
+or passed on to entries built on it) and #187 (an ungrouped float `SUM` depends
+on the layout of the file it reads, which the snapshot format version pins).
+Found while checking these docs, with no issue filed yet: the staleness scan
+rewrites `source_digests.json` holding only the file it hashed last; an entry
+that pins its parent by hash stays stale on the source axis after an upstream
+source edit, since its replay gives the same hash; and a recipe's
+`read_project_file` resolves the project from the `active_project` file, not
+the MCP session's own project, so the two can disagree after another session
+switches projects (related to #39).
+Older open issues in the same areas: #118 (concurrent reads can fail with
+`Already borrowed`), #170 (Buckaroo is not pointed at the project's stats and
+post-processing functions), #191 (staleness cannot resolve a CSV outside
+`data/`) and #157 (Buckaroo's on-disk statistics cache has not been seen to give
+a first-load hit).
 
 ## Related documentation
 
-Currency notes below reflect a docs-vs-code audit on 2026-06-25. They will drift;
+Currency notes below reflect a docs-against-code check on 2026-09-22, against
+the branch of #189 (ADR-007, ADR-008 and ADR-009 implemented). They will drift;
 when in doubt, the code wins.
 
-### Architecture docs (`docs/`) — describe the current system
+### Architecture docs (`docs/`): the current system
 
-- [system-contract.md](system-contract.md) — **normative**: the invariants and
-  binding rules the system guarantees (identity, read/write/cache contracts).
-  Where the descriptive docs and this contract disagree, the difference is a
-  bug. The read path implements it as of the #163 fix (PR #167). **Current.**
-- [expression-lifecycle.md](expression-lifecycle.md) — one expression from MCP
-  ingest to rendered rows, naming every artifact and cache write. **Current.**
-- [reactive-recalc.md](reactive-recalc.md) — revise an alias, recompute its
-  dependents; the cone and the dependency graph. **Current.**
-- [caching.md](caching.md) — the caches across the stack and their invalidation.
-  **Mostly current.**
-- [installing.md](installing.md) — install and run the spike. **Mostly current.**
-- [mcp-server.md](mcp-server.md) — every MCP tool and prompt Claude Code drives,
-  with parameters, return shapes, and per-tool side effects. **Current.**
+- [system-contract.md](system-contract.md): **normative**. The invariants and
+  rules the system guarantees (identity, reads, writes, materialization, row
+  order). Where the code or a descriptive doc disagrees with it, the difference
+  is a bug; its last section lists the known ones. **Current.**
+- [expression-lifecycle.md](expression-lifecycle.md): one expression from MCP
+  ingest to rendered rows, naming every file written and when. **Current.**
+- [caching.md](caching.md): every cache in xorq, tallyman and Buckaroo, what it
+  saves, what keys it, and what invalidates it. **Current.**
+- [reactive-recalc.md](reactive-recalc.md): revise an alias, recompute its
+  dependents; the dependency graph, staleness and the cone. **Current.**
+- [mcp-server.md](mcp-server.md): every MCP tool and the prompt, with
+  parameters, return shapes and side effects. **Current.**
+- [installing.md](installing.md): install and run tallyman. **Current.**
 
-### Design records / ADRs (`plans/`)
+### Design records (`plans/ADR-*.md`)
 
-- [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md)
-  — content-addressed source reads so `content_hash` tracks source data.
-  **Mostly current.**
-- [ADR-001-git-subprocess-threading.md](../plans/ADR-001-git-subprocess-threading.md) —
-  calling git from the multithreaded server (fork-safe `posix_spawn`).
-  **Mostly current.**
-- [ADR-003-result-cache-cost-rubric.md](../plans/ADR-003-result-cache-cost-rubric.md) —
-  a *proposed* cost-vs-size cache rubric. **Partially stale / not adopted:** the
-  structural `cache_worthy` admission test it proposes to remove is still the
-  live gatekeeper, and `ensure_result` it names was removed (#73).
-- [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md)
-  — a canonically-ordered snapshot and a digest of it, replacing the per-row
-  Python digest (#137). **Partially superseded:** the canonical sort stays; the
-  digest is now a content digest of the file read back (ADR-009), and the CSV
-  row-index column is `__row_order` (ADR-008).
-- [ADR-006-read-path-loads-builds.md](../plans/ADR-006-read-path-loads-builds.md)
-  — reads load the frozen build (#163). **Partially superseded** by ADR-007: the
-  parent's cache node no longer travels in a child's build, and the
-  snapshot-key tripwire is gone.
+- [ADR-001-git-subprocess-threading.md](../plans/ADR-001-git-subprocess-threading.md):
+  calling git from the multithreaded server (fork-free `posix_spawn`).
+  **Accepted; mostly current.**
+- [ADR-002-source-identity-content-hash.md](../plans/ADR-002-source-identity-content-hash.md):
+  content-addressed source clones, so `content_hash` tracks source data.
+  **Accepted; mostly current:** since #189 a recipe reads an ordered copy made
+  from the clone (ADR-008), and a reset moves unreferenced clones to the
+  bullpen instead of deleting them (ADR-007).
+- [ADR-003-result-cache-cost-rubric.md](../plans/ADR-003-result-cache-cost-rubric.md):
+  a cost-against-size cache rubric. **Proposed, not adopted.** The structural
+  cheap-or-worthy test it would remove still decides, now as ADR-008's
+  allow-list recorded in the manifest; `classify_build` and `ensure_result`,
+  which it names, are gone; ADR-007's bare-read chaining addressed its
+  motivating case; its budget and eviction half is still open.
+- [ADR-004-result-digest-canonical-ordering.md](../plans/ADR-004-result-digest-canonical-ordering.md):
+  a canonically ordered snapshot and a digest of it, replacing the per-row
+  Python digest (#137). **Partly superseded:** the digest is a content digest of
+  the file read back (ADR-009), and the row-index column is `__row_order`,
+  written by every writer and appended to every sort (ADR-008).
+- [ADR-005-intelligent-csv-import.md](../plans/ADR-005-intelligent-csv-import.md):
+  the CSV reader's schema and error contract. **Partly superseded** by ADR-008
+  and ADR-007: the column is `__row_order`, the trailing `order_by` is gone,
+  and the ordered copy is keyed by the CSV's content, lives under
+  `compute_cache/`, and is made again from the clone when missing.
+- [ADR-006-read-path-loads-builds.md](../plans/ADR-006-read-path-loads-builds.md):
+  reads load the frozen build (#163). **Partly superseded** by ADR-007: ADR-006
+  D4 (chaining inlines the parent's cache node) and ADR-006 D8 (the manifest
+  records a snapshot key that reads check) are retired, and ADR-006 D5 (the
+  canonical sort) is amended by ADR-008 and ADR-009.
 - [ADR-007-tallyman-owned-materialization.md](../plans/ADR-007-tallyman-owned-materialization.md),
   [ADR-008-row-order-of-reads.md](../plans/ADR-008-row-order-of-reads.md) and
-  [ADR-009-digest-stability.md](../plans/ADR-009-digest-stability.md) — the cache
-  redesign this doc and [caching.md](caching.md) describe: tallyman writes its
-  own result files, every file carries `__row_order`, and a rewritten file is
-  flagged only when the result changed.
+  [ADR-009-digest-stability.md](../plans/ADR-009-digest-stability.md): the cache
+  redesign that this doc and [caching.md](caching.md) describe. Tallyman writes
+  its own result files, every file carries `__row_order`, and a re-created file
+  is flagged only when the result changed. **Accepted (2026-09-22), implemented
+  in #189.** Each has an "Implementation notes" section saying where the code
+  differs from its text.
+- [ADR-010-immutable-store-one-owner.md](../plans/ADR-010-immutable-store-one-owner.md):
+  an immutable result store, every entry materialized, one owning process.
+  **Rejected (2026-09-22)**; kept for the record. ADR-007, ADR-008 and ADR-009
+  stand.
 
 ### Plans (`plans/`)
 
-- [native-catalog-store.md](../plans/native-catalog-store.md) — the native
-  `tallyman_core.catalog` that replaced xorq's catalog package. **Mostly current.**
-- [recalc-mechanism.md](../plans/recalc-mechanism.md) — how reactive recalc
-  works. **Mostly current.**
-- [auto-recalc-on-revise.md](../plans/auto-recalc-on-revise.md) — atomic
-  auto-recalc on revise. **Partially stale:** line numbers and a couple of
-  function names drifted (`_recalc_walk` → `_replay_cone`), and the "future
-  Stage C" frontend SSE listener already shipped.
-- [remove-ondemand-result-parquet.md](../plans/remove-ondemand-result-parquet.md)
-  — removing the on-demand `result.parquet` layer (#104). **Current.**
-- [project_switcher.md](../plans/project_switcher.md) — the project switcher.
-  **Mostly current.**
-- [89-determinism-prereqs-execution.md](../plans/89-determinism-prereqs-execution.md)
-  — clearing #89's determinism prerequisites. **Mostly current.**
-- [catalog-xorq-integration-tests.md](../plans/catalog-xorq-integration-tests.md)
-  — coexistence/reset integration tests. **Partially stale:** references the old
-  `catalog.yaml` / `aliases.json` formats since replaced by JSONL.
-- [llm-summary-stats.md](../plans/llm-summary-stats.md) — LLM-authored summary
-  stats. **Partially stale:** the Buckaroo-side klass pattern it describes
-  (`_Generated_*` classes) is now a `@stat()` decorator; a few signatures and
-  the notify `kind` differ.
+- [native-catalog-store.md](../plans/native-catalog-store.md): the native
+  catalog store that replaced xorq's catalog package. **Mostly current:**
+  `compute_cache.jsonl` and the reset's compute-cache prune are gone (ADR-007).
+- [recalc-mechanism.md](../plans/recalc-mechanism.md): how reactive recalc
+  works. **Partly stale:** auto-recalc on revise now exists, and a source edit
+  makes every descendant directly stale, across worthy entries too.
+- [auto-recalc-on-revise.md](../plans/auto-recalc-on-revise.md): atomic
+  auto-recalc on revise. **Implemented; partly stale:** function names drifted
+  (`_recalc_walk` is `_replay_cone`), and its "future Stage C" SSE listener
+  shipped.
+- [remove-ondemand-result-parquet.md](../plans/remove-ondemand-result-parquet.md):
+  removing the on-demand `result.parquet` layer (#104). **Partly stale:** the
+  single materialized copy is now tallyman's snapshot, not xorq's cache
+  (ADR-007).
+- [project_switcher.md](../plans/project_switcher.md): the project switcher.
+  **Mostly current:** the home root is `~/.tallyman-notebooks/`, and there is
+  no Buckaroo session file (ADR-007).
+- [89-determinism-prereqs-execution.md](../plans/89-determinism-prereqs-execution.md):
+  clearing #89's determinism prerequisites. **Point in time;** the digest and
+  heal verification it describes were replaced by ADR-007 and ADR-009.
+- [cache-soundness-audit.md](../plans/cache-soundness-audit.md): an inventory
+  of the #163 bug class, 2026-07-30. **Point in time;** #167 and #189 changed
+  several findings.
+- [catalog-xorq-integration-tests.md](../plans/catalog-xorq-integration-tests.md):
+  coexistence and reset integration tests. **Partly stale:** it refers to the
+  old `catalog.yaml` and `aliases.json` formats.
+- [llm-summary-stats.md](../plans/llm-summary-stats.md): LLM-authored summary
+  stats. **Partly stale:** Buckaroo's `_Generated_*` classes are now a `@stat()`
+  decorator, a few signatures and the notify `kind` differ, and the stats are
+  not found by Buckaroo (#170).
 
-### Research notes / experiment logs (`plans/`, `demo/`) — point-in-time records
+### Research notes and experiment logs (`plans/`, `demo/`, `docs/research/`)
 
-The digest investigation behind #137 (current):
+Point-in-time records. The digest investigation behind #137:
 [datafusion-scan-order-findings.md](../plans/datafusion-scan-order-findings.md)
-— why a parallel datafusion scan emits rows in a different order each run, and
-the polars-ingest decision — and
+(why a parallel DataFusion scan emits rows in a different order each run, and
+the decision to ingest with polars, which still stands) and
 [result-digest-vs-xorq-staleness.md](../plans/result-digest-vs-xorq-staleness.md)
-— why `result_digest` can't reuse xorq's content-aware cache staleness.
+(why `result_digest` cannot reuse xorq's cache staleness). Both have a status
+note for what #189 changed.
 
 Older, historical:
 [eda-prompt-research.md](../plans/eda-prompt-research.md),
@@ -483,23 +838,25 @@ Older, historical:
 [plotting-testcases.md](../plans/plotting-testcases.md),
 [xorq-sklearn-assessment.md](../plans/xorq-sklearn-assessment.md),
 [ds-demo-scripts.md](../plans/ds-demo-scripts.md),
-[demo/datasets.md](../demo/datasets.md). These are historical; staleness mostly
-doesn't apply, except where they assert current system behavior (a few reference
-the removed `result.parquet` and the old `~/.tallyman/` path).
+[demo/datasets.md](../demo/datasets.md), and the CSV importer research under
+[docs/research/csv-importers/](research/csv-importers/). Some of them mention
+the removed `result.parquet`, xorq's result cache and the old `~/.tallyman/`
+path; `ds-demo-scripts.md` has a status note saying so.
 
-### Root & meta
+### Root and meta
 
-- [README.md](../README.md) — V0 spike overview and run instructions. **Current.**
-- [proposal.md](../proposal.md) — the talk pitch. **Current** (it's a pitch, not
-  a spec).
+- [README.md](../README.md): what tallyman is, and how to run it. **Current.**
+- [tallyman_explanation.md](../tallyman_explanation.md): the owner's framing of
+  tallyman, a feature list and a walkthrough. **Current** in the sections
+  written from the code; the owner's own sections are his and are not checked.
+- [proposal.md](../proposal.md): the talk pitch. **Current** (a pitch, not a
+  spec).
 
-The original `plan.md` (V0.6 plan) and `TICKETS.md` (V0 punchlist) were removed
-as stale cruft — they predated the React SPA migration, the `result.parquet`
-removal, and the JSONL catalog format. This doc supersedes them as the
-architecture reference.
+The original `plan.md` (V0.6 plan) and `TICKETS.md` (V0 punch list) were removed
+as stale: they predated the React SPA, the `result.parquet` removal and the
+JSONL catalog format. This doc replaces them as the architecture reference.
 
 > Gaps: there is no dedicated reference for the REST API, the CLI, or the
-> frontend SPA architecture. (The MCP tool surface and the authoring extension
-> points it exposes — display klasses, summary stats, post-processing — are now
-> covered in [mcp-server.md](mcp-server.md).) See the project's gap tracking for
-> the current list.
+> frontend. The MCP tool surface, including the extension points it exposes
+> (display klasses, summary stats, post-processing), is covered in
+> [mcp-server.md](mcp-server.md).

@@ -614,6 +614,30 @@ def test_ensure_materialized_recreates_a_source_snapshot_from_the_clone(project:
     assert [r for r in list_errors(project, limit=1000) if r.get("hash") == out["hash"]] == []
 
 
+def test_a_csv_source_snapshot_is_recreated_under_the_reader_options_it_was_imported_with(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """The re-creation has only the manifest's record of the reader, which went through JSON (#198)."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1), ("west", 2)], sep=";")
+    schema = (("region", "string"), ("n", "float64"))
+    out = source_import.update_and_depend(str(src), "orders", separator=";", schema=schema)
+    before = snapshot_path(project, out["hash"]).read_bytes()
+    src.unlink()
+    snapshot_path(project, out["hash"]).unlink()
+
+    ensure_materialized(project, out["hash"])
+
+    assert snapshot_path(project, out["hash"]).read_bytes() == before
+    frame = _snapshot_frame(project, out["hash"])
+    assert frame.columns == ["region", "n", ROW_ORDER]
+    assert frame["n"].to_list() == [1.0, 2.0]
+
+
 def test_a_recreated_source_snapshot_is_verified_against_its_recorded_digest(
     project: str, tmp_path: Path, monkeypatch
 ):

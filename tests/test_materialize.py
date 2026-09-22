@@ -456,6 +456,23 @@ def test_the_ordered_copy_lives_under_the_compute_cache_and_is_recorded(project,
     assert record["content_digest"] == snapshot_file_digest(copies[0])
 
 
+def test_an_empty_digest_sidecar_is_recomputed_not_recorded(project, orders_parquet, monkeypatch):
+    """#211: the ``.digest`` file beside a copy caches its content digest. One left empty (a write cut off between its
+    truncate and its write) is treated as missing: the next build that reads the source takes the digest from the copy
+    and records that, not ``""``, which would make a later re-creation look unfaithful."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _hash(catalog_create("orders", _root_code(project)))
+    [copy] = _ordered_copies(project)
+    sidecar = copy.with_suffix(".digest")
+    sidecar.write_text("")
+
+    h = build_and_persist(project, _agg_code(project)).content_hash  # a second recipe over the same source
+
+    digest = snapshot_file_digest(copy)
+    assert read_manifest(entry_dir(project, h)).ordered_copies[copy.stem]["content_digest"] == digest
+    assert sidecar.read_text() == digest
+
+
 def test_a_deleted_ordered_copy_is_made_again_from_the_clone_and_checked(project, orders_parquet, monkeypatch):
     """ADR-007 D13 and D5: opening a root entry re-creates its ordered copy from the clone."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)

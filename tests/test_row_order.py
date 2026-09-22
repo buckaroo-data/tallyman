@@ -13,8 +13,10 @@ module that does not exist yet makes ruff mis-group the block, the CI lint job f
 
 from __future__ import annotations
 
+import datetime
 import os
 import re
+from decimal import Decimal
 from pathlib import Path
 
 import pyarrow as pa
@@ -22,11 +24,13 @@ import pyarrow.parquet as pq
 import pytest
 import xorq.api as xo
 import xorq.vendor.ibis as ibis
+from polars.exceptions import PanicException
 
 from tallyman_companion.diff import build_compare_expr, build_diff_expr
 from tallyman_core import data_dir, read_manifest, set_alias
 from tallyman_core.paths import compute_cache_dir, entry_build_dir, entry_dir
 from tallyman_xorq.build import BuildError, build_and_persist
+from tallyman_xorq.io import read_project_file
 from tallyman_xorq.primary_key import resolve_primary_key
 from tallyman_xorq.result_cache import cache_worthy, cached_result_expr
 
@@ -180,6 +184,58 @@ def test_a_parquet_source_with_its_own_row_order_column_has_it_overwritten(proje
     assert list(df.columns) == ["k", ROW_ORDER]
     assert df["k"].tolist() == [10, 20, 30, 40]
     assert df[ROW_ORDER].tolist() == [0, 1, 2, 3], "the source's own values must be overwritten with 0..N-1"
+
+
+def _arrow_fields(schema: pa.Schema) -> list[tuple[str, str]]:
+    return [(f.name, str(f.type)) for f in schema]
+
+
+def _ibis_fields(schema) -> list[tuple[str, str]]:
+    return [(name, str(dtype)) for name, dtype in schema.items()]
+
+
+def test_the_ordered_copy_of_a_parquet_source_keeps_the_sources_types(project):
+    """#197: the copy's schema is the source's plus ``__row_order``, so a recipe sees the types a direct read gives.
+
+    polars used to write the copy, and changed types on the way: a ``date64`` came back as a timestamp, a map as a list
+    of structs, and a ``time32`` or ``time64`` as ``time64[ns]``. ``fixed_size_binary`` is left out: xorq cannot read it
+    from the source either.
+    """
+    source = _write(
+        project,
+        "typed.parquet",
+        {
+            "day": pa.array([datetime.date(2026, 9, 22), None], pa.date64()),
+            "tags": pa.array([[("a", 1)], [("b", 2), ("c", 3)]], pa.map_(pa.string(), pa.int64())),
+            "clock_s": pa.array([datetime.time(1, 2, 3), None], pa.time32("s")),
+            "clock_us": pa.array([datetime.time(1, 2, 3, 4), None], pa.time64("us")),
+        },
+    )
+    seen = read_project_file("typed.parquet", project=project).schema()
+
+    [copy] = _ordered_copies(project)
+    assert _arrow_fields(pq.read_schema(copy)) == [*_arrow_fields(pq.read_schema(source)), (ROW_ORDER, "int64")]
+    direct = xo.deferred_read_parquet(str(source)).schema()
+    assert _ibis_fields(seen) == [*_ibis_fields(direct), (ROW_ORDER, "int64")]
+    assert pq.read_table(copy).drop_columns([ROW_ORDER]).equals(pq.read_table(source))
+
+
+def test_a_decimal256_source_builds_and_keeps_its_type(project):
+    """#197: polars holds at most 38 decimal digits, and writing the copy of a ``decimal256(40, 2)`` column panicked.
+
+    The panic is a ``PanicException``, a ``BaseException``, so no ``except Exception`` on the build or MCP path caught
+    it. Caught here so the test fails instead of the panic escaping it.
+    """
+    amounts = [Decimal("1.25"), Decimal("12345678901234567890123456789012345678.90")]
+    _write(project, "wide.parquet", {"amount": pa.array(amounts, pa.decimal256(40, 2))})
+    try:
+        res = build_and_persist(project, _over(project, "wide.parquet", "t"))
+    except PanicException as exc:
+        pytest.fail(f"building over a decimal256 source raised a PanicException, not a BuildError: {exc}")
+
+    [copy] = _ordered_copies(project)
+    assert pq.read_schema(copy).field("amount").type == pa.decimal256(40, 2)
+    assert cached_result_expr(project, res.content_hash).execute()["amount"].tolist() == amounts
 
 
 def test_a_worthy_entry_that_keeps_its_parents_rows_renumbers_them(project, orders_parquet):

@@ -11,11 +11,13 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from polars.exceptions import PanicException
 
 from tallyman_core import data_dir, entry_dir, read_manifest
 from tallyman_core.paths import compute_cache_dir, tallyman_home
 from tallyman_mcp.server import catalog_create
-from tallyman_xorq.build import list_entries
+from tallyman_xorq.build import BuildError, build_and_persist, list_entries
+from tallyman_xorq.ordered_copy import SourceUnavailable
 from tallyman_xorq.result_cache import (
     baked_snapshot_path,
     cache_worthy,
@@ -273,6 +275,63 @@ expr = tallyman_read_csv({str(p)!r}, schema=schema, separator=";")
     assert {"id", "name", "__row_order"} <= fields, (
         f"separator=';' not forwarded — columns did not split: {fields}"
     )
+
+
+def _renaming_code(csv_path: Path, with_column_names: str) -> str:
+    return f"""
+from tallyman_xorq.io import tallyman_read_csv
+expr = tallyman_read_csv({str(csv_path)!r}, with_column_names={with_column_names})
+"""
+
+
+def _create_without_panic(name: str, code: str) -> dict:
+    """``catalog_create``, with a polars ``PanicException`` turned into a test failure.
+
+    The panic is a ``BaseException``, so it would otherwise escape both the MCP tool and the test.
+    """
+    try:
+        return catalog_create(name, code)
+    except PanicException as exc:
+        pytest.fail(f"polars panicked and the PanicException escaped catalog_create: {exc}")
+
+
+def test_a_function_reader_option_reaches_polars_as_given(project, sample_csv, monkeypatch):
+    """#198: the first ingest hands polars the caller's own reader options, not the JSON form the manifest records.
+
+    JSON turns a function into its repr, so ``with_column_names=lambda ...`` reached polars as a string and polars
+    panicked calling it.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = _create_without_panic("upper", _renaming_code(sample_csv, "lambda cols: [c.upper() for c in cols]"))
+    assert "error" not in res, res
+    assert [f["name"] for f in res["schema"]["fields"]] == ["ID", "NAME", "VALUE", "__row_order"]
+
+
+def test_a_deleted_copy_read_with_a_function_option_cannot_be_made_again(project, sample_csv, monkeypatch):
+    """#198: the manifest records only the function's repr (``lossless: False``), so a deleted copy of the read cannot
+    be made again from it, and opening the entry says so."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    res = _create_without_panic("upper", _renaming_code(sample_csv, "lambda cols: [c.upper() for c in cols]"))
+    assert "error" not in res, res
+    [copy] = _ordered_copies(project)
+    assert read_manifest(entry_dir(project, res["hash"])).ordered_copies[copy.stem]["reader"]["lossless"] is False
+
+    copy.unlink()
+    cached_result_expr.cache_clear()
+    with pytest.raises(SourceUnavailable, match="cannot be made again"):
+        cached_result_expr(project, res["hash"])
+
+
+def test_a_polars_panic_reading_a_csv_is_a_build_error(project, sample_csv):
+    """#197: polars panics when a function it calls raises. The panic is a ``BaseException``, which no ``except
+    Exception`` on the build or MCP path catches, so ingest turns it into a ``BuildError``."""
+    # The typo `colz` is a NameError when polars calls the function.
+    code = _renaming_code(sample_csv, "lambda cols: [c.upper() for c in colz]")
+    try:
+        with pytest.raises(BuildError, match="polars panicked"):
+            build_and_persist(project, code)
+    except PanicException as exc:
+        pytest.fail(f"polars panicked and the PanicException escaped the build: {exc}")
 
 
 # --------------------------------------------------------------------------- #

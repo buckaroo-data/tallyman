@@ -1,11 +1,13 @@
 # ADR: An immutable result store, every entry materialized, one owning process
 
-- **Status:** Proposed (2026-09-21). Decided in outline by Paddy the same day, after the review of
-  buckaroo-data/tallyman#189 produced #193 to #211 ("Go with A"). Not implemented.
-- **Amends:** `plans/ADR-007-tallyman-owned-materialization.md`, `plans/ADR-008-row-order-of-reads.md` and
-  `plans/ADR-009-digest-stability.md`. Those three are on the branches of #184 (text) and #189 (implementation), not
-  yet on `main`; the paths here resolve once #189 merges. The table under "What happens to ADR-007, 008 and 009" says
-  which of their decisions stand, which change and which are retired.
+- **Status:** Rejected (2026-09-22). Proposed 2026-09-21, after the review of buckaroo-data/tallyman#189 produced #193
+  to #211 ("Go with A"). Paddy rejected it after a review: it does not solve the problem comprehensively, and it does
+  not simplify the design as much as expected. See "Why it was rejected". Never implemented. The rest of this document
+  is the proposal as it stood, kept for the record.
+- **Would have amended:** `plans/ADR-007-tallyman-owned-materialization.md`, `plans/ADR-008-row-order-of-reads.md` and
+  `plans/ADR-009-digest-stability.md`. Since it was rejected, those three stand as written. They are on the branches of
+  #184 (text) and #189 (implementation), not yet on `main`; the paths here resolve once #189 merges. The table under
+  "What happens to ADR-007, 008 and 009" says which of their decisions this ADR would have kept, changed or retired.
 - **Reading decision labels:** a bare label such as "D4" means this ADR's own decision. Another ADR's decision is
   written with its number and a few words saying what it decides.
 - **Tickets this closes or narrows:** listed per decision, and summarised under "Issues".
@@ -13,6 +15,48 @@
   `digest.py`, `result_cache.py`, `build.py`, `io.py`, `source_identity.py`, `staleness.py`, `recalc.py`;
   `src/tallyman_core/catalog_state.py` (`reset_to`, `project_lock`, the bullpen), `paths.py`, `catalog.py`;
   `src/tallyman_companion/app.py` and `buckaroo_lifecycle.py`; `src/tallyman_mcp/server.py`; `src/tallyman_cli/main.py`.
+
+## Why it was rejected
+
+A review on 2026-09-21 and 2026-09-22 found the following. Probe scripts were run from the session scratchpad and not
+kept; the numbers are from xorq 0.3.26, xorq-datafusion 0.2.7 and pyarrow 21.0.0 on a 14-core machine, 5 runs each.
+
+- **D7 (a re-created result that differs makes its descendants stale) cannot be carried out as written.** A child's
+  content hash covers the path of its parent's result, not the parent's rows. After a heal writes different rows under
+  the same name, the staleness scan sees nothing, since no alias moved and no source changed. Recalc replays the child,
+  gets the same hash and returns early (the complete-entry early return in `build.py`; `recalc.py` already documents
+  that a same-hash recompute cannot refresh an entry). D5's "if the name exists, the writer returns it" says the same.
+  A probe on #189's code confirmed it: after an unfaithful heal of a parent, the scan reported the child fresh, recalc
+  reported `noop`, and the child's file kept a total computed from rows that no longer existed. D3's tolerance
+  comparison needs both results, and at a heal only the recorded digest is left.
+- **D2's default partitioning gives up deterministic order, and more than paging depends on it.** At 14 partitions
+  against 1:
+  - A read of a 75 MB source kept file order in 0 of 5 runs, against 5 of 5.
+  - A filter over a 5 MB source kept file order in 0 of 5, against 5 of 5.
+  - A filter over a sorted parent stayed sorted in 0 of 5, against 5 of 5.
+  - A grouped float `SUM`/`AVG` gave 5 distinct digests, against 1.
+  - `collect()` and `first()` gave 5 distinct results, against 1.
+  - An unsorted `limit` gave 3 distinct results, against 1.
+  - A top-row-per-group window over tied keys gave 5 distinct results, against 1. That pattern appears in 8 of the
+    146 recipes in the local catalogs.
+
+  These break `docs/system-contract.md` I2 (every answer is byte-identical with all caches empty) and I6 (a page is
+  the same in any cache state), which this ADR did not address.
+- **D3's `rel_tol=1e-9` fails where a float total is near zero.** For group sums that cancel exactly, two runs
+  disagreed in 901 of 1000 groups.
+- **Restoring determinism without single-partition execution brings much of ADR-008 back.** It needs explicit
+  tie-free orders at every order-sensitive step (sorts, windows, unsorted limits, `collect`/`first`), a private carry
+  of the input order through row-preserving steps, and ordered ingest of sources. Floats also have to be treated as
+  approximate.
+  - These mechanisms work at 14 partitions: a tie-free `ORDER BY`, `collect(order_by=...)` and a tie-broken window
+    each gave 1 result in 5.
+  - An explicit sort holds the whole result in memory. Copying a 298 MB file peaked at 1.0 GB, against 292 MB
+    single-partition. xorq's DataFusion binding exposes neither a declared file order nor spill-to-disk.
+  - Single-partition execution is not an acceptable answer either. It does not cover unions, loaded builds that are
+    not rebound, float totals that depend on file layout (#187), engine upgrades, Buckaroo's own queries, or ties in a
+    sort.
+
+The issues listed under "Issues" stay open.
 
 ## Terms
 

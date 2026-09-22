@@ -10,6 +10,8 @@ lead's contract, so the names imported lazily below do not exist yet and these t
 
 from __future__ import annotations
 
+import errno
+import importlib
 import json
 import os
 import shutil
@@ -22,6 +24,7 @@ import pytest
 
 from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_companion.diff import build_diff_expr
+from tallyman_core import catalog_state as cs
 from tallyman_core import data_dir, entry_dir
 from tallyman_core.manifest import read_manifest
 from tallyman_core.paths import compute_cache_dir, tallyman_home
@@ -80,6 +83,15 @@ def _root_child_code(alias: str) -> str:  # a cheap child over a cheap root, so 
 from tallyman_xorq.io import tracked_expr_from_alias
 t = tracked_expr_from_alias({alias!r})
 expr = t.filter(t.qty > 1)
+"""
+
+
+def _random_code(project: str) -> str:  # random() is not pure, so the entry is worthy and not reproducible
+    return f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import read_project_file
+t = read_project_file("orders.parquet", project={project!r})
+expr = t.mutate(r=ibis.random())
 """
 
 
@@ -268,6 +280,91 @@ def test_a_failed_materialization_keeps_the_previous_file(project, orders_parque
     with pytest.raises(OSError, match="disk full"):
         materialize(project, h)
     assert snap.read_bytes() == before
+    assert sorted(p.name for p in snap.parent.iterdir()) == [snap.name]
+
+
+# Where a create can fail once it has started writing: either run of its query (a create runs it twice, ADR-009 D6),
+# or the manifest write after both runs have finished. Each is (module, function, which call fails).
+_FAILURES = {
+    "first run": ("tallyman_xorq.materialize", "_run_once", 1),
+    "second run": ("tallyman_xorq.materialize", "_run_once", 2),
+    "manifest write": ("tallyman_xorq.build", "write_manifest", 1),
+}
+
+
+def _disk_fills_at(monkeypatch, where: str) -> None:
+    """Make the next create fail at *where* with the error a full disk raises. Every other call runs as usual."""
+    module_name, name, failing_call = _FAILURES[where]
+    module = importlib.import_module(module_name)
+    real = getattr(module, name)
+    calls = 0
+
+    def fill(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == failing_call:
+            raise OSError(errno.ENOSPC, "No space left on device")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(module, name, fill)
+
+
+@pytest.mark.parametrize(
+    ("recipe", "where"),
+    [
+        pytest.param(_random_code, "second run", id="not-reproducible-second-run"),
+        pytest.param(_agg_code, "first run", id="aggregate-first-run"),
+        pytest.param(_random_code, "manifest write", id="not-reproducible-manifest-write"),
+    ],
+)
+def test_a_failed_create_keeps_the_snapshot_a_reset_left_on_disk(project, orders_parquet, monkeypatch, recipe, where):
+    """ADR-007 D4 (the file changes only by an atomic replace of a complete one) and D14 (a reset leaves
+    ``compute_cache/`` alone), #193. A reset back parks the entry and leaves its snapshot, and adding the recipe again
+    is a create. A create that fails, in either run of its query or after both, leaves that file as it was. For an
+    entry that is not reproducible it is the only copy of the rows its parked manifest records, and the reset forward
+    reads them."""
+    from tallyman_xorq.materialize import snapshot_path
+
+    cs.ensure_catalog_repo(project)
+    empty = cs.checkpoint_catalog(project, "empty")
+    code = recipe(project)
+    h = build_and_persist(project, code).content_hash
+    built = cs.checkpoint_catalog(project, "built")
+    assert None not in (empty, built)
+    snap, digest = snapshot_path(project, h), _digest_of(project, h)
+    cs.reset_to(project, empty)
+    assert not entry_dir(project, h).exists()
+    assert snapshot_file_digest(snap) == digest
+
+    _disk_fills_at(monkeypatch, where)
+    with pytest.raises((BuildError, OSError), match="No space left on device"):
+        build_and_persist(project, code)
+    assert snap.is_file(), f"a create that failed at the {where} deleted the snapshot the reset left on disk"
+    assert snapshot_file_digest(snap) == digest
+    assert sorted(p.name for p in snap.parent.iterdir()) == [snap.name]
+
+    cs.reset_to(project, built)
+    assert result_cache.verify_result_faithful(project, h) is True
+
+
+def test_a_failed_retry_of_a_half_built_entry_keeps_its_snapshot(project, orders_parquet, monkeypatch):
+    """ADR-007 D4, #193. A build killed between writing the snapshot and writing the manifest leaves an entry
+    directory with no manifest, and its snapshot is still served (``cache_worthy`` falls back to the file). A retry is
+    a create, and one that fails removes the half-built directory and leaves the snapshot as it was."""
+    from tallyman_xorq.materialize import snapshot_path
+
+    code = _agg_code(project)
+    h = build_and_persist(project, code).content_hash
+    snap, digest = snapshot_path(project, h), _digest_of(project, h)
+    (entry_dir(project, h) / "manifest.json").unlink()
+    cached_result_expr.cache_clear()
+    assert len(cached_result_expr(project, h).execute()) > 0
+
+    _disk_fills_at(monkeypatch, "first run")
+    with pytest.raises(BuildError, match="No space left on device"):
+        build_and_persist(project, code)
+    assert snap.is_file(), "a retry that failed deleted the snapshot of the half-built entry"
+    assert snapshot_file_digest(snap) == digest
     assert sorted(p.name for p in snap.parent.iterdir()) == [snap.name]
 
 

@@ -465,10 +465,11 @@ def test_a_reset_keeps_the_clone_of_an_imported_source_alive(project: str, tmp_p
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    from tallyman_core.catalog_state import _live_source_digests
+    from tallyman_core.catalog_state import _live_source_digests, capture_tallyman_state
 
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
     out = source_import.update_and_depend(str(src), "orders")
+    capture_tallyman_state(project)  # what a checkpoint does; the retention closure reads its pointer list
 
     assert out["digest"] in (_live_source_digests(project) or set())
 

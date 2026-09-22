@@ -51,6 +51,14 @@ from tallyman_core import artifacts_dir, data_dir
 # faithfulness warning.
 _log = logging.getLogger("tallyman.perf")
 
+class CloneDigestMismatch(ValueError):
+    """The clone tallyman just wrote does not hash to the name it was given (ADR-011 D9)."""
+
+
+class LostSourceVersion(FileNotFoundError):
+    """A version tallyman promised is gone: no clone, and the live file no longer has those bytes (ADR-011 D9)."""
+
+
 _MODE_ENV = "TALLYMAN_SOURCE_IDENTITY"
 _REHASH_ENV = "TALLYMAN_SOURCE_REHASH"
 _MODES = ("off", "cas", "salt")
@@ -131,6 +139,12 @@ def _clone(src: Path, dst: Path) -> None:
 
 
 def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
+    """The clone of *src* named by *digest*, written if it is not there yet, and verified before it is published.
+
+    The digest is computed before the copy, so a file edited mid-copy would otherwise leave a clone whose name lies
+    about its content — and that clone is the only frozen record of what an entry was built from. The written bytes
+    are re-digested and a mismatch raises ``CloneDigestMismatch`` rather than publishing the file (ADR-011 D9).
+    """
     cas_dir = data_dir(project) / ".cas"
     cas_dir.mkdir(parents=True, exist_ok=True)
     dst = cas_dir / f"{digest}{src.suffix}"
@@ -139,6 +153,12 @@ def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
         tmp = dst.with_name(f"{dst.name}.{uuid.uuid4().hex}.tmp")
         try:
             _clone(src, tmp)
+            written = _digest_file(tmp)
+            if written != digest:
+                raise CloneDigestMismatch(
+                    f"the copy of {src} hashes to {written}, not the {digest} it was named by — the file changed "
+                    "while it was being copied. Nothing was written; try again once the file is settled."
+                )
             os.replace(tmp, dst)
         finally:
             tmp.unlink(missing_ok=True)
@@ -160,8 +180,9 @@ def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
     file *content* (``_digest_file``), never ``digest_for``, so the stat-keyed memo
     can't certify an in-place edit that preserved ``(mtime_ns, size, inode)`` as the
     original (the documented memo hole). When the clone is gone AND the live source has
-    drifted, the original bytes are unrecoverable: serve the live source best-effort
-    (never crash a read) but warn — this is the one branch that is NOT content-faithful.
+    drifted, the original bytes are unrecoverable and this raises ``LostSourceVersion``
+    (ADR-011 D9): a version tallyman promised and then lost is a failure, not a
+    downgrade to whatever is on disk now.
     """
     cas_dir = data_dir(project) / ".cas"
     dst = cas_dir / f"{digest}{live_src.suffix}"
@@ -169,14 +190,11 @@ def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
         return dst
     if live_src.exists() and _digest_file(live_src) == digest:
         return ensure_cas_path(project, live_src, digest)
-    _log.warning(
-        "recon_cas_path: frozen .cas clone %s%s missing and live source %s drifted — "
-        "serving live bytes; this cold read is NOT faithful to the build (#115)",
-        digest,
-        live_src.suffix,
-        live_src,
+    raise LostSourceVersion(
+        f"the bytes {digest}{live_src.suffix} are gone: their frozen clone under data/.cas is missing and "
+        f"{live_src} no longer has that content. Whatever was built from them cannot be read faithfully; "
+        "import the data again, or rebuild the entry from the current file."
     )
-    return live_src
 
 
 def gc_cas(project: str, live_digests: set[str], *, bullpen: Path | None = None) -> int:

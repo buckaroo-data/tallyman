@@ -27,6 +27,26 @@ class ParentRef(BaseModel):
     follow: bool
 
 
+class SourceProvenance(BaseModel):
+    """Where a source version's bytes came from, recorded once at import (ADR-011 D1, D12).
+
+    A manifest that carries one IS a source entry: a version of a source alias, whose rows are an imported file
+    rather than a computation. ``path`` is the **provenance path** — the outside path the bytes were imported from,
+    recorded here and never read again, so deleting or editing that file changes nothing. ``digest`` is the md5 of
+    the imported bytes, which names their clone in ``data/.cas/<digest><suffix>`` and, with ``reader``, determines
+    the entry's content hash. ``reader`` is the reader options the import used (``{"kind": "parquet"}``, or a CSV's
+    schema spec and ``scan_csv`` options): fixed at import and never re-derived at build time.
+    """
+
+    alias: str
+    version: int
+    path: str
+    digest: str
+    suffix: str
+    reader: dict
+    imported_at: str
+
+
 class Manifest(BaseModel):
     content_hash: str
     project: str
@@ -71,6 +91,9 @@ class Manifest(BaseModel):
     # Resolved tracked_expr_from_alias parent edges ({hash, ref, follow}), recorded at build
     # time so the inter-entry DAG survives #73/#74; absent for root entries (#84).
     parents: list[ParentRef] | None = None
+    # Set only on a source entry: the import that minted it (ADR-011 D1). Its presence is what makes the entry a
+    # source version — worthy, with its imported bytes as its snapshot, no parents and no recipe to revise.
+    provenance: SourceProvenance | None = None
 
 
 def write_manifest(entry_path: Path, manifest: Manifest) -> Path:

@@ -4,9 +4,17 @@ Aliases are mutable handles that name a sequence of content hashes:
 
     alias_map:      {alias: latest_hash}
     alias_history:  {alias: [hash_v1, hash_v2, ...]}   # oldest first
+    alias_kinds:    {alias: "catalog" | "source"}
 
-Both live in a tracked ``aliases.jsonl`` in the catalog repo — one line per
-alias, ``{"alias", "latest", "history": [...]}``. The native store tracks the
+An alias has a **kind** (ADR-011 D1). A *catalog* alias names a computation,
+revised by ``catalog_revise``. A *source* alias names a raw input dataset whose
+versions are imported files, advanced only by ``catalog_import_source``; there is
+no recipe to revise and no diff to promote onto it. Both live in the same store
+with the same head-plus-history shape, so ``orders-v2`` resolves through the one
+``VERSION_REF_RE``, and a name is one kind or the other but never both.
+
+All three live in a tracked ``aliases.jsonl`` in the catalog repo — one line per
+alias, ``{"alias", "latest", "history": [...], "kind"}``. The native store tracks the
 file directly, so alias state clones and versions with the catalog and
 ``reset_to``'s ``git reset`` rolls it back with the rest of the tree (no
 separate reconcile). Before the native cut this had to be smuggled into
@@ -33,6 +41,16 @@ class AliasExists(ValueError):
 
 class AliasNotFound(KeyError):
     pass
+
+
+class AliasKindMismatch(ValueError):
+    """A name already belongs to the other kind of alias (ADR-011 D1)."""
+
+
+# A catalog alias names a computation; a source alias names an imported dataset.
+CATALOG_KIND = "catalog"
+SOURCE_KIND = "source"
+_KINDS = (CATALOG_KIND, SOURCE_KIND)
 
 
 # "<alias>-v<N>" — the version-reference syntax pinned_expr_from_alias accepts
@@ -80,16 +98,17 @@ def _aliases_file(project: str):
     return catalog_dir(project) / "aliases.jsonl"
 
 
-def _read(project: str) -> tuple[dict[str, str], dict[str, list[str]]]:
-    """Read the alias map + history out of the tracked ``aliases.jsonl``.
+def _read(project: str) -> tuple[dict[str, str], dict[str, list[str]], dict[str, str]]:
+    """Read the alias map, history and kinds out of the tracked ``aliases.jsonl``.
 
-    One line per alias: ``{"alias", "latest", "history": [...]}``. The native
-    store tracks this file directly, so ``reset_to``'s ``git reset`` rolls alias
-    state back with the rest of the tree (no separate reconcile).
+    One line per alias: ``{"alias", "latest", "history": [...], "kind"}``. The
+    native store tracks this file directly, so ``reset_to``'s ``git reset`` rolls
+    alias state back with the rest of the tree (no separate reconcile).
     """
     p = _aliases_file(project)
     alias_map: dict[str, str] = {}
     history: dict[str, list[str]] = {}
+    kinds: dict[str, str] = {}
     if p.exists():
         for line in p.read_text().splitlines():
             if not line.strip():
@@ -97,12 +116,15 @@ def _read(project: str) -> tuple[dict[str, str], dict[str, list[str]]]:
             rec = json.loads(line)
             alias_map[rec["alias"]] = rec["latest"]
             history[rec["alias"]] = rec.get("history", [])
-    return alias_map, history
+            kinds[rec["alias"]] = rec.get("kind", CATALOG_KIND)
+    return alias_map, history, kinds
 
 
-def _write(project: str, aliases: dict[str, str], history: dict[str, list[str]]) -> None:
-    """Persist the alias map + history to ``aliases.jsonl`` (sorted for a stable
-    diff; an empty map removes the file)."""
+def _write(
+    project: str, aliases: dict[str, str], history: dict[str, list[str]], kinds: dict[str, str]
+) -> None:
+    """Persist the alias map, history and kinds to ``aliases.jsonl`` (sorted for a
+    stable diff; an empty map removes the file)."""
     ensure_project(project)
     p = _aliases_file(project)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -110,7 +132,15 @@ def _write(project: str, aliases: dict[str, str], history: dict[str, list[str]])
         p.unlink(missing_ok=True)
         return
     body = "".join(
-        json.dumps({"alias": name, "latest": aliases[name], "history": history.get(name, [])}) + "\n"
+        json.dumps(
+            {
+                "alias": name,
+                "latest": aliases[name],
+                "history": history.get(name, []),
+                "kind": kinds.get(name, CATALOG_KIND),
+            }
+        )
+        + "\n"
         for name in sorted(aliases)
     )
     atomic_write_text(p, body)
@@ -122,6 +152,16 @@ def load_aliases(project: str) -> dict[str, str]:
 
 def load_history(project: str) -> dict[str, list[str]]:
     return _read(project)[1]
+
+
+def load_kinds(project: str) -> dict[str, str]:
+    """``{alias: "catalog" | "source"}`` for every alias in the project (ADR-011 D1)."""
+    return _read(project)[2]
+
+
+def alias_kind(project: str, name: str) -> str | None:
+    """The kind of *name*, or None when no such alias exists."""
+    return _read(project)[2].get(name)
 
 
 def get_alias(project: str, name: str) -> str | None:
@@ -180,53 +220,76 @@ def previous_version(project: str, content_hash: str, alias: str | None = None) 
     return hist[idx] if 0 <= idx < len(hist) else None
 
 
-def set_alias(project: str, name: str, content_hash: str, *, expect_exists: bool | None = None) -> dict:
+def set_alias(
+    project: str,
+    name: str,
+    content_hash: str,
+    *,
+    expect_exists: bool | None = None,
+    kind: str = CATALOG_KIND,
+) -> dict:
     """Point `name` at `content_hash` and append to history.
 
     expect_exists:
       None — accept either fresh or existing alias.
       True — error if alias does NOT exist (`catalog_revise` semantics).
       False — error if alias DOES exist (`catalog_create`/`catalog_alias` semantics).
+
+    `kind` is what the caller is setting: ``CATALOG_KIND`` for a computation (the
+    default, so every existing caller keeps its meaning) or ``SOURCE_KIND`` for a
+    version of an imported dataset. A name that already belongs to the other kind
+    raises ``AliasKindMismatch`` — the collision is refused both ways (ADR-011 D1).
     """
+    if kind not in _KINDS:
+        raise ValueError(f"alias kind {kind!r}; expected one of {_KINDS}")
     ensure_project(project)
     validate_alias_name(name)
-    aliases, history = _read(project)
+    aliases, history, kinds = _read(project)
     exists = name in aliases
     if expect_exists is True and not exists:
         raise AliasNotFound(name)
     if expect_exists is False and exists:
         raise AliasExists(name)
+    if exists and kinds.get(name, CATALOG_KIND) != kind:
+        raise AliasKindMismatch(
+            f"{name!r} is a {kinds.get(name, CATALOG_KIND)} alias and cannot be set as a {kind} alias; "
+            "a name is one kind or the other"
+        )
 
     aliases[name] = content_hash
+    kinds[name] = kind
     history.setdefault(name, [])
     # Avoid duplicate consecutive entries.
     if not history[name] or history[name][-1] != content_hash:
         history[name].append(content_hash)
 
-    _write(project, aliases, history)
+    _write(project, aliases, history, kinds)
 
     return {
         "name": name,
         "hash": content_hash,
         "version": len(history[name]),
+        "kind": kind,
     }
 
 
 def rename_alias(project: str, old_name: str, new_name: str) -> dict:
     validate_alias_name(new_name)
-    aliases, history = _read(project)
+    aliases, history, kinds = _read(project)
     if old_name not in aliases:
         raise AliasNotFound(old_name)
     if new_name in aliases:
         raise AliasExists(new_name)
     aliases[new_name] = aliases.pop(old_name)
     history[new_name] = history.pop(old_name, [])
-    _write(project, aliases, history)
+    kinds[new_name] = kinds.pop(old_name, CATALOG_KIND)  # a rename carries the kind over
+    _write(project, aliases, history, kinds)
     return {"old": old_name, "new": new_name, "hash": aliases[new_name]}
 
 
 def remove_alias(project: str, name: str) -> None:
-    aliases, history = _read(project)
+    aliases, history, kinds = _read(project)
     aliases.pop(name, None)
     history.pop(name, None)
-    _write(project, aliases, history)
+    kinds.pop(name, None)
+    _write(project, aliases, history, kinds)

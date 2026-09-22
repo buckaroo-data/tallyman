@@ -33,6 +33,7 @@ from tallyman_xorq import source_identity
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.dependents import descendant_cone, parents_of, sources_of
 from tallyman_xorq.io import ProjectDataNotFound, project_path
+from tallyman_xorq.source_import import is_source_entry
 
 # digest_for memoizes on (mtime_ns, size, inode); a same-stat in-place content
 # swap would otherwise serve the cached digest and the source axis would
@@ -92,11 +93,14 @@ def entry_staleness(project: str, content_hash: str) -> StaleVerdict:
         elif head != parent.hash:
             reasons.append(StaleReason(axis="alias", ref=parent.ref, was=parent.hash, now=head))
 
-    # Axis 2: a recorded source drifted on disk.
-    sources = sources_of(project, content_hash)
-    if sources is None:
+    # Axis 2: a recorded source drifted on disk. A source entry has no axis 2 at all (ADR-011 D1): its rows ARE an
+    # imported file, held in the arena, and the outside path it came from is provenance that nothing reads again —
+    # so "the file on disk moved" is not a question about it, and reporting the axis unknown would be noise.
+    imported = is_source_entry(project, content_hash)
+    sources = None if imported else sources_of(project, content_hash)
+    if sources is None and not imported:
         unknown.append("source")  # built under mode=off; the axis is unavailable
-    else:
+    elif sources:
         with _force_source_rehash():
             for rel_path, recorded in sources.items():
                 try:

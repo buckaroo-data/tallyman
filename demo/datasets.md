@@ -97,19 +97,19 @@ df['tip_pct'] = (df['tip_amount'] / df['fare_amount'].replace(0, float('nan')))
 Type these into Claude Code with the tallyman MCP server running:
 
 ```
-Use catalog_load_parquet to load /tmp/nyc_taxi/yellow_tripdata_2024-01.parquet,
-name it yellow_jan_2024. Prompt: "NYC yellow cab trips January 2024".
+Use catalog_import_source to import /tmp/nyc_taxi/yellow_tripdata_2024-01.parquet
+under the alias yellow_jan_2024. Prompt: "NYC yellow cab trips January 2024".
 ```
 
 ```
-Create a named entry trips_by_zone that joins yellow_jan_2024 with the taxi zone
-lookup at /tmp/nyc_taxi/taxi_zone_lookup.csv on PULocationID, groups by Zone,
-and counts trips with mean fare. Name it trips_by_zone.
+Import /tmp/nyc_taxi/taxi_zone_lookup.csv under the alias taxi_zones, then create
+a named entry trips_by_zone that joins yellow_jan_2024 with taxi_zones on
+PULocationID, groups by Zone, and counts trips with mean fare.
 ```
 
 ```
-Use catalog_load_parquet to load /tmp/citibike/citibike_h1_2024.parquet,
-name it citibike_h1. Prompt: "Citibike trips January–June 2024".
+Use catalog_import_source to import /tmp/citibike/citibike_h1_2024.parquet
+under the alias citibike_h1. Prompt: "Citibike trips January–June 2024".
 ```
 
 ```

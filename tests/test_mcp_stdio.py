@@ -57,7 +57,7 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
     # All tools from server.py should be present.
     for required in {
         "catalog_run",
-        "catalog_load_parquet",
+        "catalog_import_source",
         "catalog_create",
         "catalog_revise",
         "catalog_alias",
@@ -74,12 +74,12 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
 
 @pytest.mark.integration
 @needs_uv
-def test_stdio_round_trips_catalog_load_parquet(isolated_home: Path, project: str, orders_parquet: Path):
+def test_stdio_round_trips_catalog_import_source(isolated_home: Path, project: str, orders_parquet: Path):
     async def go():
         async with _client(project, isolated_home) as client:
             result = await client.call_tool(
-                "catalog_load_parquet",
-                {"rel_path": "orders.parquet", "prompt": "raw"},
+                "catalog_import_source",
+                {"outside_path": str(orders_parquet), "alias": "orders", "prompt": "raw"},
             )
             return result.data
 

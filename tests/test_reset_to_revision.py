@@ -290,7 +290,7 @@ def test_every_mcp_tool_is_checkpoint_wrapped():
     assert server.mcp.tool.__name__ == "_checkpointing_tool"  # registration is wrapped
     mutating = {
         "catalog_run",
-        "catalog_load_parquet",
+        "catalog_import_source",
         "catalog_create",
         "catalog_revise",
         "catalog_alias",

@@ -147,6 +147,7 @@ def _recipe_expr(project: str, content_hash: str):
     from tallyman_core.paths import entry_dir, project_dir
     from tallyman_xorq.build import BuildError, _import_script
     from tallyman_xorq.portable import PLACEHOLDER
+    from tallyman_xorq.source_import import in_source_recipe, is_source_entry, release_source_recipe
 
     active = _RECONSTRUCTING.get()
     if len(active) >= _MAX_RECON_DEPTH:
@@ -165,9 +166,14 @@ def _recipe_expr(project: str, content_hash: str):
     # and reset in this finally, NOT the sys.modules-cleanup finally below.
     token = _RECONSTRUCTING.set(active | {(project, content_hash)})
     recon_token = _RECON_SOURCES.set((project, _recorded_sources(project, content_hash)))
+    # A source entry's recipe is the one the importer generated, and its read_project_file is the one raw read
+    # tallyman allows (ADR-011 D2): mark it so the read resolves to this entry's own snapshot.
+    source_token = in_source_recipe(project, content_hash) if is_source_entry(project, content_hash) else None
     try:
         module, tmp = _import_script(code)
     finally:
+        if source_token is not None:
+            release_source_recipe(source_token)
         _RECON_SOURCES.reset(recon_token)
         _RECONSTRUCTING.reset(token)
     try:

@@ -31,10 +31,10 @@ expr = t.mutate(doubled=t.price * 2)
 """
 
 
-def _pinned_child_code(content_hash: str) -> str:  # pinned (no lineage) child off a specific hash
+def _pinned_child_code(ref: str) -> str:  # pinned (no lineage) child off one version of an alias
     return f"""
 from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({content_hash!r})
+t = pinned_expr_from_alias({ref!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
@@ -86,9 +86,9 @@ def test_followed_alias_advance_marks_child_stale(project, orders_parquet, monke
 def test_hash_pinned_parent_is_not_stale_when_alias_advances(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     base_v1 = _hash(catalog_create("base", _base_code(project)))
-    # A literal-hash argument is recorded follow=False (a pin), so the alias
+    # A version reference is recorded follow=False (a pin), so the alias
     # advancing must not make this child stale.
-    child_hash = _hash(catalog_create("child", _pinned_child_code(base_v1)))
+    child_hash = _hash(catalog_create("child", _pinned_child_code("base-v1")))
 
     _hash(catalog_revise("base", _base_code_v2(project)))
     assert get_alias(project, "base") != base_v1

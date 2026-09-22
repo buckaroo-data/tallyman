@@ -78,6 +78,7 @@ class OldCatalog:
     recipes: dict[str, str] = field(default_factory=dict)  # old_hash -> expr.py text
     aliases: dict[str, str] = field(default_factory=dict)  # alias -> current old_hash
     history: dict[str, list[str]] = field(default_factory=dict)  # alias -> [old_hash, ...]
+    kinds: dict[str, str] = field(default_factory=dict)  # alias -> "catalog" | "source" (ADR-011 D1)
     charts: dict[str, str] = field(default_factory=dict)  # old_hash -> vega-lite spec text
     prompts: dict[str, list[dict]] = field(default_factory=dict)  # old_hash -> [{prompt, at}, ...]
     post_processing: dict[str, str] = field(default_factory=dict)  # name -> source
@@ -99,6 +100,7 @@ def read_old_catalog(project: str) -> OldCatalog:
     Each section reads from its decomposed file if present, else falls back to
     ``catalog.yaml``.
     """
+    from tallyman_core.aliases import CATALOG_KIND  # noqa: PLC0415
     from tallyman_core.paths import catalog_dir  # noqa: PLC0415
 
     cat = catalog_dir(project)
@@ -133,6 +135,7 @@ def read_old_catalog(project: str) -> OldCatalog:
                 rec = json.loads(line)
                 oc.aliases[rec["alias"]] = rec["latest"]
                 oc.history[rec["alias"]] = rec.get("history", [])
+                oc.kinds[rec["alias"]] = rec.get("kind", CATALOG_KIND)
     elif (cat / "aliases.json").is_file():
         oc.aliases = json.loads((cat / "aliases.json").read_text())
         ah = cat / "alias_history.json"
@@ -321,6 +324,7 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
         project,
         {name: remap.get(h, h) for name, h in oc.aliases.items()},
         {name: [remap.get(x, x) for x in hs] for name, hs in oc.history.items()},
+        {name: oc.kinds.get(name, al.CATALOG_KIND) for name in oc.aliases},
     )
 
     for old_h, spec in oc.charts.items():

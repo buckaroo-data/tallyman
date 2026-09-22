@@ -19,6 +19,45 @@ class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
+# Set this to run recipes that still read a file directly, while the test corpus is rewritten onto imported source
+# aliases (ADR-011 stage 2). Scaffolding, with an expiry: it goes with the rewrite, and nothing in production sets it.
+_LEGACY_READS_ENV = "TALLYMAN_LEGACY_FILE_READS"
+
+
+def _source_entry_read(project: str, fn: str, path: str):
+    """The expression a raw read resolves to, or None when the caller must be refused (ADR-011 D2).
+
+    A file enters the catalog by an explicit import and by nothing else, so a raw read is a build error in an
+    authored recipe. It survives in exactly two places: the recipe the importer generates for a source entry, where
+    it resolves to that entry's own snapshot, and the reconstruction of an entry built before the import path
+    existed, where the caller resolves it from the digest the manifest recorded.
+    """
+    import os
+
+    from tallyman_xorq.source_import import source_entry_context
+
+    content_hash = source_entry_context(project)
+    if content_hash is not None:
+        from xorq.expr.api import deferred_read_parquet
+
+        from tallyman_xorq.materialize import snapshot_path
+
+        return deferred_read_parquet(str(snapshot_path(project, content_hash)))
+    if _reconstructing_source_digest(project, _relative_to_data(project, Path(path))) is not None:
+        return None  # a pre-ADR-011 entry replaying its recipe; the caller resolves it from the recorded digest
+    if os.environ.get(_LEGACY_READS_ENV):
+        return None
+    from tallyman_xorq.build import BuildError
+
+    raise BuildError(
+        f"{fn}({path!r}) reads a file tallyman does not own, which is not allowed in a recipe: the entry's rows "
+        "would depend on a file anyone can edit or delete, and nothing would record which bytes it was built from. "
+        f"Import the file first — catalog_import_source({path!r}, '<alias>') — and then read it in the recipe with "
+        "tracked_expr_from_alias('<alias>'), which follows the alias, or pinned_expr_from_alias('<alias>-v<N>') to "
+        "pin one version of it."
+    )
+
+
 def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
     """Resolve `rel_path` against the project's data dir. Raises if absent.
 
@@ -42,10 +81,12 @@ def project_path(rel_path: str, project: str | None = None, must_exist: bool = T
 def read_project_file(rel_path: str, project: str | None = None):
     """Load a raw data file from `<project>/data/<rel_path>` as a xorq expression.
 
-    Use this to bring raw input files (parquet, csv, etc.) into the catalog's
-    expression layer. This is the root of the dependency DAG — the file has no
-    catalog hash, no recipe, no lineage entry. Everything built on top of it
-    flows through tracked_expr_from_alias.
+    NOT for an authored recipe (ADR-011 D2): a file enters the catalog only through
+    `catalog_import_source` / `update_and_depend`, and a recipe reads the resulting
+    source alias with `tracked_expr_from_alias`. Calling this in an authored recipe is
+    a build error naming the import. It survives here for the recipe the importer
+    generates for a source entry — where it resolves to that entry's own snapshot —
+    and for reconstructing an entry built before the import path existed.
 
     The file is never read directly (ADR-008 D2). It goes through source
     identity (tallyman_xorq.source_identity): its content digest is taken, in
@@ -63,6 +104,9 @@ def read_project_file(rel_path: str, project: str | None = None):
     from tallyman_xorq import source_identity as si
 
     proj = resolve_project(project)
+    pinned = _source_entry_read(proj, "read_project_file", rel_path)
+    if pinned is not None:
+        return pinned
     reader = oc.parquet_reader()
     recorded = _reconstructing_source_digest(proj, rel_path)
     if recorded is not None:
@@ -447,6 +491,11 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
 def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwargs):
     """Read a CSV into a xorq expression with a stable ``__row_order``.
 
+    NOT for an authored recipe (ADR-011 D2), for the same reason as
+    ``read_project_file``: import the CSV with ``catalog_import_source(path, alias,
+    separator=..., schema=...)`` and read the source alias. The reader options move
+    to the import call and are recorded on the entry (ADR-011 D12).
+
     Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. The CSV
     goes through source identity like a parquet source (``read_project_file``):
     its content digest is taken, it is cloned to ``data/.cas/``, and an ordered
@@ -490,6 +539,9 @@ def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwar
             "plain dict, or tuple-of-tuples), never schema_overrides."
         )
     proj = resolve_project(project)
+    pinned = _source_entry_read(proj, "tallyman_read_csv", path)
+    if pinned is not None:
+        return pinned
     reader = oc.csv_reader(schema, kwargs)
     src = Path(path)
     rel = _relative_to_data(proj, src)
@@ -618,31 +670,47 @@ def pinned_expr_from_alias(ref: str, project: str | None = None):
     not advance it when the parent alias moves. Use this when you want to stay on
     a specific version of a parent rather than following alias changes.
 
-    Accepts a content hash or an explicit version reference ``"<alias>-v<N>"``
-    (1-based into the alias history — the V1…Vn the UI shows). A bare alias is
-    rejected (#166): it reads like a pin but resolves to whatever the head
-    happens to be when the recipe is built, so the recipe text under-determines
-    the entry. A pinned reference must denote the same entry forever.
+    Accepts an explicit version reference ``"<alias>-v<N>"`` only (1-based into the
+    alias history — the V1…Vn the UI shows). Two other forms are rejected:
+
+    - a bare alias (#166), which reads like a pin but resolves to whatever the head
+      happens to be when the recipe is built, so the recipe text under-determines
+      the entry. A pinned reference must denote the same entry forever;
+    - a bare content hash (ADR-011 D5). Every parent edge names an alias, followed
+      or pinned at a version, so no opaque hash appears in a recipe or in
+      ``manifest.parents``. An entry with no alias — one built by ``catalog_run`` —
+      must be named (``catalog_alias``) before anything can build on it.
 
     The parent edge is suppressed during reconstruction (same as tracked_expr_from_alias)
     so re-running a child's recipe doesn't accidentally write to the manifest.
 
     Args:
-        ref: A content hash, or a version reference like "shoe_sales-v2".
+        ref: A version reference like "shoe_sales-v2".
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref
+    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref, version_of_hash
     from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
     if entry_dir(proj, ref).exists():
-        content_hash = ref
+        named = version_of_hash(proj, ref)
+        steer = (
+            f"Pin it as {named[0] + '-v' + str(named[1])!r} instead."
+            if named
+            else f"Entry {ref} heads no alias history, so there is no version to name: give it a name with "
+            "catalog_alias first, then pin it as '<alias>-v<N>'."
+        )
+        raise ProjectDataNotFound(
+            f"pinned_expr_from_alias({ref!r}) is a bare content hash, which a recipe may not name (ADR-011 D5): "
+            f"a parent edge names an alias and a version of it, so the DAG is readable and a hash never leaks into "
+            f"a recipe. {steer}"
+        )
     elif get_alias(proj, ref) is not None:
         raise ProjectDataNotFound(
             f"pinned_expr_from_alias({ref!r}) is a bare alias, which would silently pin "
             f"whatever the head happens to be right now (#166). Pin an exact version — "
-            f"a content hash, or {ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) "
-            "to follow the alias."
+            f"{ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) to follow the "
+            "alias. A bare content hash is not the way either (ADR-011 D5)."
         )
     else:
         content_hash = resolve_version_ref(proj, ref)

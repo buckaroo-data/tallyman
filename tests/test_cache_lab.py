@@ -65,6 +65,7 @@ import pytest
 
 from tallyman_core import catalog_state as cs
 from tallyman_core import paths
+from tallyman_core.aliases import set_alias
 from tallyman_core.paths import data_dir, ensure_project, entry_dir, set_active_project
 from tallyman_xorq.build import build_and_persist
 from tallyman_xorq.result_cache import cached_result_expr
@@ -428,9 +429,9 @@ def cleaned_trips_code(project: str) -> str:
     )
 
 
-def child_of_catalog_code(project: str, parent_hash: str) -> str:
+def child_of_catalog_code(project: str, parent_ref: str) -> str:
     return _prelude(project) + (
-        f"base = pinned_expr_from_alias({parent_hash!r}, project=_P)\n"
+        f"base = pinned_expr_from_alias({parent_ref!r}, project=_P)\n"
         "base = base.mutate(minutes=(base.ended_at.cast('int64') - base.started_at.cast('int64')) / 60_000_000)\n"
         "expr = base.group_by(['start_station_id', 'rideable_type']).aggregate(\n"
         "    n=base.ride_id.count(), avg_minutes=base.minutes.mean())\n"
@@ -764,7 +765,9 @@ def test_parent_regen(lab):
     import tempfile
 
     parent = build(lab.project, cleaned_trips_code(lab.project))
-    child_code = child_of_catalog_code(lab.project, parent["hash"])
+    # A recipe pins by version reference, never by bare hash (ADR-011 D5), so the parent needs a name first.
+    set_alias(lab.project, "lab_parent", parent["hash"])
+    child_code = child_of_catalog_code(lab.project, "lab_parent-v1")
     c1 = build(lab.project, child_code)
 
     # The parent (cleaned_trips: filter+projection) is cheap, so it bakes no

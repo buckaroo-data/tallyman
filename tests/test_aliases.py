@@ -52,7 +52,7 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
 
 def test_set_alias_first_time(project: str):
     info = set_alias(project, "x", "h1")
-    assert info == {"name": "x", "hash": "h1", "version": 1}
+    assert info == {"name": "x", "hash": "h1", "version": 1, "kind": "catalog"}
     assert load_aliases(project) == {"x": "h1"}
     assert load_history(project) == {"x": ["h1"]}
 

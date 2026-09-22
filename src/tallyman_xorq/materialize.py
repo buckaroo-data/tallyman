@@ -246,6 +246,31 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
         raise BuildError(f"entry {owner_hash} in {project!r}: {path} is still missing after it was made again")
 
 
+def _refuse_to_rebuild_a_source(project: str, content_hash: str) -> None:
+    """A source version's snapshot is data, not cache (ADR-007 D13, ADR-011 D1), so nothing re-creates it.
+
+    Its rows were manufactured from a file tallyman does not control, and re-running the entry's build would read
+    the very snapshot that is missing. The error names the alias and the version, because importing the bytes again
+    is the only repair.
+    """
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq.build import BuildError
+
+    try:
+        provenance = read_manifest(entry_dir(project, content_hash)).provenance
+    except (OSError, ValueError):
+        return
+    if provenance is None:
+        return
+    raise BuildError(
+        f"the data of {provenance.alias}-v{provenance.version} (entry {content_hash}) is missing: "
+        f"{snapshot_path(project, content_hash)} is not on disk. A source version is data, not cache — nothing "
+        f"re-creates it, because its rows came from a file outside the catalog. Import it again with "
+        f"catalog_import_source({provenance.path!r}, {provenance.alias!r}, pinned_version={provenance.version})."
+    )
+
+
 def _ensure(project: str, content_hash: str) -> bool:
     """``ensure_materialized``, returning whether the entry is worthy (the caller usually needs to know)."""
     from tallyman_xorq.result_cache import _resolve_result_plan, cache_worthy
@@ -253,6 +278,7 @@ def _ensure(project: str, content_hash: str) -> bool:
     worthy = cache_worthy(project, content_hash)
     if worthy and snapshot_path(project, content_hash).exists():
         return True
+    _refuse_to_rebuild_a_source(project, content_hash)
     plan = _resolve_result_plan(project, content_hash)
     for path in plan.reads:
         if not path.exists():
@@ -281,9 +307,10 @@ def ensure_materialized(project: str, content_hash: str) -> None:
 def pinned_reason(project: str, content_hash: str) -> str | None:
     """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
 
-    A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
-    time gave different digests), or a heal already produced different rows than were built. The Cache page's delete
-    leaves such a file alone and says why. ``compute_cache/`` as a whole is still deletable by definition.
+    A snapshot is pinned when it cannot be made again faithfully: it is a source version's imported data
+    (ADR-011 D1), the recipe is not reproducible (two runs at create time gave different digests), or a heal already
+    produced different rows than were built. The Cache page's delete leaves such a file alone and says why.
+    ``compute_cache/`` as a whole is still deletable by definition.
     """
     from tallyman_core import read_manifest
     from tallyman_core.errors import list_errors
@@ -293,6 +320,12 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
         manifest = read_manifest(entry_dir(project, content_hash))
     except (OSError, ValueError):
         manifest = None
+    if manifest is not None and manifest.provenance is not None:
+        return (
+            f"this file is the data of the source version {manifest.provenance.alias}-v"
+            f"{manifest.provenance.version}, imported from {manifest.provenance.path} — nothing can make it "
+            "again, so it is kept"
+        )
     if manifest is not None and manifest.reproducible is False:
         columns = ", ".join(manifest.nonreproducible_columns or [])
         return (

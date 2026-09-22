@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tallyman_mcp.server import catalog_list, catalog_load_parquet, catalog_run
+from tallyman_mcp.server import catalog_import_source, catalog_list, catalog_run
 
 
 def _code(parquet: Path) -> str:
@@ -39,33 +39,27 @@ def test_catalog_list_after_run(project: str, orders_parquet: Path, monkeypatch)
     assert rows[0]["row_count"] == 4
 
 
-def test_catalog_load_parquet_success(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_import_source_success(project: str, orders_parquet: Path, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_load_parquet("orders.parquet", prompt="raw orders")
+    out = catalog_import_source(str(orders_parquet), "orders", prompt="raw orders")
     assert "error" not in out
     assert out["row_count"] == 200  # the test fixture has 200 rows
     assert any(f["name"] == "region" for f in out["schema"]["fields"])
-
-
-def test_catalog_load_parquet_missing(project: str, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_load_parquet("nope.parquet")
-    assert "error" in out
-    assert "nope.parquet" in out["error"]
-
-
-def test_catalog_load_parquet_with_name_creates_alias(project: str, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_load_parquet("orders.parquet", prompt="raw", name="orders")
-    assert "error" not in out
     assert out["alias"] == "orders"
     assert out["version"] == 1
-    # Notebook auto-appended.
+    # Notebook auto-appended on the first version.
     from tallyman_core import notebook
 
     cells = notebook.load(project)["cells"]
     assert len(cells) == 1
     assert cells[0]["alias"] == "orders"
+
+
+def test_catalog_import_source_missing(project: str, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    out = catalog_import_source(str(tmp_path / "nope.parquet"), "orders")
+    assert "error" in out
+    assert "nope.parquet" in out["error"]
 
 
 def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_parquet: Path, monkeypatch):
@@ -84,21 +78,23 @@ expr = t.mutate(built_at=ibis.now())
     assert any("now()" in w for w in out["lint_warnings"])
 
 
-def test_catalog_load_parquet_name_collision_rejected(project: str, orders_parquet, monkeypatch):
+def test_catalog_import_source_repeated_on_unchanged_bytes_is_a_noop(project: str, orders_parquet, monkeypatch):
+    """The old catalog_load_parquet errored on an existing alias; an import of the same bytes is idempotent."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_load_parquet("orders.parquet", name="orders")
-    out = catalog_load_parquet("orders.parquet", name="orders")
-    assert "error" in out
-    assert "already exists" in out["error"]
+    first = catalog_import_source(str(orders_parquet), "orders")
+    again = catalog_import_source(str(orders_parquet), "orders")
+    assert "error" not in again
+    assert again["hash"] == first["hash"]
+    assert again["version"] == 1
+    assert again["created"] is False
 
 
-def test_catalog_load_parquet_records_relative_path_only(project: str, orders_parquet, monkeypatch):
-    """The synthesized code uses `read_project_file(rel_path)` without an explicit
-    project= arg, so a project rename wouldn't invalidate the build. (T-24.)"""
+def test_catalog_import_source_records_no_project_argument(project: str, orders_parquet, monkeypatch):
+    """The generated recipe carries no explicit project=, so a project rename does not invalidate the build. (T-24.)"""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_load_parquet("orders.parquet")
+    out = catalog_import_source(str(orders_parquet), "orders")
     from tallyman_core import entry_dir
 
     code = (entry_dir(project, out["hash"]) / "expr.py").read_text()
     assert "project=" not in code
-    assert "read_project_file('orders.parquet')" in code
+    assert "read_project_file(" in code

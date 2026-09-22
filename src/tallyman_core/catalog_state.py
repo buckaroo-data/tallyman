@@ -173,7 +173,11 @@ def _cas_bullpen(project: str) -> Path:
 
 
 def _live_source_digests(project: str) -> set[str] | None:
-    """The union of every surviving entry's ``manifest.sources`` digests, or None when a manifest can't be read.
+    """Every clone digest a surviving entry needs, or None when a manifest can't be read.
+
+    Two ways an entry refers to a clone: ``manifest.sources`` (the retention record a build folds up from what it
+    read) and ``manifest.provenance.digest`` (the bytes an import copied in, ADR-011 D1 — the clone is the only
+    record of the file as imported and a re-import is the only way back).
 
     An unreadable manifest means the sweep would run on partial information, and a clone wrongly retired is the only
     frozen copy of somebody's bytes, so callers skip the sweep.
@@ -184,11 +188,13 @@ def _live_source_digests(project: str) -> set[str] | None:
     live: set[str] = set()
     for h in read_tallyman_state(project)["entry_hashes"]:
         try:
-            sources = read_manifest(entry_dir(project, h)).sources
+            manifest = read_manifest(entry_dir(project, h))
         except Exception:
             return None
-        if sources:
-            live.update(sources.values())
+        if manifest.sources:
+            live.update(manifest.sources.values())
+        if manifest.provenance is not None:
+            live.add(manifest.provenance.digest)
     return live
 
 

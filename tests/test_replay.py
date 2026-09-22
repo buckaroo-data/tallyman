@@ -16,9 +16,9 @@ def _storyboard(project: str, parquet: Path) -> dict:
         "project": project,
         "steps": [
             {
-                "tool": "catalog_load_parquet",
-                "args": {"rel_path": "orders.parquet", "name": "orders", "prompt": "raw"},
-                "narration": "load the parquet",
+                "tool": "catalog_import_source",
+                "args": {"outside_path": str(parquet), "alias": "orders", "prompt": "raw"},
+                "narration": "import the parquet",
             },
             {
                 "tool": "catalog_create",
@@ -63,7 +63,7 @@ def test_replay_stops_on_error_by_default(project: str, orders_parquet: Path, tm
         "project": project,
         "steps": [
             {"tool": "catalog_run", "args": {"code": "expr = nope", "prompt": "broken"}},
-            {"tool": "catalog_load_parquet", "args": {"rel_path": "orders.parquet"}},
+            {"tool": "catalog_import_source", "args": {"outside_path": str(orders_parquet), "alias": "orders"}},
         ],
     }
     sb_file = tmp_path / "demo.json"
@@ -79,7 +79,7 @@ def test_replay_continue_on_error(project: str, orders_parquet: Path, tmp_path: 
         "project": project,
         "steps": [
             {"tool": "catalog_run", "args": {"code": "expr = nope"}},
-            {"tool": "catalog_load_parquet", "args": {"rel_path": "orders.parquet"}},
+            {"tool": "catalog_import_source", "args": {"outside_path": str(orders_parquet), "alias": "orders"}},
         ],
     }
     sb_file = tmp_path / "demo.json"
@@ -94,7 +94,7 @@ def test_replay_skip_field(project: str, orders_parquet: Path, tmp_path: Path, m
     sb = {
         "project": project,
         "steps": [
-            {"tool": "catalog_load_parquet", "args": {"rel_path": "orders.parquet"}},
+            {"tool": "catalog_import_source", "args": {"outside_path": str(orders_parquet), "alias": "orders"}},
             {"tool": "catalog_run", "args": {"code": "won't run"}, "skip": True},
         ],
     }

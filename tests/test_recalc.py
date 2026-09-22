@@ -53,10 +53,10 @@ expr = t.mutate(doubled=t.price * 2)
 """
 
 
-def _pinned_child_code(content_hash: str) -> str:  # pinned child off a specific hash
+def _pinned_child_code(ref: str) -> str:  # pinned child off one version of an alias
     return f"""
 from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({content_hash!r})
+t = pinned_expr_from_alias({ref!r})
 expr = t.mutate(doubled=t.price * 2)
 """
 
@@ -181,9 +181,9 @@ def test_recalc_is_one_undoable_transaction(project, orders_parquet, monkeypatch
 def test_hash_pinned_child_is_left_on_its_pin(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     a1 = _hash(catalog_create("a", _base_code(project)))
-    # A literal-hash argument records follow=False — the child asked for THIS
+    # A version reference records follow=False — the child asked for THIS
     # revision, so a recalc that advances the alias must not advance the child.
-    b1 = _hash(catalog_create("b", _pinned_child_code(a1)))
+    b1 = _hash(catalog_create("b", _pinned_child_code("a-v1")))
 
     a2 = _hash(catalog_revise("a", _base_code_v2(project)))
     assert a2 != a1

@@ -198,6 +198,20 @@ def run_mcp(project: str | None) -> None:
     mcp_main()
 
 
+def _expand_project_root(value, project: str | None):
+    """Expand ``${TALLYMAN_PROJECT_ROOT}`` in a storyboard string argument.
+
+    A storyboard that imports a file shipped under the project (``catalog_import_source``) has to name an absolute
+    path, since ``data/`` is not a special location any more; the placeholder is how it stays portable.
+    """
+    if not isinstance(value, str) or not project:
+        return value
+    from tallyman_core.paths import project_dir
+    from tallyman_xorq.portable import PLACEHOLDER
+
+    return value.replace(PLACEHOLDER, str(project_dir(project)))
+
+
 @cli.command("replay")
 @click.argument("storyboard", type=click.Path(exists=True, dir_okay=False))
 @click.option("--project", default=None, help="Project name override.")
@@ -216,14 +230,18 @@ def replay_storyboard(storyboard: str, project: str | None, delay: float, stop_o
         {
           "project": "spike",
           "steps": [
-            {"tool": "catalog_load_parquet", "args": {...}, "narration": "..."},
+            {"tool": "catalog_import_source", "args": {...}, "narration": "..."},
             ...
           ]
         }
 
     Each step calls the named tool from tallyman_mcp.server with `args` as
-    kwargs. Use this for stage rehearsal, fallback recordings, or as a
-    deterministic regression test of the full storyboard.
+    kwargs. A string argument may contain ``${TALLYMAN_PROJECT_ROOT}``, expanded
+    to the project's directory, so a storyboard that imports a file shipped with
+    the project stays portable across machines and projects.
+
+    Use this for stage rehearsal, fallback recordings, or as a deterministic
+    regression test of the full storyboard.
     """
     import importlib
     import json
@@ -247,7 +265,7 @@ def replay_storyboard(storyboard: str, project: str | None, delay: float, stop_o
             click.echo(f"[{i}/{len(steps)}] (skipped: {step.get('tool')})")
             continue
         tool_name = step.get("tool")
-        args = step.get("args", {})
+        args = {k: _expand_project_root(v, sb_project) for k, v in step.get("args", {}).items()}
         narration = step.get("narration", "")
         tool_fn = getattr(mcp_module, tool_name, None)
         if not callable(tool_fn):

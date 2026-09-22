@@ -1,6 +1,6 @@
 # ADR: A raw input is an alias, and files enter only by an explicit import
 
-- **Status:** Proposed (2026-09-22). Written from Paddy's design session the
+- **Status:** Stage 1 implemented (PR #217, 2026-09-22); D6, D8 and the call-site rewrite are stage 2. Proposed (2026-09-22). Written from Paddy's design session the
   same day, after a review of PR #189 found that a child pinned to its parent
   by content hash is permanently stale and reports itself as an UNEXPLAINED
   orphan. The direction is his: "treat the orders.parquet like an alias that
@@ -331,7 +331,57 @@ every build. Options are evaluated once, at import, and stored.
 
 ## Implementation notes
 
-(Empty until implemented.)
+**Stage 1 (PR #217, 2026-09-22): the import path and the refusals — D1, D2, D3,
+D5, D9, D10, D12.** D6 (deleting the staleness source axis), D8 (deleting the
+source-identity modes) and the rewrite of the 309 `read_project_file` call sites
+are stage 2. What the code does that this document did not say:
+
+- **A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
+  truncated to xorq's 12 hex.** It cannot come from `build_expr`, because the
+  generated recipe reads the snapshot and the snapshot is named by the hash. The
+  bytes and the reader options are the whole identity, which is what makes two
+  imports of one file under two aliases mint one entry (`source_import.py`).
+- **The generated recipe still calls `read_project_file`**, and a contextvar
+  (`_SOURCE_ENTRY`) is what makes that call legal and resolves it to the entry's
+  own snapshot. `result_cache._recipe_expr` sets the same contextvar when it
+  reconstructs a source entry. The path in the recipe is provenance; nothing
+  opens it.
+- **The snapshot is written by polars, not by `materialize`.** polars is the only
+  reader that preserves file row order and applies the CSV schema DSL, so the
+  import writes the file directly with the ordered-copy layout
+  (`ORDERED_COPY_ROW_GROUP_ROWS`), which `SNAPSHOT_FORMAT_VERSION` already covers.
+  It therefore differs from a computed snapshot in row-group size and in the
+  pyarrow-only options (`version="2.6"`, the page index). D1 says the import
+  writes a snapshot "like every other snapshot" and does not say which writer;
+  unifying the two is open.
+- **Provenance lives in one manifest field**, `manifest.provenance`
+  (`{alias, version, path, digest, suffix, reader, imported_at}`), and its
+  presence is what makes an entry a source entry. `manifest.sources` stays empty
+  for one, so `catalog_state._live_source_digests` had to learn to keep a clone
+  alive from `provenance.digest` as well — otherwise a reset retires the only
+  copy of the imported bytes.
+- **`entry_staleness` skips axis 2 for a source entry** rather than reporting it
+  unknown. A small piece of D6, forced: every source entry would otherwise carry
+  a permanent "source axis unknown".
+- **`data/` stops being special.** An import takes any path. A relative path
+  resolves against the working directory, and the replay CLI expands
+  `${TALLYMAN_PROJECT_ROOT}` in storyboard arguments so `demo/storyboard.json`
+  can name a file shipped with the project.
+- **Open question 1 is answered "keep both" for stage 1.** The imported bytes stay
+  in `data/.cas/<digest><suffix>` beside the ordered snapshot, because ADR-005's
+  suggestion-and-retry contract has to re-read the file as imported and the
+  outside path may be gone. Every import therefore stores the data twice.
+- **`tallyman_read_csv` is refused alongside `read_project_file`.** D2 names only
+  the latter, but both open a file the catalog does not own, and leaving the CSV
+  reader open would be a hole in the rule.
+- A source entry keeps a real `xorq_build/`, so `load_entry_expr`, the diff and
+  the viewer treat it as an ordinary entry. Nothing reads it on the normal path:
+  a worthy entry whose snapshot exists is served by a bare read of that file.
+
+**Deliberate debt.** `TALLYMAN_LEGACY_FILE_READS=1` disables D2's refusal, and
+`tests/conftest.py` sets it for the whole suite. It exists only so stage 1 can
+land before the 309-call-site rewrite; nothing in production sets it, and the
+tests of D2 clear it per-test. It goes with the rewrite.
 
 ## Open questions
 

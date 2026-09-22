@@ -1668,8 +1668,8 @@ def create_app(
             msg = (
                 f"this revision references its own alias {alias!r}, which makes an opaque, "
                 f"permanently-stale (follows-its-own-head) entry. Write a self-contained recipe: "
-                f"inline the source (read_project_file / read_csv …) for a source-shaped entry, or "
-                f"reference the previous version by hash with pinned_expr_from_alias({prev_hash!r}) "
+                f"start from the source alias (tracked_expr_from_alias) for a source-shaped entry, or "
+                f"reference the previous version with pinned_expr_from_alias('{alias}-v{len(history_for(project, alias))}') "  # noqa: E501
                 f"for an expensive one."
             )
             rec = _record_error(project, code=code, message=msg, tool="api_code")

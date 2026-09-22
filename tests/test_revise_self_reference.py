@@ -27,10 +27,10 @@ expr = t.mutate(region2=t.region)
 """
 
 
-def _pin_by_hash(project: str, prev_hash: str) -> str:
+def _pin_by_version(project: str, ref: str) -> str:
     return f"""
 from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({prev_hash!r}, project={project!r})
+t = pinned_expr_from_alias({ref!r}, project={project!r})
 expr = t.mutate(region2=t.region)
 """
 
@@ -47,10 +47,10 @@ def test_revise_rejects_self_alias_reference(project, orders_parquet, monkeypatc
     assert get_alias(project, "parking") == v1["hash"]
 
 
-def test_revise_allows_pin_by_hash_of_prior_version(project, orders_parquet, monkeypatch):
+def test_revise_allows_pin_by_version_of_prior_version(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    v1 = catalog_create("parking", _src(project))
-    out = catalog_revise("parking", _pin_by_hash(project, v1["hash"]))
+    catalog_create("parking", _src(project))
+    out = catalog_revise("parking", _pin_by_version(project, "parking-v1"))
     assert "error" not in out, out
     assert out.get("version") == 2
 

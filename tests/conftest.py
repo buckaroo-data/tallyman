@@ -12,6 +12,14 @@ from pathlib import Path
 _TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="tallyman_xorq_cache_"))
 os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 
+# ADR-011 stage 2 scaffolding, with an expiry. D2 makes read_project_file / tallyman_read_csv a build error in an
+# authored recipe: a file enters the catalog only through catalog_import_source. 309 call sites across 55 test files
+# still author those reads, and rewriting them onto imported source aliases is stage 2 of the ADR. Until then the
+# suite runs with the documented escape hatch. It is set here, at module level, rather than in an autouse fixture,
+# because module- and session-scoped fixtures build entries before a function-scoped monkeypatch would apply.
+# Nothing in production sets it; the tests of D2 clear it per-test. Delete this with the rewrite.
+os.environ.setdefault("TALLYMAN_LEGACY_FILE_READS", "1")
+
 import pytest  # noqa: E402
 
 from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402

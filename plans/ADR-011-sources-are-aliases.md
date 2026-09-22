@@ -1,8 +1,11 @@
 # ADR: A raw input is an alias, and files enter only by an explicit import
 
 - **Status:** Accepted (2026-09-22). Stage 1 — the import path and the refusals
-  (D1, D2, D3, D5, D9, D10, D12) — is implemented in PR #217. Stage 2 is D6, D8
-  and the rewrite of every call site that still authors a raw file read.
+  (D1, D2, D3, D5, D9, D10, D12) — is implemented in PR #217, with two later
+  decisions of the same day folded into D1: the snapshot is written by pyarrow
+  in the pinned layout, and it is cache that `ensure_materialized` re-creates
+  from the clone. Stage 2 is D6, D8 and the rewrite of every call site that
+  still authors a raw file read.
   Written from Paddy's design session the same day, after a review of PR #189
   found that a child pinned to its parent by content hash is permanently stale
   and reports itself as an UNEXPLAINED orphan. The direction is his: "treat the
@@ -41,8 +44,8 @@
   through an ordered copy, a raw read is a build error — are the precedent this
   extends to `read_project_file` itself),
   `plans/ADR-007-tallyman-owned-materialization.md` (D13, a file is cache only
-  if it can be re-created; a source version's bytes stop being cache and become
-  data).
+  if it can be re-created; a source version's snapshot passes that test, because
+  the clone of the imported bytes re-creates it).
 - **Evidence:** the probes in the 2026-09-22 session, reproduced under Problem.
 
 ## Terms
@@ -148,11 +151,25 @@ snapshot. `manifest.ordered_copies` and the copy key
 (`md5(digest ǀ reader signature)`) both go, because the entry hash now names
 the file and the reader options are recorded on the entry that used them (D12).
 
-That snapshot is **data, not cache**, in the sense of ADR-007 D13: nothing can
-re-create it once the outside file is gone, so `ensure_materialized` never
-rebuilds it and the Cache page never offers to delete it. Two imports of
-identical bytes under different aliases produce the same entry hash and share
-one file, with both aliases pointing at it.
+That snapshot is **cache**, in the sense of ADR-007 D13 — a file is cache if
+`ensure_materialized` can re-create it. The import keeps the bytes it was given
+in the clone store (`data/.cas/<digest><suffix>`, open question 1) and records
+the reader options on the entry (D12), which is everything needed to write the
+file again, so a deleted source snapshot is re-created from the clone and
+checked against the recorded `result_digest` exactly as any other re-created
+snapshot is. The Cache page lists it unpinned and its delete takes it. The
+outside file has nothing to do with this: it may be gone, and the re-creation
+never looks at it.
+
+Only when the clone is gone as well are the rows unrecoverable. Then the
+snapshot is the last copy, so it is pinned, the delete answers 409, and a read
+of an entry whose snapshot is already gone fails with an error naming the
+missing clone and the re-import that repairs it. A source version is therefore
+the one kind of entry whose "cache or data" answer depends on a second file
+being present, which is the price of not storing the bytes three times.
+
+Two imports of identical bytes under different aliases produce the same entry
+hash and share one file, with both aliases pointing at it.
 
 ### D2. Files enter only by an explicit import
 
@@ -308,6 +325,15 @@ every build. Options are evaluated once, at import, and stored.
 - Deleting the outside file after import changes nothing.
 - A clone whose bytes do not match its name fails the import (D9), and a
   missing clone with a drifted source raises rather than serving live bytes.
+- A deleted source snapshot is re-created from the clone, byte for byte, with
+  the outside file gone; a child reads through it; the Cache page lists the row
+  unpinned and its delete is taken. With the clone gone too the row is pinned,
+  the delete answers 409, and a read raises an error naming the clone and the
+  re-import.
+- A source snapshot is written by pyarrow: format version 2.6, a page index,
+  row groups of `ORDERED_COPY_ROW_GROUP_ROWS`, the same as a computed snapshot's
+  in a project holding both. A parquet import touches no polars and keeps the
+  file's types; a CSV import never collects the frame.
 - One scan of a project with N sources performs zero digests.
 
 ## Consequences
@@ -348,14 +374,45 @@ are stage 2. What the code does that this document did not say:
   own snapshot. `result_cache._recipe_expr` sets the same contextvar when it
   reconstructs a source entry. The path in the recipe is provenance; nothing
   opens it.
-- **The snapshot is written by polars, not by `materialize`.** polars is the only
-  reader that preserves file row order and applies the CSV schema DSL, so the
-  import writes the file directly with the ordered-copy layout
-  (`ORDERED_COPY_ROW_GROUP_ROWS`), which `SNAPSHOT_FORMAT_VERSION` already covers.
-  It therefore differs from a computed snapshot in row-group size and in the
-  pyarrow-only options (`version="2.6"`, the page index). D1 says the import
-  writes a snapshot "like every other snapshot" and does not say which writer;
-  unifying the two is open.
+- **pyarrow writes the snapshot; polars only parses a CSV.** `result_cache/`
+  holds one shape of parquet file, so the import writes through the settings
+  every computed snapshot uses (`materialize._PARQUET_OPTIONS`, via
+  `materialize.write_pinned_parquet`), in row groups of
+  `ORDERED_COPY_ROW_GROUP_ROWS`. A parquet source needs no parser: pyarrow reads
+  it with `ParquetFile.iter_batches`, which also means it keeps the types the
+  file has (polars rewrote a `date32` as a timestamp, a `time32[ms]` as a
+  `time64[ns]` and a map as a list of structs, #197). A CSV is parsed by polars,
+  which is the only reader that holds the file's row order and applies the schema
+  DSL and inference ladder of ADR-005, and its batches go to the same writer
+  through `collect_batches`, so nothing collects the whole frame.
+- **A newer polars would not have helped.** Checked 2026-09-22: 1.40.1 is
+  installed, 1.44.2 is the latest on PyPI, and neither exposes the parquet
+  format version or a page-index option — `sink_parquet` writes format 1.0 and
+  the request is pola-rs/polars#12752, still open. `use_pyarrow=True` is just
+  pyarrow doing the write. So there is no polars upgrade that reaches the pinned
+  layout, and writing the file twice to re-encode it was rejected.
+- **The pinned layout costs size on high-cardinality numeric columns.** On the
+  1.5M-row `tests/big_parquet.py` fixture (`id` sequential int64, `g` 200
+  values, `v` random float) the snapshot goes from 16,188,593 bytes (polars) to
+  25,495,419 (pyarrow), +57%, with the same 13 row groups of 122,880 rows.
+  Measured cause: pyarrow dictionary-encodes by default, one 122,880-row chunk
+  of int64 is ~983 KB, just under its 1 MB `dictionary_pagesize_limit`, so the
+  dictionary never overflows to PLAIN and the file carries both. The same data
+  is 16,205,749 bytes with `use_dictionary=False`, and 17,827,724 with
+  1,048,576-row groups (where the limit does kick in). That is a question about
+  `_PARQUET_OPTIONS` and about whether the two row-group sizes should be one,
+  which is ADR-009's to answer for every snapshot at once; nothing here writes a
+  source snapshot differently from a computed one to avoid it. Also measured:
+  the page index is present either way — polars writes one without being asked —
+  so the format version and the encoder are what actually differed.
+- **`SNAPSHOT_FORMAT_VERSION` stays 1**, as it did for the same change to the
+  ordered copies in #215, even though the bytes of a source snapshot do change.
+  A source entry imported before this change records the digest of the
+  polars-written file, so re-creating its snapshot now writes different bytes
+  and the heal is recorded as unfaithful, attributed to the recipe rather than to
+  the format. Bumping the version would attribute that one case correctly and
+  would misattribute every computed entry, whose layout did not change; per the
+  project rule the corpus is rebuilt instead, so there is no such entry.
 - **Provenance lives in one manifest field**, `manifest.provenance`
   (`{alias, version, path, digest, suffix, reader, imported_at}`), and its
   presence is what makes an entry a source entry. `manifest.sources` stays empty
@@ -369,10 +426,13 @@ are stage 2. What the code does that this document did not say:
   resolves against the working directory, and the replay CLI expands
   `${TALLYMAN_PROJECT_ROOT}` in storyboard arguments so `demo/storyboard.json`
   can name a file shipped with the project.
-- **Open question 1 is answered "keep both" for stage 1.** The imported bytes stay
-  in `data/.cas/<digest><suffix>` beside the ordered snapshot, because ADR-005's
+- **Open question 1 is answered "keep both".** The imported bytes stay in
+  `data/.cas/<digest><suffix>` beside the ordered snapshot, because ADR-005's
   suggestion-and-retry contract has to re-read the file as imported and the
-  outside path may be gone. Every import therefore stores the data twice.
+  outside path may be gone. Every import therefore stores the data twice, and
+  the second copy now earns its keep twice over: it is also what makes the
+  snapshot cache rather than data (D1). Dropping the clone would not halve the
+  storage, it would move the same bytes into the pinned column.
 - **`tallyman_read_csv` is refused alongside `read_project_file`.** D2 names only
   the latter, but both open a file the catalog does not own, and leaving the CSV
   reader open would be a hole in the rule.

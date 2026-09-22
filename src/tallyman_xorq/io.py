@@ -416,7 +416,7 @@ def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] 
     return repr(pairs)
 
 
-def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
+def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *, write=None) -> None:
     """Read *src* (a CSV) into a row-order-stable parquet at *tmp_path* (#143).
 
     Inference mode (no schema, or a spec with inferred columns) escalates the
@@ -429,6 +429,12 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     The last column is ``__row_order`` (ADR-008 D2). A CSV that already has a
     column of that name has it overwritten, which is the right outcome for a
     file tallyman exported.
+
+    *write* takes the parsed LazyFrame of one rung of the ladder and puts it on
+    disk; an import passes one that streams the rows into pyarrow, so a source
+    snapshot has the layout every other snapshot has (ADR-011 D1). The default
+    is polars' own parquet sink, which is what the ordered copies of ADR-008 D2
+    still use.
     """
     import polars as pl
 
@@ -474,11 +480,16 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
         # __row_order last and cast to int64 (a fresh with_row_index yields uint32).
         return lf.select([*cols, pl.col(ROW_ORDER).cast(pl.Int64)])
 
+    if write is None:
+
+        def write(frame, dest: Path) -> None:
+            frame.sink_parquet(str(dest), **_WRITE)
+
     ladder = [_DEFAULT_INFER] if explicit_only else [_DEFAULT_INFER, _ESCALATED_INFER, None]
     last_exc = None
     for infer_len in ladder:
         try:
-            _ordered(infer_len).sink_parquet(str(tmp_path), **_WRITE)
+            write(_ordered(infer_len), tmp_path)
             return
         except pl.exceptions.ComputeError as exc:
             last_exc = exc

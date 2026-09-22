@@ -104,6 +104,43 @@ class Materialized:
     differing_columns: list[str] = field(default_factory=list)
 
 
+def row_groups(batches, rows: int):
+    """The rows of *batches*, in order, as tables of *rows* rows each; the last one may be shorter.
+
+    The one place a stream is cut into row groups, so a file's layout is a function of its rows and not of how the
+    producer batched them (ADR-009 D3). Memory is bounded by one row group.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    for batch in batches:
+        if not batch.num_rows:
+            continue
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        while pending_rows >= rows:
+            table = pa.Table.from_batches(pending)
+            yield table.slice(0, rows)
+            tail = table.slice(rows)
+            pending, pending_rows = tail.to_batches(), tail.num_rows
+    if pending_rows:
+        yield pa.Table.from_batches(pending)
+
+
+def write_pinned_parquet(batches, schema: pa.Schema, dest: Path, *, row_group_rows: int) -> None:
+    """Write *batches*, in order, to *dest* in the pinned parquet settings of ``_PARQUET_OPTIONS`` (ADR-009 D3).
+
+    Every file under ``compute_cache/`` goes through here or through ``_stream_to_parquet``, so ``result_cache/``
+    holds one shape of parquet: the same format version, page index and compression, whether the rows were computed
+    by an entry's build or parsed out of an imported file (ADR-011 D1). Each row group is combined into contiguous
+    arrays first, so the bytes do not depend on the producer's chunking.
+    """
+    with pq.ParquetWriter(dest, schema, **_PARQUET_OPTIONS) as writer:
+        for table in row_groups(batches, row_group_rows):
+            if not table.schema.equals(schema, check_metadata=False):
+                table = table.cast(schema)
+            writer.write_table(table.combine_chunks(), row_group_size=row_group_rows)
+
+
 def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     """Write the rows of *expr* to *dest* in the snapshot format, numbering them in a last ``__row_order`` column.
 
@@ -120,9 +157,7 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     written = 0
 
     with pq.ParquetWriter(dest, out_schema, **_PARQUET_OPTIONS) as writer:
-
-        def flush(table: pa.Table) -> None:
-            nonlocal written
+        for table in row_groups(reader, SNAPSHOT_ROW_GROUP_ROWS):
             n = table.num_rows
             numbered = table.select(names).append_column(
                 pa.field(ROW_ORDER, pa.int64()), pa.array(np.arange(written, written + n, dtype=np.int64))
@@ -131,21 +166,6 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
                 numbered = numbered.cast(out_schema)
             writer.write_table(numbered.combine_chunks(), row_group_size=SNAPSHOT_ROW_GROUP_ROWS)
             written += n
-
-        pending: list[pa.RecordBatch] = []
-        pending_rows = 0
-        for batch in reader:
-            if not batch.num_rows:
-                continue
-            pending.append(batch)
-            pending_rows += batch.num_rows
-            while pending_rows >= SNAPSHOT_ROW_GROUP_ROWS:
-                table = pa.Table.from_batches(pending)
-                flush(table.slice(0, SNAPSHOT_ROW_GROUP_ROWS))
-                tail = table.slice(SNAPSHOT_ROW_GROUP_ROWS)
-                pending, pending_rows = tail.to_batches(), tail.num_rows
-        if pending_rows:
-            flush(pa.Table.from_batches(pending))
     return written, out_schema
 
 

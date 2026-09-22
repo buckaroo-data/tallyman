@@ -206,21 +206,99 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
 # ---------------------------------------------------------------------------
 
 
+def _numbered(batches):
+    """*batches*, each with a last ``__row_order`` column continuing the count over the whole stream (ADR-008 D2)."""
+    import numpy as np
+    import pyarrow as pa
+
+    from tallyman_xorq.row_order import ROW_ORDER
+
+    written = 0
+    for batch in batches:
+        if not batch.num_rows:
+            continue
+        numbers = pa.array(np.arange(written, written + batch.num_rows, dtype=np.int64))
+        yield batch.append_column(pa.field(ROW_ORDER, pa.int64()), numbers)
+        written += batch.num_rows
+
+
+def _write_parquet_snapshot(clone: Path, dest: Path) -> None:
+    """Copy the parquet *clone* to *dest*, in file order, numbering the rows in a last ``__row_order``.
+
+    pyarrow reads and writes every type a parquet file can hold, so the snapshot's schema is the imported file's
+    plus ``__row_order``, and a recipe over the source alias sees the types the file has. polars, which wrote this
+    before, turned a ``date32`` into a timestamp, a ``time32`` into a ``time64`` and a map into a list of structs
+    (#197). An existing ``__row_order`` is dropped and written again, last.
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import write_pinned_parquet
+    from tallyman_xorq.ordered_copy import ORDERED_COPY_ROW_GROUP_ROWS
+    from tallyman_xorq.row_order import ROW_ORDER
+
+    with pq.ParquetFile(clone) as source:
+        kept = [f for f in source.schema_arrow if f.name != ROW_ORDER]
+        schema = pa.schema([*kept, pa.field(ROW_ORDER, pa.int64())])
+        batches = source.iter_batches(columns=[f.name for f in kept])
+        write_pinned_parquet(_numbered(batches), schema, dest, row_group_rows=ORDERED_COPY_ROW_GROUP_ROWS)
+
+
+def _write_csv_snapshot(clone: Path, reader: dict, dest: Path) -> None:
+    """Parse the CSV *clone* with polars under the recorded reader options, and write it with pyarrow.
+
+    polars is here because it is the only reader that holds the file's row order (datafusion's parallel scan does
+    not, above its repartition threshold) and the only one that applies the schema DSL and the inference ladder of
+    ADR-005. It does not write the file: its batches go to the same writer every other snapshot uses.
+    """
+    from tallyman_xorq.io import _materialize_ordered
+    from tallyman_xorq.ordered_copy import _spec_from_json
+
+    _materialize_ordered(
+        clone, _spec_from_json(reader["schema"]), dict(reader["scan_kwargs"]), dest, write=_write_frames
+    )
+
+
+def _write_frames(frame, dest: Path) -> None:
+    """Write the rows of the polars LazyFrame *frame* to *dest*, in order, without ever collecting the whole thing.
+
+    ``collect_batches`` pulls the streaming engine one chunk at a time, so memory is bounded by a row group and a
+    source larger than RAM imports the way a big one is supposed to. The frame already carries ``__row_order`` last
+    (``io._materialize_ordered``), and its schema is taken from the query rather than from the first batch, so a
+    CSV with a header and no rows still writes a file with the right columns.
+    """
+    import polars as pl
+
+    from tallyman_xorq.materialize import write_pinned_parquet
+    from tallyman_xorq.ordered_copy import ORDERED_COPY_ROW_GROUP_ROWS
+
+    schema = pl.DataFrame(schema=frame.collect_schema()).to_arrow().schema
+    batches = (
+        batch
+        for chunk in frame.collect_batches(chunk_size=ORDERED_COPY_ROW_GROUP_ROWS)
+        for batch in chunk.to_arrow().to_batches()
+    )
+    write_pinned_parquet(batches, schema, dest, row_group_rows=ORDERED_COPY_ROW_GROUP_ROWS)
+
+
 def _write_snapshot(clone: Path, reader: dict, dest: Path) -> str:
     """Write the ordered parquet of *clone* to *dest*, and return the content digest of what was written.
 
-    polars reads the clone and numbers the rows in a last ``__row_order`` column (ADR-008 D2): it preserves the file's
-    row order, which datafusion's parallel scan does not above its repartition threshold, and it is the only reader
-    that can apply the CSV schema DSL. The layout is the frozen ordered-copy layout, which
-    ``SNAPSHOT_FORMAT_VERSION`` already covers (ADR-009 D3).
+    One writer for both readers: pyarrow, in the pinned layout of ``materialize._PARQUET_OPTIONS`` with row groups of
+    ``ORDERED_COPY_ROW_GROUP_ROWS``, which ``SNAPSHOT_FORMAT_VERSION`` covers (ADR-009 D3). A parquet source needs
+    no parser at all; a CSV is parsed by polars and written here. polars cannot write the layout itself — 1.40.1
+    (installed) and 1.44.2 (latest) expose neither the parquet format version nor the page index
+    (pola-rs/polars#12752) — and a file written twice to be re-encoded is worse than a file written once.
     """
     from tallyman_xorq.digest import content_digest
-    from tallyman_xorq.ordered_copy import _write_copy
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_name(f".{dest.stem}.{uuid.uuid4().hex}.tmp")
     try:
-        _write_copy(clone, reader, tmp)
+        if reader["kind"] == "parquet":
+            _write_parquet_snapshot(clone, tmp)
+        else:
+            _write_csv_snapshot(clone, reader, tmp)
         os.replace(tmp, dest)
     finally:
         tmp.unlink(missing_ok=True)

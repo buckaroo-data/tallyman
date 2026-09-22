@@ -355,3 +355,88 @@ def test_api_aliases_returns_history(fresh_companion_app, project: str):
     assert names["a"]["hash"] == "h2"
     assert names["a"]["history"] == ["h1", "h2"]
     assert names["b"]["hash"] == "x1"
+
+
+# ---------------------------------------------------------------------------
+# ADR-011 D1 — a source alias is a distinct kind. Its versions are raw input
+# datasets, so there is no recipe to revise and no diff to promote onto it,
+# and a name can be one kind or the other but never both.
+# ---------------------------------------------------------------------------
+
+
+def _import(project: str, tmp_path: Path, alias: str, n_rows: int = 5) -> dict:
+    import pandas as pd
+
+    from tallyman_xorq import source_import
+
+    src = tmp_path / "outside" / f"{alias}.parquet"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"region": [f"r{i}" for i in range(n_rows)]}).to_parquet(src)
+    return source_import.update_and_depend(str(src), alias, project=project)
+
+
+def _over_source(alias: str, project: str) -> str:
+    return (
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({alias!r}, project={project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n"
+    )
+
+
+def test_source_alias_kind_is_recorded(project: str, tmp_path: Path, monkeypatch):
+    """catalog_list has to be able to separate inputs from computations."""
+    from tallyman_core.aliases import CATALOG_KIND, SOURCE_KIND, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+    assert "error" not in catalog_create("by_region", _over_source("orders", project))
+
+    assert alias_kind(project, "orders") == SOURCE_KIND
+    assert alias_kind(project, "by_region") == CATALOG_KIND
+    assert alias_kind(project, "nope") is None
+
+
+def test_a_catalog_alias_cannot_take_a_source_alias_name(project: str, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+
+    out = catalog_create("orders", _over_source("orders", project))
+
+    assert "error" in out
+    assert "source alias" in out["error"]
+
+
+def test_an_import_cannot_take_a_catalog_alias_name(project: str, tmp_path: Path, monkeypatch):
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+    assert "error" not in catalog_create("by_region", _over_source("orders", project))
+    other = tmp_path / "outside" / "orders.parquet"
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(other), "by_region", project=project)
+
+    assert "catalog alias" in str(exc.value)
+
+
+def test_set_alias_refuses_to_change_an_alias_kind(project: str):
+    from tallyman_core.aliases import SOURCE_KIND, AliasKindMismatch
+
+    set_alias(project, "orders", "aaaaaaaaaaaa", kind=SOURCE_KIND)
+
+    with pytest.raises(AliasKindMismatch):
+        set_alias(project, "orders", "bbbbbbbbbbbb")
+
+
+def test_renaming_a_source_alias_keeps_its_kind(project: str, tmp_path: Path, monkeypatch):
+    """Rename and unalias behave as they do for catalog aliases (D1)."""
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+
+    catalog_rename("orders", "raw_orders")
+
+    assert alias_kind(project, "raw_orders") == SOURCE_KIND
+    assert alias_kind(project, "orders") is None

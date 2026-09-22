@@ -116,6 +116,17 @@ def test_pinned_version_ref_out_of_range_names_count(orders_parquet: Path, proje
     assert "2 version" in res["error"], res["error"]
 
 
+def test_pinned_bare_content_hash_rejected(orders_parquet: Path, project: str, monkeypatch):
+    """ADR-011 D5: a recipe names aliases. A bare content hash is opaque — the DAG is made of
+    aliases, so a pin must say which alias and which version of it."""
+    from tallyman_mcp.server import catalog_create
+
+    v1, _ = _two_versions(project, monkeypatch)
+    res = catalog_create("child", _pin_child_code(v1))
+    assert "error" in res, res
+    assert "trips-v1" in res["error"], res["error"]
+
+
 def test_alias_name_matching_version_syntax_rejected(orders_parquet: Path, project: str, monkeypatch):
     """An alias literally named "foo-v2" would collide with version-reference
     syntax; reject it at creation and at rename (#166's cheapest closure),
@@ -131,3 +142,54 @@ def test_alias_name_matching_version_syntax_rejected(orders_parquet: Path, proje
     renamed = catalog_rename("orders", "orders-v3")
     assert "error" in renamed, renamed
     assert "orders-o3" in renamed["error"], renamed["error"]
+
+
+# ---------------------------------------------------------------------------
+# ADR-011 D2 — files enter only by an explicit import. A raw read of a file
+# tallyman does not own is a build error in an authored recipe, the same
+# treatment ADR-008 D7 gives a raw xo.deferred_read_parquet.
+# ---------------------------------------------------------------------------
+
+
+def test_read_project_file_refused_in_an_authored_recipe(orders_parquet: Path, project: str, monkeypatch):
+    """The error names the import call, so the author can self-correct in one step."""
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.delenv("TALLYMAN_LEGACY_FILE_READS", raising=False)
+    res = catalog_create("orders", _parent_code(project))
+    assert "error" in res, res
+    assert "catalog_import_source" in res["error"], res["error"]
+    assert "read_project_file" in res["error"], res["error"]
+
+
+def test_tallyman_read_csv_refused_in_an_authored_recipe(project: str, tmp_path: Path, monkeypatch):
+    """Same rule, same message: a CSV is a file outside the arena until it is imported."""
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.delenv("TALLYMAN_LEGACY_FILE_READS", raising=False)
+    csv = tmp_path / "outside" / "orders.csv"
+    csv.parent.mkdir(parents=True, exist_ok=True)
+    csv.write_text("region,n\nnorth,1\nsouth,2\n")
+    code = f"from tallyman_xorq.io import tallyman_read_csv\nexpr = tallyman_read_csv({str(csv)!r})\n"
+    res = catalog_create("orders", code)
+    assert "error" in res, res
+    assert "catalog_import_source" in res["error"], res["error"]
+
+
+def test_read_project_file_still_works_inside_a_generated_source_recipe(project: str, tmp_path: Path, monkeypatch):
+    """The importer's own recipe is the one place the raw read survives (D2)."""
+    import pandas as pd
+
+    from tallyman_core import entry_dir
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.delenv("TALLYMAN_LEGACY_FILE_READS", raising=False)
+    src = tmp_path / "outside" / "orders.parquet"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(src)
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    recipe = (entry_dir(project, out["hash"]) / "expr.py").read_text()
+    assert "read_project_file" in recipe

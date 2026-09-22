@@ -1,8 +1,12 @@
 # ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
-- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
-  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
-  written; the differences between the text and the code are under "Implementation notes" below.
+- **Status:** Accepted (2026-09-22). Implemented in #189.
+  History: implemented in buckaroo-data/tallyman#189 on 2026-09-21, at Paddy's request to implement the
+  set, and accepted on 2026-09-22, when `plans/ADR-010-immutable-store-one-owner.md` (a proposal to replace
+  this set) was rejected and #189 was chosen as the direction. Where this text says a decision is "not yet
+  confirmed" or "Proposed", it was implemented as written; the differences between the text and the code
+  are under "Implementation notes" below. The defects the review of #189 found are open as #193 to #211;
+  those touching this ADR are #197, #198, #199, #200, #205, #206 and #211.
   Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, and again the same day after a review of PR #184, which made the fix for #168 a precondition of D2 and D7, and a third time that day after a second review: D4 and D6 were tightened, and D10 to D12 are new). Awaiting Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy proposed baking a row-order column into every file tallyman writes and sorting every page by it. The measurements below favour that, so it is now the decision and the engine setting is the rejected alternative under D5. Amends `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position of the row-order column) and INV-2 (the trailing `order_by`). Corrects a threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5 (the canonical sort) and three other places.
   **Extended by `plans/ADR-011-sources-are-aliases.md` (2026-09-22, PR #218).** D2 and D7 here make a raw
   `xo.deferred_read_parquet` a build error, so that every source enters through an ordered copy. ADR-011 D2

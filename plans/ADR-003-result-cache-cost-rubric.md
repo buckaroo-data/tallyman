@@ -1,6 +1,16 @@
 # ADR: Result-cache admission and eviction by measured cost vs size
 
-- **Status:** Proposed (2026-06-10)
+- **Status:** Proposed (2026-06-10); not adopted.
+  Partly overtaken (noted 2026-09-22). The structural cheap-or-worthy test this ADR would remove still
+  decides whether an entry is materialized, now as the allow-list of `plans/ADR-008-row-order-of-reads.md`
+  D4 (cheap means row-preserving over one file), computed once and recorded in the manifest. `classify_build`,
+  the regex over `expr.yaml` that it names, is gone, and so is `ensure_result` (#73). Its motivating case,
+  computed-column revisions below a join that each wrote a full copy, is answered by
+  `plans/ADR-007-tallyman-owned-materialization.md` D3 (a child of a worthy entry reads that entry's
+  snapshot, so such a child is cheap). Its measurement half landed in #87 (`compile_seconds` and
+  `cache_bytes` in the manifest, beside `execute_seconds`). Its budget and eviction half is still open: under
+  ADR-007 D12 files are deleted only by an explicit user action, and a disk budget waits on a rewrite of
+  this ADR against that design.
 - **Context ticket:** buckaroo-data/tallyman#30 (measured cost/size cache rubric; supersedes #12, feeds #10 and #21)
 - **Affected code:** `src/tallyman_xorq/result_cache.py` (`classify_build`, `cache_worthy`, `cached_result_expr`, `ensure_result`), `src/tallyman_xorq/build.py` (`build_and_persist`, manifest write), `src/tallyman_core/manifest.py`
 - **Related ADR:** `plans/ADR-002-source-identity-content-hash.md` (why `content_hash` is a stable cache key)

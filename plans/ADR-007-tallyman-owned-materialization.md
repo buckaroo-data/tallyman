@@ -1,8 +1,12 @@
 # ADR: Tallyman owns result materialization (no xorq cache nodes in builds)
 
-- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
-  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
-  written; the differences between the text and the code are under "Implementation notes" below.
+- **Status:** Accepted (2026-09-22). Implemented in #189.
+  History: implemented in buckaroo-data/tallyman#189 on 2026-09-21, at Paddy's request to implement the
+  set, and accepted on 2026-09-22, when `plans/ADR-010-immutable-store-one-owner.md` (a proposal to replace
+  this set) was rejected and #189 was chosen as the direction. Where this text says a decision is "not yet
+  confirmed" or "Proposed", it was implemented as written; the differences between the text and the code
+  are under "Implementation notes" below. The defects the review of #189 found are open as #193 to #211;
+  `docs/architecture.md` ("Known defects") lists them.
   Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, which added the governing rule, decisions D10 to D12, and the resolution recorded under D5, and again the same day after a review of PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's session-ending clause was dropped, and D12's rule was restated, and a third time that day after a second review of PR #184: two kinds of entry were confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass reload, and D13 and D14 are new). Awaiting Paddy's review; nothing here is implemented. Supersedes two decisions of `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the parent's cache node) and its D8 (the manifest records the snapshot key and reads assert it). Five other ADR-006 decisions keep their intent: D5 (the canonical sort), D6 (a missing build is a hard error), D7 (verification runs in production and is loud), D10 (an unfaithful heal wipes the entry's Buckaroo state) and D12 (unfaithful entries are pinned and badged). The last three attach to `ensure_materialized`, which is this ADR's D5.
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always

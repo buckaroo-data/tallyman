@@ -20,6 +20,15 @@
   under a second alias. And the retry loop this ADR is built around — read, see the suggestion, adjust the
   schema, read again — is a loop over imports, which is why ADR-011 keeps the raw bytes in the clone store
   rather than only the parsed snapshot (its Open question 1).
+  INV-3 (the parsed parquet is what reconstruction reads, never the live CSV) still holds, but the parquet
+  has moved twice (noted 2026-09-22, revised 2026-09-24). #189 keyed the copy by the CSV's content digest and the
+  reader options and kept it under `compute_cache/ordered_sources/`; ADR-011 made it the source entry's
+  snapshot, `compute_cache/result_cache/<hash>.parquet`, where the entry hash covers the digest and the reader
+  options and `ensure_materialized` re-creates the file from the clone
+  (`plans/ADR-007-tallyman-owned-materialization.md` D13, a file is cache only if it can be re-created). D5's
+  deferred drift check was built in #189, as a CSV digest in `manifest.sources` that the staleness scan
+  compared with the file on disk, and removed by ADR-011 D6 (staleness has one axis): editing the outside CSV
+  changes nothing until it is imported again, and that import mints the next version of its source alias.
 - **Affected code:** `src/tallyman_xorq/io.py` (`tallyman_read_csv`,
   `_polars_overrides`, `_IBIS_TO_POLARS`, a new schema-spec normaliser and a
   suggestion engine), `src/tallyman_mcp/server.py` (the `catalog_run` CSV

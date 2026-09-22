@@ -27,6 +27,14 @@
   What survives unchanged is the substance of this ADR: content-addressed
   clones under `data/.cas/<digest><suffix>`, written copy-on-write where the
   filesystem offers it, parked in the bullpen by a reset rather than unlinked.
+  Status note (2026-09-22), from ADR-007 to ADR-009 as implemented in #189:
+  there is no `result.parquet`, and xorq's snapshot cache is not used. Reads
+  load the frozen build and no longer re-run recipes
+  (`plans/ADR-006-read-path-loads-builds.md`, #163), so the reconstruction
+  caveat has no reader left either. #189 also put an ordered copy between the
+  clone and a recipe (`plans/ADR-008-row-order-of-reads.md` D2, every source
+  enters through an ordered copy); ADR-011 replaced it with the source entry's
+  snapshot, which is re-created from the clone when it is missing.
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),

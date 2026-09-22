@@ -20,7 +20,7 @@ from __future__ import annotations
 import logging
 import os
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
@@ -95,7 +95,7 @@ def single_partition_backend():
 class Materialized:
     """What one materialization wrote."""
 
-    path: Path
+    path: Path  # the snapshot, or the temp file beside it while a create has not published it (``publish=False``)
     digest: str  # the content digest of the file as read back, ``arrow-sha256:<hex>``
     row_count: int
     schema: pa.Schema  # read from the written file (parquet changes some types: timestamp[s] comes back [ms])
@@ -163,17 +163,25 @@ def _temp_beside(path: Path) -> Path:
     return path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
 
 
-def materialize(project: str, content_hash: str, *, check_reproducible: bool = False) -> Materialized:
+def materialize(
+    project: str, content_hash: str, *, check_reproducible: bool = False, publish: bool = True
+) -> Materialized:
     """Run the entry's build and write its snapshot; return what was written (ADR-007 D4).
 
-    It always runs the query and replaces whatever is at the path, so an entry that is added again after a reset is
-    honest and the reproducibility check below has something to compare. It takes the project's write lock, and the
-    file only ever changes by an atomic replace of a complete one. It does not read the manifest: a create calls it
-    before the manifest exists.
+    It always runs the query, and what it writes replaces whatever is at the path, so an entry that is added again
+    after a reset is honest and the reproducibility check below has something to compare. It takes the project's
+    write lock, and the file only ever changes by an atomic replace of a complete one. It does not read the manifest:
+    a create calls it before the manifest exists.
 
     With ``check_reproducible`` (what a create does, ADR-009 D6) it runs the query twice through the same writer and
     compares the two content digests. The second file is discarded. When they differ the entry is not reproducible,
     and ``differing_columns`` names the columns whose digests differ. A heal runs the query once.
+
+    With ``publish=False`` (what a create also does) the file is left complete at a temp name beside the snapshot,
+    and ``path`` is that name. The caller moves it into place with ``publish_snapshot``, or deletes it. The build
+    publishes as its last step, after the manifest, so a build that fails leaves whatever file was already at the
+    path, such as the snapshot a reset left on disk (ADR-007 D14), and removes only its own temp file (#193). A heal
+    publishes at once.
     """
     from tallyman_core.catalog_state import project_lock
     from tallyman_xorq.digest import file_digests
@@ -197,10 +205,29 @@ def materialize(project: str, content_hash: str, *, check_reproducible: bool = F
                 reproducible = digest_again == digest
                 if not reproducible:
                     differing = [c for c in columns if columns[c] != columns_again.get(c)] or list(columns)
-            os.replace(tmp, dest)
-        finally:
+            staged = Materialized(tmp, digest, rows, pq.read_schema(tmp), reproducible, differing)
+        except BaseException:
             tmp.unlink(missing_ok=True)
-    return Materialized(dest, digest, rows, pq.read_schema(dest), reproducible, differing)
+            raise
+        return publish_snapshot(project, content_hash, staged) if publish else staged
+
+
+def publish_snapshot(project: str, content_hash: str, staged: Materialized) -> Materialized:
+    """Move a file that ``materialize(..., publish=False)`` left at its temp name into place (ADR-007 D4).
+
+    An atomic replace of a complete file, under the project's write lock. If the replace fails the temp file is
+    removed, and the file at the snapshot's path is unchanged. Returns what was written, at the snapshot's path.
+    """
+    from tallyman_core.catalog_state import project_lock
+
+    dest = snapshot_path(project, content_hash)
+    with project_lock(project):
+        try:
+            os.replace(staged.path, dest)
+        except BaseException:
+            staged.path.unlink(missing_ok=True)
+            raise
+    return replace(staged, path=dest)
 
 
 # ---------------------------------------------------------------------------

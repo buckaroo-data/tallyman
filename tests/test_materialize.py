@@ -347,6 +347,18 @@ def test_a_failed_create_keeps_the_snapshot_a_reset_left_on_disk(project, orders
     assert result_cache.verify_result_faithful(project, h) is True
 
 
+@pytest.mark.parametrize("where", list(_FAILURES))
+def test_a_failed_first_create_leaves_no_snapshot_and_no_temp_file(project, orders_parquet, monkeypatch, where):
+    """ADR-007 D4, #193: a create keeps its file at a temp name until the manifest is written, so one that fails,
+    wherever it fails, removes that temp file and leaves nothing under ``result_cache/``."""
+    from tallyman_xorq.materialize import snapshots_dir
+
+    _disk_fills_at(monkeypatch, where)
+    with pytest.raises((BuildError, OSError), match="No space left on device"):
+        build_and_persist(project, _agg_code(project))
+    assert list(snapshots_dir(project).glob("*")) == []  # the temp names start with a dot, and glob matches them
+
+
 def test_a_failed_retry_of_a_half_built_entry_keeps_its_snapshot(project, orders_parquet, monkeypatch):
     """ADR-007 D4, #193. A build killed between writing the snapshot and writing the manifest leaves an entry
     directory with no manifest, and its snapshot is still served (``cache_worthy`` falls back to the file). A retry is

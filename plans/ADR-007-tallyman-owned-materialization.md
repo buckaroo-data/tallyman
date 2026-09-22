@@ -848,6 +848,11 @@ What the implementation does that the text above does not say, or says different
   `pinned_reason` per row and lists a file whose entry is gone as `orphan`; the delete route answers 409 with the reason.
 - **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
   the whole build, including the recipe import, so a chained build waits for its parent's materialization.
+- **A create publishes its snapshot last (D4, #193).** The build calls `materialize(..., publish=False)`, which leaves
+  the file complete at its temp name, and moves it into place with `publish_snapshot` after the manifest is written.
+  A build that fails before then removes only its temp file, so a file already at the path, such as the one a reset
+  left on disk (D14), is kept. A heal publishes at once. A crash between the manifest write and the publish leaves a
+  complete entry over the file that was there before, or over none, which a heal then makes.
 - **Clones (D13, D14).** `ensure_cas_path` clones to a unique temp name, since two builders cloning one source shared
   one. `gc_cas` moves clones into `<catalog>/bullpen/cas/` when given a bullpen.
 - **Not done here.** The independent bugs listed under D9 step 3 (the chart error loop, eager notebook sessions, the

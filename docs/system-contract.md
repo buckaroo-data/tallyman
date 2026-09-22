@@ -464,7 +464,9 @@ the failing one deleting the winner's directory):
    digest, the reproducibility verdict and the schema read from the written file.
    A cheap entry is streamed once in full and keeps nothing (honest evaluation,
    fails fast).
-6. **Record** — schema, manifest (written last, atomic).
+6. **Record** — schema, manifest (atomic, the entry directory's last write), and
+   then the snapshot, moved into place from its temp name. A build that fails
+   before that leaves any file already at the snapshot's path as it was.
 7. **Checkpoint** — when the MCP tool returns: recipe zip, tracked pointers,
    one git commit.
 

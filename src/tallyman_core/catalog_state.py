@@ -16,8 +16,9 @@ dirs, in one tracked JSONL file:
 Those heavy artifacts are content-addressed, additive, and gitignored, so
 ``git reset`` can't roll them back; ``reset_to`` reconciles them to the recorded
 pointers via the bullpen: evictions retire (not deleted), and anything a
-restored step records but is missing comes back by copy. Live operations never
-read the bullpen.
+restored step records but is missing comes back by copy. An eviction replaces a
+parked dir of the same name, since the live one matches the snapshot on disk
+(#194). Live operations never read the bullpen.
 
 ``compute_cache/`` is not managed here (ADR-007 D14). Its files are named by
 content hash and each one can be made again by ``ensure_materialized``, so a
@@ -137,14 +138,21 @@ def capture_tallyman_state(project: str) -> dict:
 
 
 def _retire(src: Path, dest: Path) -> None:
-    """Move an evicted artifact into the bullpen.
+    """Move an evicted entry dir into the bullpen, replacing any dir already parked under its name.
 
-    Content-addressed names mean an existing *dest* is the same content, so
-    the source is simply dropped rather than re-moved.
+    The name is the content hash, but the dir's contents are not a function of it: the manifest records ``created_at``
+    and ``prompt``, and a recipe that is not reproducible records another ``result_digest`` each time it is created.
+    The live dir is the one that agrees with the snapshot on disk, since a create always rewrites the snapshot
+    (ADR-007 D4), so it replaces the parked one (#194). A crash between the two steps loses only the older copy. A live
+    dir with no manifest is what an interrupted build leaves (the manifest is the build's last write), so it never
+    replaces a parked dir and is dropped instead. Source clones are content-addressed files: ``source_identity.gc_cas``
+    retires them, and still drops one whose copy is already parked.
     """
     if dest.exists():
-        shutil.rmtree(src) if src.is_dir() else src.unlink()
-        return
+        if not (src / "manifest.json").is_file():
+            shutil.rmtree(src)
+            return
+        shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
 

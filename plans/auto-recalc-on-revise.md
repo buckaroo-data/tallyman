@@ -6,6 +6,10 @@
   dependents in the same atomic checkpoint.** The recalc engine already exists; this
   is about *triggering* it from revise, folding it into *one* git transaction, and
   *reporting* what cascaded. No new compute.
+- **Status note (2026-09-22):** implemented, on by default. Two statements below
+  are out of date: the SPA now listens for the `recalc` SSE event (Stage C
+  shipped), and the checkpoint-free walk is `_replay_cone`, not `_recalc_walk`.
+  `docs/reactive-recalc.md` ("Trigger model") describes the current behaviour.
 - **Builds on:** `recalc.py` (the cone walk + re-point + single checkpoint),
   `catalog_revise` (`tallyman_mcp/server.py`), the companion revise route
   (`tallyman_companion/app.py`), and the normalized cross-process notify/SSE path

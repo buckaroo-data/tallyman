@@ -1,6 +1,12 @@
 # DataFusion scan ordering — findings and decision
 
 - **Status:** Resolved (2026-06-25) — **stick with polars for the ingest reader.**
+- **Status note (2026-09-22):** the polars decision stands, and since #189 covers
+  parquet sources too: every source is read through a polars-written ordered copy
+  (`plans/ADR-008-row-order-of-reads.md` D2). The row-index column is
+  `__row_order`, not `original_row_order`, and `result_digest` is a content digest
+  of the snapshot read back, not a hash of its bytes
+  (`plans/ADR-009-digest-stability.md`).
 - **Origin:** Investigation behind `plans/ADR-004-result-digest-canonical-ordering.md`,
   prompted by datafusion's nondeterministic parallel scan order producing false
   "drift" on the order-sensitive result digest.

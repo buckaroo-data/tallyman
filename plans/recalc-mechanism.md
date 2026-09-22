@@ -5,6 +5,16 @@
   `plans/reactive-staleness-recalc.md` (the staged plan) and
   `plans/adr-reactive-catalog-recalc.md` (the design questions). Stage 1
   (staleness detection) shipped in PR #126; the #115 cold-read blocker in PR #127.
+- **Status note (2026-09-22):** three things below no longer hold. A cheap child's
+  build inlines its parent's frozen graph and does not re-run the parent's recipe;
+  every child, of a cheap or a worthy parent, records its parents' source digests,
+  so a source edit makes every descendant directly stale on the source axis, and
+  an expensive intermediate no longer stops that (on the alias axis the direct and
+  transitive split below is unchanged). Auto-recalc on revise exists and is on by
+  default
+  (`plans/auto-recalc-on-revise.md`). And a hash pin is written
+  `pinned_expr_from_alias("<hash>")`, since `tracked_expr_from_alias` refuses a
+  hash. `docs/reactive-recalc.md` describes the current behaviour.
 - **Code:** `src/tallyman_xorq/recalc.py` (the engine), `tallyman_xorq/staleness.py`
   and `tallyman_xorq/dependents.py` (Stage 1, the inputs it reads), the MCP tools
   `catalog_scan_staleness` / `catalog_recalc` in `tallyman_mcp/server.py`, and the

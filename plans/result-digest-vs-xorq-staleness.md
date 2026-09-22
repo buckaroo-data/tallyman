@@ -1,6 +1,12 @@
 # result_digest vs xorq's content-aware cache staleness
 
 - **Status:** Research note (2026-06-26)
+- **Status note (2026-09-22):** tallyman no longer uses xorq's cache at all
+  (`plans/ADR-007-tallyman-owned-materialization.md`, #189): no build holds a cache
+  node, and tallyman writes its own snapshots. `result_digest` is now a content
+  digest of the snapshot read back (`plans/ADR-009-digest-stability.md`), not a
+  hash of its bytes. The note's argument for keeping an output digest separate
+  from input identity still holds.
 - **Question:** xorq already ships a content-aware cache that knows when a cached
   result is stale. Why does tallyman maintain a separate `result_digest` /
   `verify_result_faithful`? Can we reuse xorq's staleness mechanism instead — or a

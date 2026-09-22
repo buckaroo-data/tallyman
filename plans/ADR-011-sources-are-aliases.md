@@ -1,12 +1,14 @@
 # ADR: A raw input is an alias, and files enter only by an explicit import
 
-- **Status:** Stage 1 implemented (PR #217, 2026-09-22); D6, D8 and the call-site rewrite are stage 2. Proposed (2026-09-22). Written from Paddy's design session the
-  same day, after a review of PR #189 found that a child pinned to its parent
-  by content hash is permanently stale and reports itself as an UNEXPLAINED
-  orphan. The direction is his: "treat the orders.parquet like an alias that
-  got updated externally", and "we want people pointing at aliases not hashes.
-  aliases are what gives us the dag, hashes are brittle." Nothing here is
-  implemented.
+- **Status:** Accepted (2026-09-22). Stage 1 — the import path and the refusals
+  (D1, D2, D3, D5, D9, D10, D12) — is implemented in PR #217. Stage 2 is D6, D8
+  and the rewrite of every call site that still authors a raw file read.
+  Written from Paddy's design session the same day, after a review of PR #189
+  found that a child pinned to its parent by content hash is permanently stale
+  and reports itself as an UNEXPLAINED orphan. The direction is his: "treat the
+  orders.parquet like an alias that got updated externally", and "we want
+  people pointing at aliases not hashes. aliases are what gives us the dag,
+  hashes are brittle."
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.

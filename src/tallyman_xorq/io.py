@@ -471,7 +471,11 @@ def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwar
         **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
             ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
             ``has_header``, ``encoding``. They participate in the copy's key,
-            so changing one re-ingests. ``infer_schema_length`` and
+            so changing one re-ingests. The first read passes them as given;
+            the manifest records them as JSON, which keeps only the repr of a
+            function (``with_column_names``), so a deleted copy of such a read
+            cannot be made again and its entry has to be rebuilt (#198).
+            ``infer_schema_length`` and
             ``schema_overrides`` are managed internally (see ``_RESERVED_SCAN_KWARGS``)
             and rejected — they would collide with the values every internal
             ``scan_csv`` call already sets.
@@ -501,7 +505,7 @@ def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwar
     if si.mode() != "off":
         si.note_source(rel, digest)
     source = si.ensure_cas_path(proj, src, digest) if si.mode() == "cas" else src
-    copy = oc.ensure_ordered_copy(proj, source, digest=digest, rel=rel, reader=reader)
+    copy = oc.ensure_ordered_copy(proj, source, digest=digest, rel=rel, reader=reader, csv_args=(schema, kwargs))
     return deferred_read_parquet(str(copy))
 
 

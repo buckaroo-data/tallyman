@@ -192,13 +192,31 @@ def _write_parquet_copy(src: Path, dest: Path) -> None:
                 written += table.num_rows
 
 
-def _write_copy(src: Path, reader: dict, dest: Path) -> None:
+def _write_copy(src: Path, reader: dict, dest: Path, *, rel: str, csv_args: tuple | None = None) -> None:
+    """Write the ordered copy of *src*, the source *rel*, to *dest*.
+
+    A CSV is parsed with *csv_args*, the ``(schema, scan_kwargs)`` that ``tallyman_read_csv`` was called with, when they
+    are given: that is the first write. A re-creation has only the manifest's record of them, which went through JSON,
+    and JSON turns a function into its repr (#198); ``recreate_ordered_copy`` refuses a record marked
+    ``lossless: False``.
+    """
     if reader["kind"] == "parquet":
         _write_parquet_copy(src, dest)
         return
+    import polars as pl
+
     from tallyman_xorq.io import _materialize_ordered
 
-    _materialize_ordered(src, _spec_from_json(reader["schema"]), dict(reader["scan_kwargs"]), dest)
+    if csv_args is None:
+        csv_args = (_spec_from_json(reader["schema"]), dict(reader["scan_kwargs"]))
+    schema, scan_kwargs = csv_args
+    try:
+        _materialize_ordered(src, schema, scan_kwargs, dest)
+    except pl.exceptions.PanicException as exc:
+        # A PanicException is a BaseException, so no `except Exception` on the build or MCP path would catch it (#197).
+        from tallyman_xorq.build import BuildError
+
+        raise BuildError(f"tallyman_read_csv: polars panicked reading {rel!r}: {exc}") from exc
 
 
 def _digest_sidecar(path: Path) -> Path:
@@ -221,14 +239,14 @@ def _content_digest_of(path: Path) -> str:
         return digest
 
 
-def _write_atomically(src: Path, reader: dict, target: Path) -> str:
+def _write_atomically(src: Path, reader: dict, target: Path, *, rel: str, csv_args: tuple | None = None) -> str:
     """Write the copy to a unique temp name beside its destination, replace, and return its content digest."""
     from tallyman_xorq.digest import content_digest
 
     target.parent.mkdir(parents=True, exist_ok=True)
     tmp = target.with_name(f"{target.stem}.{uuid.uuid4().hex}.tmp")
     try:
-        _write_copy(src, reader, tmp)
+        _write_copy(src, reader, tmp, rel=rel, csv_args=csv_args)
         os.replace(tmp, target)
     finally:
         tmp.unlink(missing_ok=True)
@@ -237,10 +255,14 @@ def _write_atomically(src: Path, reader: dict, target: Path) -> str:
     return digest
 
 
-def ensure_ordered_copy(project: str, source: Path, *, digest: str, rel: str, reader: dict) -> Path:
+def ensure_ordered_copy(
+    project: str, source: Path, *, digest: str, rel: str, reader: dict, csv_args: tuple | None = None
+) -> Path:
     """The ordered copy of *source* (whose content digest is *digest*), written if it is not on disk yet.
 
-    *source* is the file polars reads: the clone in cas mode, the live file otherwise. The copy is recorded for the
+    *source* is the file that is read: the clone in cas mode, the live file otherwise. For a CSV, *csv_args* are the
+    ``(schema, scan_kwargs)`` its caller passed, and the first write parses the CSV with them as they are; *reader*
+    holds their JSON form, which names the copy and is what a re-creation replays (#198). The copy is recorded for the
     build in progress, so its manifest can make it again.
     """
     from tallyman_core.catalog_state import project_lock
@@ -250,7 +272,7 @@ def ensure_ordered_copy(project: str, source: Path, *, digest: str, rel: str, re
     if not target.exists():
         with project_lock(project):
             if not target.exists():  # a peer may have written it while we waited
-                _write_atomically(source, reader, target)
+                _write_atomically(source, reader, target, rel=rel, csv_args=csv_args)
     note_ordered_copy(
         key,
         {
@@ -354,7 +376,7 @@ def recreate_ordered_copy(project: str, owner_hash: str, path: Path) -> None:
         if path.exists():
             return
         src = _clone_or_live(project, record)
-        digest = _write_atomically(src, reader, path)
+        digest = _write_atomically(src, reader, path, rel=record["source"])
     if digest != record["content_digest"]:
         message = (
             f"the ordered copy of {record['source']!r} was made again with content digest {digest}, not the "

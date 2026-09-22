@@ -706,7 +706,8 @@ that does not exist yet fails on import, and that counts as red. Paddy,
   the copy in the snapshot's parquet settings with 122,880-row groups, so the copy's schema is the source's plus
   `__row_order`. polars wrote it at first and did not keep every type: a `date64` came back as a timestamp, a map as
   a list of structs, `time32` and `time64` as `time64[ns]`, and a `decimal256` made it panic. polars still parses a
-  CSV.
+  CSV, and a panic there is a `BuildError`. The first ingest of a CSV passes the reader options as the caller gave
+  them; the JSON form the manifest records is only replayed to make a deleted copy again (#198).
 - **A CSV that already has a `__row_order` column** has it overwritten, like a parquet source; the previous check that
   the column was a canonical `0..N-1` sequence is gone, and `original_row_order` is ordinary data.
 

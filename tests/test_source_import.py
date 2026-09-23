@@ -929,3 +929,46 @@ def test_promote_diff_refuses_a_source_alias_as_its_target(project: str, tmp_pat
 
     assert "error" in out
     assert "source alias" in out["error"]
+
+
+# ---------------------------------------------------------------------------
+# D6 — the ordered-copy store is subsumed into the source entry's snapshot
+# ---------------------------------------------------------------------------
+
+
+def test_the_ordered_copy_store_is_gone(project: str, tmp_path: Path, monkeypatch):
+    """There is one shape of file under ``compute_cache/``: a snapshot named by an entry hash.
+
+    ADR-008 D2 gave every source an ordered copy keyed by ``md5(digest ǀ reader signature)``. With the
+    source itself an entry, the entry hash names the file and the reader options live on the entry that
+    used them (D12), so the second store and the key that addressed it have nothing left to do.
+    """
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq import ordered_copy as oc
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import RESULT_CACHE_DIRNAME
+
+    for name in (
+        "copy_key",
+        "ensure_ordered_copy",
+        "existing_ordered_copy",
+        "recreate_ordered_copy",
+        "ORDERED_COPIES_DIRNAME",
+        "ordered_copies_dir",
+        "is_ordered_copy_path",
+        "note_ordered_copy",
+        "begin_collect",
+        "end_collect",
+        "SourceUnavailable",
+    ):
+        assert not hasattr(oc, name), f"ordered_copy.{name} is deleted by ADR-011 D6"
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    out = source_import.update_and_depend(str(src), "orders")
+    from tallyman_xorq.build import build_and_persist
+
+    build_and_persist(project, _child_code("orders", project))
+
+    assert snapshot_path(project, out["hash"]).is_file()
+    assert [d.name for d in sorted(compute_cache_dir(project).iterdir())] == [RESULT_CACHE_DIRNAME]

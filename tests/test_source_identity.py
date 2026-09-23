@@ -94,3 +94,26 @@ def test_cas_clone_is_a_snapshot_not_a_hardlink(project):
 
     assert pd.read_parquet(clone).shape[0] == 3
     assert clone.stat().st_ino != src.stat().st_ino  # distinct inode — not a hardlink
+
+
+def test_source_identity_has_one_mode():
+    """ADR-011 D8: import always digests and always clones.
+
+    There is no configuration under which a raw input is unversioned, so ``TALLYMAN_SOURCE_IDENTITY``,
+    the ``off`` and ``salt`` modes and the salted hash they needed are gone — checked against the source
+    tree, because a mode nothing reads is still a mode someone can set and be misled by.
+    """
+    import re
+    from pathlib import Path
+
+    for name in ("mode", "salted_hash", "digest_for", "begin_collect", "note_source", "end_collect"):
+        assert not hasattr(si, name), f"source_identity.{name} is deleted by ADR-011 D6/D8"
+
+    src = Path(__file__).resolve().parent.parent / "src"
+    pattern = re.compile(r"TALLYMAN_SOURCE_IDENTITY|TALLYMAN_SOURCE_REHASH|source_digests\.json")
+    offenders = [
+        f"{p.relative_to(src)}:{p.read_text().count(chr(10), 0, m.start()) + 1}"
+        for p in sorted(src.rglob("*.py"))
+        for m in pattern.finditer(p.read_text())
+    ]
+    assert not offenders, f"the source-identity modes and their digest memo are gone: {offenders}"

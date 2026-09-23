@@ -193,3 +193,45 @@ def test_read_project_file_still_works_inside_a_generated_source_recipe(project:
 
     recipe = (entry_dir(project, out["hash"]) / "expr.py").read_text()
     assert "read_project_file" in recipe
+
+
+# ---------------------------------------------------------------------------
+# ADR-011 stage 2 — the escape hatch that let the suite keep authoring raw
+# reads is gone, and so is the source-record folding that fed manifest.sources.
+# ---------------------------------------------------------------------------
+
+
+def test_the_legacy_file_reads_escape_hatch_is_gone(orders_parquet: Path, project: str, monkeypatch):
+    """``TALLYMAN_LEGACY_FILE_READS=1`` no longer buys an authored recipe a raw read.
+
+    It was scaffolding with an expiry: stage 1 shipped the refusal, the suite ran behind the hatch, and
+    the hatch goes with the call-site rewrite. Nothing in the repo may name it — a disabled refusal that
+    one environment variable turns off is not a refusal.
+    """
+    import re
+
+    from tallyman_mcp.server import catalog_create
+
+    monkeypatch.setenv("TALLYMAN_LEGACY_FILE_READS", "1")
+    res = catalog_create("orders", _parent_code(project))
+    assert "error" in res, res
+    assert "catalog_import_source" in res["error"], res["error"]
+
+    root = Path(__file__).resolve().parent.parent
+    pattern = re.compile(r"TALLYMAN_LEGACY_FILE_READS")
+    offenders = [
+        str(p.relative_to(root))
+        for base in ("src", "tests", "scripts")
+        for p in sorted((root / base).rglob("*.py"))
+        if pattern.search(p.read_text()) and p != Path(__file__).resolve()
+    ]
+    assert offenders == [], f"the stage-1 escape hatch survives in {offenders}"
+
+
+def test_the_parent_source_record_folding_is_gone():
+    """``io._note_parent_records`` folded a parent's source digests into its child so ``gc_cas`` could
+    walk the closure. ADR-011 D6: the closure is the DAG, which ``manifest.parents`` already records."""
+    from tallyman_xorq import io
+
+    assert not hasattr(io, "_note_parent_records")
+    assert not hasattr(io, "_reconstructing_source_digest")

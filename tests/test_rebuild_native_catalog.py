@@ -178,3 +178,53 @@ def test_read_old_catalog_reads_catalog_yaml_era(project):
     assert oc.post_processing.get("pp1")
     assert oc.stats.get("st1")
     assert [c["alias"] for c in oc.notebook_cells] == ["thing"]
+
+
+def test_rebuild_replays_a_source_entry_as_an_import(project, tmp_path):
+    """A source entry has no recipe to re-exec, so the rebuild imports it again (ADR-011).
+
+    ``build_and_persist`` cannot rebuild one: the generated recipe reads the entry's own snapshot, which
+    the rebuild has just wiped, and a raw read is a build error anywhere else. The replay therefore goes
+    through ``update_and_depend``, from the provenance path when it still holds the imported bytes and
+    from the clone in ``data/.cas`` when it does not. The hash is a function of the bytes and the reader
+    options, so it survives the round-trip unchanged even though the outside file is gone.
+    """
+    import pandas as pd
+
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind, history_for
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import update_and_depend
+
+    rb = _load_rebuild()
+    cs.genesis(project)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pd.DataFrame({"region": ["n", "s", "n"], "price": [1.0, 2.0, 3.0]}).to_parquet(src)
+
+    v1 = update_and_depend(src, "orders", project=project)
+    child = build_and_persist(
+        project,
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias('orders', {project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n",
+        prompt="count by region",
+    )
+    al.set_alias(project, "regions", child.content_hash)
+    cs.checkpoint_catalog(project, "corpus")
+    src.unlink()  # the outside file is provenance; the clone is what the rebuild reads
+
+    remap = rb.rebuild_project(project, log=lambda *a: None)
+
+    assert set(remap) == {v1["hash"], child.content_hash}
+    assert remap[v1["hash"]] == v1["hash"], "a source entry's hash is its bytes and its reader options"
+    assert alias_kind(project, "orders") == SOURCE_KIND
+    assert history_for(project, "orders") == [v1["hash"]]
+    provenance = read_manifest(entry_dir(project, v1["hash"])).provenance
+    assert provenance is not None and provenance.alias == "orders" and provenance.version == 1
+    assert len(cached_result_expr(project, remap[child.content_hash]).execute()) == 2
+
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == set(remap.values())
+    catalog.assert_catalog_consistent(project, pointers)

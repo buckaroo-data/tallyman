@@ -153,3 +153,62 @@ def test_scan_distinguishes_direct_from_transitive_staleness(project, orders_par
     assert verdicts[b].transitively_stale is False
     assert verdicts[c].stale is False
     assert verdicts[c].transitively_stale is True
+
+
+# ---------------------------------------------------------------------------
+# ADR-011 D6 — staleness has one axis. An entry is stale when a followed alias
+# has moved, and that is the only reason: the source axis, and the digests it
+# took of files outside the arena, are gone.
+# ---------------------------------------------------------------------------
+
+
+def _import(project: str, path, alias: str) -> dict:
+    from tallyman_xorq.source_import import update_and_depend
+
+    return update_and_depend(path, alias, project=project)
+
+
+def test_a_scan_has_one_axis_and_digests_no_file(project, tmp_path, monkeypatch):
+    """Three imported sources and two children: the scan reads aliases and manifests, and nothing else.
+
+    The digest counter is its own positive control — each import takes two digests, one of the file as
+    given and one of the clone as written (D9) — so a counter that stays at zero across the scan is a
+    measurement that the scan took none, not an assertion that the code looks like it wouldn't.
+    ``manifest.sources`` and the ``unknown`` source axis go with it: a verdict never carries a source
+    reason, and never reports an axis it could not evaluate.
+    """
+    import pandas as pd
+
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq import staleness
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+
+    digested: list[str] = []
+    real = si._digest_file
+
+    def counting_digest(path):
+        digested.append(str(path))
+        return real(path)
+
+    monkeypatch.setattr(si, "_digest_file", counting_digest)
+
+    for alias in ("orders", "orders_b", "orders_c"):
+        frame = pd.DataFrame({"region": ["n", "s", "e"], "price": [1.0, 2.0, 3.0], "who": [alias] * 3})
+        frame.to_parquet(outside / f"{alias}.parquet")
+        _import(project, outside / f"{alias}.parquet", alias)
+    catalog_create("totals", _agg_child_code("orders"))
+    catalog_create("flagged", _const_child_code("orders_b"))
+    assert len(digested) == 6, f"three imports, each digesting the file and then its clone; got {digested}"
+
+    digested.clear()
+    verdicts = scan(project)
+
+    assert digested == [], f"a staleness scan must digest nothing; it digested {digested}"
+    assert not hasattr(si, "digest_for"), "the stat-memoized digest went with source_digests.json (D6)"
+    assert not hasattr(staleness, "_force_source_rehash"), "nothing forces a rehash; nothing hashes"
+    for content_hash, verdict in verdicts.items():
+        assert verdict.unknown_axes == [], (content_hash, verdict.unknown_axes)
+        assert [r.axis for r in verdict.reasons if r.axis != "alias"] == [], (content_hash, verdict.reasons)

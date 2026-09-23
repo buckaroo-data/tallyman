@@ -7,8 +7,6 @@ and project validation is enforced at the API layer.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from tallyman_mcp.server import catalog_create

@@ -31,12 +31,21 @@ from tallyman_xorq import build_and_persist
 from tallyman_xorq.result_cache import cached_result_expr
 
 
-def _recipe(project: str, source: str, tail: str = "") -> str:
+def _recipe(alias: str, tail: str = "") -> str:
+    """A recipe over an imported source alias — a recipe cannot open a file (ADR-011 D2)."""
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({source!r}, project={project!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({alias!r})\n"
         f"expr = t{tail}\n"
     )
+
+
+def _import(project: str, path: Path, alias: str) -> str:
+    """Import *path* as a source alias and return the digest of the bytes, which names its clone."""
+    from tallyman_xorq.source_import import update_and_depend
+
+    out = update_and_depend(path, alias, project=project)
+    return read_manifest(entry_dir(project, out["hash"])).provenance.digest
 
 
 def _stat_map(root: Path) -> dict[str, tuple[int, int, int]]:
@@ -55,12 +64,16 @@ def two_steps(project: str, orders_parquet: Path) -> SimpleNamespace:
     extra = data_dir(project) / "extra.parquet"
     pd.DataFrame({"k": ["x", "y", "x", "z"], "v": [1.0, 2.0, 3.0, 4.0]}).to_parquet(extra)
 
-    base = build_and_persist(project, _recipe(project, "orders.parquet")).content_hash
+    orders_digest = _import(project, orders_parquet, "orders_base_src")
+    base = build_and_persist(project, _recipe("orders_base_src")).content_hash
     s1 = cs.checkpoint_catalog(project, "s1")
-    cheap = build_and_persist(project, _recipe(project, "extra.parquet", ".filter(t.v > 1)")).content_hash
-    worthy = build_and_persist(
-        project, _recipe(project, "extra.parquet", ".group_by('k').aggregate(s=t.v.sum())")
-    ).content_hash
+
+    # extra is imported AFTER s1, so the reset back retires its source entry too (ADR-011 D1 makes a
+    # source version an ordinary entry). Its clone is then the one no surviving entry refers to, which
+    # is the case D13 is about: park it in the bullpen, never unlink it.
+    extra_digest = _import(project, extra, "extra_src")
+    cheap = build_and_persist(project, _recipe("extra_src", ".filter(t.v > 1)")).content_hash
+    worthy = build_and_persist(project, _recipe("extra_src", ".group_by('k').aggregate(s=t.v.sum())")).content_hash
     s2 = cs.checkpoint_catalog(project, "s2")
     assert s1 is not None and s2 is not None and s1 != s2
 
@@ -71,8 +84,8 @@ def two_steps(project: str, orders_parquet: Path) -> SimpleNamespace:
         worthy=worthy,
         s1=s1,
         s2=s2,
-        extra_digest=read_manifest(entry_dir(project, cheap)).sources["extra.parquet"],
-        orders_digest=read_manifest(entry_dir(project, base)).sources["orders.parquet"],
+        extra_digest=extra_digest,
+        orders_digest=orders_digest,
     )
 
 
@@ -141,7 +154,8 @@ def test_no_compute_cache_pointer_file_is_written(project: str, orders_parquet: 
     """ADR-007 D14: ``compute_cache.jsonl``, the git-tracked list of every file that was under the directory at each
     checkpoint, is retired. Capturing it was a cost every checkpoint paid, and it grew with the cache (#22)."""
     cs.ensure_catalog_repo(project)
-    build_and_persist(project, _recipe(project, "orders.parquet", ".group_by('region').aggregate(n=t.count())"))
+    _import(project, orders_parquet, "orders_base_src")
+    build_and_persist(project, _recipe("orders_base_src", ".group_by('region').aggregate(n=t.count())"))
 
     assert cs.checkpoint_catalog(project, "one") is not None
 

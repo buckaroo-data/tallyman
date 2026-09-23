@@ -37,11 +37,11 @@ def _load_rebuild():
     return mod
 
 
-def _agg(parquet: Path, *, avg: bool = False) -> str:
+def _agg(source: str, *, avg: bool = False) -> str:
     extra = ", avg=t.price.mean()" if avg else ""
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({parquet.name!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({source!r})\n"
         f"expr = t.group_by('region').aggregate(n=t.count(){extra})\n"
     )
 
@@ -53,11 +53,11 @@ def _child(alias: str, project: str) -> str:
     )
 
 
-def _build_corpus(project: str, parquet: Path) -> dict:
+def _build_corpus(project: str, source: str) -> dict:
     cs.genesis(project)
-    a = build_and_persist(project, _agg(parquet), prompt="agg by region")
+    a = build_and_persist(project, _agg(source), prompt="agg by region")
     al.set_alias(project, "regions", a.content_hash)
-    a2 = build_and_persist(project, _agg(parquet, avg=True), prompt="add avg")
+    a2 = build_and_persist(project, _agg(source, avg=True), prompt="add avg")
     al.set_alias(project, "regions", a2.content_hash)  # revision: history [a, a2]
     b = build_and_persist(project, _child("regions", project), prompt="filter regions")
     from tallyman_core.charts import set_chart
@@ -67,14 +67,16 @@ def _build_corpus(project: str, parquet: Path) -> dict:
     return {"a": a.content_hash, "a2": a2.content_hash, "b": b.content_hash}
 
 
-def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parquet):
+def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_src):
     rb = _load_rebuild()
-    before = _build_corpus(project, orders_parquet)
+    before = _build_corpus(project, orders_src)
+    source_hash = al.get_alias(project, orders_src)
 
     remap = rb.rebuild_project(project, log=lambda *a: None)
 
-    # Every original entry was rebuilt.
-    assert set(remap) == set(before.values())
+    # Every original entry was rebuilt, the imported source among them.
+    assert set(remap) == set(before.values()) | {source_hash}
+    assert remap[source_hash] == source_hash
     # A same-path rebuild is hash-stable for the recipe-deterministic roots. The
     # tracked_expr_from_alias child bakes its aggregate parent's snapshot, whose bytes are
     # not datafusion-order-deterministic, so its hash may drift — the rebuild
@@ -101,16 +103,17 @@ def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parque
         assert len(cached_result_expr(project, h).execute()) >= 0
 
 
-def test_rebuild_dry_run_writes_nothing(project, orders_parquet):
+def test_rebuild_dry_run_writes_nothing(project, orders_src):
     rb = _load_rebuild()
-    before = _build_corpus(project, orders_parquet)
+    before = _build_corpus(project, orders_src)
+    expected = set(before.values()) | {al.get_alias(project, orders_src)}
     head_before = cs.list_revisions(project)
 
     remap = rb.rebuild_project(project, dry_run=True, log=lambda *a: None)
 
     assert remap == {}  # nothing rebuilt
     # Catalog untouched: same entries, same revision timeline.
-    assert set(cs.read_tallyman_state(project)["entry_hashes"]) == set(before.values())
+    assert set(cs.read_tallyman_state(project)["entry_hashes"]) == expected
     assert cs.list_revisions(project) == head_before
 
 

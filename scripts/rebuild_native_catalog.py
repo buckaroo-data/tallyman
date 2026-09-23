@@ -19,6 +19,12 @@ to the absolute source path). So the rebuild treats hashes as NOT preserved and
 remaps every hash-keyed artifact through an ``old_hash -> new_hash`` table built
 as it goes:
 
+* a SOURCE entry (ADR-011: a version of a source alias, whose rows are an imported
+  file) is not re-exec'd at all — its generated recipe reads the very snapshot the
+  rebuild just wiped, and a raw file read is a build error anywhere else. It is
+  replayed through ``update_and_depend``, from the provenance path when that still
+  holds the imported bytes and from the clone under ``data/.cas`` when it does not.
+  Its hash is a function of the bytes and the reader options, so it is preserved;
 * recipes that chain by ALIAS (``tracked_expr_from_alias("citibike")``) survive untouched —
   the alias is re-pointed at the rebuilt parent before the child is built;
 * recipes that chain by literal HASH (``tracked_expr_from_alias("763193211746")``) are
@@ -64,6 +70,7 @@ import re
 import shutil
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 
 # 12-char lowercase-hex content hash (the entry-dir / pointer naming).
 _HASH_RE = re.compile(r"\b[0-9a-f]{12}\b")
@@ -79,6 +86,7 @@ class OldCatalog:
     aliases: dict[str, str] = field(default_factory=dict)  # alias -> current old_hash
     history: dict[str, list[str]] = field(default_factory=dict)  # alias -> [old_hash, ...]
     kinds: dict[str, str] = field(default_factory=dict)  # alias -> "catalog" | "source" (ADR-011 D1)
+    provenance: dict[str, dict] = field(default_factory=dict)  # old_hash -> manifest.provenance (source entries)
     charts: dict[str, str] = field(default_factory=dict)  # old_hash -> vega-lite spec text
     prompts: dict[str, list[dict]] = field(default_factory=dict)  # old_hash -> [{prompt, at}, ...]
     post_processing: dict[str, str] = field(default_factory=dict)  # name -> source
@@ -118,6 +126,12 @@ def read_old_catalog(project: str) -> OldCatalog:
         for d in sorted(entries.iterdir()):
             if d.is_dir() and (d / "expr.py").is_file() and (d / "manifest.json").is_file():
                 oc.recipes[d.name] = (d / "expr.py").read_text()
+                try:
+                    provenance = (json.loads((d / "manifest.json").read_text()) or {}).get("provenance")
+                except (OSError, ValueError):
+                    provenance = None
+                if provenance:
+                    oc.provenance[d.name] = provenance
                 pj = d / "prompts.jsonl"
                 if pj.is_file():
                     oc.prompts[d.name] = [json.loads(x) for x in pj.read_text().splitlines() if x.strip()]
@@ -183,6 +197,7 @@ def parse_deps(
     aliases: dict[str, str],
     history: dict[str, list[str]],
     known: set[str],
+    provenance: dict | None = None,
 ) -> set[str]:
     """The old hashes this recipe depends on, as the build resolved them.
 
@@ -191,8 +206,15 @@ def parse_deps(
     revise — ``tracked_expr_from_alias`` of one's own alias, #74), the dependency is the
     PREVIOUS revision in the alias history, not the current latest (which would be
     this very entry, a false self-cycle); otherwise it is the alias's current hash.
+
+    A SOURCE entry reads nothing, but its versions are minted in order — ``update_and_depend``
+    refuses to skip one — so it depends on the previous version of its own alias.
     """
     out: set[str] = set()
+    if provenance:
+        hist = history.get(provenance["alias"], [])
+        if self_hash in hist and hist.index(self_hash) > 0:
+            out.add(hist[hist.index(self_hash) - 1])
     for ref in _FROM_CAT_RE.findall(expr_text):
         if ref in aliases:
             hist = history.get(ref, [])
@@ -209,12 +231,16 @@ def parse_deps(
 
 
 def toposort(
-    recipes: dict[str, str], aliases: dict[str, str], history: dict[str, list[str]] | None = None
+    recipes: dict[str, str],
+    aliases: dict[str, str],
+    history: dict[str, list[str]] | None = None,
+    provenance: dict[str, dict] | None = None,
 ) -> list[str]:
     """Dependency order (parents before children) over the tracked_expr_from_alias graph."""
     history = history or {}
+    provenance = provenance or {}
     known = set(recipes)
-    dmap = {h: parse_deps(t, h, aliases, history, known) for h, t in recipes.items()}
+    dmap = {h: parse_deps(t, h, aliases, history, known, provenance.get(h)) for h, t in recipes.items()}
     order: list[str] = []
     placed: set[str] = set()
     while len(placed) < len(recipes):
@@ -240,6 +266,53 @@ def rewrite_hash_refs(expr_text: str, remap: dict[str, str]) -> str:
     return _HASH_RE.sub(sub, expr_text)
 
 
+def replay_import(project: str, provenance: dict, *, prompt: str | None = None, log=print) -> str:
+    """Re-import a source version and return its content hash (ADR-011).
+
+    A source entry cannot be re-exec'd: its generated recipe reads its own snapshot, which the rebuild
+    has just wiped, and ``read_project_file`` is a build error outside that recipe. What it CAN do is
+    the import again, which is deterministic — the entry hash is ``md5("source|<digest>|<reader>")``,
+    so the same bytes under the same reader options mint the same entry, whichever file they are read
+    from.
+
+    Reads the provenance path when it still holds the imported bytes, and otherwise the clone under
+    ``data/.cas``, which survives the rebuild because it lives under ``data/`` and only the catalog
+    bookkeeping is wiped. Taking the clone changes the provenance path the rebuilt entry records (it
+    then names the clone), which is logged; it changes nothing else.
+    """
+    from tallyman_core.paths import data_dir  # noqa: PLC0415
+    from tallyman_xorq import source_identity as si  # noqa: PLC0415
+    from tallyman_xorq.ordered_copy import _spec_from_json  # noqa: PLC0415
+    from tallyman_xorq.source_import import update_and_depend  # noqa: PLC0415
+
+    digest, suffix = provenance["digest"], provenance.get("suffix", "")
+    original = Path(provenance["path"])
+    clone = data_dir(project) / ".cas" / f"{digest}{suffix}"
+    if original.is_file() and si._digest_file(original) == digest:
+        src = original
+    elif clone.is_file():
+        src = clone
+        log(f"  {provenance['alias']}-v{provenance['version']}: {original} is gone; re-importing from {clone.name}")
+    else:
+        raise RuntimeError(
+            f"cannot rebuild {provenance['alias']}-v{provenance['version']}: {original} no longer has the "
+            f"imported bytes and their clone {clone} is missing, so there is nothing to import"
+        )
+
+    reader = provenance["reader"]
+    schema = _spec_from_json(reader["schema"]) if reader["kind"] == "csv" else None
+    options = dict(reader.get("scan_kwargs") or {}) if reader["kind"] == "csv" else {}
+    out = update_and_depend(
+        src,
+        provenance["alias"],
+        project=project,
+        prompt=prompt,
+        schema=schema,
+        **options,
+    )
+    return out["hash"]
+
+
 def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[str, str]:
     """Re-exec a project's recipes into the native store. Returns old->new hash map.
 
@@ -261,10 +334,11 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
     oc = read_old_catalog(project)
     if not oc.recipes:
         raise RuntimeError(f"no rebuildable entries (expr.py + manifest.json) found in project {project!r}")
-    order = toposort(oc.recipes, oc.aliases, oc.history)
+    order = toposort(oc.recipes, oc.aliases, oc.history, oc.provenance)
     log(
-        f"project {project!r}: {len(oc.recipes)} entries, {len(oc.aliases)} aliases, "
-        f"{len(oc.charts)} charts, {len(oc.post_processing)} post-processing, {len(oc.stats)} stats"
+        f"project {project!r}: {len(oc.recipes)} entries ({len(oc.provenance)} imported sources), "
+        f"{len(oc.aliases)} aliases, {len(oc.charts)} charts, "
+        f"{len(oc.post_processing)} post-processing, {len(oc.stats)} stats"
     )
     log(f"build order (topological): {order}")
 
@@ -304,18 +378,25 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
 
     remap: dict[str, str] = {}
     for old_hash in order:
-        recipe = oc.recipes[old_hash].replace("${TALLYMAN_PROJECT_ROOT}", root)
-        recipe = rewrite_hash_refs(recipe, remap)  # fix literal parent-hash refs
         prompts = oc.prompts.get(old_hash, [])
         first = prompts[0].get("prompt") if prompts else None
-        res = build_and_persist(project, recipe, prompt=first)
-        remap[old_hash] = res.content_hash
-        tag = "" if res.content_hash == old_hash else f"  (rehashed -> {res.content_hash})"
+        provenance = oc.provenance.get(old_hash)
+        if provenance is not None:
+            new_hash = replay_import(project, provenance, prompt=first, log=log)
+        else:
+            recipe = oc.recipes[old_hash].replace("${TALLYMAN_PROJECT_ROOT}", root)
+            recipe = rewrite_hash_refs(recipe, remap)  # fix literal parent-hash refs
+            new_hash = build_and_persist(project, recipe, prompt=first).content_hash
+        remap[old_hash] = new_hash
+        tag = "" if new_hash == old_hash else f"  (rehashed -> {new_hash})"
         log(f"  built {old_hash}{tag}")
         for name in revises_at.get(old_hash, []):
-            al.set_alias(project, name, res.content_hash)
+            # An import already pointed its own alias, with the source kind; re-pointing it as a
+            # catalog alias would be refused (aliases.AliasKindMismatch).
+            if provenance is None:
+                al.set_alias(project, name, new_hash)
         if len(prompts) > 1:  # build wrote only the first; carry the rest
-            p = prompts_path(project, res.content_hash)
+            p = prompts_path(project, new_hash)
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text("".join(json.dumps(x) + "\n" for x in prompts))
 

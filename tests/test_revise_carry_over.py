@@ -8,8 +8,8 @@ from tallyman_xorq.build import list_entries
 
 def _select(project: str, cols: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select({cols})
 """
 
@@ -19,7 +19,7 @@ def _current_hash(project: str) -> str:
     return list_entries(project)[0]["content_hash"]
 
 
-def test_revise_carries_chart_and_display_config(project, orders_parquet, monkeypatch):
+def test_revise_carries_chart_and_display_config(project, orders_src, monkeypatch):
     """A revise must seed the new version's per-entry config (chart + display
     config) from the previous version. Both are keyed by content hash, so the
     new version's fresh hash would otherwise orphan them ("chart didn't carry

@@ -26,19 +26,19 @@ from tallyman_core import catalog_state as cs
 from tallyman_xorq import build_and_persist
 
 
-def _agg_code(parquet_path: Path) -> str:
-    # A parquet file enters a recipe through read_project_file (ADR-008 D12); the file sits in the project's data dir.
+def _agg_code(src: str) -> str:
+    # Data enters a recipe as a source alias (ADR-011 D1); the file behind it was imported by the fixture.
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({parquet_path.name!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({src!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
     )
 
 
-def _agg_code_n(parquet_path: Path, agg: str) -> str:
+def _agg_code_n(src: str, agg: str) -> str:
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({parquet_path.name!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({src!r})\n"
         f"expr = t.group_by('region').aggregate({agg})\n"
     )
 
@@ -48,6 +48,18 @@ _AGGS = ["total=t.price.sum()", "avg=t.price.mean()", "mx=t.price.max()", "mn=t.
 
 def _tracked_zip_hashes(project: str) -> set[str]:
     return catalog.tracked_recipe_hashes(project)
+
+
+def _src_hash(project: str, src: str) -> str:
+    """The entry the source alias points at.
+
+    An import mints an ordinary entry (ADR-011 D1), so every project that uses the ``orders_src``
+    fixture carries one more entry dir, one more durable recipe zip and one more pointer than it
+    did when a recipe read the file directly.
+    """
+    from tallyman_core import aliases as al
+
+    return al.load_aliases(project)[src]
 
 
 def _build_checkpoint(project: str, code: str, message: str) -> str:
@@ -60,7 +72,7 @@ class _XorqSpy:
     """Wrap ``subprocess.run`` and count only ``uv run xorq catalog ...`` calls.
 
     Scoped to the xorq argv so it never trips on the ``cp -c`` CoW clone
-    (source_identity.py:111) or any other subprocess. Delegates everything to
+    (source_identity.py:73) or any other subprocess. Delegates everything to
     the real ``subprocess.run`` so behaviour is unchanged.
     """
 
@@ -92,13 +104,13 @@ def test_uses_no_subprocess_alias(project, monkeypatch):
     al.set_alias(project, "myalias", "deadbeefdead", expect_exists=False)
 
 
-def test_uses_no_subprocess_build(project, orders_parquet, monkeypatch):
+def test_uses_no_subprocess_build(project, orders_src, monkeypatch):
     """A full build invokes zero ``xorq catalog`` subprocesses (call-count spy,
     not "did not raise" — the swallowed-registration path would false-green)."""
     cs.genesis(project)
     spy = _XorqSpy(subprocess.run)
     monkeypatch.setattr(subprocess, "run", spy)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     assert spy.xorq_calls == 0, f"build spawned {spy.xorq_calls} xorq catalog subprocess(es)"
 
 
@@ -130,13 +142,13 @@ def test_src_has_no_xorq_catalog_argv():
 # ---------------------------------------------------------------------------
 
 
-def test_recipe_zip_members_are_allowlist(project, orders_parquet, tmp_path):
+def test_recipe_zip_members_are_allowlist(project, orders_src, tmp_path):
     """write_recipe_zip archives exactly the allowlist — never a stray.
 
     Allowlist-not-denylist: a denylist skipping only today's known strays would
     pass existence checks yet leak a future artifact (here ``foo.bin``).
     """
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="seed")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="seed")
     ed = paths.entry_dir(project, res.content_hash)
     # strays that must NOT leak into the durable zip (prompts.jsonl is relocated
     # to a tracked prompts/<hash>.jsonl now; drop one here to prove the zip
@@ -160,7 +172,7 @@ def test_recipe_zip_members_are_allowlist(project, orders_parquet, tmp_path):
     assert not any(s in r for r in rels for s in ("foo.bin", "result.parquet", "prompts.jsonl", "xorq_build_expanded"))
 
 
-def test_recipe_zip_byte_stable_across_rebuilds(project, orders_parquet, tmp_path):
+def test_recipe_zip_byte_stable_across_rebuilds(project, orders_src, tmp_path):
     """The archive is byte-identical across rebuilds — a defaulted ZipInfo mtime
     would embed the wall clock and silently re-churn the content-addressed git
     blob on every rebuild. Bumping file mtimes between the two zips is what a
@@ -168,7 +180,7 @@ def test_recipe_zip_byte_stable_across_rebuilds(project, orders_parquet, tmp_pat
     import os
     import time
 
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     ed = paths.entry_dir(project, res.content_hash)
     z1 = tmp_path / "a.zip"
     catalog.write_recipe_zip(ed, z1, res.content_hash)
@@ -183,41 +195,18 @@ def test_recipe_zip_byte_stable_across_rebuilds(project, orders_parquet, tmp_pat
     assert z1.read_bytes() == z2.read_bytes()
 
 
-def test_recipe_zip_contains_expr_py(project, orders_parquet, tmp_path):
+def test_recipe_zip_contains_expr_py(project, orders_src, tmp_path):
     """expr.py is a durable zip member (D3): the tracked_expr_from_alias chaining path
     re-execs it so a cheap entry's recompute roots on the shared in-process
     backend, and two entries union/join on one backend (#75)."""
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     ed = paths.entry_dir(project, res.content_hash)
     dest = tmp_path / "recipe.zip"
     catalog.write_recipe_zip(ed, dest, res.content_hash)
     assert f"{res.content_hash}/expr.py" in zipfile.ZipFile(dest).namelist()
 
 
-def test_salt_zip_named_by_salted_hash(project, monkeypatch):
-    """Under source-identity salt mode the durable zip is named by the salted
-    content_hash (= the entry dir name), not xorq's path-identity build hash, so
-    the tracked zip set and the entry pointers don't diverge (Risk #5)."""
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "salt")
-    from tallyman_cli.fixtures import write_shoe_orders
-
-    write_shoe_orders(paths.data_dir(project) / "orders.parquet", n_rows=120, seed=1)
-    code = (
-        "from tallyman_xorq.io import read_project_file\n"
-        "t = read_project_file('orders.parquet')\n"
-        "expr = t.group_by('region').aggregate(n=t.count())\n"
-    )
-    cs.genesis(project)
-    res = build_and_persist(project, code)
-    import json
-
-    manifest = json.loads((paths.entry_dir(project, res.content_hash) / "manifest.json").read_text())
-    assert manifest.get("sources"), "salt mode should have captured a source digest"
-    cs.checkpoint_catalog(project, "create")
-    assert res.content_hash in _tracked_zip_hashes(project)
-
-
-def test_failed_build_no_orphan_pointer(project, orders_parquet, monkeypatch):
+def test_failed_build_no_orphan_pointer(project, orders_src, monkeypatch):
     """A build that fails after creating its entry dir leaves no dir behind, so
     the next checkpoint records no pointer without a durable recipe (D1/Risk #7).
     """
@@ -230,14 +219,15 @@ def test_failed_build_no_orphan_pointer(project, orders_parquet, monkeypatch):
 
     monkeypatch.setattr(compiler, "load_expr", _boom_load)
     with pytest.raises(Exception):
-        build_and_persist(project, _agg_code(orders_parquet))
+        build_and_persist(project, _agg_code(orders_src))
     # No monkeypatch.undo(): it shares the instance that isolated_home used to set
     # TALLYMAN_HOME, so undo() would point entries_dir at the real home and make
     # this check vacuous. monkeypatch auto-reverts at teardown.
 
     ed = paths.entries_dir(project)
+    # The import's own entry is the only dir that may be there: it was minted before the build ran.
     leftover = [c.name for c in ed.iterdir() if c.is_dir()] if ed.exists() else []
-    assert not leftover, f"failed build left orphan entry dir(s): {leftover}"
+    assert leftover == [_src_hash(project, orders_src)], f"failed build left orphan entry dir(s): {leftover}"
 
 
 # ---------------------------------------------------------------------------
@@ -245,43 +235,43 @@ def test_failed_build_no_orphan_pointer(project, orders_parquet, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_zip_staged_not_committed_until_checkpoint(project, orders_parquet):
+def test_zip_staged_not_committed_until_checkpoint(project, orders_src):
     """The durable ``entries/<hash>.zip`` is written by the checkpoint, not the
     build (D1)."""
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     assert res.content_hash not in _tracked_zip_hashes(project), "zip must not exist before a checkpoint"
     cs.checkpoint_catalog(project, "create")
     assert res.content_hash in _tracked_zip_hashes(project), "checkpoint did not commit the recipe zip"
 
 
-def test_n_builds_track_n_zips(project, orders_parquet):
+def test_n_builds_track_n_zips(project, orders_src):
     """N distinct builds, each checkpointed, leave N durable tracked zips (the
     #48 failure mode was N build dirs but fewer tracked recipes)."""
     cs.genesis(project)
-    hashes = [_build_checkpoint(project, _agg_code_n(orders_parquet, _AGGS[i]), f"c{i}") for i in range(4)]
+    hashes = [_build_checkpoint(project, _agg_code_n(orders_src, _AGGS[i]), f"c{i}") for i in range(4)]
     tracked = _tracked_zip_hashes(project)
     missing = [h for h in hashes if h not in tracked]
     assert not missing, f"entries with no durable tracked zip: {missing} (tracked: {tracked})"
 
 
-def test_build_dir_files_not_staged(project, orders_parquet):
+def test_build_dir_files_not_staged(project, orders_src):
     """The untracked build dir (``entries/<hash>/xorq_build/...``) is never
     git-tracked under ``git add -A`` — the .gitignore + allowlist keep it out
     (Risk #1)."""
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")
     rc, out, _ = cs.run_git(["ls-files"], cwd=paths.catalog_dir(project))
     staged = [p for p in out.split() if "/xorq_build/" in p or p.endswith("/expr.py") or p.endswith("/manifest.json")]
     assert not staged, f"build-dir files were staged: {staged}"
 
 
-def test_unlisted_path_not_tracked(project, orders_parquet):
+def test_unlisted_path_not_tracked(project, orders_src):
     """A tracked path outside the allowed surface fails the consistency check —
     the durable guard against ``git add -A`` silently committing a stray."""
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")
     cd = paths.catalog_dir(project)
     (cd / "stray.txt").write_text("not part of the tracked surface\n")
@@ -295,21 +285,21 @@ def test_unlisted_path_not_tracked(project, orders_parquet):
 # ---------------------------------------------------------------------------
 
 
-def test_reset_keeps_pointer_zip_agreement(project, orders_parquet):
+def test_reset_keeps_pointer_zip_agreement(project, orders_src):
     """A reset to an earlier step leaves the tracked recipe set equal to the
     entry_hashes pointers (the consistency check passes, #52)."""
     cs.genesis(project)
-    hashes = [_build_checkpoint(project, _agg_code_n(orders_parquet, _AGGS[i]), f"c{i}") for i in range(2)]
-    cs.reset_to(project, 1)  # back to the one-entry step
+    hashes = [_build_checkpoint(project, _agg_code_n(orders_src, _AGGS[i]), f"c{i}") for i in range(2)]
+    cs.reset_to(project, 1)  # back to the step with only the first build on top of the import
     pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
-    assert pointers == _tracked_zip_hashes(project) == {hashes[0]}
+    assert pointers == _tracked_zip_hashes(project) == {hashes[0], _src_hash(project, orders_src)}
 
 
-def test_back_then_forward_restores_recipe(project, orders_parquet):
+def test_back_then_forward_restores_recipe(project, orders_src):
     """Reset back then forward restores entry 2's durable recipe zip, not merely
     its bullpen dir copy."""
     cs.genesis(project)
-    hashes = [_build_checkpoint(project, _agg_code_n(orders_parquet, _AGGS[i]), f"c{i}") for i in range(2)]
+    hashes = [_build_checkpoint(project, _agg_code_n(orders_src, _AGGS[i]), f"c{i}") for i in range(2)]
     cs.reset_to(project, 1)
     cs.reset_to(project, 2)
     assert hashes[1] in _tracked_zip_hashes(project)
@@ -320,7 +310,7 @@ def test_back_then_forward_restores_recipe(project, orders_parquet):
 # ---------------------------------------------------------------------------
 
 
-def test_connect_shim_matches_xorq_api_connect(project, orders_parquet, monkeypatch):
+def test_connect_shim_matches_xorq_api_connect(project, orders_src, monkeypatch):
     """The catalog-free connect shim is equivalent to xorq.api.connect(): it
     builds the same datafusion backend, so a materialization run through the
     shim (``single_partition_backend`` connects through it) writes the SAME
@@ -348,7 +338,7 @@ def test_connect_shim_matches_xorq_api_connect(project, orders_parquet, monkeypa
     assert type(shim) is type(api)
     assert _profile_content_token(shim) == _profile_content_token(api), "the shim must build the same kind of backend"
 
-    res = build_and_persist(project, _agg_code(orders_parquet))  # materialized through the shim
+    res = build_and_persist(project, _agg_code(orders_src))  # materialized through the shim
     snap = snapshot_path(project, res.content_hash)
     assert snap.exists(), "the shim must write a real snapshot"
     shim_df = pd.read_parquet(snap).sort_values("region").reset_index(drop=True)
@@ -366,17 +356,17 @@ def test_connect_shim_matches_xorq_api_connect(project, orders_parquet, monkeypa
 # ---------------------------------------------------------------------------
 
 
-def test_prompt_history_survives_reset(project, orders_parquet):
+def test_prompt_history_survives_reset(project, orders_src):
     """The per-entry prompt history is a tracked ``prompts/<hash>.jsonl`` now, so
     a re-run's appended prompt rolls back with the tree on reset (it used to be a
     loose, untracked ``entries/<hash>/prompts.jsonl`` git reset never touched)."""
     from tallyman_xorq import read_prompts
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="first")
     h = res.content_hash
     cs.checkpoint_catalog(project, "c1")
-    build_and_persist(project, _agg_code(orders_parquet), prompt="second")  # re-run, same hash, appends
+    build_and_persist(project, _agg_code(orders_src), prompt="second")  # re-run, same hash, appends
     cs.checkpoint_catalog(project, "c2")
     assert [p["prompt"] for p in read_prompts(project, h)] == ["first", "second"]
     cs.reset_to(project, 1)  # only "first" had been recorded at step 1
@@ -385,14 +375,14 @@ def test_prompt_history_survives_reset(project, orders_parquet):
     assert [p["prompt"] for p in read_prompts(project, h)] == ["first", "second"]
 
 
-def test_display_config_survives_reset(project, orders_parquet):
+def test_display_config_survives_reset(project, orders_src):
     """A display config (tracked ``display_configs/<hash>.json``) rolls back with
     git reset — the one decomposed section with no survives-reset coverage before
     (its old capture/materialize round-trip tests are deleted with this cut)."""
     from tallyman_core import display_configs as dc
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     h = res.content_hash
     cs.checkpoint_catalog(project, "c1")  # step 1: entry, no display config
     dc.set_display_config(project, h, {"pinned_rows": [1, 2]})
@@ -404,7 +394,7 @@ def test_display_config_survives_reset(project, orders_parquet):
     assert dc.get_display_config(project, h) == {"pinned_rows": [1, 2]}
 
 
-def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
+def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
     """End to end: after building an entry and touching every decomposed section,
     the git-tracked tree is *exactly* the native decomposed surface — no
     catalog.yaml, no build dirs, no xorq metadata/symlinks. Pins the whole cut."""
@@ -415,7 +405,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
     from tallyman_core import summary_stats as ss
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="first")
     h = res.content_hash
     al.set_alias(project, "by_region", h, expect_exists=False)
     charts.set_chart(project, h, {"mark": "bar"})
@@ -433,6 +423,8 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
         "notebook.jsonl",
         "entries.jsonl",  # no compute_cache.jsonl: a reset leaves compute_cache/ alone (ADR-007 D14)
         f"entries/{h}.zip",
+        # The imported source is a version of a source alias, so it has a recipe zip of its own (ADR-011 D1).
+        f"entries/{_src_hash(project, orders_src)}.zip",
         f"chart_specs/{h}.vl.json",
         f"display_configs/{h}.json",
         "post_processing/pp1.py",
@@ -457,7 +449,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_parquet):
         "display_configs/nested/leak.json",
     ],
 )
-def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_parquet, rel):
+def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_src, rel):
     """A stray nested *under* an allowlisted dir prefix must be rejected.
 
     ``fnmatch``'s ``*`` spans ``/``, so ``post_processing/sub/leak.py`` wrongly
@@ -466,7 +458,7 @@ def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_parqu
     allowlist must be path-segment-aware.
     """
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")
     cd = paths.catalog_dir(project)
     p = cd / rel
@@ -480,11 +472,11 @@ def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_parqu
         catalog.assert_catalog_consistent(project, pointers)
 
 
-def test_legit_disabled_subdir_member_still_passes(project, orders_parquet):
+def test_legit_disabled_subdir_member_still_passes(project, orders_src):
     """The segment-aware allowlist must not over-reject the legitimate two-level
     members it already tracks (``post_processing/_disabled/*.py``, &c.)."""
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")
     cd = paths.catalog_dir(project)
     for rel in ("post_processing/_disabled/old.py", "stats/_disabled/old.py"):
@@ -496,7 +488,7 @@ def test_legit_disabled_subdir_member_still_passes(project, orders_parquet):
     catalog.assert_catalog_consistent(project, pointers)  # must NOT raise
 
 
-def test_interrupted_atomic_write_tmp_not_committed(project, orders_parquet):
+def test_interrupted_atomic_write_tmp_not_committed(project, orders_src):
     """A ``*.tmp`` left by a crash mid atomic-write (``aliases._write`` /
     ``write_recipe_zip``) must never be staged by the checkpoint's ``git add -A``,
     so it cannot durably wedge a later ``reset_to`` via the tracked-surface
@@ -504,7 +496,7 @@ def test_interrupted_atomic_write_tmp_not_committed(project, orders_parquet):
     from tallyman_core import aliases as al
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     al.set_alias(project, "regions", res.content_hash)
     cs.checkpoint_catalog(project, "cp1")
     cd = paths.catalog_dir(project)
@@ -540,7 +532,7 @@ def test_checkpoint_skips_manifestless_entry_dir(project):
 # ---------------------------------------------------------------------------
 
 
-def test_consistency_guard_surfaces_dangling_alias_hash(project, orders_parquet):
+def test_consistency_guard_surfaces_dangling_alias_hash(project, orders_src):
     """A committed ``aliases.jsonl`` whose latest/history hash names no durable
     recipe must fail the consistency guard, not reset clean (M1). A dangling
     alias head later blows up the self-chaining ``tracked_expr_from_alias`` build, so
@@ -548,23 +540,24 @@ def test_consistency_guard_surfaces_dangling_alias_hash(project, orders_parquet)
     from tallyman_core import aliases as al
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     al.set_alias(project, "ghost", "ffffffffffff", expect_exists=False)  # no such entry
     cs.checkpoint_catalog(project, "dangling alias")
     pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
-    assert pointers == {res.content_hash}  # the real entry's pointer/recipe agree (guard 2 passes)
+    # The real entries — the build and the import behind it — have pointer/recipe agreement (guard 2 passes).
+    assert pointers == {res.content_hash, _src_hash(project, orders_src)}
     with pytest.raises(RuntimeError, match="ffffffffffff"):
         catalog.assert_catalog_consistent(project, pointers)
 
 
-def test_consistency_guard_surfaces_dangling_alias_history_hash(project, orders_parquet):
+def test_consistency_guard_surfaces_dangling_alias_history_hash(project, orders_src):
     """The alias check covers history, not only the latest head — a revised alias
     whose *older* version's recipe is missing is just as dangling (M1: 'at minimum
     cover aliases.jsonl history')."""
     from tallyman_core import aliases as al
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet))
+    res = build_and_persist(project, _agg_code(orders_src))
     al.set_alias(project, "regions", "ffffffffffff", expect_exists=False)  # v1: no recipe
     al.set_alias(project, "regions", res.content_hash)  # v2: real head; history = [ffff…, res]
     cs.checkpoint_catalog(project, "alias with a dangling history entry")
@@ -573,14 +566,14 @@ def test_consistency_guard_surfaces_dangling_alias_history_hash(project, orders_
         catalog.assert_catalog_consistent(project, pointers)
 
 
-def test_consistency_guard_surfaces_orphan_chart_hash(project, orders_parquet):
+def test_consistency_guard_surfaces_orphan_chart_hash(project, orders_src):
     """A committed ``chart_specs/<hash>.vl.json`` whose hash names no durable
     recipe must fail the guard (L1) — the guard validates every content-addressed
     sidecar against the live recipe set, not just the recipe↔pointer pair."""
     from tallyman_core import charts
 
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     charts.set_chart(project, "ffffffffffff", {"mark": "bar"})  # no such entry
     cs.checkpoint_catalog(project, "orphan chart")
     pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
@@ -588,14 +581,14 @@ def test_consistency_guard_surfaces_orphan_chart_hash(project, orders_parquet):
         catalog.assert_catalog_consistent(project, pointers)
 
 
-def test_consistency_guard_surfaces_orphan_display_config_hash(project, orders_parquet):
+def test_consistency_guard_surfaces_orphan_display_config_hash(project, orders_src):
     """A committed ``display_configs/<hash>.json`` whose hash names no durable
     recipe must fail the guard (L1), the display-config twin of the orphan-chart
     case."""
     from tallyman_core import display_configs as dc
 
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     dc.set_display_config(project, "ffffffffffff", {"pinned_rows": [1]})  # no such entry
     cs.checkpoint_catalog(project, "orphan display config")
     pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
@@ -603,7 +596,7 @@ def test_consistency_guard_surfaces_orphan_display_config_hash(project, orders_p
         catalog.assert_catalog_consistent(project, pointers)
 
 
-def test_failed_build_after_copy_leaves_no_orphan_dir(project, orders_parquet, monkeypatch):
+def test_failed_build_after_copy_leaves_no_orphan_dir(project, orders_src, monkeypatch):
     """A build that fails AFTER the entry dir is populated but past the
     load_expr/execute paths (here: ``make_portable_inplace``) must also leave no
     orphan entry dir (L4). The D1 'no partial dirs' invariant covers every
@@ -617,23 +610,24 @@ def test_failed_build_after_copy_leaves_no_orphan_dir(project, orders_parquet, m
 
     monkeypatch.setattr(build_mod, "make_portable_inplace", _boom)
     with pytest.raises(Exception):
-        build_and_persist(project, _agg_code(orders_parquet))
+        build_and_persist(project, _agg_code(orders_src))
     # No monkeypatch.undo(): it would also revert isolated_home's TALLYMAN_HOME
     # setenv (same monkeypatch instance), pointing entries_dir at the real home
     # and making this check vacuous. monkeypatch auto-reverts at teardown.
 
     ed = paths.entries_dir(project)
+    # The import's own entry is the only dir that may be there: it was minted before the build ran.
     leftover = [c.name for c in ed.iterdir() if c.is_dir()] if ed.exists() else []
-    assert not leftover, f"failed build left orphan entry dir(s): {leftover}"
+    assert leftover == [_src_hash(project, orders_src)], f"failed build left orphan entry dir(s): {leftover}"
 
 
-def test_consistency_guard_surfaces_orphan_recipe(project, orders_parquet):
+def test_consistency_guard_surfaces_orphan_recipe(project, orders_src):
     """The orphan branch of guard 2 (a tracked ``entries/<hash>.zip`` with no
     pointer) must raise — the untested half of the pointer/recipe agreement check
     (L8). The missing-pointer half is covered by
     ``test_reset_to_revision.py::test_reset_surfaces_pointer_without_durable_recipe``."""
     cs.genesis(project)
-    build_and_persist(project, _agg_code(orders_parquet))
+    build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")  # tracks entries/<hash>.zip
     with pytest.raises(RuntimeError, match="tracked recipes with no pointer"):
         catalog.assert_catalog_consistent(project, set())  # pointers empty, recipe tracked
@@ -644,7 +638,7 @@ def test_consistency_guard_surfaces_orphan_recipe(project, orders_parquet):
 # ---------------------------------------------------------------------------
 
 
-def test_alias_state_survives_reset(project, orders_parquet):
+def test_alias_state_survives_reset(project, orders_src):
     """The alias map + history (the tracked ``aliases.jsonl`` this cut introduced)
     rolls back with ``git reset`` — the carrier whose only coverage was the deleted
     ``test_reset_rolls_back_alias_state`` (M2). Mirrors the display-config /
@@ -652,24 +646,26 @@ def test_alias_state_survives_reset(project, orders_parquet):
     from tallyman_core import aliases as al
 
     cs.genesis(project)
-    h0 = _build_checkpoint(project, _agg_code_n(orders_parquet, _AGGS[0]), "c0")  # step 1
+    # The source alias was set by the import, before step 0, so it is in every step's tree.
+    src = {orders_src: _src_hash(project, orders_src)}
+    h0 = _build_checkpoint(project, _agg_code_n(orders_src, _AGGS[0]), "c0")  # step 1
     al.set_alias(project, "regions", h0, expect_exists=False)
     cs.checkpoint_catalog(project, "c1")  # step 2: regions -> h0 (history [h0])
-    h1 = build_and_persist(project, _agg_code_n(orders_parquet, _AGGS[1])).content_hash
+    h1 = build_and_persist(project, _agg_code_n(orders_src, _AGGS[1])).content_hash
     al.set_alias(project, "regions", h1)  # revise: history [h0, h1]
     al.set_alias(project, "avg", h1, expect_exists=False)
     cs.checkpoint_catalog(project, "c2")  # step 3: regions -> h1 (history [h0, h1]) + avg -> h1
 
-    assert al.load_aliases(project) == {"regions": h1, "avg": h1}
+    assert al.load_aliases(project) == {"regions": h1, "avg": h1, **src}
     cs.reset_to(project, 2)
-    assert al.load_aliases(project) == {"regions": h0}
+    assert al.load_aliases(project) == {"regions": h0, **src}
     assert al.history_for(project, "regions") == [h0]
     cs.reset_to(project, 3)
-    assert al.load_aliases(project) == {"regions": h1, "avg": h1}
+    assert al.load_aliases(project) == {"regions": h1, "avg": h1, **src}
     assert al.history_for(project, "regions") == [h0, h1]
 
 
-def test_append_prompt_is_atomic_and_complete(project, orders_parquet):
+def test_append_prompt_is_atomic_and_complete(project, orders_src):
     """``_append_prompt`` rewrites ``prompts/<hash>.jsonl`` via tmp + replace (C2):
     it runs outside the project lock (only the checkpoint holds it), so the file
     must stay whole JSONL across appends with no leftover ``*.tmp`` the
@@ -677,8 +673,8 @@ def test_append_prompt_is_atomic_and_complete(project, orders_parquet):
     from tallyman_xorq import read_prompts
 
     cs.genesis(project)
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="first")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="first")
     h = res.content_hash
-    build_and_persist(project, _agg_code(orders_parquet), prompt="second")  # re-run, same hash, appends
+    build_and_persist(project, _agg_code(orders_src), prompt="second")  # re-run, same hash, appends
     assert [r["prompt"] for r in read_prompts(project, h)] == ["first", "second"]
     assert not list(paths.prompts_path(project, h).parent.glob("*.tmp"))  # no interrupted temp left behind

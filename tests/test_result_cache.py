@@ -7,27 +7,29 @@ from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.result_cache import cache_worthy
 
+ORDERS_SRC = "orders_src"  # the source alias conftest's ``orders_src`` fixture imports the shoe-orders file under
+
 
 def _agg_code(project: str) -> str:  # Aggregate → expensive → cache-worthy
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
-def _project_code(project: str) -> str:  # parquet read + projection → cheap (keeps __row_order, ADR-008 D3)
+def _project_code(project: str) -> str:  # source read + projection → cheap (keeps __row_order, ADR-008 D3)
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
 
 
 def _parent_code(project: str, col: str) -> str:  # single-column rename → distinct, unionable
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.select("__row_order", k=t.{col})
 """
 
@@ -59,8 +61,8 @@ expr = t.mutate(total2=t.total * 2)
 
 def _agg_avg_code(project: str) -> str:  # a second Aggregate → expensive, joins on region
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.group_by("region").aggregate(avg_price=t.price.mean())
 """
 
@@ -76,12 +78,12 @@ expr = a.join(b, "region", how="left")
 
 def _scalar_udf_code(project: str) -> str:  # scalar UDF only (no Aggregate/Join/Sort) → worthy via UDF (#81)
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 from xorq.expr.udf import make_pandas_udf
 import xorq.vendor.ibis.expr.datatypes as dt
 from xorq.vendor.ibis import schema as ibis_schema
 
-t = read_project_file("orders.parquet", project={project!r})
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 
 
 def plusone(df):
@@ -118,10 +120,18 @@ def _call_under_tight_recursion_guard(fn, *args):
 
 
 def _hash_of(project: str) -> str:
-    return list_entries(project)[0]["content_hash"]
+    """The most recently written built entry.
+
+    An import is an entry too (ADR-011 D1), so skip the ones whose manifest records one: every project
+    here carries the ``orders_src`` version, and a test always means the entry it just created.
+    """
+    for manifest in list_entries(project):
+        if not manifest.get("provenance"):
+            return manifest["content_hash"]
+    raise AssertionError(f"{project!r} has no built entry, only imported sources")
 
 
-def test_classifier_skips_cheap_caches_expensive(project, orders_parquet, monkeypatch):
+def test_classifier_skips_cheap_caches_expensive(project, orders_src, monkeypatch):
     # The verdict is decided once, at build, on the live expression (ADR-008 D4) and read from the manifest ever after.
     from tallyman_core import read_manifest
 
@@ -137,7 +147,7 @@ def test_classifier_skips_cheap_caches_expensive(project, orders_parquet, monkey
     assert "cheap" in read_manifest(entry_dir(project, proj_h)).cache_worthy_why
 
 
-def test_cheap_entry_writes_no_result_parquet(project, orders_parquet, monkeypatch):
+def test_cheap_entry_writes_no_result_parquet(project, orders_src, monkeypatch):
     # A cheap entry materialises nothing — no result.parquet, ever (not at build,
     # not on read), and nothing under the (retired) result_cache dir.
     from tallyman_xorq.result_cache import cached_result_expr
@@ -155,7 +165,7 @@ def test_cheap_entry_writes_no_result_parquet(project, orders_parquet, monkeypat
     assert not rp.exists()
 
 
-def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
+def test_expensive_entry_bakes_result_cache(project, orders_src, monkeypatch):
     # An expensive entry is materialised when it is created (ADR-007 D4): its snapshot is written to the compute cache
     # — not a build-time entry result.parquet, not the retired catalog-level result_cache dir.
     from tallyman_core.paths import compute_cache_dir
@@ -180,7 +190,7 @@ def test_expensive_entry_bakes_result_cache(project, orders_parquet, monkeypatch
     assert not (entry_dir(project, h) / "result.parquet").exists()
 
 
-def test_scalar_udf_is_worthy(project, orders_parquet, monkeypatch):
+def test_scalar_udf_is_worthy(project, orders_src, monkeypatch):
     # #81: a scalar UDF used without any accompanying expensive op must be judged
     # worthy. A make_pandas_udf node is classed after the user's function (here
     # `plusone`), so its live leaf name carries no "UDF"; it is matched by base class
@@ -199,7 +209,7 @@ def test_scalar_udf_is_worthy(project, orders_parquet, monkeypatch):
     assert classify_expr(_recipe_expr(project, h)).worthy is True
 
 
-def test_scalar_udf_only_entry_bakes_result_cache(project, orders_parquet, monkeypatch):
+def test_scalar_udf_only_entry_bakes_result_cache(project, orders_src, monkeypatch):
     # #81 net effect: a scalar-UDF-only expression that was judged cheap wrote no snapshot, so every viewer / diff /
     # tracked_expr_from_alias read recomputed the UDF over the whole DAG (a silent perf regression). With the UDF
     # judged worthy the entry is materialised like any other expensive entry and cached_result_expr reads a
@@ -223,7 +233,7 @@ def test_scalar_udf_only_entry_bakes_result_cache(project, orders_parquet, monke
     assert any(compute_cache_dir(project).rglob("result_cache/*.parquet"))
 
 
-def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parquet, monkeypatch):
+def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_src, monkeypatch):
     # A cheap entry recomputes on read — its expression is not a CachedNode.
     from tallyman_xorq.result_cache import cached_result_expr
 
@@ -233,7 +243,7 @@ def test_cheap_entry_cached_result_expr_is_not_a_cache_node(project, orders_parq
     assert type(cached_result_expr(project, h).op()).__name__ != "CachedNode"
 
 
-def test_cold_read_logs_path_and_wall_time(project, orders_parquet, monkeypatch, caplog):
+def test_cold_read_logs_path_and_wall_time(project, orders_src, monkeypatch, caplog):
     # #87: each cold read is visible on tallyman.perf with wall-clock, so a Join-descendant that is structurally worthy
     # but cost-cheap is visible from the read path, not just lifecycle counts. A worthy entry whose snapshot exists is
     # served without loading its build (ADR-007 D2), so it logs no cold read; a cheap entry's cold read loads its
@@ -271,7 +281,7 @@ def test_cold_read_logs_path_and_wall_time(project, orders_parquet, monkeypatch,
     assert any("healed" in m and agg_h in m for m in msgs)
 
 
-def test_multi_parent_tracked_expr_from_alias_shares_one_backend(project, orders_parquet, monkeypatch):
+def test_multi_parent_tracked_expr_from_alias_shares_one_backend(project, orders_src, monkeypatch):
     # #75: combining two tracked_expr_from_alias parents in one expression must resolve to a
     # single backend. #73's expression-level tracked_expr_from_alias loaded each parent into
     # its own backend, so a union/join raised "Multiple backends found".
@@ -289,7 +299,7 @@ def test_multi_parent_tracked_expr_from_alias_shares_one_backend(project, orders
     ibis.union(a, b)._find_backend()
 
 
-def test_multi_parent_tracked_expr_from_alias_union_builds(project, orders_parquet, monkeypatch):
+def test_multi_parent_tracked_expr_from_alias_union_builds(project, orders_src, monkeypatch):
     # #75: an entry that unions two tracked_expr_from_alias parents must build end-to-end.
     # On the #73 branch this aborted with BuildError: Multiple backends found.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -302,64 +312,64 @@ def test_multi_parent_tracked_expr_from_alias_union_builds(project, orders_parqu
     assert res["row_count"] == 400
 
 
-def _mix_code(project: str, parent: str) -> str:  # read_project_file + tracked_expr_from_alias in one expression
+def _mix_code(project: str, parent: str) -> str:  # a source parent + a cheap parent in one expression
     return f"""
-from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
-fp = read_project_file("orders.parquet", project={project!r}).select(k="region")
+from tallyman_xorq.io import tracked_expr_from_alias
+fp = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r}).select(k="region")
 fc = tracked_expr_from_alias({parent!r}).select(k="k")
 expr = fp.union(fc)
 """
 
 
-def test_read_project_file_and_tracked_expr_from_alias_mix_shares_one_backend(project, orders_parquet, monkeypatch):
-    # #75: a read_project_file read combined with a tracked_expr_from_alias parent in one
-    # expression must resolve to a single backend. #73 rooted read_project_file on the
-    # default backend but loaded tracked_expr_from_alias into its own, so the mix raised
-    # "Multiple backends found".
+def test_source_and_cheap_parent_mix_shares_one_backend(project, orders_src, monkeypatch):
+    # #75: the two ways a parent resolves must meet on one backend. A source version is worthy, so it
+    # comes back as a bare read of its snapshot; a cheap parent comes back as its own frozen graph.
+    # #73 rooted the raw read on the default backend but loaded a parent into its own, so the mix
+    # raised "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
+    from tallyman_xorq.io import tracked_expr_from_alias
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
 
-    fp = read_project_file("orders.parquet", project=project).select(k="region")
+    fp = tracked_expr_from_alias(orders_src, project=project).select(k="region")
     fc = tracked_expr_from_alias("pa").select(k="k")
     ibis.union(fp, fc)._find_backend()  # must not raise
 
 
-def test_read_project_file_and_tracked_expr_from_alias_mix_builds(project, orders_parquet, monkeypatch):
-    # #75: an entry mixing read_project_file and tracked_expr_from_alias must build end-to-end.
+def test_source_and_cheap_parent_mix_builds(project, orders_src, monkeypatch):
+    # #75: an entry mixing a source parent and a cheap parent must build end-to-end.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("pa", _parent_code(project, "region"))
 
     res = catalog_create("mix", _mix_code(project, "pa"))
     assert "error" not in res, res
-    # 200 read_project_file rows + 200 tracked_expr_from_alias rows.
+    # 200 rows from the source version + 200 from the cheap parent over it.
     assert res["row_count"] == 400
 
 
-def test_expensive_tracked_expr_from_alias_mix_shares_one_backend(project, orders_parquet, monkeypatch):
+def test_expensive_tracked_expr_from_alias_mix_shares_one_backend(project, orders_src, monkeypatch):
     # #75: an expensive parent resolves to a deferred read of its baked snapshot —
-    # a bare Read on the default backend — so mixing it with a read_project_file read
-    # also stays on one backend. A baked CachedNode (the #73 form) would have
+    # a bare Read on the default backend — so mixing it with a fresh aggregate over
+    # the source stays on one backend. A baked CachedNode (the #73 form) would have
     # dragged its own storage backend in and re-raised "Multiple backends found".
     import xorq.vendor.ibis as ibis
 
-    from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
+    from tallyman_xorq.io import tracked_expr_from_alias
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))  # Aggregate → expensive → baked snapshot
 
-    ft = read_project_file("orders.parquet", project=project)
+    ft = tracked_expr_from_alias(orders_src, project=project)
     fp = ft.group_by("region").aggregate(total=ft.price.sum(), n=ft.count())
     fc = tracked_expr_from_alias("agg").drop("__row_order")  # region, total, n — same schema as fp
     ibis.union(fp, fc)._find_backend()  # must not raise
 
 
-def test_diff_route_survives_cold_cache(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_diff_route_survives_cold_cache(fresh_companion_app, project, orders_src, monkeypatch):
     # The diff route composes both entries' reads; on a cold compute cache it must make the files they read exist (the
-    # ordered copy of the source) rather than blank the diff (there is no per-entry result.parquet to evict any more).
+    # source version's snapshot) rather than blank the diff (there is no per-entry result.parquet to evict any more).
     import shutil
 
     from tallyman_core.paths import compute_cache_dir
@@ -378,7 +388,7 @@ def test_diff_route_survives_cold_cache(fresh_companion_app, project, orders_par
     assert "stats" in diff or "keyed" in diff
 
 
-def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(project, orders_parquet, monkeypatch):
+def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(project, orders_src, monkeypatch):
     """#73/#74: reading an entry that ``tracked_expr_from_alias``s an expensive parent must
     make an evicted parent snapshot exist again, not error.
 
@@ -413,7 +423,7 @@ def test_cached_result_expr_self_heals_expensive_parent_chain_on_cold_cache(proj
     assert len(df) == expected_rows
 
 
-def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_parquet, monkeypatch):
+def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache(project, orders_src, monkeypatch):
     """#73/#75: a multi-parent entry joining two expensive ``tracked_expr_from_alias`` parents
     must make *both* evicted parent snapshots exist again on a cold cache.
 
@@ -446,7 +456,7 @@ def test_cached_result_expr_self_heals_multi_parent_expensive_join_on_cold_cache
     assert len(df) == expected_rows
 
 
-def test_revise_in_place_self_reference_terminates(project, orders_parquet, monkeypatch):
+def test_revise_in_place_self_reference_terminates(project, orders_src, monkeypatch):
     """A revise-in-place recipe that reads ``tracked_expr_from_alias`` of its OWN alias must
     not self-recurse forever when later reconstructed (the recipe re-import that remains).
 
@@ -554,7 +564,7 @@ def test_resolve_noncyclic_hash_multi_hop_stays_in_requested_lineage(project):
         _RECONSTRUCTING.reset(token)
 
 
-def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_parquet, monkeypatch):
+def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_src, monkeypatch):
     # Recipe reconstruction (_recipe_expr -> _import_script) survives as a diagnostic (the structural-nondeterminism
     # check, which re-imports the recipe twice); it was a per-READ operation under #73. _import_script registers the
     # recipe module in sys.modules under a unique uuid name; left there, every reconstruction leaks a module object
@@ -587,27 +597,13 @@ def test_ensure_result_is_removed():
     assert not hasattr(rc, "ensure_viewer_expanded_build")
 
 
-def _overwrite_orders(project: str, seed: int) -> None:
-    """Rewrite the orders source with different values (same schema, same rows).
-
-    A read_project_file recompute under ``off`` identity reads the live path, so this
-    makes a previously-built entry's recompute drift from its build-time bytes —
-    the execution-nondeterminism stand-in #83's faithfulness check must catch.
-    """
-    from tallyman_cli.fixtures import write_shoe_orders
-    from tallyman_core import data_dir
-
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=seed)
-
-
-def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch):
+def test_build_records_stable_result_digest(project, orders_src, monkeypatch):
     # ADR-004-result-digest-canonical-ordering, as redefined by ADR-009 D2: worthy entries record a result_digest, the
     # content digest (arrow-sha256) of the snapshot read back, stable run-to-run because the snapshot is written in a
     # canonical order on a single-partition connection. Cheap entries record no digest — they have no snapshot to hash.
     from tallyman_core import entry_dir, read_manifest
     from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
 
     # Worthy entry (Aggregate): must record a digest equal to the snapshot's content digest.
@@ -627,14 +623,13 @@ def test_build_records_stable_result_digest(project, orders_parquet, monkeypatch
     assert not cheap_digest, f"cheap entry unexpectedly recorded result_digest: {cheap_digest!r}"
 
 
-def test_verify_result_faithful_true_for_deterministic_entry(project, orders_parquet, monkeypatch):
+def test_verify_result_faithful_true_for_deterministic_entry(project, orders_src, monkeypatch):
     # ADR-004-result-digest-canonical-ordering: for a worthy (snapshot-writing) entry,
     # verify_result_faithful compares the snapshot's content digest to the recorded
     # digest and returns True for a clean, deterministic build. A cheap entry records
     # no digest, so verify_result_faithful returns None for it.
     from tallyman_xorq.result_cache import verify_result_faithful
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
 
     # Worthy entry: digest recorded at build; verify_result_faithful checks the file.
@@ -648,7 +643,7 @@ def test_verify_result_faithful_true_for_deterministic_entry(project, orders_par
     assert verify_result_faithful(project, h2) is None
 
 
-def test_verify_result_faithful_detects_snapshot_drift(project, orders_parquet, monkeypatch):
+def test_verify_result_faithful_detects_snapshot_drift(project, orders_src, monkeypatch):
     # ADR-004-result-digest-canonical-ordering: verify_result_faithful compares the
     # snapshot's content digest against the recorded digest. For a worthy entry
     # whose snapshot no longer holds the rows it was built with (one value differs),
@@ -658,7 +653,6 @@ def test_verify_result_faithful_detects_snapshot_drift(project, orders_parquet, 
 
     from tallyman_xorq.result_cache import baked_snapshot_path, verify_result_faithful
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
 
     # Worthy entry: starts faithful.
@@ -676,15 +670,13 @@ def test_verify_result_faithful_detects_snapshot_drift(project, orders_parquet, 
     pq.write_table(drifted, snap)
     assert verify_result_faithful(project, h) is False
 
-    # Cheap entry: always None, even after source change.
+    # Cheap entry: always None — it has no snapshot, so there is nothing to compare.
     catalog_create("proj", _project_code(project))
     h2 = _hash_of(project)
     assert verify_result_faithful(project, h2) is None
-    _overwrite_orders(project, seed=1)
-    assert verify_result_faithful(project, h2) is None
 
 
-def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkeypatch, caplog):
+def test_self_heal_warns_on_unfaithful_recompute(project, orders_src, monkeypatch, caplog):
     # #83: eviction's load-bearing assumption is that an evicted snapshot recomputes
     # to what was evicted. For an entry whose recompute differs from the digest
     # recorded at build, that is false — the snapshot self-heals to DIFFERENT rows,
@@ -692,17 +684,15 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkey
     # snapshot's digest != the recorded one, and the read still succeeds (the check
     # is advisory, never fatal).
     #
-    # Source drift can no longer provoke this on its own: the ordered copy an entry
-    # reads is named by the source's content (ADR-008 D2), so a heal reads the rows the
-    # entry was built from, and an edited source is a new entry
-    # (test_cas_expensive_self_heal_after_edit_serves_built_bytes). The mismatch is
-    # provoked directly, by recording a digest the frozen build cannot reproduce.
+    # Source drift cannot provoke this at all: an entry reads a source version's snapshot, editing the
+    # imported file changes nothing, and importing the edited bytes mints a new version (ADR-011 D1,
+    # tests/test_source_import.py::test_editing_the_outside_file_after_import_changes_nothing). The
+    # mismatch is provoked directly, by recording a digest the frozen build cannot reproduce.
     import json
     import logging
 
     from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))  # expensive → snapshot
     h = _hash_of(project)
@@ -727,7 +717,7 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_parquet, monkey
 
 
 def test_structural_attribution_degrades_to_not_structural_when_the_manifest_is_unreadable(
-    project, orders_parquet, monkeypatch
+    project, orders_src, monkeypatch
 ):
     # #88 part 2, best-effort contract: the structural-vs-execution attribution must
     # never break the read it only annotates. recipe_is_structurally_nondeterministic
@@ -739,7 +729,6 @@ def test_structural_attribution_degrades_to_not_structural_when_the_manifest_is_
     # labeled execution (#83) and the read still succeeds.
     from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
@@ -749,7 +738,7 @@ def test_structural_attribution_degrades_to_not_structural_when_the_manifest_is_
     assert recipe_is_structurally_nondeterministic(project, h) is False
 
 
-def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_parquet, monkeypatch):
+def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_src, monkeypatch):
     """An expensive entry's baked snapshot evicted *after* a warm read must still
     self-heal on the next read, not dangle on a stale ``deferred_read_parquet``.
 
@@ -778,7 +767,7 @@ def test_cached_result_expr_self_heals_after_warm_then_evict(project, orders_par
     assert len(df) == expected
 
 
-def test_concurrent_cold_heal_is_single_flighted(project, orders_parquet, monkeypatch):
+def test_concurrent_cold_heal_is_single_flighted(project, orders_src, monkeypatch):
     """Concurrent cold reads of the same expensive entry must single-flight the
     snapshot heal (#79).
 
@@ -851,257 +840,7 @@ def test_concurrent_cold_heal_is_single_flighted(project, orders_parquet, monkey
     assert len(cached_result_expr(project, agg_h).execute()) == expected
 
 
-# ---------------------------------------------------------------------------
-# #115: a cold read must serve the rows the entry was BUILT from, not the live
-# source after it is edited in place. #86 made *build* identity content-aware
-# (a rebuild forks the hash). Under ADR-008 D2 a read never touches the live source at
-# all: the frozen build reads an ordered copy named by the source's content, and a copy
-# that is missing is made again from the frozen data/.cas/<digest> clone (ADR-007 D13).
-# These pin the closure for both #74 hazards: a cheap entry's cold read, and an
-# expensive entry self-healing an evicted snapshot.
-# ---------------------------------------------------------------------------
-
-
-def _write_ints(path, values) -> None:
-    import pandas as pd
-
-    pd.DataFrame({"x": list(values)}).to_parquet(path)
-
-
-def _src_read_code(project: str, rel: str) -> str:  # cheap: a bare project read
-    return f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel!r}, project={project!r})\n"
-
-
-def _src_group_code(project: str, rel: str) -> str:  # expensive: group_by → Aggregate → baked snapshot
-    # order_by('x') pins a deterministic row order so the #83 result_digest is stable
-    # build-to-self-heal (an unordered aggregate would reshuffle and read as drift).
-    return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({rel!r}, project={project!r})\n"
-        "expr = t.group_by('x').aggregate(c=t.count()).order_by('x')\n"
-    )
-
-
-def test_cas_cold_read_after_inplace_edit_serves_built_bytes(project, monkeypatch):
-    """#115: a cheap entry's cold read serves the rows it was built from, even after
-    the source is edited in place.
-
-    Pre-#115 the cold read re-imported the recipe and re-ran read_project_file, which under
-    cas re-digested the now-edited live file and cloned it under a NEW digest — serving
-    the edited rows under the entry's ORIGINAL content_hash. The read now loads the frozen build, which
-    reads the ordered copy of the bytes the entry was built from.
-    """
-    from tallyman_core import data_dir
-    from tallyman_xorq import build_and_persist
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq.result_cache import cached_result_expr
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")  # several sibling tests force off
-    assert si.mode() == "cas"
-
-    src = data_dir(project) / "src.parquet"
-    _write_ints(src, [0, 1, 2])
-    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
-
-    # Edit the source in place AFTER building. The 3→5 row edit changes the file
-    # size, so the stat-keyed digest memo invalidates without TALLYMAN_SOURCE_REHASH.
-    _write_ints(src, [0, 1, 2, 3, 4])
-    cached_result_expr.cache_clear()  # force a genuinely COLD read (load the frozen build again)
-
-    df = cached_result_expr(project, h).execute()
-    # Assert on VALUES, not just the count, so a fix that read some other 3-row file
-    # can't false-green: only the frozen clone holds exactly {0,1,2} now.
-    assert sorted(df["x"].tolist()) == [0, 1, 2]
-
-
-def test_cas_cold_read_after_source_deleted_serves_built_bytes(project, monkeypatch):
-    """#115 / #148-review: a cold read serves the frozen bytes even when the live
-    source has been DELETED (or moved), not just edited in place.
-
-    Pre-fix read_project_file called project_path first, whose is_file() guard raised
-    ProjectDataNotFound before the pinned reconstruction could run — so a deleted source
-    defeated it entirely. A read no longer needs the live source: the frozen build reads
-    its ordered copy.
-    """
-    from tallyman_core import data_dir
-    from tallyman_xorq import build_and_persist
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq.result_cache import cached_result_expr
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
-    assert si.mode() == "cas"
-
-    src = data_dir(project) / "src.parquet"
-    _write_ints(src, [0, 1, 2])
-    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
-
-    src.unlink()  # source gone entirely — the frozen .cas clone is the only copy left
-    cached_result_expr.cache_clear()  # force a genuinely COLD read (load the frozen build again)
-
-    df = cached_result_expr(project, h).execute()
-    # Only the frozen bytes hold exactly {0,1,2}; assert on values, not just the count.
-    assert sorted(df["x"].tolist()) == [0, 1, 2]
-
-
-def test_cas_expensive_self_heal_after_edit_serves_built_bytes(project, monkeypatch, caplog):
-    """#115: an expensive entry self-healing an evicted snapshot recomputes from the
-    FROZEN source, not the edited live file.
-
-    Pre-#115 the self-heal re-imported the recipe and re-executed it, and that recompute read the edited source, so
-    the snapshot self-healed to different rows under the original content_hash — exactly the #83 UNFAITHFUL signal.
-    A heal now runs the entry's frozen build, which reads the ordered copy of the bytes it was built from, so the heal
-    is faithful and the warning does not fire.
-    """
-    import logging
-
-    from tallyman_core import data_dir
-    from tallyman_xorq import build_and_persist
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
-    assert si.mode() == "cas"
-
-    src = data_dir(project) / "src.parquet"
-    _write_ints(src, [0, 1, 2])
-    h = build_and_persist(project, _src_group_code(project, "src.parquet")).content_hash
-
-    # The snapshot's path is a function of the content hash (ADR-007 D2), so it does not move when the source is edited.
-    p = baked_snapshot_path(project, h)
-    assert p is not None and p.exists()
-
-    _write_ints(src, [0, 1, 2, 3, 4])  # edit the source in place
-    p.unlink()  # evict the baked snapshot → the next read must self-heal
-    cached_result_expr.cache_clear()
-
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="tallyman.perf"):
-        df = cached_result_expr(project, h).execute()
-
-    # group_by('x') over the frozen {0,1,2} → 3 groups; the edited {0,1,2,3,4} would
-    # give 5. The self-heal must recompute from the frozen clone.
-    assert sorted(df["x"].tolist()) == [0, 1, 2]
-    assert p.exists()  # the heal rewrote the ORIGINAL-keyed snapshot, not a drifted one
-    # The #83 faithfulness check must NOT fire: the recompute matches the build digest
-    # because it read the frozen rows (pre-fix it self-healed to edited rows and
-    # logged UNFAITHFUL).
-    msgs = [r.getMessage() for r in caplog.records if r.name == "tallyman.perf"]
-    assert not any("UNFAITHFUL" in m for m in msgs), msgs
-
-
-def test_cas_nested_chain_reconstruction_pins_each_entrys_sources(project, monkeypatch):
-    """#115: a nested chain remakes each entry's own frozen source.
-
-    B unions tracked_expr_from_alias(A) with its own read_project_file(b). B's plan reads two ordered copies: the
-    parent A's, because A is cheap and its graph is inlined into B's build, and B's own. With BOTH sources edited in
-    place and every file under compute_cache gone, reading B remakes each ordered copy from the clone of ITS OWN
-    built bytes (each record travels in B's manifest: A's was folded in from A's), so the rows are the frozen ones.
-    Pre-ADR-007 this pinned a contextvar that had to be overwritten for A's reconstruction and restored for B's.
-    """
-    import shutil
-
-    from tallyman_core import data_dir
-    from tallyman_core.paths import compute_cache_dir
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq.result_cache import cached_result_expr
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
-    assert si.mode() == "cas"
-
-    srca = data_dir(project) / "a.parquet"
-    srcb = data_dir(project) / "b.parquet"
-    _write_ints(srca, [0, 1, 2])
-    _write_ints(srcb, [10, 11])
-
-    catalog_create("pa", _src_read_code(project, "a.parquet"))  # cheap parent over a.parquet
-    b_code = (
-        "from tallyman_xorq.io import read_project_file, tracked_expr_from_alias\n"
-        "a = tracked_expr_from_alias('pa')\n"
-        f"b = read_project_file('b.parquet', project={project!r})\n"
-        "expr = a.union(b)\n"
-    )
-    res = catalog_create("pb", b_code)
-    assert "error" not in res, res
-    b_h = _hash_of(project)
-
-    _write_ints(srca, [0, 1, 2, 3, 4])  # edit BOTH sources in place after building
-    _write_ints(srcb, [10, 11, 12])
-    shutil.rmtree(compute_cache_dir(project), ignore_errors=True)  # only the clones and the manifests are left
-    cached_result_expr.cache_clear()
-
-    df = cached_result_expr(project, b_h).execute()
-    # Frozen a = {0,1,2} ∪ frozen b = {10,11}. A mix-up would serve the edited {0,1,2,3,4} and/or {10,11,12}.
-    assert sorted(df["x"].tolist()) == [0, 1, 2, 10, 11]
-
-
-def test_cas_child_records_reconstructed_parent_frozen_digest(project, monkeypatch):
-    """#115: building a child records the parent's FROZEN source digest, keeping the
-    parent's .cas clone alive for the reset's clone sweep.
-
-    Chaining a child off the parent inlines the parent's frozen graph. The child must record the parent's frozen
-    digest (the bytes actually read) into its manifest.sources — folded in from the parent's manifest, not a
-    re-digest of the edited live file — so the clone the child's ordered copy is made from stays referenced.
-    """
-    from tallyman_core import data_dir, entry_dir, read_manifest
-    from tallyman_xorq import source_identity as si
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
-    assert si.mode() == "cas"
-
-    src = data_dir(project) / "src.parquet"
-    _write_ints(src, [0, 1, 2])
-    catalog_create("pp", _src_read_code(project, "src.parquet"))
-    p_h = _hash_of(project)
-    p_digest = read_manifest(entry_dir(project, p_h)).sources["src.parquet"]
-
-    _write_ints(src, [0, 1, 2, 3, 4])  # edit in place, then build a child off the parent
-    cc_code = (
-        "from tallyman_xorq.io import tracked_expr_from_alias\n"
-        "t = tracked_expr_from_alias('pp')\nexpr = t.mutate(y=t.x * 2)\n"
-    )
-    res = catalog_create("cc", cc_code)
-    assert "error" not in res, res
-    c_h = _hash_of(project)
-
-    child_sources = read_manifest(entry_dir(project, c_h)).sources or {}
-    assert child_sources.get("src.parquet") == p_digest
-    # Sanity: the frozen digest the child pinned is NOT the edited live digest.
-    assert si.digest_for(project, src) != p_digest
-
-
-def test_off_built_entry_reads_under_cas_default_without_crash(project, monkeypatch):
-    """#115 graceful degradation: an entry built under mode=off (no recorded sources)
-    read under the cas default reads its ordered copy, not a crash.
-
-    Under mode=off no clone is taken and manifest.sources is None, but the ordered copy is still written (named by
-    the source's content) and recorded, so a read after flipping to cas serves the built rows without any live read.
-    (Per the single-user rebuild-always policy, rebuilding such an entry under cas is the path to a frozen clone;
-    this only pins the no-crash contract.)
-    """
-    from tallyman_core import data_dir, entry_dir, read_manifest
-    from tallyman_xorq import build_and_persist
-    from tallyman_xorq.result_cache import cached_result_expr
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    src = data_dir(project) / "src.parquet"
-    _write_ints(src, [0, 1, 2])
-
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
-    h = build_and_persist(project, _src_read_code(project, "src.parquet")).content_hash
-    assert read_manifest(entry_dir(project, h)).sources is None  # off records no sources
-
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")  # flip to the default
-    cached_result_expr.cache_clear()
-    df = cached_result_expr(project, h).execute()  # must not raise; reads the ordered copy
-    assert sorted(df["x"].tolist()) == [0, 1, 2]
-
-
-def test_reset_to_clears_result_plan_memo(project, orders_parquet, monkeypatch):
+def test_reset_to_clears_result_plan_memo(project, orders_src, monkeypatch):
     """reset_to changes which entries exist (it retires and restores entry dirs, and leaves compute_cache alone,
     ADR-007 D14), so it must also invalidate the in-process ``_resolve_result_plan`` memo, which holds loaded builds
     (#80 / #96). A reactive reset layer needs this cache invalidated alongside the entry sweep, not left to
@@ -1126,7 +865,7 @@ def test_reset_to_clears_result_plan_memo(project, orders_parquet, monkeypatch):
     assert cached_result_expr.cache_info().currsize == 0
 
 
-def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, orders_src, monkeypatch):
     """The diff compare-expr LRU (``_build_compare_expr``) caches a serialized
     build that bakes in each entry's snapshot path and — unlike
     ``cached_result_expr`` — never re-checks ``path.exists()`` on a hit. A reset
@@ -1155,7 +894,7 @@ def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, o
     assert _build_compare_expr.cache_info().currsize == 0
 
 
-def test_notify_project_reset_evicts_the_compare_build(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_notify_project_reset_evicts_the_compare_build(fresh_companion_app, project, orders_src, monkeypatch):
     """The cross-process ``project_reset`` notify evicts the companion's compare build.
 
     ``reset-to`` is normally run out of process (the ``tallyman reset-to`` CLI):
@@ -1207,7 +946,7 @@ def test_notify_project_reset_evicts_the_compare_build(fresh_companion_app, proj
     assert _build_compare_expr.cache_info().currsize == 0
 
 
-def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, project, orders_src, monkeypatch):
     """Parity with the in-server reset: the cross-process ``project_reset`` notify
     clears the companion's ``cached_result_expr`` memo too. Hygiene rather than
     correctness — ``cached_result_expr`` makes its files exist on every read — but both reset
@@ -1231,7 +970,7 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
     assert cached_result_expr.cache_info().currsize == 0
 
 
-def test_result_digest_is_snapshot_content_digest(project, orders_parquet, monkeypatch):
+def test_result_digest_is_snapshot_content_digest(project, orders_src, monkeypatch):
     # ADR-009 D2 (amending ADR-004-result-digest-canonical-ordering): the result_digest for a worthy entry is the
     # content digest of the snapshot read back (arrow-sha256:<hex>), not a hash of the file's bytes (which moves with
     # the writer's version, the codec and the row-group size) and not a per-row repr() hash. It equals
@@ -1240,7 +979,6 @@ def test_result_digest_is_snapshot_content_digest(project, orders_parquet, monke
     from tallyman_core import entry_dir, read_manifest
     from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
@@ -1263,40 +1001,38 @@ def _literal_nondeterministic_code(project: str) -> str:
     # frozen build twice, ADR-009 D6, does not flag it either.)
     return (
         "import random\n"
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum()).mutate(nonce=random.random())\n"
     )
 
 
-def test_structural_nondeterminism_detected_for_baked_literal(project, orders_parquet, monkeypatch):
+def test_structural_nondeterminism_detected_for_baked_literal(project, orders_src, monkeypatch):
     # #88 part 2: the structural case the op lint is blind to. Two reconstructions of
     # a recipe that bakes a random literal at author time hash differently, so the
     # entry's structural content_hash is itself unstable — distinct from an
     # execution-nondeterministic recipe whose graph is fixed.
     from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("nd", _literal_nondeterministic_code(project))
     h = _hash_of(project)
     assert recipe_is_structurally_nondeterministic(project, h) is True
 
 
-def test_deterministic_recipe_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+def test_deterministic_recipe_is_not_structurally_nondeterministic(project, orders_src, monkeypatch):
     # #88 part 2: a deterministic recipe reconstructs to the same graph hash both
     # times, so the structural detector does not false-positive on a clean entry —
     # its drift, if any, is execution-level (#83), not structural.
     from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("agg", _agg_code(project))
     h = _hash_of(project)
     assert recipe_is_structurally_nondeterministic(project, h) is False
 
 
-def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, orders_parquet, monkeypatch):
+def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, orders_src, monkeypatch):
     # #88 part 2: a deterministic UDF recipe must NOT be flagged structural. xorq's
     # make_pandas_udf mints a fresh class per reconstruction (see
     # test_scalar_udf_is_worthy), so two reconstructions
@@ -1306,14 +1042,13 @@ def test_deterministic_udf_entry_is_not_structurally_nondeterministic(project, o
     # exclude UDF entries so a UDF self-heal drift is labeled execution, not structural.
     from tallyman_xorq.result_cache import recipe_is_structurally_nondeterministic
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("udf", _scalar_udf_code(project))
     h = _hash_of(project)
     assert recipe_is_structurally_nondeterministic(project, h) is False
 
 
-def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_parquet, monkeypatch, caplog):
+def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_src, monkeypatch, caplog):
     # Inversion of the pre-#163 behavior this test used to pin. On main, reading
     # an entry whose recipe bakes a random literal re-imported expr.py, re-rolled
     # the literal, derived a *different* snapshot key, and self-healed to bytes
@@ -1328,7 +1063,6 @@ def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_
 
     from tallyman_xorq.result_cache import cached_result_expr, verify_result_faithful
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("nd", _literal_nondeterministic_code(project))  # expensive (Aggregate) → baked
     h = _hash_of(project)
@@ -1348,13 +1082,12 @@ def test_baked_literal_entry_reads_faithfully_from_frozen_build(project, orders_
 # ---------------------------------------------------------------------------
 
 
-def test_cheap_entry_records_no_digest(project, orders_parquet, monkeypatch):
+def test_cheap_entry_records_no_digest(project, orders_src, monkeypatch):
     # ADR-004-result-digest-canonical-ordering: a cheap entry (row-preserving over one file)
     # writes no snapshot, so there is nothing to hash. The manifest must record no
     # result_digest (None / falsy).
     from tallyman_core import entry_dir, read_manifest
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("proj", _project_code(project))
     h = _hash_of(project)
@@ -1371,13 +1104,13 @@ def _ordered_agg_code(project: str) -> str:
     # author's own key, which is kept (ADR-008 D10) — Sort adds a Sort op making it
     # expensive/worthy regardless.
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count()).order_by("region")
 """
 
 
-def test_result_digest_stable_run_to_run(project, orders_parquet, monkeypatch):
+def test_result_digest_stable_run_to_run(project, orders_src, monkeypatch):
     # ADR-004-result-digest-canonical-ordering: the result_digest for a worthy entry
     # with a deterministic (explicitly ordered) result is stable across two independent
     # materialisations. Uses an explicitly-ordered aggregate (Sort op) so the rows are
@@ -1385,7 +1118,6 @@ def test_result_digest_stable_run_to_run(project, orders_parquet, monkeypatch):
     from tallyman_core import entry_dir, read_manifest
     from tallyman_xorq.result_cache import baked_snapshot_path, snapshot_file_digest
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "off")
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
 
     catalog_create("agg_ord", _ordered_agg_code(project))

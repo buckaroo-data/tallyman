@@ -118,8 +118,8 @@ def _user_imports_bare_ibis(code: str) -> bool:
     return False
 
 
-# Read helpers the model reaches for on the wrong namespace. The project-aware
-# way is read_project_file/tracked_expr_from_alias/tallyman_read_csv.
+# Read helpers the model reaches for on the wrong namespace. A recipe reads an alias
+# (tracked_expr_from_alias / pinned_expr_from_alias), never a file.
 _READ_FNS = frozenset(
     {"read_parquet", "read_csv", "read_in_memory", "read_delta", "deferred_read_parquet", "deferred_read_csv"}
 )
@@ -168,7 +168,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
       - `module 'xorq' has no attribute 'X'` — xorq is not the API entrypoint
         (`import xorq.api as xo`); `_` lives on `xorq.vendor.ibis`;
       - `module 'ibis' has no attribute 'X'` — math is a column method, reads
-        go through read_project_file/tracked_expr_from_alias, `ibis.case` is now `ibis.cases`;
+        go through tracked_expr_from_alias, `ibis.case` is now `ibis.cases`;
       - `cannot import name 'X' from 'tallyman_xorq.io'` — invented loader;
       - any duckdb reach — there is no duckdb backend, only datafusion;
       - `'Table' object has no attribute 'X'` — guessed a column name.
@@ -197,11 +197,9 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
         elif name in _READ_FNS:
             hints.append(
                 f"`xorq.{name}` does not exist — `xorq` is not the API entrypoint "
-                "(`import xorq.api as xo`). Read data with `from tallyman_xorq.io "
-                "import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
-                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs (the only "
-                "supported CSV ingest) and `read_project_file(rel_path)` for a "
-                "parquet file under <project>/data/."
+                "(`import xorq.api as xo`), and a recipe does not open a file at all. Import the "
+                "file once with `catalog_import_source('<abs path>', '<alias>')` and read it with "
+                "`from tallyman_xorq.io import tracked_expr_from_alias`."
             )
         else:
             hints.append(
@@ -217,31 +215,31 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             hints.append(f"math/elementwise functions are column methods: `col.{name}()`, not `ibis.{name}(col)`.")
         elif name in {"read_parquet", "read_csv", "read_table"}:
             hints.append(
-                f"`ibis.{name}` does not exist — read data with "
-                "`from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, tallyman_read_csv`; "
-                "use `tallyman_read_csv(abs_path, schema=...)` for CSVs."
+                f"`ibis.{name}` does not exist — a recipe reads an alias, not a file. Import the file "
+                "once with `catalog_import_source('<abs path>', '<alias>')`, then "
+                "`from tallyman_xorq.io import tracked_expr_from_alias`."
             )
         elif name == "case":
             hints.append("`ibis.case` is gone — use `ibis.cases((cond, val), ..., else_=default)`.")
         else:
             hints.append(
                 f"`ibis.{name}` does not exist on `xorq.vendor.ibis`. Many operations are column methods "
-                "(`col.method()`), and data is read via read_project_file/tracked_expr_from_alias."
+                "(`col.method()`), and data is read via tracked_expr_from_alias."
             )
 
     m = re.search(r"cannot import name '(\w+)' from 'tallyman_xorq\.io'", exc_msg)
     if m:
         hints.append(
-            f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `read_project_file` "
-            "(raw files under <project>/data/), `tracked_expr_from_alias` (alias → records lineage), "
-            "`pinned_expr_from_alias` (hash or 'name-vN' version ref, pinned), and `tallyman_read_csv` "
-            "(CSV ingest with a stable __row_order)."
+            f"`tallyman_xorq.io` has no `{m.group(1)}` — it exports `tracked_expr_from_alias` "
+            "(an alias, followed, recording the parent edge) and `pinned_expr_from_alias` "
+            "('<alias>-v<N>', pinned). A file is not a recipe input: import it with "
+            "`catalog_import_source('<abs path>', '<alias>')` first."
         )
 
     if "duckdb" in exc_msg.lower():
         hints.append(
             "there is no duckdb backend here — the only backend is xorq's built-in datafusion. "
-            "Build with the ibis expression API over read_project_file/tracked_expr_from_alias sources; "
+            "Build with the ibis expression API over tracked_expr_from_alias sources; "
             "do not use duckdb, `.sql()`, or `con.register()`."
         )
 
@@ -279,9 +277,10 @@ _NONDETERMINISTIC_OPS = {
 def _csv_direct_read_check(expr) -> None:
     """Raise BuildError if the recipe calls xo.deferred_read_csv directly.
 
-    tallyman_read_csv is the only supported CSV ingest path — it goes through source identity and writes an ordered
-    copy with a stable ``__row_order``, so the entry's rows are fixed under its hash and paging is repeatable. A raw
-    deferred_read_csv bypasses that and gives a nondeterministic row order above datafusion's repartition threshold.
+    A CSV enters the catalog by an import, which digests it, clones the bytes and writes one ordered snapshot of
+    them (ADR-011 D1), so the entry's rows are fixed under its hash and paging is repeatable. A raw
+    deferred_read_csv bypasses all of it and gives a nondeterministic row order above datafusion's repartition
+    threshold.
     """
     try:
         from xorq.expr.relations import Read
@@ -295,10 +294,10 @@ def _csv_direct_read_check(expr) -> None:
         return  # if the walk fails, don't block the build
     if csv_nodes:
         raise BuildError(
-            "xo.deferred_read_csv is not allowed in tallyman recipes — "
-            "use tallyman_read_csv(abs_path, schema=...) instead. "
-            "tallyman_read_csv ingests the CSV once into an ordered copy with a stable __row_order, so the "
-            "entry's rows are fixed under its hash; deferred_read_csv gives "
+            "xo.deferred_read_csv is not allowed in tallyman recipes — a recipe never opens a file. Import the "
+            "CSV once, catalog_import_source('<abs path>', '<alias>', schema=...), and read it with "
+            "tracked_expr_from_alias('<alias>'). The import writes one ordered snapshot with a stable "
+            "__row_order, so the entry's rows are fixed under its hash; deferred_read_csv gives a "
             "nondeterministic row order above datafusion's repartition threshold."
         )
 
@@ -306,9 +305,9 @@ def _csv_direct_read_check(expr) -> None:
 def _raw_parquet_read_check(expr, project: str) -> None:
     """Raise BuildError if the recipe reads a parquet file that tallyman did not write (ADR-008 D12).
 
-    Such a read has no digest, no clone and no ordered copy, so an entry built on it has no ``__row_order`` to page by.
-    Tallyman's own files are the snapshots and ordered copies under the project's ``compute_cache/``; everything else
-    goes through ``read_project_file``.
+    Such a read has no digest and no clone, so an entry built on it has no ``__row_order`` to page by and no record
+    of which bytes it was built from. Tallyman's own files are the snapshots under the project's ``compute_cache/``;
+    everything else enters by an import (ADR-011 D2).
     """
     from xorq.common.utils.graph_utils import walk_nodes
     from xorq.expr.relations import Read
@@ -324,9 +323,9 @@ def _raw_parquet_read_check(expr, project: str) -> None:
             continue
         raise BuildError(
             f"the recipe reads {path} with xo.deferred_read_parquet, which is not allowed: the file gets no "
-            "content digest, no clone and no ordered copy, so the entry would have no __row_order to page by. "
-            "Read a parquet file under <project>/data/ with read_project_file('<name>.parquet'), and a catalog "
-            "entry with tracked_expr_from_alias('<alias>')."
+            "content digest and no clone, so the entry would have no __row_order to page by and no record of "
+            f"which bytes it was built from. Import the file first — catalog_import_source({str(path)!r}, "
+            "'<alias>') — and read it, like any other parent, with tracked_expr_from_alias('<alias>')."
         )
 
 
@@ -410,7 +409,7 @@ def build_and_persist(
         return _build_and_persist(project, code, expr_name, prompt)
 
 
-def _reading(expr, project: str, ordered: dict[str, dict]) -> str:
+def _reading(expr, project: str) -> str:
     """What a cheap entry reads, in words, for the message that says it must keep ``__row_order`` (ADR-008 D3)."""
     from xorq.common.utils.graph_utils import walk_nodes
     from xorq.expr.relations import Read
@@ -419,13 +418,12 @@ def _reading(expr, project: str, ordered: dict[str, dict]) -> str:
 
     paths = [dict(r.read_kwargs).get("hash_path") for r in walk_nodes(Read, expr)]
     paths = [Path(str(p)) for p in paths if p]
-    return describe_read(project, paths[0], ordered) if len(paths) == 1 else "a file"
+    return describe_read(project, paths[0]) if len(paths) == 1 else "a file"
 
 
 def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | None) -> BuildResult:
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
-    from tallyman_xorq import ordered_copy as oc
     from tallyman_xorq._git_state_guard import install_git_state_guard
     from tallyman_xorq.materialize import SNAPSHOT_FORMAT_VERSION, engine_versions, materialize, snapshot_path
     from tallyman_xorq.result_cache import stream_row_count
@@ -436,22 +434,16 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
     # from the long-lived server) and abort the whole build. Make it best-effort.
     install_git_state_guard()
 
-    # Collect source digests while user code imports (read_project_file notes each
-    # file it reads), and the ordered copies each source was ingested into (what a
-    # manifest needs so ensure_materialized can make one again).
+    # Collect the resolved tracked_expr_from_alias parent edges while user code imports (#84). They are the whole
+    # record of what the entry reads: a recipe names aliases and never a file (ADR-011 D2), so there are no source
+    # digests to fold up and no ordered copies to record.
     from tallyman_xorq import parent_capture as pc
-    from tallyman_xorq import source_identity as si
 
-    collect_token = si.begin_collect()
     parent_token = pc.begin_collect()
-    copies_token = oc.begin_collect()
     try:
         module, tmp_script = _import_script(code)
     finally:
-        sources = si.end_collect(collect_token)
-        # Resolved tracked_expr_from_alias parent edges captured during import (#84).
         parents = pc.end_collect(parent_token)
-        ordered = oc.end_collect(copies_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
         names = ", ".join(n for n in dir(module) if not n.startswith("_"))
@@ -460,8 +452,9 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
     # Advisory nondeterminism lint (#88) on the author's expression, surfaced on the result, never fatal.
     lint_warnings = _nondeterminism_warnings(expr_obj)
 
-    # Fatal: raw reads are banned. tallyman_read_csv and read_project_file are the only ingest paths (each writes an
-    # ordered copy with a stable __row_order); a raw deferred_read_csv or deferred_read_parquet bypasses them.
+    # Fatal: raw reads are banned. A file enters the catalog by an import and a recipe reads the source alias
+    # (ADR-011 D2); read_project_file and tallyman_read_csv refuse in io.py, and these two catch the xorq readers
+    # that would otherwise go straight to a file with no digest, no clone and no __row_order.
     _csv_direct_read_check(expr_obj)
     _raw_parquet_read_check(expr_obj, project)
 
@@ -479,7 +472,7 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             expr_obj,
             project,
             verdict=verdict,
-            reading=_reading(expr_obj, project, ordered) if not verdict.worthy else None,
+            reading=_reading(expr_obj, project) if not verdict.worthy else None,
         )
     except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
         raise BuildError(str(exc)) from exc
@@ -505,10 +498,6 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
                 raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
             content_hash = build_path.name
-            if si.mode() == "salt" and sources:
-                # xorq's hash is path-identity only; mixing the source digests in
-                # makes the entry hash content-sensitive (same shape, 12 hex).
-                content_hash = si.salted_hash(content_hash, sources)
             target = entry_dir(project, content_hash)
 
             if target.exists():
@@ -641,8 +630,6 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             nonreproducible_columns=differing or None,
             snapshot_format=SNAPSHOT_FORMAT_VERSION,
             engine_versions=engine_versions(),
-            ordered_copies=ordered or None,
-            sources=sources or None,
             parents=parents or None,
         )
         write_manifest(target, manifest)

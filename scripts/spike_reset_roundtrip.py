@@ -4,9 +4,11 @@ Three kinds of file sit behind an entry, and ``reset_to`` treats them differentl
 
 - the entry directory: moved to the bullpen, copied back by a forward reset;
 - the snapshots under ``compute_cache/``: the same, driven by a git-tracked list of the files that existed;
-- the content-addressed clone of the source under ``data/.cas/``: DELETED by ``gc_cas``, not moved.
+- the content-addressed clone of an imported source under ``data/.cas/``: MOVED to the bullpen by ``gc_cas`` when
+  no surviving entry needs it, and copied back by a forward reset.
 
-Step s1 has an entry over ``orders.parquet``. Step s2 adds a cheap entry and a worthy entry over ``extra.parquet``.
+Step s1 has an entry over an imported ``orders.parquet``. Step s2 imports ``extra.parquet`` and adds a cheap entry
+and a worthy entry over it.
 The script resets to s1, resets forward to s2, and reads both s2 entries. ``extra.parquet`` is never touched. It then
 empties the cache, which is the cold state of ADR-007 D7, and reads the worthy entry again so that it has to heal.
 
@@ -32,14 +34,15 @@ from tallyman_core import data_dir, ensure_project, set_active_project  # noqa: 
 from tallyman_core.paths import compute_cache_dir  # noqa: E402
 from tallyman_xorq import build_and_persist  # noqa: E402
 from tallyman_xorq.result_cache import cached_result_expr  # noqa: E402
+from tallyman_xorq.source_import import update_and_depend  # noqa: E402
 
 PROJECT = "spike"
 
 
-def recipe(source: str, tail: str = "") -> str:
+def recipe(alias: str, tail: str = "") -> str:
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file({source!r}, project={PROJECT!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({alias!r}, project={PROJECT!r})\n"
         f"expr = t{tail}\n"
     )
 
@@ -66,10 +69,12 @@ def main() -> None:
     pd.DataFrame({"region": ["a", "b", "a"], "price": [1.0, 2.0, 3.0]}).to_parquet(data / "orders.parquet")
     pd.DataFrame({"k": ["x", "y", "x", "z"], "v": [1.0, 2.0, 3.0, 4.0]}).to_parquet(data / "extra.parquet")
 
-    build_and_persist(PROJECT, recipe("orders.parquet"))
+    update_and_depend(data / "orders.parquet", "orders_src", project=PROJECT)
+    build_and_persist(PROJECT, recipe("orders_src"))
     s1 = cs.checkpoint_catalog(PROJECT, "s1")
-    cheap = build_and_persist(PROJECT, recipe("extra.parquet", ".filter(t.v > 1)"))
-    worthy = build_and_persist(PROJECT, recipe("extra.parquet", ".group_by('k').aggregate(s=t.v.sum())"))
+    update_and_depend(data / "extra.parquet", "extra_src", project=PROJECT)
+    cheap = build_and_persist(PROJECT, recipe("extra_src", ".filter(t.v > 1)"))
+    worthy = build_and_persist(PROJECT, recipe("extra_src", ".group_by('k').aggregate(s=t.v.sum())"))
     s2 = cs.checkpoint_catalog(PROJECT, "s2")
 
     print(f"at s2, clones: {clones()}")
@@ -80,7 +85,7 @@ def main() -> None:
     print(f"after the reset to s1, clones: {clones()}")
     cs.reset_to(PROJECT, s2)
     print(f"after the reset forward to s2, clones: {clones()}; extra.parquet is unchanged on disk")
-    read("cheap entry, which reads the clone on every read", cheap.content_hash)
+    read("cheap entry, which reads its source's snapshot on every read", cheap.content_hash)
     read("worthy entry, whose snapshot came back from the bullpen", worthy.content_hash)
 
     for snapshot in compute_cache_dir(PROJECT).rglob("*.parquet"):

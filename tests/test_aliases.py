@@ -30,16 +30,16 @@ from tallyman_xorq import build_and_persist
 
 def _agg_code(project_name: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project_name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project_name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _filter_code(project_name: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project_name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project_name!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
@@ -160,7 +160,7 @@ def test_rename_alias_collision(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_create_assigns_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_assigns_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg_code(project), prompt="sales by region")
     assert "error" not in out
@@ -169,7 +169,7 @@ def test_catalog_create_assigns_alias(project: str, orders_parquet: Path, monkey
     assert get_alias(project, "shoe_sales") == out["hash"]
 
 
-def test_catalog_create_rejects_duplicate(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_rejects_duplicate(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_create("shoe_sales", _agg_code(project))
@@ -177,7 +177,7 @@ def test_catalog_create_rejects_duplicate(project: str, orders_parquet: Path, mo
     assert "already exists" in out["error"]
 
 
-def test_catalog_revise_bumps_version(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_bumps_version(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     v1 = catalog_create("shoe_sales", _agg_code(project))
     v2 = catalog_revise("shoe_sales", _filter_code(project))
@@ -187,14 +187,14 @@ def test_catalog_revise_bumps_version(project: str, orders_parquet: Path, monkey
     assert get_alias(project, "shoe_sales") == v2["hash"]
 
 
-def test_catalog_revise_rejects_missing_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_rejects_missing_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_revise("nonexistent", _agg_code(project))
     assert "error" in out
     assert "does not exist" in out["error"]
 
 
-def test_catalog_alias_promotes_scratch(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_promotes_scratch(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project), prompt="exploratory")
     out = catalog_alias(scratch["hash"], "shoe_sales")
@@ -209,7 +209,7 @@ def test_catalog_alias_rejects_missing_hash(project: str, monkeypatch):
     assert "error" in out
 
 
-def test_catalog_alias_rejects_taken_name(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_rejects_taken_name(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project))
     catalog_alias(scratch["hash"], "shoe_sales")
@@ -218,7 +218,7 @@ def test_catalog_alias_rejects_taken_name(project: str, orders_parquet: Path, mo
     assert "error" in out
 
 
-def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_rename(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("foo", _agg_code(project))
     out = catalog_rename("foo", "bar")
@@ -233,7 +233,7 @@ def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_run_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_run_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run(_agg_code(project), prompt="url check")
     assert "url" in out
@@ -241,7 +241,7 @@ def test_catalog_run_returns_url(project: str, orders_parquet: Path, monkeypatch
     assert project in out["url"]
 
 
-def test_catalog_create_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg_code(project), prompt="url check")
     assert "url" in out
@@ -249,7 +249,7 @@ def test_catalog_create_returns_url(project: str, orders_parquet: Path, monkeypa
     assert project in out["url"]
 
 
-def test_catalog_revise_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_revise("shoe_sales", _filter_code(project), prompt="url check")
@@ -258,7 +258,7 @@ def test_catalog_revise_returns_url(project: str, orders_parquet: Path, monkeypa
     assert project in out["url"]
 
 
-def test_catalog_alias_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project))
     out = catalog_alias(scratch["hash"], "shoe_sales")
@@ -272,7 +272,7 @@ def test_catalog_alias_returns_url(project: str, orders_parquet: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, orders_parquet: Path):
+def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, orders_src: str):
     build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", build_and_persist(project, _filter_code(project)).content_hash)
     c = TestClient(fresh_companion_app)
@@ -283,7 +283,7 @@ def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, ord
     assert entries["shoe_sales"]["version"] == 1
 
 
-def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, orders_parquet: Path):
+def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, orders_src: str):
     v1 = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", v1.content_hash)
     v2 = build_and_persist(project, _filter_code(project))
@@ -300,7 +300,7 @@ def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, o
     assert current[0]["version"] == 2
 
 
-def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, orders_src: str):
     res = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", res.content_hash)
     c = TestClient(fresh_companion_app)
@@ -311,7 +311,7 @@ def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, o
     assert body["alias"] == "shoe_sales"
 
 
-def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, orders_src: str):
     v1 = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", v1.content_hash)
     v2 = build_and_persist(project, _filter_code(project))
@@ -325,7 +325,7 @@ def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, 
     assert len(body["forensic_history"]) == 2
 
 
-def test_catalog_renders_section_headers(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_renders_section_headers(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """T-13: entries API groups named/forensic/scratch with correct flags."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_revise, catalog_run

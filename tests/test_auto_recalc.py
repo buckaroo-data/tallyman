@@ -25,6 +25,7 @@ from tallyman_mcp.server import catalog_create, catalog_recalc, catalog_revise
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.dependents import descendant_cone
 from tallyman_xorq.recalc import followers_of
+from tallyman_xorq.source_import import update_and_depend
 from tallyman_xorq.staleness import scan
 
 # ---------------------------------------------------------------------------
@@ -32,18 +33,18 @@ from tallyman_xorq.staleness import scan
 # ---------------------------------------------------------------------------
 
 
-def _src_code(project: str, src: str = "orders.parquet") -> str:  # a source projection
+def _src_code(project: str, src: str = "orders_src") -> str:  # a projection of a source alias
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file({src!r}, project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
 
 
-def _src_code_v2(project: str, src: str = "orders.parquet") -> str:  # different graph, same source
+def _src_code_v2(project: str, src: str = "orders_src") -> str:  # different graph, same source
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file({src!r}, project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.select("region", "price", "__row_order").mutate(extra=1)
 """
 
@@ -69,14 +70,24 @@ def _hash(result: dict) -> str:
     return result["hash"]
 
 
-def _second_source(project: str, name: str = "widgets.parquet", *, seed: int = 1, n: int = 120):
-    return write_shoe_orders(data_dir(project) / name, n_rows=n, seed=seed)
+WIDGETS_SRC = "widgets_src"
+
+
+def _second_source(project: str, *, seed: int = 1, n: int = 120) -> str:
+    """Import a second, unrelated source alias and return its name.
+
+    Called again with a different seed it imports different bytes under the same alias, which
+    advances it (ADR-011 D3) and makes whatever reads it stale. That is the replacement for
+    editing a file on disk, which a build never sees.
+    """
+    path = write_shoe_orders(data_dir(project) / "widgets.parquet", n_rows=n, seed=seed)
+    update_and_depend(path, WIDGETS_SRC, project=project)
+    return WIDGETS_SRC
 
 
 def _clean_env(monkeypatch) -> None:
-    """Default-ON path: no env override, content-addressed sources."""
+    """Default-ON path: no env override."""
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +95,7 @@ def _clean_env(monkeypatch) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_revise_cascades_to_follower_without_explicit_recalc(project, orders_parquet, monkeypatch):
+def test_revise_cascades_to_follower_without_explicit_recalc(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     a1 = _hash(catalog_create("a", _src_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
@@ -110,7 +121,7 @@ def test_revise_cascades_to_follower_without_explicit_recalc(project, orders_par
 # ---------------------------------------------------------------------------
 
 
-def test_revise_and_cascade_is_one_undoable_revision(project, orders_parquet, monkeypatch):
+def test_revise_and_cascade_is_one_undoable_revision(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     a1 = _hash(catalog_create("a", _src_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
@@ -132,7 +143,7 @@ def test_revise_and_cascade_is_one_undoable_revision(project, orders_parquet, mo
 # ---------------------------------------------------------------------------
 
 
-def test_flag_off_leaves_follower_stale(project, orders_parquet, monkeypatch):
+def test_flag_off_leaves_follower_stale(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     set_auto_recalc(project, False)
     assert auto_recalc_enabled(project) is False
@@ -151,7 +162,7 @@ def test_flag_off_leaves_follower_stale(project, orders_parquet, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_revise_with_no_followers_is_one_checkpoint_empty_report(project, orders_parquet, monkeypatch):
+def test_revise_with_no_followers_is_one_checkpoint_empty_report(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     a1 = _hash(catalog_create("a", _src_code(project)))  # nothing follows a
     step_before = current_step(project)
@@ -169,7 +180,7 @@ def test_revise_with_no_followers_is_one_checkpoint_empty_report(project, orders
 # ---------------------------------------------------------------------------
 
 
-def test_broken_downstream_stops_and_reports_revise_still_lands(project, orders_parquet, monkeypatch):
+def test_broken_downstream_stops_and_reports_revise_still_lands(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     a1 = _hash(catalog_create("a", _src_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
@@ -191,7 +202,7 @@ def test_broken_downstream_stops_and_reports_revise_still_lands(project, orders_
 # ---------------------------------------------------------------------------
 
 
-def test_recalc_sub_report_shape(project, orders_parquet, monkeypatch):
+def test_recalc_sub_report_shape(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     _hash(catalog_create("a", _src_code(project)))
     _hash(catalog_create("b", _child_code("a")))
@@ -203,7 +214,7 @@ def test_recalc_sub_report_shape(project, orders_parquet, monkeypatch):
     assert r["status"] == "ok"
 
 
-def test_auto_recalc_report_carries_real_checkpoint_step(project, orders_parquet, monkeypatch):
+def test_auto_recalc_report_carries_real_checkpoint_step(project, orders_src, monkeypatch):
     # The auto-path sub-report's `checkpoint_step` must be the step the cascade
     # actually committed in. The walk takes no checkpoint of its own (the per-op
     # dispatch decorator owns it, after the handler returns), so the report is
@@ -226,16 +237,17 @@ def test_auto_recalc_report_carries_real_checkpoint_step(project, orders_parquet
 # ---------------------------------------------------------------------------
 
 
-def test_orphan_stale_is_left_untouched_logged_and_classified(project, orders_parquet, monkeypatch, caplog):
+def test_orphan_stale_is_left_untouched_logged_and_classified(project, orders_src, monkeypatch, caplog):
     _clean_env(monkeypatch)
-    _second_source(project, "widgets.parquet", seed=1)
-    a1 = _hash(catalog_create("a", _src_code(project)))  # over orders.parquet
+    widgets = _second_source(project, seed=1)
+    a1 = _hash(catalog_create("a", _src_code(project)))  # over orders_src
     b1 = _hash(catalog_create("b", _child_code("a")))
-    c1 = _hash(catalog_create("c", _src_code(project, "widgets.parquet")))
+    c1 = _hash(catalog_create("c", _src_code(project, widgets)))
 
-    # Make c directly source-stale for a reason unrelated to the revise of a.
-    _second_source(project, "widgets.parquet", seed=7, n=250)
-    assert scan(project)[c1].stale is True  # c is directly source-stale
+    # Make c directly stale for a reason unrelated to the revise of a: re-import
+    # widgets, which advances the alias c reads.
+    _second_source(project, seed=7, n=250)
+    assert scan(project)[c1].stale is True  # c is directly stale on the widgets_src edge
 
     with caplog.at_level(logging.WARNING):
         out = catalog_revise("a", _src_code_v2(project))
@@ -258,10 +270,10 @@ def test_orphan_stale_is_left_untouched_logged_and_classified(project, orders_pa
 # ---------------------------------------------------------------------------
 
 
-def test_cascade_failure_persists_and_ties_back(project, orders_parquet, monkeypatch):
+def test_cascade_failure_persists_and_ties_back(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
-    _second_source(project, "widgets.parquet", seed=1)
-    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    widgets = _second_source(project, seed=1)
+    _hash(catalog_create("z", _src_code(project, widgets)))  # unrelated alias
     _hash(catalog_create("a", _src_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
     (entry_dir(project, b1) / "expr.py").write_text("broken (((\n")
@@ -275,7 +287,7 @@ def test_cascade_failure_persists_and_ties_back(project, orders_parquet, monkeyp
 
     # A later auto-recalc driven by an UNRELATED alias still sees b1 stale; b1 is
     # not a follower of z, so it lands in orphan_stale, classified explained-by-error.
-    out2 = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
+    out2 = catalog_revise("z", _src_code_v2(project, widgets))
     orphans = {o["hash"]: o for o in out2["recalc"]["orphan_stale"]}
     assert b1 in orphans
     assert err["id"] in orphans[b1]["explanation"]
@@ -310,7 +322,7 @@ def test_env_overrides_config_file(project, monkeypatch):
     assert auto_recalc_enabled(project) is False
 
 
-def test_config_json_is_tracked_and_reset_restores_it(project, orders_parquet, monkeypatch):
+def test_config_json_is_tracked_and_reset_restores_it(project, orders_src, monkeypatch):
     # config.json must be on the catalog's tracked-surface allowlist: it is swept
     # into checkpoints and reset_to's assert_catalog_consistent would otherwise
     # reject it as an unlisted tracked path. Pin both that reset doesn't raise and
@@ -349,7 +361,7 @@ def test_read_config_tolerates_unreadable_file(project, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parquet, monkeypatch):
+def test_self_referential_revise_is_not_unexplained_orphan(project, orders_src, monkeypatch):
     # A self-referential head (a recipe that reads tracked_expr_from_alias of its OWN
     # alias) is permanently alias-stale by design (#74/#85: the self-pin can never
     # refresh). catalog_revise now rejects creating one (#135), but historical heads
@@ -357,9 +369,9 @@ def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parqu
     # a head as "self-referential", NOT UNEXPLAINED ("file a bug") — otherwise the
     # UNEXPLAINED signal becomes untrustworthy.
     _clean_env(monkeypatch)
-    _second_source(project, "widgets.parquet", seed=1)
+    widgets = _second_source(project, seed=1)
     _hash(catalog_create("tpd", _src_code(project)))  # has a price column
-    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    _hash(catalog_create("z", _src_code(project, widgets)))  # unrelated alias
 
     # catalog_revise rejects a self-referential recipe (#135), so build the self-ref
     # head directly to exercise the staleness classification for an existing one.
@@ -372,14 +384,14 @@ def test_self_referential_revise_is_not_unexplained_orphan(project, orders_parqu
 
     # A later, unrelated revise must classify the self-ref head as explained
     # ("self-referential"), not UNEXPLAINED — keeping the UNEXPLAINED signal trustworthy.
-    out = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
+    out = catalog_revise("z", _src_code_v2(project, widgets))
     orphans = {o["hash"]: o for o in out["recalc"]["orphan_stale"]}
     assert tpd_head in orphans  # it IS directly (self-)stale, so it is accounted for
     assert "UNEXPLAINED" not in orphans[tpd_head]["explanation"]
     assert "self-referential" in orphans[tpd_head]["explanation"].lower()
 
 
-def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orders_parquet, monkeypatch):
+def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orders_src, monkeypatch):
     # When a cascade halts, an entry it SKIPS that is itself directly stale must
     # still be accounted for: recorded against the durable error store so a later
     # unrelated revise classifies it "explained", not a false UNEXPLAINED.
@@ -389,8 +401,8 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
     # walk reaches first fails and halts, leaving the other SKIPPED while still
     # directly stale — exactly the case the skipped-record covers, order-agnostic.
     _clean_env(monkeypatch)
-    _second_source(project, "widgets.parquet", seed=1)
-    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    widgets = _second_source(project, seed=1)
+    _hash(catalog_create("z", _src_code(project, widgets)))  # unrelated alias
     _hash(catalog_create("a", _src_code(project)))
     # Distinct recipes so b and c are different entries (same recipe → same hash →
     # one entry with two aliases), both following a.
@@ -419,7 +431,7 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
     # the skipped-but-directly-stale entry is recorded, so error_for_hash resolves it
     assert error_for_hash(project, skipped) is not None
 
-    out2 = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))  # unrelated revise
+    out2 = catalog_revise("z", _src_code_v2(project, widgets))  # unrelated revise
     orphans = {o["hash"]: o for o in out2["recalc"]["orphan_stale"]}
     assert skipped in orphans
     assert "UNEXPLAINED" not in orphans[skipped]["explanation"]
@@ -432,7 +444,7 @@ def test_skipped_but_directly_stale_entry_ties_back_to_the_failure(project, orde
 # ---------------------------------------------------------------------------
 
 
-def test_cascade_failure_records_triggering_tool(project, orders_parquet, monkeypatch):
+def test_cascade_failure_records_triggering_tool(project, orders_src, monkeypatch):
     # The persisted recalc failure must name the tool that actually ran. On the
     # auto-recalc path that is catalog_revise; "catalog_recalc" (which never ran
     # here) would misattribute the failure in the error banner / forensics.
@@ -455,7 +467,7 @@ def test_cascade_failure_records_triggering_tool(project, orders_parquet, monkey
 # ---------------------------------------------------------------------------
 
 
-def test_auto_recalc_scans_staleness_once(project, orders_parquet, monkeypatch):
+def test_auto_recalc_scans_staleness_once(project, orders_src, monkeypatch):
     # auto_recalc computed verdicts via scan(), then the cone walk scanned again —
     # two full staleness scans (each re-digests every source) per revise. The walk
     # must reuse the verdicts auto_recalc already holds.
@@ -508,7 +520,7 @@ def _make_divergent_husk(project) -> tuple[str, str, str]:
     return leaf1, husk, live
 
 
-def test_revising_leaf_does_not_replay_a_superseded_husk(project, orders_parquet, monkeypatch):
+def test_revising_leaf_does_not_replay_a_superseded_husk(project, orders_src, monkeypatch):
     # THE f2dd/cb24 REGRESSION. Revising a leaf the husk pins must recompute only
     # u's live head, not replay the divergent husk into a brand-new junk entry.
     _clean_env(monkeypatch)
@@ -527,7 +539,7 @@ def test_revising_leaf_does_not_replay_a_superseded_husk(project, orders_parquet
     assert husk not in out["recalc"]["remap"]
 
 
-def test_followers_of_excludes_superseded_husk(project, orders_parquet, monkeypatch):
+def test_followers_of_excludes_superseded_husk(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     set_auto_recalc(project, False)  # advance leaf WITHOUT the cascade, to inspect the raw roots
     _leaf1, husk, live = _make_divergent_husk(project)
@@ -538,7 +550,7 @@ def test_followers_of_excludes_superseded_husk(project, orders_parquet, monkeypa
     assert husk not in follows  # the dead husk is not
 
 
-def test_scan_excludes_husk_from_stale_but_keeps_it_in_the_dict(project, orders_parquet, monkeypatch):
+def test_scan_excludes_husk_from_stale_but_keeps_it_in_the_dict(project, orders_src, monkeypatch):
     _clean_env(monkeypatch)
     set_auto_recalc(project, False)
     _leaf1, husk, live = _make_divergent_husk(project)
@@ -550,24 +562,24 @@ def test_scan_excludes_husk_from_stale_but_keeps_it_in_the_dict(project, orders_
     assert husk in v  # ...but still present in the dict (the replay loop indexes every cone member)
 
 
-def test_superseded_husk_is_not_an_unexplained_orphan(project, orders_parquet, monkeypatch):
+def test_superseded_husk_is_not_an_unexplained_orphan(project, orders_src, monkeypatch):
     # The perpetual-false-alarm half: a husk must not fill orphan_stale with
     # "file a bug", while a genuinely-stale live head with no error still does.
     _clean_env(monkeypatch)
     set_auto_recalc(project, False)
-    _second_source(project, "widgets.parquet", seed=1)
+    widgets = _second_source(project, seed=1)
     _leaf1, husk, live = _make_divergent_husk(project)
     catalog_revise("leaf", _src_code_v2(project))  # leaf advances → husk + live both stale, none recomputed
-    _hash(catalog_create("z", _src_code(project, "widgets.parquet")))  # unrelated alias
+    _hash(catalog_create("z", _src_code(project, widgets)))  # unrelated alias
     set_auto_recalc(project, True)
 
-    out = catalog_revise("z", _src_code_v2(project, "widgets.parquet"))
+    out = catalog_revise("z", _src_code_v2(project, widgets))
     orphans = {o["hash"]: o for o in out["recalc"]["orphan_stale"]}
     assert live in orphans and "UNEXPLAINED" in orphans[live]["explanation"]  # real stale head still flagged
     assert husk not in orphans  # the husk is no longer a false UNEXPLAINED
 
 
-def test_scan_driven_recalc_does_not_replay_husk(project, orders_parquet, monkeypatch):
+def test_scan_driven_recalc_does_not_replay_husk(project, orders_src, monkeypatch):
     # The SECOND junk-site: a no-arg catalog_recalc defaults its roots to every
     # directly-stale entry (server.py), bypassing followers_of. The head-gate must
     # cover it too, or the husk churns junk here instead of on the revise path.
@@ -582,26 +594,30 @@ def test_scan_driven_recalc_does_not_replay_husk(project, orders_parquet, monkey
     assert new == {get_alias(project, "u")}  # only u's live-head recompute; no husk junk
 
 
-def test_scan_driven_recalc_does_not_replay_husk_under_source_drift(project, orders_parquet, monkeypatch):
-    # The SOURCE-DRIFT sibling of the test above. Instead of REVISING the leaf
-    # (which advances its head, so the leaf drops out of the root set), drift the
-    # leaf's SOURCE FILE on disk. The leaf HEAD stays a directly-stale root, so
+def test_scan_driven_recalc_does_not_replay_husk_under_source_reimport(
+    project, orders_parquet, orders_src, monkeypatch
+):
+    # The RE-IMPORT sibling of the test above. Instead of REVISING the leaf
+    # (which advances its head, so the leaf drops out of the root set), advance the
+    # source alias the leaf reads. The leaf HEAD stays a directly-stale root, so
     # descendant_cone([leaf]) re-expands through the husk's follow=True parent edge
     # and drags the husk back into the cone. The head-gate lives on the ROOT SET,
     # not on cone membership, so _replay_cone rebuilds the husk anyway — the
-    # f2dd/cb24 junk-replay regression, on the source-drift path.
+    # f2dd/cb24 junk-replay regression, on the advancing-input path.
     _clean_env(monkeypatch)
     set_auto_recalc(project, False)
     leaf1, husk, _live = _make_divergent_husk(project)
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=1)  # drift leaf's source in place
+    write_shoe_orders(orders_parquet, n_rows=200, seed=1)
+    update_and_depend(orders_parquet, "orders_src", project=project)  # orders_src v2: the leaf's input moved
 
     v = scan(project)
-    assert v[leaf1].stale is True  # leaf head directly stale on the source axis → a recalc root
+    assert v[leaf1].stale is True  # leaf head directly stale on the orders_src edge → a recalc root
     assert v[husk].stale is False and v[husk].live is False  # husk gated out of the root set...
     assert husk in descendant_cone(project, [leaf1])  # ...but still dragged into the leaf's cone
 
     before = {e["content_hash"] for e in list_entries(project)}
     catalog_recalc(dry_run=False)  # roots default to the scan-driven directly-stale set = [leaf]
     new = {e["content_hash"] for e in list_entries(project)} - before
-    # exactly two new entries — the leaf source-recompute and u's live-head recompute — no junk husk replay
+    # exactly two new entries — the leaf's rebuild against orders_src v2 and u's live-head
+    # recompute — no junk husk replay
     assert new == {get_alias(project, "leaf"), get_alias(project, "u")}

@@ -11,8 +11,8 @@ connection, so a float aggregate merges its partial sums in one order (ADR-009 D
 that fixes the layout of the file (ADR-009 D3) and numbers them in a last column, ``__row_order`` (ADR-008 D2), and
 returns the content digest of the file it wrote, read back (ADR-009 D2).
 
-``ensure_materialized`` is the one entry point that makes files exist: every snapshot, ordered copy and clone an
-entry's plan reads is on disk before anything executes (ADR-007 D5).
+``ensure_materialized`` is the one entry point that makes files exist: every snapshot an entry's plan reads is on
+disk before anything executes (ADR-007 D5).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ perf_log = logging.getLogger("tallyman.perf")
 # The snapshot format (ADR-009 D3). The row-group size decides the batch boundaries an entry built on this file sees,
 # and an ungrouped float total depends on them (#187), so the row-group size and the materialization connection's batch
 # size are part of the reproducibility contract: changing either is a corpus rebuild, and the version below stands for
-# both (and for the layout of the ordered copies of sources, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
+# both (and for the row groups a source snapshot is written in, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
 SNAPSHOT_ROW_GROUP_ROWS = 1_048_576
 SNAPSHOT_BATCH_SIZE = 8192
 SNAPSHOT_FORMAT_VERSION = 1
@@ -242,8 +242,12 @@ def _heal(project: str, content_hash: str) -> None:
 
 
 def _recreate(project: str, owner_hash: str, path: Path) -> None:
-    """Make a missing file the owner's plan reads again, by the rule for its class (ADR-007 D13)."""
-    from tallyman_xorq import ordered_copy as oc
+    """Make a missing file the owner's plan reads again (ADR-007 D13).
+
+    There is one class of file to make again: another entry's snapshot, named by its content hash, made
+    by recursing on it. A source's ordered copy was the second class and is gone — a source is an entry,
+    so its rows come back through this same path (``_heal_a_source`` under ``_ensure``), ADR-011 D1.
+    """
     from tallyman_xorq.build import BuildError
 
     if path.parent == snapshots_dir(project):
@@ -256,8 +260,6 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
                 "catalog, so it cannot be made again"
             )
         ensure_materialized(project, parent)
-    elif oc.is_ordered_copy_path(project, path):
-        oc.recreate_ordered_copy(project, owner_hash, path)
     else:
         raise BuildError(
             f"entry {owner_hash} in {project!r} reads {path}, which tallyman did not write and cannot make again"
@@ -340,8 +342,8 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     1. A worthy entry whose snapshot exists is done, and no build is loaded.
     2. Otherwise load the entry's build (the plan is kept in the existing LRU) and collect every file its ``Read``
        nodes point at.
-    3. Re-create each that is missing by the rule for its class: a snapshot by recursing on the hash in its file name,
-       an ordered copy of a source from its clone, a clone from the live source while the bytes still match.
+    3. Re-create each that is missing: every one is another entry's snapshot, made by recursing on the hash in its
+       file name. A source version is re-created from the clone of its imported bytes (``_heal_a_source``).
     4. If the entry is worthy, heal its own snapshot and verify it.
 
     Every caller that composes or executes an entry goes through here, so nothing ever runs over a file that is

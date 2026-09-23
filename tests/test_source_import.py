@@ -315,12 +315,12 @@ def test_the_snapshot_is_the_ordered_copy(project: str, tmp_path: Path, monkeypa
     assert frame.columns[-1] == ROW_ORDER
     assert frame[ROW_ORDER].to_list() == list(range(7))
 
-    from tallyman_xorq.ordered_copy import ordered_copies_dir
+    from tallyman_core.paths import compute_cache_dir
+    from tallyman_xorq.materialize import RESULT_CACHE_DIRNAME
 
-    assert not ordered_copies_dir(project).exists(), "an import writes no separate ordered copy"
-    manifest = read_manifest(entry_dir(project, out["hash"]))
-    assert manifest.ordered_copies is None
-    assert manifest.cache_worthy is True
+    subdirs = [d.name for d in compute_cache_dir(project).iterdir()]
+    assert subdirs == [RESULT_CACHE_DIRNAME], f"an import writes no separate ordered copy: {subdirs}"
+    assert read_manifest(entry_dir(project, out["hash"])).cache_worthy is True
 
 
 def test_two_aliases_over_identical_bytes_share_one_entry(project: str, tmp_path: Path, monkeypatch):

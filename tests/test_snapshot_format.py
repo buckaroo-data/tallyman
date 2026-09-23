@@ -5,8 +5,8 @@ Decisions covered, all from ``plans/ADR-009-digest-stability.md``:
 - D1 (materialization runs single-partition): float aggregates heal to the digest they were built with, and the plan
   runs on a connection with ``target_partitions = 1`` that is not the process default.
 - D3 (the snapshot's format): one row group is 1,048,576 rows, zstd, format 2.6, statistics and a page index, and
-  ``__row_order`` is the last column. The ordered copy of a source has 122,880-row groups. ``schema.json`` is read from
-  the file that was written.
+  ``__row_order`` is the last column. A source version's own snapshot has 122,880-row groups instead. ``schema.json``
+  is read from the file that was written.
 - D4 (a mismatch record names its likely cause): the manifest records engine versions and the snapshot format
   version, and an unfaithful heal says "the engine changed" when it did.
 - D6 (create runs the query twice and compares): a recipe that differs run to run is recorded as not reproducible and
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
@@ -37,11 +36,12 @@ import pytest
 from fastapi.testclient import TestClient
 from xorq.config import default_backend
 
-from tallyman_core import data_dir, ensure_project
+from tallyman_core import data_dir, ensure_project, set_active_project
 from tallyman_core.errors import list_errors
 from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import compute_cache_dir, entry_dir, entry_schema_path
+from tallyman_core.paths import entry_dir, entry_schema_path
 from tallyman_xorq.build import build_and_persist
+from tallyman_xorq.ordered_copy import ORDERED_COPY_ROW_GROUP_ROWS
 from tallyman_xorq.result_cache import (
     UNFAITHFUL_HEAL_HOOKS,
     baked_snapshot_path,
@@ -49,12 +49,15 @@ from tallyman_xorq.result_cache import (
     snapshot_file_digest,
     verify_result_faithful,
 )
+from tallyman_xorq.source_import import update_and_depend
 from tests.big_parquet import write_big_parquet
 
 PREFIX = "arrow-sha256:"
 SNAPSHOT_ROW_GROUP = 1_048_576  # ADR-009 D3
-ORDERED_COPY_ROW_GROUP = 122_880  # ADR-009 D3, io._CSV_PARQUET_WRITE
+SOURCE_ROW_GROUP = 122_880  # ADR-009 D3, ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS
 BIG_ROWS = 1_500_000  # tests/big_parquet.py default
+ORDERS_SRC = "orders_src"  # the shoe-orders source alias the conftest fixture imports
+BIG_SRC = "big_src"  # the 1.5M-row fixture, imported per project
 
 
 # ---------------------------------------------------------------------------
@@ -92,8 +95,10 @@ def _evict(project: str, content_hash: str) -> Path:
     return snap
 
 
-def _install(project: str, big_source: Path, name: str = "big.parquet") -> None:
-    shutil.copy(big_source, data_dir(project) / name)
+def _import_big(project: str, big_source: Path) -> str:
+    """Import the 1.5M-row fixture as a source alias (ADR-011 D1); returns the alias name a recipe reads."""
+    update_and_depend(big_source, BIG_SRC, project=project)
+    return BIG_SRC
 
 
 # ---------------------------------------------------------------------------
@@ -103,16 +108,16 @@ def _install(project: str, big_source: Path, name: str = "big.parquet") -> None:
 
 def _agg_code(project: str) -> str:  # Aggregate: worthy, deterministic
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
-def _order_by_code(project: str) -> str:  # a Sort over the 1.5M-row file: worthy, and more than one row group
+def _order_by_code(project: str) -> str:  # a Sort over the 1.5M-row source: worthy, and more than one row group
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("big.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({BIG_SRC!r}, project={project!r})
 expr = t.order_by("id")
 """
 
@@ -120,8 +125,8 @@ expr = t.order_by("id")
 def _float_agg_code(project: str, *, grouped: bool) -> str:
     aggregate = "t.group_by('g').aggregate" if grouped else "t.aggregate"
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("big.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({BIG_SRC!r}, project={project!r})
 expr = {aggregate}(s=t.v.sum(), m=t.v.mean())
 """
 
@@ -129,12 +134,12 @@ expr = {aggregate}(s=t.v.sum(), m=t.v.mean())
 def _noisy_udf_code(project: str) -> str:
     """A scalar UDF that returns a different value on every call: the entry is worthy and not reproducible."""
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 from xorq.expr.udf import make_pandas_udf
 import xorq.vendor.ibis.expr.datatypes as dt
 from xorq.vendor.ibis import schema as ibis_schema
 
-t = read_project_file("orders.parquet", project={project!r})
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 
 
 def noisy(df):
@@ -154,13 +159,13 @@ def _counting_udf_code(project: str, counter: Path) -> str:
     xorq pickles a UDF into the build, so a module-level counter would be a copy; a file is visible from outside.
     """
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 from xorq.expr.udf import make_pandas_udf
 import xorq.vendor.ibis.expr.datatypes as dt
 from xorq.vendor.ibis import schema as ibis_schema
 
 COUNTER = {str(counter)!r}
-t = read_project_file("orders.parquet", project={project!r})
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 
 
 def bump(df):
@@ -177,10 +182,10 @@ expr = t.mutate(qty_plus=_udf.on_expr(t))
 def _timestamp_code(project: str) -> str:
     """An expression whose type is ``timestamp[s]``, which parquet stores as ``timestamp[ms]``."""
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis.expr.datatypes as dt
 
-t = read_project_file("events.parquet", project={project!r})
+t = tracked_expr_from_alias("events_src", project={project!r})
 expr = t.mutate(ts0=t.ts.cast(dt.Timestamp(scale=0))).order_by("id")
 """
 
@@ -200,6 +205,7 @@ class _Built:
     home: Path
     project: str
     content_hash: str
+    source_hash: str  # the entry the import minted, whose snapshot the recipe reads
 
 
 @pytest.fixture(scope="module")
@@ -210,9 +216,13 @@ def _big_built(tmp_path_factory, big_source):
     patch.setenv("TALLYMAN_HOME", str(home))
     try:
         ensure_project("fmt")
-        _install("fmt", big_source)
+        # An import resolves the read in its generated recipe through the ACTIVE project
+        # (``source_import._recipe`` writes ``read_project_file(path)`` with no project), so a project built in a
+        # home of its own has to be marked active before anything can be imported into it.
+        set_active_project("fmt")
+        imported = update_and_depend(big_source, BIG_SRC, project="fmt")
         result = build_and_persist("fmt", _order_by_code("fmt"))
-        yield _Built(home, "fmt", result.content_hash)
+        yield _Built(home, "fmt", result.content_hash, imported["hash"])
     finally:
         patch.undo()
 
@@ -248,7 +258,7 @@ def test_float_aggregate_heals_to_the_digest_it_was_built_with(project, big_sour
     different file, an ``unfaithful_heal`` record and a stat-cache wipe each time. Both shapes are checked because the
     ungrouped accumulator and the grouped one merge differently.
     """
-    _install(project, big_source)
+    _import_big(project, big_source)
     result = build_and_persist(project, _float_agg_code(project, grouped=grouped))
     h = result.content_hash
     recorded = read_manifest(entry_dir(project, h)).result_digest
@@ -284,7 +294,7 @@ def test_single_partition_backend_is_one_partition_with_a_pinned_batch_size():
         assert _show(default_backend(), "datafusion.execution.target_partitions") != "1"
 
 
-def test_materialize_runs_the_plan_on_the_single_partition_backend(project, orders_parquet, monkeypatch):
+def test_materialize_runs_the_plan_on_the_single_partition_backend(project, orders_src, monkeypatch):
     """ADR-009 D1: the loaded build is rebound onto the single-partition connection, not left on its own backends.
 
     ``load_expr`` mints its own backend objects, so a loaded build ignores a single-partition connection it was never
@@ -364,21 +374,25 @@ def test_snapshot_ends_in_row_order_numbered_from_zero_in_file_order(big_built):
     assert (table["id"].to_numpy() == np.arange(n)).all()
 
 
-def test_ordered_copy_of_a_source_has_row_groups_of_122880_rows(big_built):
-    """ADR-009 D3 (the format version covers the ordered copies): polars writes them, in pinned 122,880-row groups.
+def test_the_snapshot_of_a_source_has_row_groups_of_122880_rows(big_built):
+    """ADR-009 D3 (the format version covers a source version's snapshot too): pinned 122,880-row groups.
 
-    An ungrouped float total over a source reads that layout (#187), so it is as pinned as the snapshot's.
+    A source version is an entry and its snapshot is the ordered copy of ADR-008 D2, so it is written by the same
+    writer as any other snapshot but in the smaller groups the import pins. An ungrouped float total straight off a
+    source reads that layout (#187), so it is as fixed as the 1,048,576 rows of a computed snapshot.
     """
-    copies = sorted((compute_cache_dir(big_built.project) / "ordered_sources").glob("*.parquet"))
-    assert copies, "reading a source should have written an ordered copy under compute_cache/ordered_sources/"
-    for copy in copies:
-        sizes = _row_group_sizes(copy)
-        assert sizes[:-1] == [ORDERED_COPY_ROW_GROUP] * (len(sizes) - 1), (copy.name, len(sizes), sizes[:3])
-        assert 0 < sizes[-1] <= ORDERED_COPY_ROW_GROUP
-        assert pq.read_schema(copy).names[-1] == "__row_order"
+    assert ORDERED_COPY_ROW_GROUP_ROWS == SOURCE_ROW_GROUP
+    snapshot = _materialize_module().snapshot_path(big_built.project, big_built.source_hash)
+    assert snapshot.exists(), "the import should have written the source entry's snapshot"
+
+    sizes = _row_group_sizes(snapshot)
+    assert sizes[:-1] == [SOURCE_ROW_GROUP] * (len(sizes) - 1), (len(sizes), sizes[:3])
+    assert 0 < sizes[-1] <= SOURCE_ROW_GROUP
+    assert sum(sizes) == BIG_ROWS
+    assert pq.read_schema(snapshot).names[-1] == "__row_order"
 
 
-def test_manifest_records_the_snapshot_format_version(project, orders_parquet):
+def test_manifest_records_the_snapshot_format_version(project, orders_src):
     """ADR-009 D3: row-group size and ``batch_size`` are contract; the manifest records a version for both."""
     materialize_module = _materialize_module()
     result = build_and_persist(project, _agg_code(project))
@@ -386,7 +400,7 @@ def test_manifest_records_the_snapshot_format_version(project, orders_parquet):
     assert manifest.snapshot_format == materialize_module.SNAPSHOT_FORMAT_VERSION
 
 
-def test_materialize_returns_the_content_digest_of_the_file_it_wrote(project, orders_parquet):
+def test_materialize_returns_the_content_digest_of_the_file_it_wrote(project, orders_src):
     """ADR-009 D2 and ADR-007 D4 (one writer): the digest is computed by one function, from the file read back."""
     materialize_module = _materialize_module()
     h = build_and_persist(project, _agg_code(project)).content_hash
@@ -411,6 +425,7 @@ def test_recorded_schema_is_read_from_the_written_file(project):
 
     The expression's type is ``timestamp[s]``; parquet has no seconds unit, so the file holds ``timestamp[ms]``.
     """
+    events = data_dir(project) / "events.parquet"
     pq.write_table(
         pa.table(
             {
@@ -419,8 +434,9 @@ def test_recorded_schema_is_read_from_the_written_file(project):
                 "v": np.random.default_rng(1).random(100),
             }
         ),
-        data_dir(project) / "events.parquet",
+        events,
     )
+    update_and_depend(events, "events_src", project=project)
     h = build_and_persist(project, _timestamp_code(project)).content_hash
 
     recorded = {f["name"]: f["type"] for f in json.loads(entry_schema_path(project, h).read_text())["fields"]}
@@ -442,7 +458,7 @@ def test_recorded_schema_is_read_from_the_written_file(project):
     ],
     ids=["cheap computed column", "aggregate", "sort", "window function"],
 )
-def test_every_recorded_schema_ends_in_row_order(project, orders_parquet, body, expected):
+def test_every_recorded_schema_ends_in_row_order(project, orders_src, body, expected):
     """ADR-009 D3 and ADR-008 D2: cheap entries carry ``__row_order`` last, worthy ones get it from the writer.
 
     A worthy entry that keeps its parent's rows inherits ``__row_order`` mid-table and the writer replaces it with a
@@ -450,8 +466,8 @@ def test_every_recorded_schema_ends_in_row_order(project, orders_parquet, body, 
     """
     code = f"""
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 {body}
 """
     h = build_and_persist(project, code).content_hash
@@ -464,7 +480,7 @@ t = read_project_file("orders.parquet", project={project!r})
 # ---------------------------------------------------------------------------
 
 
-def test_manifest_records_the_engine_versions(project, orders_parquet):
+def test_manifest_records_the_engine_versions(project, orders_src):
     """ADR-009 D4 (a mismatch record names its likely cause): xorq, xorq-datafusion and pyarrow at build."""
     result = build_and_persist(project, _agg_code(project))
     recorded = read_manifest(entry_dir(project, result.content_hash)).engine_versions
@@ -475,7 +491,7 @@ def test_manifest_records_the_engine_versions(project, orders_parquet):
 
 @pytest.mark.parametrize("engine_changed", [True, False], ids=["engine version changed", "engine versions match"])
 def test_an_unfaithful_heal_names_an_engine_change_instead_of_blaming_the_recipe(
-    project, orders_parquet, engine_changed
+    project, orders_src, engine_changed
 ):
     """ADR-009 D4: with an upgrade in play the record says so, and the loud response of ADR-006 D7 still happens.
 
@@ -519,7 +535,7 @@ def test_an_unfaithful_heal_names_an_engine_change_instead_of_blaming_the_recipe
 # ---------------------------------------------------------------------------
 
 
-def test_create_records_a_non_reproducible_recipe_and_names_the_column(project, orders_parquet):
+def test_create_records_a_non_reproducible_recipe_and_names_the_column(project, orders_src):
     """ADR-009 D6 (create runs the query twice and compares): the build succeeds, the entry says it is not reproducible.
 
     A recipe that calls ``sample()`` is legitimate, so the build still succeeds. The columns whose per-column digests
@@ -537,7 +553,7 @@ def test_create_records_a_non_reproducible_recipe_and_names_the_column(project, 
     assert snap is not None and snap.exists()
 
 
-def test_create_records_a_deterministic_recipe_as_reproducible(project, orders_parquet):
+def test_create_records_a_deterministic_recipe_as_reproducible(project, orders_src):
     """ADR-009 D6: a recipe that runs the same both times is recorded as reproducible, with no offending columns."""
     result = build_and_persist(project, _agg_code(project))
     assert result.reproducible is True
@@ -547,11 +563,11 @@ def test_create_records_a_deterministic_recipe_as_reproducible(project, orders_p
     assert not manifest.nonreproducible_columns
 
 
-def test_a_cheap_entry_is_not_checked_for_reproducibility(project, orders_parquet):
+def test_a_cheap_entry_is_not_checked_for_reproducibility(project, orders_src):
     """ADR-009 D6: a cheap entry is not run twice here; it records no digest either (ADR-006 D9, no cheap digests)."""
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({ORDERS_SRC!r}, project={project!r})
 expr = t.mutate(total=t.price * t.qty)
 """
     result = build_and_persist(project, code)
@@ -561,7 +577,7 @@ expr = t.mutate(total=t.price * t.qty)
     assert manifest.result_digest is None
 
 
-def test_create_runs_the_query_twice_and_a_heal_runs_it_once(project, orders_parquet, tmp_path):
+def test_create_runs_the_query_twice_and_a_heal_runs_it_once(project, orders_src, tmp_path):
     """ADR-009 D6: only a create runs the query twice, since a create has nothing recorded to compare against.
 
     A heal is compared against the recorded digest, so once is enough. The UDF appends a byte to a file on every call.
@@ -581,7 +597,7 @@ def test_create_runs_the_query_twice_and_a_heal_runs_it_once(project, orders_par
     assert at_create == 2 * at_heal, f"create called the UDF {at_create} times, a heal {at_heal}"
 
 
-def test_materialize_runs_once_and_runs_twice_only_when_asked_to_check(project, orders_parquet, tmp_path):
+def test_materialize_runs_once_and_runs_twice_only_when_asked_to_check(project, orders_src, tmp_path):
     """ADR-009 D6 and ADR-007 D4: the checking run is an option of the one writer, not a second code path."""
     materialize_module = _materialize_module()
     counter = tmp_path / "calls.bin"
@@ -600,7 +616,7 @@ def test_materialize_runs_once_and_runs_twice_only_when_asked_to_check(project, 
     assert checked.differing_columns == []
 
 
-def test_materialize_names_the_columns_that_differ_between_the_two_runs(project, orders_parquet):
+def test_materialize_names_the_columns_that_differ_between_the_two_runs(project, orders_src):
     """ADR-009 D6: ``differing_columns`` is what the build result reports to the author."""
     materialize_module = _materialize_module()
     h = build_and_persist(project, _noisy_udf_code(project)).content_hash
@@ -614,7 +630,7 @@ def test_materialize_names_the_columns_that_differ_between_the_two_runs(project,
 # ---------------------------------------------------------------------------
 
 
-def test_verify_result_faithful_follows_the_content_not_the_bytes(project, orders_parquet):
+def test_verify_result_faithful_follows_the_content_not_the_bytes(project, orders_src):
     """ADR-009 D2 in the verify path: the same rows in another format are faithful, a changed value is not.
 
     ``verify_result_faithful`` runs on every heal and in the corpus sweep. Under a byte hash, rewriting the snapshot
@@ -638,7 +654,7 @@ def test_verify_result_faithful_follows_the_content_not_the_bytes(project, order
     assert verify_result_faithful(project, h) is False
 
 
-def test_verify_result_faithful_is_false_after_the_recorded_digest_is_tampered(project, orders_parquet):
+def test_verify_result_faithful_is_false_after_the_recorded_digest_is_tampered(project, orders_src):
     """ADR-009 D2: the recorded value is an ``arrow-sha256:`` digest, and a wrong one fails verification."""
     h = build_and_persist(project, _agg_code(project)).content_hash
     assert read_manifest(entry_dir(project, h)).result_digest.startswith(PREFIX)
@@ -653,7 +669,7 @@ def test_verify_result_faithful_is_false_after_the_recorded_digest_is_tampered(p
 # ---------------------------------------------------------------------------
 
 
-def test_a_non_reproducible_entrys_snapshot_survives_an_explicit_delete(fresh_companion_app, project, orders_parquet):
+def test_a_non_reproducible_entrys_snapshot_survives_an_explicit_delete(fresh_companion_app, project, orders_src):
     """ADR-009 D6: the Cache page's delete skips a file that cannot be recreated, and says why.
 
     A snapshot whose recipe is not reproducible would come back as different rows, and everything built on the
@@ -674,7 +690,7 @@ def test_a_non_reproducible_entrys_snapshot_survives_an_explicit_delete(fresh_co
 
 
 def test_an_entry_whose_heal_was_unfaithful_is_pinned_against_an_explicit_delete(
-    fresh_companion_app, project, orders_parquet
+    fresh_companion_app, project, orders_src
 ):
     """ADR-009 D6 and ADR-006 D12 (unfaithful entries are pinned and badged): the same pin, reached after the fact."""
     h = build_and_persist(project, _agg_code(project)).content_hash

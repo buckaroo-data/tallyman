@@ -8,8 +8,8 @@ from tallyman_core import data_dir, entry_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.result_cache import cache_worthy
 
-# The rewrite step before a build (ADR-007 D1): no xorq cache node is ever created, raw CSV reads are banned (every
-# CSV goes through tallyman_read_csv), and in-memory reads are rejected.
+# The rewrite step before a build (ADR-007 D1): no xorq cache node is ever created, raw CSV reads are banned (a CSV
+# enters the catalog by an import, ADR-011 D2), and in-memory reads are rejected.
 
 
 @pytest.fixture
@@ -43,8 +43,8 @@ expr = t.group_by("region").aggregate(total=t.price.sum())
 
 def _parquet_projection(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
 
@@ -54,12 +54,12 @@ def _build_yaml(project: str, content_hash: str) -> str:
 
 
 def test_deferred_read_csv_is_banned(project, sales_csv, monkeypatch):
-    # xo.deferred_read_csv is banned — tallyman_read_csv is the only CSV ingest path.
+    # xo.deferred_read_csv is banned — a CSV enters by catalog_import_source and a recipe reads the alias.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, _csv_projection(project))
     assert "deferred_read_csv" in str(exc.value)
-    assert "tallyman_read_csv" in str(exc.value)
+    assert "catalog_import_source" in str(exc.value)
 
 
 def test_deferred_read_csv_banned_for_aggregate(project, sales_csv, monkeypatch):
@@ -68,10 +68,10 @@ def test_deferred_read_csv_banned_for_aggregate(project, sales_csv, monkeypatch)
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, _csv_aggregate(project))
     assert "deferred_read_csv" in str(exc.value)
-    assert "tallyman_read_csv" in str(exc.value)
+    assert "catalog_import_source" in str(exc.value)
 
 
-def test_parquet_read_has_no_source_cache(project, orders_parquet, monkeypatch):
+def test_parquet_read_has_no_source_cache(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _parquet_projection(project))
     # No build carries a cache node (ADR-007 D1), and a projection over a parquet source is cheap: nothing is

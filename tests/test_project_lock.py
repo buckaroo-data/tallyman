@@ -19,18 +19,18 @@ from tallyman_core import entry_dir, read_manifest
 from tallyman_xorq import build_and_persist
 
 
-def _agg_code(project: str) -> str:
+def _agg_code(project: str, src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
-def _cheap_code(project: str) -> str:
+def _cheap_code(project: str, src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.filter(t.price > 0)
 """
 
@@ -111,7 +111,7 @@ def test_project_lock_is_public_and_the_private_name_is_an_alias():
 # ---------------------------------------------------------------------------
 
 
-def test_two_builds_in_one_project_never_run_at_once(project, orders_parquet, monkeypatch):
+def test_two_builds_in_one_project_never_run_at_once(project, orders_src, monkeypatch):
     """ADR-007 D11: a build is a write, so two builds of two different entries in one project queue. ``build_expr`` is
     the first heavy step of a build; it is wrapped to count how many threads are inside it. Each waits (on an event,
     not a sleep) for the other to be inside too. Unserialized, they meet at once and the peak is 2. Serialized, the
@@ -151,7 +151,7 @@ def test_two_builds_in_one_project_never_run_at_once(project, orders_parquet, mo
 
         return run
 
-    threads = _run_in_threads([builder(_agg_code(project)), builder(_cheap_code(project))])
+    threads = _run_in_threads([builder(_agg_code(project, orders_src)), builder(_cheap_code(project, orders_src))])
 
     assert not any(t.is_alive() for t in threads), "a build never finished"
     assert state["peak"] == 1, f"{state['peak']} builds of one project ran at the same time"
@@ -159,7 +159,7 @@ def test_two_builds_in_one_project_never_run_at_once(project, orders_parquet, mo
     assert len(results) == 2 and results[0].content_hash != results[1].content_hash
 
 
-def test_a_failing_concurrent_build_of_one_entry_cannot_delete_the_winners_entry(project, orders_parquet, monkeypatch):
+def test_a_failing_concurrent_build_of_one_entry_cannot_delete_the_winners_entry(project, orders_src, monkeypatch):
     """ADR-007 D11 (the audit's finding): two builds of one entry, and one of them fails after laying down the entry
     directory. Its cleanup removes the directory, which the other build is still using, so the winner then fails too.
 
@@ -189,10 +189,8 @@ def test_a_failing_concurrent_build_of_one_entry_cannot_delete_the_winners_entry
             second_arrived.wait(timeout=1.5)
         return real_load_expr(*args, **kwargs)
 
-    # Two cold builders also race for the content-addressed clone of the source (``ensure_cas_path`` writes a fixed
-    # ``<digest>.parquet.tmp``), which is a second instance of the same defect but not the one injected below.
-    # Building any other entry over the same source first leaves the clone in place, so that only the injection differs.
-    build_and_persist(project, _cheap_code(project))
+    # The source's clone and snapshot are written once by the import (ADR-011 D1), before either builder starts, so
+    # nothing but the injection below distinguishes the two threads.
     monkeypatch.setattr(compiler, "load_expr", instrumented)
     start = threading.Barrier(2)
     results: list = []
@@ -201,7 +199,7 @@ def test_a_failing_concurrent_build_of_one_entry_cannot_delete_the_winners_entry
     def builder() -> None:
         try:
             start.wait(timeout=10)
-            results.append(build_and_persist(project, _agg_code(project)))
+            results.append(build_and_persist(project, _agg_code(project, orders_src)))
         except BaseException as exc:  # noqa: BLE001 - reported by the assertion below
             errors.append(exc)
 
@@ -229,7 +227,7 @@ def _snapshot_path(project: str, content_hash: str):
     return snapshot_path(project, content_hash)
 
 
-def test_concurrent_materializations_of_one_entry_all_succeed(project, orders_parquet):
+def test_concurrent_materializations_of_one_entry_all_succeed(project, orders_src):
     """ADR-007 D11 and D4 (one writer, used by the build and by every heal): four threads materialize the same entry.
     The writer takes a unique temp name in the destination directory and renames it into place, under the project
     lock, so each call succeeds and the file is whole afterwards. xorq's writer used a fixed ``<key>.parquet.tmp``:
@@ -239,7 +237,7 @@ def test_concurrent_materializations_of_one_entry_all_succeed(project, orders_pa
 
     from tallyman_xorq.result_cache import snapshot_file_digest
 
-    h = build_and_persist(project, _agg_code(project)).content_hash
+    h = build_and_persist(project, _agg_code(project, orders_src)).content_hash
     manifest = read_manifest(entry_dir(project, h))
     start = threading.Barrier(4)
     digests: list[str] = []

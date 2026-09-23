@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,8 +20,8 @@ SAMPLE_SPEC = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -75,7 +74,7 @@ def test_remove_chart(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_chart_by_hash(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_by_hash(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     out = catalog_chart(res.content_hash, SAMPLE_SPEC)
@@ -84,7 +83,7 @@ def test_catalog_chart_by_hash(project: str, orders_parquet: Path, monkeypatch):
     assert get_chart(project, res.content_hash) is not None
 
 
-def test_catalog_chart_by_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_by_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_chart("shoe_sales", SAMPLE_SPEC)
@@ -101,7 +100,7 @@ def test_catalog_chart_rejects_missing(project: str, monkeypatch):
     assert "error" in out
 
 
-def test_catalog_chart_invalid_spec(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_invalid_spec(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     out = catalog_chart(res.content_hash, "{not json}")
@@ -113,7 +112,7 @@ def test_catalog_chart_invalid_spec(project: str, orders_parquet: Path, monkeypa
 # ---------------------------------------------------------------------------
 
 
-def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: str, orders_src: str):
     """Entry API includes chart_spec when a chart has been attached."""
     res = build_and_persist(project, _agg_code(project))
     set_chart(project, res.content_hash, SAMPLE_SPEC)
@@ -125,7 +124,7 @@ def test_entry_detail_renders_chart_when_present(fresh_companion_app, project: s
     assert body["chart_spec"]["mark"] == "bar"
 
 
-def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str, orders_src: str):
     """Entry API returns null chart_spec when no chart is attached."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
@@ -134,7 +133,7 @@ def test_entry_detail_omits_chart_when_absent(fresh_companion_app, project: str,
     assert r.json()["chart_spec"] is None
 
 
-def test_api_data_endpoint(fresh_companion_app, project: str, orders_parquet: Path):
+def test_api_data_endpoint(fresh_companion_app, project: str, orders_src: str):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/data/{res.content_hash}")
@@ -151,7 +150,7 @@ def test_api_data_404_on_missing(fresh_companion_app, project: str):
     assert c.get(f"/{project}/api/data/deadbeef").status_code == 404
 
 
-def test_api_data_limit_truncates(fresh_companion_app, project: str, orders_parquet: Path):
+def test_api_data_limit_truncates(fresh_companion_app, project: str, orders_src: str):
     """Sanity-check that limit is plumbed through."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
@@ -162,7 +161,7 @@ def test_api_data_limit_truncates(fresh_companion_app, project: str, orders_parq
     assert body["limit"] == 2
 
 
-def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_parquet: Path):
+def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_src: str):
     """T-20: offset+limit cursor pagination."""
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
@@ -174,20 +173,20 @@ def test_api_data_offset_paginates(fresh_companion_app, project: str, orders_par
     assert a["offset"] == 0 and b["offset"] == 2
 
 
-def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orders_parquet: Path):
+def test_api_data_rejects_negative_limit(fresh_companion_app, project: str, orders_src: str):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/data/{res.content_hash}?limit=-1")
     assert r.status_code == 400
 
 
-def test_api_data_default_limit_is_200(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_api_data_default_limit_is_200(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Defaults are demo-safe: aggregate fits, raw 2k-row loads cap at 200."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     # Use a passthrough expression (raw orders, 200 rows in the fixture).
     code = """
-from tallyman_xorq.io import read_project_file
-expr = read_project_file("orders.parquet")
+from tallyman_xorq.io import tracked_expr_from_alias
+expr = tracked_expr_from_alias("orders_src")
 """
     res = build_and_persist(project, code)
     c = TestClient(fresh_companion_app)
@@ -205,7 +204,7 @@ expr = read_project_file("orders.parquet")
 # ---------------------------------------------------------------------------
 
 
-def test_api_chart_error_records_error(fresh_companion_app, project: str, orders_parquet: Path):
+def test_api_chart_error_records_error(fresh_companion_app, project: str, orders_src: str):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.post(
@@ -229,13 +228,13 @@ def test_api_chart_error_rejects_malformed_hash(fresh_companion_app, project: st
     assert r.status_code == 400
 
 
-def test_catalog_chart_errors_empty_when_none_reported(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_errors_empty_when_none_reported(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     assert catalog_chart_errors(res.content_hash)["items"] == []
 
 
-def test_catalog_chart_errors_filters_by_hash_and_tool(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_errors_filters_by_hash_and_tool(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     res = build_and_persist(project, _agg_code(project))
     from tallyman_core import record_error
@@ -249,7 +248,7 @@ def test_catalog_chart_errors_filters_by_hash_and_tool(project: str, orders_parq
     assert out[0]["message"] == "render blew up"
 
 
-def test_catalog_chart_errors_resolves_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_chart_errors_resolves_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     from tallyman_core import get_alias, record_error

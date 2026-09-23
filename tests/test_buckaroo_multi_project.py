@@ -16,9 +16,10 @@ from pathlib import Path
 
 from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
-from tallyman_core import data_dir, ensure_project
+from tallyman_core import data_dir, ensure_project, set_active_project
 from tallyman_core.paths import artifacts_dir
 from tallyman_xorq import build_and_persist
+from tallyman_xorq.source_import import update_and_depend
 
 # ---------------------------------------------------------------------------
 # Constructor shape
@@ -38,10 +39,28 @@ def test_manager_constructor_no_longer_takes_project(isolated_home: Path):
 # ---------------------------------------------------------------------------
 
 
+SRC_ALIAS = "orders_src"
+
+
+def _seed_orders(project: str) -> None:
+    """Write the fixture into *project* and import it as a source alias.
+
+    These tests stand up their own projects rather than using the shared ``project`` fixture, so they
+    do their own import. A recipe reads the alias, never the file (ADR-011 D1).
+
+    The project is made active first because the recipe ``source_import._recipe`` generates calls
+    ``read_project_file(path)`` with no project, so the read resolves against whatever project is
+    active rather than the one passed to ``update_and_depend``.
+    """
+    set_active_project(project)
+    path = write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=50, seed=1)
+    update_and_depend(path, SRC_ALIAS, project=project)
+
+
 def _entry_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({SRC_ALIAS!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -52,7 +71,7 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
     hashes = {}
     for proj in ("alpha", "beta"):
         ensure_project(proj)
-        write_shoe_orders(data_dir(proj) / "orders.parquet", n_rows=50, seed=1)
+        _seed_orders(proj)
         hashes[proj] = build_and_persist(proj, _entry_code(proj)).content_hash
 
     mgr = BuckarooManager()
@@ -90,7 +109,7 @@ def test_no_session_file_is_written_anywhere(isolated_home: Path, monkeypatch):
     """Negative assertion: nothing gets written to ``~/.tallyman/buckaroo_sessions.json``, nor to a project's
     ``artifacts/catalog/buckaroo_sessions.json``, nor anywhere else, when sessions are opened (ADR-007 D6)."""
     ensure_project("alpha")
-    write_shoe_orders(data_dir("alpha") / "orders.parquet", n_rows=50, seed=1)
+    _seed_orders("alpha")
     h = build_and_persist("alpha", _entry_code("alpha")).content_hash
 
     mgr = BuckarooManager()

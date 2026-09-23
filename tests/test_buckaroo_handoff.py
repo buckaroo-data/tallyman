@@ -25,11 +25,11 @@ from fastapi.testclient import TestClient
 from tallyman_companion import create_app
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
 from tallyman_core import (
-    data_dir,
     entry_dir,
     entry_expanded_build_dir,
     entry_manifest_path,
     entry_stat_cache_dir,
+    get_alias,
     read_manifest,
 )
 from tallyman_core.paths import compute_cache_dir, tallyman_home
@@ -40,24 +40,24 @@ _CONFIG_KEYS = ("component_config", "column_config_overrides", "extra_grid_confi
 
 def _agg_code(project: str) -> str:  # an Aggregate: a worthy entry, materialized to a snapshot when it is created
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _second_agg_code(project: str) -> str:  # a different worthy entry in the same project
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("category").aggregate(n=t.count())
 """
 
 
-def _cheap_code(project: str) -> str:  # a filter over one file: a cheap entry, re-run on every read
+def _cheap_code(project: str) -> str:  # a filter over one source alias: a cheap entry, re-run on every read
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.filter(t.price > 0)
 """
 
@@ -143,7 +143,7 @@ def _manager(fake: FakeBuckaroo) -> BuckarooManager:
 # ---------------------------------------------------------------------------
 
 
-def test_a_session_buckaroo_forgot_is_posted_again(project, orders_parquet):
+def test_a_session_buckaroo_forgot_is_posted_again(project, orders_src):
     """ADR-007 D6 (Buckaroo is handed something that already exists): Buckaroo drops a session that has had no
     browser attached for an hour, and tallyman used to answer the next open from its own session map, handing the grid
     an id Buckaroo no longer knew. Now every open posts ``/load_expr`` with the derived id; Buckaroo's own warm-hit
@@ -165,7 +165,7 @@ def test_a_session_buckaroo_forgot_is_posted_again(project, orders_parquet):
     assert result["session_id"] == _sid(project, h)
 
 
-def test_a_repeat_open_of_an_ordinary_entry_is_a_warm_hit_in_buckaroo(project, orders_parquet):
+def test_a_repeat_open_of_an_ordinary_entry_is_a_warm_hit_in_buckaroo(project, orders_src):
     """ADR-007 D6: an ordinary entry posts none of the config-bearing fields and the same ``build_dir`` every time, so
     the second post is a no-op inside Buckaroo. This is what replaces tallyman's session map."""
     h = build_and_persist(project, _agg_code(project)).content_hash
@@ -188,7 +188,7 @@ def test_session_id_is_derived_from_the_project_and_the_hash(isolated_home):
     assert bk.session_id_for("one", "abc123") != bk.session_id_for("two", "abc123")
 
 
-def test_tallyman_keeps_no_record_of_buckaroo_sessions(project, orders_parquet):
+def test_tallyman_keeps_no_record_of_buckaroo_sessions(project, orders_src):
     """ADR-007 D6: ``_sessions``, ``evict_session``, ``~/.tallyman/buckaroo_sessions.json`` and the session count are
     retired, because nothing needs to know which grids are open."""
     h = build_and_persist(project, _agg_code(project)).content_hash
@@ -207,7 +207,7 @@ def test_tallyman_keeps_no_record_of_buckaroo_sessions(project, orders_parquet):
 # ---------------------------------------------------------------------------
 
 
-def test_worthy_entry_is_handed_a_view_build_of_its_snapshot(project, orders_parquet):
+def test_worthy_entry_is_handed_a_view_build_of_its_snapshot(project, orders_src):
     """ADR-007 D6: a worthy entry's grid is posted a *view build*: a build whose whole graph is one bare read of the
     entry's snapshot. Buckaroo then never runs the aggregate, join or sort, and never writes a snapshot."""
     import xorq.vendor.ibis.expr.operations as ops
@@ -233,7 +233,7 @@ def test_worthy_entry_is_handed_a_view_build_of_its_snapshot(project, orders_par
     assert Path(dict(reads[0].read_kwargs)["hash_path"]).resolve() == _snapshot_path(project, h).resolve()
 
 
-def test_view_build_directory_is_stable_across_opens(project, orders_parquet):
+def test_view_build_directory_is_stable_across_opens(project, orders_src):
     """ADR-007 D6: Buckaroo's stat-cache keys include the build directory's path, so the view build is written once
     to a stable per-entry directory and the same path is posted every time."""
     h = build_and_persist(project, _agg_code(project)).content_hash
@@ -249,16 +249,20 @@ def test_view_build_directory_is_stable_across_opens(project, orders_parquet):
     assert bodies[0]["build_dir"] == bodies[1]["build_dir"]
 
 
-def test_cheap_entry_is_handed_its_own_expanded_build_over_files_that_exist(project, orders_parquet):
+def test_cheap_entry_is_handed_its_own_expanded_build_over_files_that_exist(project, orders_src):
     """ADR-007 D6 and D13: a cheap entry is a stored plan over files that exist. ``load_session`` makes them exist
-    first (``ensure_materialized``), so with the clone and every cached copy of the source deleted, the build posted
-    to Buckaroo still reads files that are there at the moment it is posted."""
+    first (``ensure_materialized``), so with every cached copy of the data deleted the build posted to Buckaroo
+    still reads files that are there at the moment it is posted.
+
+    The clone of the imported bytes under ``data/.cas`` stays. It is what a source version's snapshot is written
+    again from (ADR-011 D1), so deleting it as well would make the rows unrecoverable instead of exercising the
+    heal.
+    """
     from xorq.common.utils.graph_utils import walk_nodes
     from xorq.expr.relations import Read
     from xorq.ibis_yaml.compiler import load_expr
 
     h = build_and_persist(project, _cheap_code(project)).content_hash
-    shutil.rmtree(data_dir(project) / ".cas", ignore_errors=True)
     shutil.rmtree(compute_cache_dir(project), ignore_errors=True)
 
     reads_at_post: list[Path] = []
@@ -279,7 +283,7 @@ def test_cheap_entry_is_handed_its_own_expanded_build_over_files_that_exist(proj
 
 
 @pytest.mark.parametrize("recipe", [_agg_code, _cheap_code], ids=["worthy", "cheap"])
-def test_every_load_expr_body_names_the_row_order_column(project, orders_parquet, recipe):
+def test_every_load_expr_body_names_the_row_order_column(project, orders_src, recipe):
     """ADR-008 D8 (Buckaroo's half is one hint): every ``/load_expr`` payload carries ``row_order_column`` so that
     Buckaroo can order and page by it (buckaroo-data/buckaroo#974). An ordinary entry sends none of the fields that
     would defeat Buckaroo's warm-hit short-circuit."""
@@ -300,7 +304,7 @@ def test_every_load_expr_body_names_the_row_order_column(project, orders_parquet
 # ---------------------------------------------------------------------------
 
 
-def test_explicit_delete_then_open_heals_and_verifies_before_buckaroo_is_called(project, orders_parquet):
+def test_explicit_delete_then_open_heals_and_verifies_before_buckaroo_is_called(project, orders_src):
     """ADR-007 D12 (files are deleted only by an explicit user action) and D5 (``ensure_materialized``): the Cache
     page's delete removes the snapshot, and the next open rewrites it and checks it against the recorded digest
     before the grid is posted. Buckaroo never has to repair a file."""
@@ -328,7 +332,7 @@ def test_explicit_delete_then_open_heals_and_verifies_before_buckaroo_is_called(
     assert seen["digest"] == read_manifest(entry_dir(project, h)).result_digest
 
 
-def test_unfaithful_heal_forces_a_reload_of_the_open_grid(project, orders_parquet):
+def test_unfaithful_heal_forces_a_reload_of_the_open_grid(project, orders_src):
     """ADR-007 D6: an unfaithful heal is the one event that leaves an open session wrong, since the path now holds
     other rows than the stats Buckaroo computed. tallyman keeps no session record to drop, so the companion's hook
     wipes the entry's stat cache and posts ``/load_expr`` for the derived id with ``force_reload`` set."""
@@ -365,19 +369,20 @@ def test_unfaithful_heal_forces_a_reload_of_the_open_grid(project, orders_parque
     assert seen == [(True, False)], "the reload must be posted after the stale stats are wiped"
 
 
-def test_klass_reload_reaches_every_entry_without_a_session_record(project, orders_parquet):
+def test_klass_reload_reaches_every_entry_without_a_session_record(project, orders_src):
     """ADR-007 D6: ``reload_project_sessions`` used to walk tallyman's own record of open sessions, which the design
     deletes, and Buckaroo has no route that lists sessions. With derived ids it posts ``/reload_expr/<id>`` for every
     entry of the project and treats Buckaroo's 404 as "not open". An entry that was never opened gets no session."""
+    src = get_alias(project, orders_src)  # the import's own entry is in the project too, and gets a post as well
     a = build_and_persist(project, _agg_code(project)).content_hash
     b = build_and_persist(project, _second_agg_code(project)).content_hash
     fake = FakeBuckaroo()
     bk = _manager(fake)
-    assert bk.load_session(a, project)["status"] == "ok"  # A is open in a tab; B never was
+    assert bk.load_session(a, project)["status"] == "ok"  # A is open in a tab; B and the source never were
 
     reloaded = bk.reload_project_sessions(project)
 
-    assert sorted(fake.reloads()) == sorted([f"/reload_expr/{_sid(project, a)}", f"/reload_expr/{_sid(project, b)}"])
+    assert sorted(fake.reloads()) == sorted(f"/reload_expr/{_sid(project, h)}" for h in (src, a, b))
     assert reloaded == 1, "only the open grid can have been reloaded"
     assert _sid(project, b) not in fake.sessions
     assert not hasattr(bk, "_sessions")

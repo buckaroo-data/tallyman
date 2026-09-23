@@ -13,7 +13,6 @@ is followed by another step has no effect on what is written.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pyarrow as pa
@@ -23,21 +22,26 @@ import pytest
 from tallyman_core import data_dir
 from tallyman_xorq.build import BuildError, build_and_persist
 from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.source_import import update_and_depend
 from tests.big_parquet import write_big_parquet
 
 ROW_ORDER = "__row_order"
+AMOUNTS_SRC = "amounts_src"
+BIG_SRC = "big_src"
 
-_PRELUDE = "import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import read_project_file\n"
+_PRELUDE = "import xorq.vendor.ibis as ibis\nfrom tallyman_xorq.io import tracked_expr_from_alias\n"
 
 # The parent's rows are in this order, so an entry that ignores the author's sort is written 40, 10, 60, ...
 AMOUNTS = [40, 10, 60, 20, 50, 30]
 
 
 @pytest.fixture
-def amounts(project: str) -> Path:
+def amounts(project: str) -> str:
+    """Six rows out of amount order, imported as a source alias (ADR-011 D1); the alias name a recipe reads."""
     path = data_dir(project) / "amounts.parquet"
     pq.write_table(pa.table({"name": list("abcdef"), "amount": AMOUNTS}), path)
-    return path
+    update_and_depend(path, AMOUNTS_SRC, project=project)
+    return AMOUNTS_SRC
 
 
 @pytest.fixture(scope="module")
@@ -45,10 +49,10 @@ def big_source(tmp_path_factory) -> Path:
     return write_big_parquet(tmp_path_factory.mktemp("big_source") / "big.parquet")
 
 
-def _sorted_then(project: str, body: str, source: str = "amounts.parquet") -> str:
+def _sorted_then(project: str, body: str, source: str = AMOUNTS_SRC) -> str:
     """A recipe whose ``by`` is the source ordered by amount, descending, followed by *body*."""
     return (
-        f"{_PRELUDE}t = read_project_file({source!r}, project={project!r})\n"
+        f"{_PRELUDE}t = tracked_expr_from_alias({source!r}, project={project!r})\n"
         "by = t.order_by(t.amount.desc())\n"
         f"expr = {body}\n"
     )
@@ -75,8 +79,11 @@ def test_a_sort_that_feeds_a_limit_keeps_the_rows_the_natural_order_picks(projec
     decided by the tie-break of the sort that feeds the limit, not by the sort above it. ``id`` is the file position,
     so ``(g, id)`` is ``(g, __row_order)``.
     """
-    shutil.copyfile(big_source, data_dir(project) / "big.parquet")
-    code = f"{_PRELUDE}t = read_project_file('big.parquet', project={project!r})\nexpr = t.order_by('g').limit(1000)\n"
+    update_and_depend(big_source, BIG_SRC, project=project)
+    code = (
+        f"{_PRELUDE}t = tracked_expr_from_alias({BIG_SRC!r}, project={project!r})\n"
+        "expr = t.order_by('g').limit(1000)\n"
+    )
     res = build_and_persist(project, code)
 
     frame = pq.read_table(big_source).to_pandas()
@@ -151,7 +158,7 @@ def test_a_sort_key_that_did_not_survive_is_a_build_error_naming_it(project, amo
 def test_a_sort_key_that_was_an_expression_is_a_build_error_when_a_step_follows(project, amounts):
     """ADR-008 D11: an expression is not an output column, so there is nothing to lead the top-level sort with."""
     code = (
-        f"{_PRELUDE}t = read_project_file('amounts.parquet', project={project!r})\n"
+        f"{_PRELUDE}t = tracked_expr_from_alias({AMOUNTS_SRC!r}, project={project!r})\n"
         "by = t.order_by(t.amount + 1)\n"
         "expr = by.mutate(double=by.amount * 2)\n"
     )

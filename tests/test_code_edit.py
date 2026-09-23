@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from tallyman_core import get_alias, history_for
@@ -12,16 +10,16 @@ from tallyman_mcp.server import catalog_create
 
 def _agg(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _filter(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(n=f.count())
 """
@@ -29,14 +27,14 @@ expr = f.group_by("region").aggregate(n=f.count())
 
 def _nondeterministic(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 import xorq.vendor.ibis as ibis
-t = read_project_file("orders.parquet", project={project!r})
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.mutate(built_at=ibis.now())
 """
 
 
-def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_revises_alias(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     v1_hash = get_alias(project, "shoe_sales")
@@ -54,7 +52,7 @@ def test_put_code_revises_alias(fresh_companion_app, project: str, orders_parque
     assert history_for(project, "shoe_sales") == [v1_hash, body["hash"]]
 
 
-def test_put_code_carries_chart_and_display(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_carries_chart_and_display(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """A code-edit revise (PUT /api/code) seeds the new version's per-entry
     chart + display config from the previous one, same as catalog_revise."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -78,7 +76,7 @@ def test_put_code_carries_chart_and_display(fresh_companion_app, project: str, o
     assert set(r.json().get("carried_over", [])) == {"chart", "display_config"}
 
 
-def test_put_code_surfaces_nondeterminism_lint(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_surfaces_nondeterminism_lint(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     # An execution-nondeterministic recipe (now()) builds fine, but the PUT
     # /api/code reply must carry the advisory lint so the SPA can show it (#88).
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -97,7 +95,7 @@ def test_put_code_missing_alias_404(fresh_companion_app, project: str):
     assert r.status_code == 404
 
 
-def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_empty_400(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
@@ -105,7 +103,7 @@ def test_put_code_empty_400(fresh_companion_app, project: str, orders_parquet: P
     assert r.status_code == 400
 
 
-def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     c = TestClient(fresh_companion_app)
@@ -119,7 +117,7 @@ def test_put_code_build_error_records_and_400s(fresh_companion_app, project: str
     assert rec["tool"] == "api_code"
 
 
-def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch):
+def test_put_code_serve_mode_403(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))
     from tallyman_companion import create_app
@@ -130,7 +128,7 @@ def test_put_code_serve_mode_403(project: str, orders_parquet: Path, monkeypatch
     assert r.status_code == 403
 
 
-def test_entry_detail_has_alias_for_named(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_entry_detail_has_alias_for_named(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Named entries include alias and code in the JSON API response."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg(project))
@@ -142,7 +140,7 @@ def test_entry_detail_has_alias_for_named(fresh_companion_app, project: str, ord
     assert body["code"].strip() != ""
 
 
-def test_entry_detail_no_alias_for_scratch(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_entry_detail_no_alias_for_scratch(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Scratch entries have no alias in the JSON API response."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_run
@@ -154,7 +152,7 @@ def test_entry_detail_no_alias_for_scratch(fresh_companion_app, project: str, or
     assert r.json()["alias"] is None
 
 
-def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_parquet: Path, monkeypatch):
+def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_src: str, monkeypatch):
     """read_only mode returns 403 on PUT /api/code/."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg(project))

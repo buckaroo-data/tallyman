@@ -347,8 +347,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     # single-user scale; revisit if it ever paginates.
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    from tallyman_core.paths import data_dir as _data_dir  # noqa: PLC0415
-    from tallyman_xorq.dependents import dependents_index, parents_of, sources_of  # noqa: PLC0415
+    from tallyman_xorq.dependents import dependents_index, parents_of  # noqa: PLC0415
 
     manifest: dict = {}
     try:
@@ -356,18 +355,27 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     except (OSError, ValueError):
         pass
 
-    # Raw source files the recipe reads. None under source-identity mode=off —
-    # kept distinct from "reads no files" so the UI can say "not tracked".
-    src_digests = sources_of(project, content_hash)
+    # The raw bytes this entry holds, which is a question only a source version has an answer to
+    # (ADR-011 D6: a computed entry reads aliases, never a file). For one it is the clone of the
+    # imported file under data/.cas — the copy that makes the snapshot re-creatable — listed under the
+    # provenance path it came from, which may be long gone.
     sources: list[dict] = []
     source_bytes = 0
-    if src_digests is not None:
-        dd = _data_dir(project)
-        for rel in sorted(src_digests):
-            sp = dd / rel
-            sz = _path_size(sp)
-            source_bytes += sz
-            sources.append({"path": rel, "bytes": sz, "formatted": _fmt_bytes(sz), "exists": sp.exists()})
+    provenance = manifest.get("provenance")
+    if provenance:
+        from tallyman_core.manifest import SourceProvenance  # noqa: PLC0415
+        from tallyman_xorq.source_import import source_clone_path  # noqa: PLC0415
+
+        clone = source_clone_path(project, SourceProvenance.model_validate(provenance))
+        source_bytes = _path_size(clone)
+        sources.append(
+            {
+                "path": provenance["path"],
+                "bytes": source_bytes,
+                "formatted": _fmt_bytes(source_bytes),
+                "exists": clone.exists(),
+            }
+        )
 
     # Last-modified across the entry's on-disk artifacts (a snapshot self-heal
     # makes this later than created_at).
@@ -406,7 +414,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
         "diff_cache_formatted": _fmt_bytes(diff_cache_bytes),
         "source_bytes": source_bytes,
         "source_formatted": _fmt_bytes(source_bytes),
-        "source_tracked": src_digests is not None,
+        "source_tracked": bool(sources),
         "sources": sources,
         "parents": parents,
         "children": children,

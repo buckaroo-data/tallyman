@@ -80,14 +80,6 @@ class Manifest(BaseModel):
     # heal can say the engine changed instead of blaming the recipe.
     snapshot_format: int | None = None
     engine_versions: dict[str, str] | None = None
-    # Ordered copies of sources this entry's plan reads (ADR-007 D13, ADR-008 D2), keyed by the copy's file stem:
-    # ``{"source": rel_or_abs_path, "digest": md5 of the source, "suffix": ".csv", "reader": {"kind": "parquet"|"csv",
-    # ...}, "content_digest": "arrow-sha256:..."}``. What ``ensure_materialized`` needs to make a deleted copy again
-    # from its clone, and the digest the new copy is checked against.
-    ordered_copies: dict[str, dict] | None = None
-    # rel data path -> content md5, recorded when a source-identity mode is
-    # active (tallyman_xorq.source_identity); absent under mode=off.
-    sources: dict[str, str] | None = None
     # Resolved tracked_expr_from_alias parent edges ({hash, ref, follow}), recorded at build
     # time so the inter-entry DAG survives #73/#74; absent for root entries (#84).
     parents: list[ParentRef] | None = None

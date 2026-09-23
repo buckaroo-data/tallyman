@@ -1,11 +1,20 @@
 # ADR: A raw input is an alias, and files enter only by an explicit import
 
-- **Status:** Accepted (2026-09-22). Stage 1 — the import path and the refusals
-  (D1, D2, D3, D5, D9, D10, D12) — is implemented in PR #217, with two later
+- **Status:** Accepted (2026-09-22), implemented. Stage 1 — the import path and
+  the refusals (D1, D2, D3, D5, D9, D10, D12) — is PR #217, with two later
   decisions of the same day folded into D1: the snapshot is written by pyarrow
   in the pinned layout, and it is cache that `ensure_materialized` re-creates
-  from the clone. Stage 2 is D6, D8 and the rewrite of every call site that
-  still authors a raw file read.
+  from the clone. Stage 2 — D6, D8 and the rewrite of every call site that
+  authored a raw file read — is PR #218, stacked on it. Amends
+  `plans/ADR-002-source-identity-content-hash.md` (its modes, its `sources` map
+  and its reconstruction caveat go; the clone store stays),
+  `plans/ADR-005-intelligent-csv-import.md` (its reader runs at import, not in
+  a recipe) and `plans/ADR-008-row-order-of-reads.md` (its refusal extends to
+  `read_project_file`, and the ordered copy becomes the source entry's
+  snapshot). Still outstanding: `docs/architecture.md`, `docs/caching.md`,
+  `docs/expression-lifecycle.md` and `docs/system-contract.md` all describe the
+  deleted source axis, and are left until PR #216 lands to avoid rewriting the
+  same four files twice.
   Written from Paddy's design session the same day, after a review of PR #189
   found that a child pinned to its parent by content hash is permanently stale
   and reports itself as an UNEXPLAINED orphan. The direction is his: "treat the
@@ -360,9 +369,7 @@ every build. Options are evaluated once, at import, and stored.
 ## Implementation notes
 
 **Stage 1 (PR #217, 2026-09-22): the import path and the refusals — D1, D2, D3,
-D5, D9, D10, D12.** D6 (deleting the staleness source axis), D8 (deleting the
-source-identity modes) and the rewrite of the 309 `read_project_file` call sites
-are stage 2. What the code does that this document did not say:
+D5, D9, D10, D12.** What the code does that this document did not say:
 
 - **A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
   truncated to xorq's 12 hex.** It cannot come from `build_expr`, because the
@@ -440,22 +447,60 @@ are stage 2. What the code does that this document did not say:
   the viewer treat it as an ordinary entry. Nothing reads it on the normal path:
   a worthy entry whose snapshot exists is served by a bare read of that file.
 
-**Deliberate debt.** `TALLYMAN_LEGACY_FILE_READS=1` disables D2's refusal, and
-`tests/conftest.py` sets it for the whole suite. It exists only so stage 1 can
-land before the 309-call-site rewrite; nothing in production sets it, and the
-tests of D2 clear it per-test. It goes with the rewrite.
+**Deliberate debt, now paid.** `TALLYMAN_LEGACY_FILE_READS=1` disabled D2's
+refusal for the whole suite so stage 1 could land before the call-site rewrite.
+Stage 2 deletes the variable, the `tests/conftest.py` line that set it and the
+branch in `io.py` that read it. There is no way to author a raw file read.
+
+**Stage 2 (PR #218, 2026-09-23): D6, D8 and the call-site rewrite.** What the
+code does that this document did not say:
+
+- **`manifest.sources` is deleted, not narrowed.** D6 says the field reverts to
+  being the retention closure; in the event it has no readers left at all, since
+  a source version is an entry and the closure is the DAG. `dependents.sources_of`
+  goes with it, and `io._note_parent_records` — the function whose folding of a
+  parent's digests into its child is the direct cause of the defect under
+  Problem — is deleted outright.
+- **`StaleReason.axis` survives as a field that is always `"alias"`.** Deleting
+  it would change the shape of every staleness reason in the API and the UI for
+  no gain; a one-value field reads the same and says the axis is no longer a
+  choice.
+- **The fixture split is `orders_parquet` and `orders_src`.** The first is the
+  file, for a test about the bytes; the second imports it and returns the alias,
+  for a test that needs a recipe. The alias is `orders_src` rather than `orders`
+  because several tests already create a catalog alias called `orders`, and a
+  name is one kind or the other and never both.
+- **An import must not depend on which project is active.** `update_and_depend(path,
+  alias, project=X)` failed whenever `X` was not the active project: the generated
+  recipe's `read_project_file` resolved the ambient project while `_SOURCE_ENTRY`
+  named `X`, so the importer's own recipe hit the refusal written for authored
+  recipes. The read follows the entry being minted. Every call site passed before
+  the rewrite because the `project` fixture also activates its project; the cache
+  lab, which warms xorq in a project of its own without activating it, is what
+  exposed it.
+- **Two test expectations changed because the behaviour is now right**, not to
+  keep them green. The page-load profiler measures three entries where it
+  measured two, because an imported source version is an entry. And the reset
+  round-trip has to import its second file *after* the first checkpoint: import
+  it before, and its source entry survives the reset back, so no clone is left
+  referenced only by a retired entry and the case ADR-007 D13 is about stops
+  being exercised at all. Arranged correctly, that test is the proof that a
+  backward reset parks a clone in the bullpen rather than unlinking it — the
+  failure mode that deleting `manifest.sources` could otherwise have caused
+  silently.
 
 ## Open questions
 
-1. **Does a source version keep its raw bytes as well as its snapshot?** The
-   snapshot is the ordered parquet (D1). The raw bytes are the file as
-   imported — the original CSV, or the parquet before `__row_order` was added.
-   Keeping both doubles the storage of every import. Dropping the raw bytes
-   means a CSV imported with the wrong schema can only be fixed by re-importing
-   from the outside file, which may be gone, and ADR-005's whole
-   suggestion-and-retry contract assumes the bytes are still there to re-read.
-   My lean is to keep both and name the cost, but it is the one place where
-   this design stores something twice.
+1. ~~**Does a source version keep its raw bytes as well as its snapshot?**~~
+   **Answered 2026-09-22: keep both.** A CSV imported with the wrong schema
+   would otherwise be fixable only from the outside file, which may be gone,
+   and ADR-005's suggestion-and-retry contract assumes the bytes can be
+   re-read. Keeping the clone also decides D1's other half: the snapshot is
+   re-creatable from it, so it is cache in the sense of ADR-007 D13 rather than
+   irreplaceable data. Every import stores the data twice; the clone is
+   copy-on-write where the filesystem offers it, so the initial cost is near
+   zero, but the snapshot is a real second materialization. See the
+   implementation notes for the measured sizes.
 2. **Directories and multi-file datasets.** A dataset that arrives as
    `orders/part-0000.parquet`, `part-0001.parquet`, … rather than one file:
    does `update_and_depend("~/exports/orders/", "orders")` import the directory

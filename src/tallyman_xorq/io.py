@@ -19,22 +19,27 @@ class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
-def _source_entry_read(project: str, fn: str, path: str):
+def _source_entry_read(fn: str, path: str):
     """The expression a raw read resolves to (ADR-011 D2).
 
     A file enters the catalog by an explicit import and by nothing else, so a raw read is a build error in an
     authored recipe. It survives in exactly one place: the recipe the importer generates for a source entry, where
     it resolves to that entry's own snapshot.
+
+    The entry being minted names its own project, and the read follows it rather than the ambient active project:
+    ``update_and_depend(path, alias, project=X)`` is an override, so an import must work whichever project happens
+    to be active. Resolving the ambient one instead made the importer's own recipe hit the refusal below.
     """
     from tallyman_xorq.source_import import source_entry_context
 
-    content_hash = source_entry_context(project)
-    if content_hash is not None:
+    ctx = source_entry_context()
+    if ctx is not None:
         from xorq.expr.api import deferred_read_parquet
 
         from tallyman_xorq.materialize import snapshot_path
 
-        return deferred_read_parquet(str(snapshot_path(project, content_hash)))
+        owner, content_hash = ctx
+        return deferred_read_parquet(str(snapshot_path(owner, content_hash)))
     from tallyman_xorq.build import BuildError
 
     raise BuildError(
@@ -77,8 +82,7 @@ def read_project_file(rel_path: str, project: str | None = None):
     a contextvar (``source_import._SOURCE_ENTRY``) resolves that call to the entry's own snapshot. The
     path in the generated recipe is provenance; nothing opens it.
     """
-    proj = resolve_project(project)
-    return _source_entry_read(proj, "read_project_file", rel_path)
+    return _source_entry_read("read_project_file", rel_path)
 
 
 # ibis primitive -> polars dtype, for reading a CSV with an explicit schema.
@@ -474,8 +478,7 @@ def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwar
             "(100 -> 10k -> whole-file); to pin column types pass schema= (an ibis schema, "
             "plain dict, or tuple-of-tuples), never schema_overrides."
         )
-    proj = resolve_project(project)
-    return _source_entry_read(proj, "tallyman_read_csv", path)
+    return _source_entry_read("tallyman_read_csv", path)
 
 
 def tracked_expr_from_alias(alias: str, project: str | None = None):

@@ -93,12 +93,13 @@ def is_source_entry(project: str, content_hash: str) -> bool:
         return False
 
 
-def source_entry_context(project: str) -> str | None:
-    """The source entry whose generated recipe is running on this stack, if it belongs to *project*."""
-    ctx = _SOURCE_ENTRY.get()
-    if ctx is None or ctx[0] != project:
-        return None
-    return ctx[1]
+def source_entry_context() -> tuple[str, str] | None:
+    """The ``(project, content_hash)`` whose generated recipe is running on this stack, or ``None``.
+
+    The project comes from the entry being minted, not from whichever project is active: ``project=`` on an
+    import is an override, and an import must work while another project is active.
+    """
+    return _SOURCE_ENTRY.get()
 
 
 def in_source_recipe(project: str, content_hash: str):

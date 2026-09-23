@@ -241,6 +241,30 @@ def test_absent_alias_with_a_skipped_pin_errors(project: str, tmp_path: Path, mo
     assert get_alias(project, "orders") is None
 
 
+def test_an_import_names_its_own_project(project: str, tmp_path: Path, monkeypatch):
+    """``project=`` is an override, so an import must not depend on which project happens to be active.
+
+    The generated recipe's ``read_project_file`` is legal because a contextvar says which source entry
+    is being minted, and the read has to resolve to the same project that contextvar names. Resolving
+    the ambient active project instead makes the importer's own recipe hit the D2 refusal written for
+    authored recipes, and the import fails with an error about a file tallyman does not own.
+    """
+    from tallyman_core import ensure_project, set_active_project
+    from tallyman_xorq import source_import
+
+    other = "other_project"
+    ensure_project(other)
+    set_active_project(project)  # the active project is NOT the one being imported into
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 6)
+
+    out = source_import.update_and_depend(str(src), "orders", project=other)
+
+    assert out["version"] == 1
+    assert get_alias(other, "orders") == out["hash"]
+    assert snapshot_path(other, out["hash"]).is_file()
+    assert not snapshot_path(project, out["hash"]).exists()
+
+
 def test_import_refuses_a_directory(project: str, tmp_path: Path, monkeypatch):
     """Multi-file datasets are open question 2 of the ADR; until one is designed a directory is refused clearly."""
     from tallyman_xorq import source_import

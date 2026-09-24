@@ -373,11 +373,12 @@ def test_bytes_of_an_older_version_of_another_alias_are_refused(project: str, tm
     assert get_alias(project, "archive") is None
 
 
-def test_a_failed_repair_leaves_the_existing_entry_in_place(project: str, tmp_path: Path, monkeypatch):
-    """A re-import that repairs a missing snapshot writes into an entry that already exists; failing, it keeps it.
+def test_a_repair_import_writes_the_snapshot_and_nothing_else(project: str, tmp_path: Path, monkeypatch):
+    """Re-importing a version whose snapshot is gone restores the snapshot and leaves the entry alone.
 
-    ``_mint`` removes the entry directory when the build step fails, which is right for a directory it created and
-    destroys the alias's only entry when the directory was already there.
+    The entry's recipe, build and manifest are the record of the import, and a repair is not an import: it goes
+    through the heal ``ensure_materialized`` uses. So nothing is rebuilt (a failing ``build_expr`` does not matter),
+    and repairing from another path does not move the recorded provenance path or its time.
     """
     import xorq.ibis_yaml.compiler as compiler
 
@@ -386,16 +387,73 @@ def test_a_failed_repair_leaves_the_existing_entry_in_place(project: str, tmp_pa
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
     a = source_import.update_and_depend(str(src), "orders")
+    entry = entry_dir(project, a["hash"])
+    record = {name: (entry / name).read_bytes() for name in ("manifest.json", "expr.py")}
+    snapshot = snapshot_path(project, a["hash"])
+    before = snapshot.read_bytes()
+    snapshot.unlink()
+    moved = _outside(tmp_path) / "moved" / "orders.parquet"
+    moved.parent.mkdir()
+    moved.write_bytes(src.read_bytes())
+
+    def rebuild(*args, **kwargs):
+        raise RuntimeError("a repair rebuilt the entry")
+
+    monkeypatch.setattr(compiler, "build_expr", rebuild)
+    out = source_import.update_and_depend(str(moved), "orders")
+
+    assert out["created"] is False
+    assert snapshot.read_bytes() == before
+    assert {name: (entry / name).read_bytes() for name in record} == record
+
+
+def test_a_repair_import_is_verified_like_any_heal(project: str, tmp_path: Path, monkeypatch):
+    """A repair that writes other rows under the recorded hash is an unfaithful heal, and is recorded as one.
+
+    The recorded digest and row count stay the build-time ones. A repair used to take whatever it wrote as the new
+    truth, so a child built on the old rows read the new ones with nothing to say they had changed.
+    """
+    from tallyman_core.errors import list_errors
+    from tallyman_xorq import source_import
+    from tallyman_xorq.digest import content_digest
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    recorded = read_manifest(entry_dir(project, a["hash"]))
     snapshot_path(project, a["hash"]).unlink()
+    write = source_import._write_snapshot
 
-    def fail(*args, **kwargs):
-        raise RuntimeError("build_expr failed")
+    def one_row_short(clone, reader, dest):  # a reader that now parses the same bytes into other rows
+        write(clone, reader, dest)
+        table = pq.read_table(dest)
+        pq.write_table(table.slice(0, table.num_rows - 1), dest)
+        return content_digest(dest)
 
-    monkeypatch.setattr(compiler, "build_expr", fail)
-    with pytest.raises(RuntimeError, match="build_expr failed"):
-        source_import.update_and_depend(str(src), "orders")
+    monkeypatch.setattr(source_import, "_write_snapshot", one_row_short)
+    source_import.update_and_depend(str(src), "orders")
 
-    assert entry_dir(project, a["hash"]).is_dir()
+    after = read_manifest(entry_dir(project, a["hash"]))
+    assert (after.result_digest, after.row_count) == (recorded.result_digest, recorded.row_count)
+    codes = [r.get("code") for r in list_errors(project, limit=1000) if r.get("hash") == a["hash"]]
+    assert "unfaithful_heal" in codes, codes
+
+
+def test_an_entry_whose_manifest_is_gone_is_written_again_by_a_re_import(project: str, tmp_path: Path, monkeypatch):
+    """An entry directory with no readable manifest, which a crash part-way through an import leaves, is not an entry.
+
+    A re-import of its bytes writes it again rather than failing to read it.
+    """
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    (entry_dir(project, a["hash"]) / "manifest.json").unlink()
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    assert (out["hash"], out["created"]) == (a["hash"], False)
     assert read_manifest(entry_dir(project, a["hash"])).provenance.alias == "orders"
 
 
@@ -972,6 +1030,50 @@ def test_a_source_version_no_alias_holds_is_not_advised_back_under_its_old_name(
     assert "no source alias" in message, message
     assert "'a_src'" not in message, message
     assert "pinned_version" not in message, message
+
+
+def test_following_the_re_import_advice_for_a_csv_repairs_the_version(project: str, tmp_path: Path, monkeypatch):
+    """A CSV's entry hash covers its reader options (D12), so the advised import has to carry them.
+
+    Without them the same file hashes to another entry, and the advised call is refused as "not orders-v1".
+    """
+    from tallyman_mcp.server import catalog_import_source
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("north", 1), ("south", 2)], sep=";")
+    out = catalog_import_source(
+        str(src), "orders", schema={"region": "string", "n": "int64"}, reader_options={"separator": ";"}
+    )
+    assert "error" not in out, out
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = catalog_import_source(*args, **kwargs)
+
+    assert "error" not in repaired, repaired
+    assert (repaired["hash"], repaired["created"]) == (out["hash"], False)
+    assert snapshot_path(project, out["hash"]).is_file()
+
+
+def test_a_pinned_import_read_another_way_says_the_reader_options_differ(project: str, tmp_path: Path, monkeypatch):
+    """The same bytes under other reader options are another entry, and the refusal has to say so.
+
+    "This file is not orders-v1" is false about the file; what differs is how it is read.
+    """
+    from tallyman_mcp.server import catalog_import_source
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("north", 1), ("south", 2)], sep=";")
+    assert "error" not in catalog_import_source(str(src), "orders", reader_options={"separator": ";"})
+
+    out = catalog_import_source(str(src), "orders", pinned_version=1)
+
+    assert "reader options" in out.get("error", ""), out
 
 
 def test_a_source_recipe_names_its_alias_as_the_one_it_was_imported_under(project: str, tmp_path: Path, monkeypatch):

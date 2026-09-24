@@ -5,18 +5,18 @@ from pathlib import Path
 from tallyman_mcp.server import catalog_import_source, catalog_list, catalog_run
 
 
-def _code(parquet: Path) -> str:
-    # The parquet sits in the project's data dir and enters a recipe through read_project_file (ADR-008 D12).
+def _code(src: str) -> str:
+    # The orders data entered the catalog as a source alias, and a recipe reads the alias (ADR-011 D2).
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file({parquet.name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
-def test_catalog_run_success(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_run_success(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_run(_code(orders_parquet), prompt="by region")
+    out = catalog_run(_code(orders_src), prompt="by region")
     assert "error" not in out
     assert "hash" in out
     assert out["row_count"] == 4
@@ -31,12 +31,14 @@ def test_catalog_run_error_returns_dict(project: str, monkeypatch):
     assert "hash" not in out
 
 
-def test_catalog_list_after_run(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_list_after_run(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_run(_code(orders_parquet), prompt="x")
+    catalog_run(_code(orders_src), prompt="x")
     rows = catalog_list()["items"]
-    assert len(rows) == 1
-    assert rows[0]["row_count"] == 4
+    # Two entries: the imported source version the fixture minted, and the aggregate built over it.
+    assert len(rows) == 2
+    assert rows[0]["row_count"] == 4  # most recent first
+    assert {r["alias"] for r in rows} == {None, orders_src}
 
 
 def test_catalog_import_source_success(project: str, orders_parquet: Path, monkeypatch):
@@ -62,14 +64,14 @@ def test_catalog_import_source_missing(project: str, tmp_path: Path, monkeypatch
     assert "nope.parquet" in out["error"]
 
 
-def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_run_surfaces_nondeterminism_lint(project: str, orders_src: str, monkeypatch):
     # An execution-nondeterministic recipe (now()) builds fine but must carry an
     # advisory lint in the tool reply so the model/user sees it (#88).
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
 import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import read_project_file
-t = read_project_file({orders_parquet.name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
 expr = t.mutate(built_at=ibis.now())
 """
     out = catalog_run(code, prompt="nondeterministic")

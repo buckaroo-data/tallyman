@@ -22,16 +22,16 @@ from tallyman_xorq.result_cache import baked_snapshot_path
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 f = t.filter(t.category == "boots")
 expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 """
@@ -39,8 +39,8 @@ expr = f.group_by("region").aggregate(total=f.price.sum(), n=f.count())
 
 def _cheap_code(project: str) -> str:  # projection → cheap, bakes no snapshot
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
 
@@ -53,7 +53,7 @@ expr = t.mutate(double=t.total * 2)
 """
 
 
-def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
     catalog_revise("shoe_sales", _filter_code(project))  # still expensive
@@ -84,7 +84,7 @@ def test_cache_pane_lists_expensive_not_cheap(fresh_companion_app, project, orde
     assert cheap_h not in listed
 
 
-def test_cache_pane_drops_evicted_snapshot(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_pane_drops_evicted_snapshot(fresh_companion_app, project, orders_src, monkeypatch):
     # The page reflects what's on disk. After a snapshot is deleted — and not yet
     # re-viewed, so nothing re-baked it — the entry must drop out of the listing,
     # not linger as a phantom "cached" row. Keying the listing on manifest.cache_bytes
@@ -112,7 +112,7 @@ def test_cache_pane_drops_evicted_snapshot(fresh_companion_app, project, orders_
     assert after["total"] == before["total"] - row_size
 
 
-def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
     h = list_entries(project)[0]["content_hash"]
@@ -137,7 +137,7 @@ def test_cache_delete_removes_only_snapshot(fresh_companion_app, project, orders
     assert h in history_for(project, "shoe_sales")  # alias history intact
 
 
-def test_cache_delete_then_read_self_heals_warm_cache(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_delete_then_read_self_heals_warm_cache(fresh_companion_app, project, orders_src, monkeypatch):
     # Deleting a snapshot must self-heal on the next read even when the read path's
     # cached_result_expr was already warm for that entry. Since ee0a90a the read
     # wrapper re-checks path.exists() on every call and self-heals regardless of the
@@ -161,7 +161,7 @@ def test_cache_delete_then_read_self_heals_warm_cache(fresh_companion_app, proje
     assert baked_snapshot_path(project, h).exists()  # re-baked
 
 
-def test_cache_delete_missing_snapshot_404(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_delete_missing_snapshot_404(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
@@ -171,7 +171,7 @@ def test_cache_delete_missing_snapshot_404(fresh_companion_app, project, orders_
     assert c.delete(f"/{project}/api/result_cache/{h}").status_code == 404
 
 
-def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch):
+def test_cache_delete_blocked_in_read_only(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
@@ -184,7 +184,7 @@ def test_cache_delete_blocked_in_read_only(project, orders_parquet, monkeypatch)
     assert snap.exists()  # untouched
 
 
-def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     c = TestClient(fresh_companion_app)
     # A content hash is lowercase hex (it names an entry dir). A junk value can
@@ -205,7 +205,7 @@ def test_cache_delete_rejects_non_hex_hash(fresh_companion_app, project, orders_
 # (#132); the rendering is the SPA's job, this pins the JSON contract.
 
 
-def test_entry_cache_expensive_breakdown(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_cache_expensive_breakdown(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))  # expensive → baked snapshot
     h = list_entries(project)[0]["content_hash"]
@@ -235,7 +235,7 @@ def test_entry_cache_expensive_breakdown(fresh_companion_app, project, orders_pa
     assert body["total_formatted"]
 
 
-def test_entry_cache_cheap_marks_snapshot_inapplicable(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_cache_cheap_marks_snapshot_inapplicable(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     cheap = catalog_create("cheap_one", _cheap_code(project))  # projection → no snapshot
     h = cheap["hash"]
@@ -251,7 +251,7 @@ def test_entry_cache_cheap_marks_snapshot_inapplicable(fresh_companion_app, proj
     assert any(comp["key"] == "build" and comp["bytes"] > 0 for comp in body["components"])
 
 
-def test_entry_cache_resolves_alias(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_cache_resolves_alias(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     h = list_entries(project)[0]["content_hash"]
@@ -262,7 +262,7 @@ def test_entry_cache_resolves_alias(fresh_companion_app, project, orders_parquet
     assert by_alias.json()["content_hash"] == h  # alias resolved to its current head
 
 
-def test_entry_cache_unknown_hash_404_malformed_400(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_cache_unknown_hash_404_malformed_400(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     c = TestClient(fresh_companion_app)
     # Well-formed hex, no such entry → 404 (not the SPA index.html fallthrough).
@@ -271,7 +271,7 @@ def test_entry_cache_unknown_hash_404_malformed_400(fresh_companion_app, project
     assert c.get(f"/{project}/api/entry_cache/NOPE-not-a-hash").status_code == 400
 
 
-def test_entry_cache_lineage_and_enrichment(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_cache_lineage_and_enrichment(fresh_companion_app, project, orders_src, monkeypatch):
     # #134: the metadata tab links the entry's parents and dependent children and
     # carries source-size / last-modified / cheap-vs-expensive enrichment.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)

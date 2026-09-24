@@ -6,15 +6,15 @@ from tallyman_mcp.server import catalog_create, catalog_revise
 # (tracked_expr_from_alias("X") / pinned_expr_from_alias("X")) — that makes the
 # code an opaque self-reference up a chain of identically-named versions instead
 # of a self-contained recipe you can read in one view. catalog_revise rejects it
-# and points at the two good shapes: inline the source (source-shaped) or pin the
-# previous version by its content hash (expensive). A by-hash reference stays
-# legal.
+# and points at the two good shapes: start from the source alias (source-shaped)
+# or pin the previous version by its content hash (expensive). A by-hash
+# reference stays legal.
 
 
 def _src(project: str, cols: str = '"region", "price", "__row_order"') -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select({cols})
 """
 
@@ -35,7 +35,7 @@ expr = t.mutate(region2=t.region)
 """
 
 
-def test_revise_rejects_self_alias_reference(project, orders_parquet, monkeypatch):
+def test_revise_rejects_self_alias_reference(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     v1 = catalog_create("parking", _src(project))
     out = catalog_revise("parking", _self_alias(project, "parking"))
@@ -47,7 +47,7 @@ def test_revise_rejects_self_alias_reference(project, orders_parquet, monkeypatc
     assert get_alias(project, "parking") == v1["hash"]
 
 
-def test_revise_allows_pin_by_version_of_prior_version(project, orders_parquet, monkeypatch):
+def test_revise_allows_pin_by_version_of_prior_version(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("parking", _src(project))
     out = catalog_revise("parking", _pin_by_version(project, "parking-v1"))
@@ -55,9 +55,9 @@ def test_revise_allows_pin_by_version_of_prior_version(project, orders_parquet, 
     assert out.get("version") == 2
 
 
-def test_revise_allows_inlined_source(project, orders_parquet, monkeypatch):
+def test_revise_allows_source_shaped_revision(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("parking", _src(project))
-    out = catalog_revise("parking", _src(project, cols='"region", "__row_order"'))  # inline, no alias ref
+    out = catalog_revise("parking", _src(project, cols='"region", "__row_order"'))  # a source alias, not its own
     assert "error" not in out, out
     assert out.get("version") == 2

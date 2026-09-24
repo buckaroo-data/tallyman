@@ -11,8 +11,8 @@ connection, so a float aggregate merges its partial sums in one order (ADR-009 D
 that fixes the layout of the file (ADR-009 D3) and numbers them in a last column, ``__row_order`` (ADR-008 D2), and
 returns the content digest of the file it wrote, read back (ADR-009 D2).
 
-``ensure_materialized`` is the one entry point that makes files exist: every snapshot, ordered copy and clone an
-entry's plan reads is on disk before anything executes (ADR-007 D5).
+``ensure_materialized`` is the one entry point that makes files exist: every snapshot an entry's plan reads is on
+disk before anything executes (ADR-007 D5).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ perf_log = logging.getLogger("tallyman.perf")
 # The snapshot format (ADR-009 D3). The row-group size decides the batch boundaries an entry built on this file sees,
 # and an ungrouped float total depends on them (#187), so the row-group size and the materialization connection's batch
 # size are part of the reproducibility contract: changing either is a corpus rebuild, and the version below stands for
-# both (and for the layout of the ordered copies of sources, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
+# both (and for the row groups a source snapshot is written in, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
 SNAPSHOT_ROW_GROUP_ROWS = 1_048_576
 SNAPSHOT_BATCH_SIZE = 8192
 SNAPSHOT_FORMAT_VERSION = 1
@@ -242,8 +242,12 @@ def _heal(project: str, content_hash: str) -> None:
 
 
 def _recreate(project: str, owner_hash: str, path: Path) -> None:
-    """Make a missing file the owner's plan reads again, by the rule for its class (ADR-007 D13)."""
-    from tallyman_xorq import ordered_copy as oc
+    """Make a missing file the owner's plan reads again (ADR-007 D13).
+
+    There is one class of file to make again: another entry's snapshot, named by its content hash, made
+    by recursing on it. A source's ordered copy was the second class and is gone — a source is an entry,
+    so its rows come back through this same path (``_heal_a_source`` under ``_ensure``), ADR-011 D1.
+    """
     from tallyman_xorq.build import BuildError
 
     if path.parent == snapshots_dir(project):
@@ -256,8 +260,6 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
                 "catalog, so it cannot be made again"
             )
         ensure_materialized(project, parent)
-    elif oc.is_ordered_copy_path(project, path):
-        oc.recreate_ordered_copy(project, owner_hash, path)
     else:
         raise BuildError(
             f"entry {owner_hash} in {project!r} reads {path}, which tallyman did not write and cannot make again"
@@ -277,6 +279,19 @@ def _source_provenance(project: str, content_hash: str):
         return None
 
 
+def _source_names(project: str, content_hash: str, provenance) -> tuple[tuple[str, int] | None, str]:
+    """``(held, imported)``: how a message names a source version (ADR-011 D1).
+
+    ``held`` is ``(alias, version)`` as the alias store has it now, or None when no source alias holds the entry
+    (``source_import.current_source_version``). ``imported`` is the ``<alias>-v<N>`` the version was imported as,
+    from ``provenance``: history, which a rename or an unalias leaves behind. A message names the version by
+    ``held``, and mentions ``imported`` only where the two differ.
+    """
+    from tallyman_xorq.source_import import current_source_version
+
+    return current_source_version(project, content_hash, provenance), f"{provenance.alias}-v{provenance.version}"
+
+
 def _heal_a_source(project: str, content_hash: str) -> bool:
     """Re-create a source version's snapshot from the clone of the bytes it was imported from (ADR-011 D1).
 
@@ -287,13 +302,17 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
     re-created snapshot.
 
     Only a clone that is gone as well makes the version unrecoverable, and then the error names the file that is
-    missing and the re-import that repairs it. Returns whether this entry is a source version, so the general path
-    can stop.
+    missing and the re-import that repairs it: the alias and version that hold the entry now (``_source_names``), so
+    the advised call re-imports into the version it names rather than minting an alias under the name the version
+    was imported as, and the reader options the entry recorded (``source_import.import_call``), without which a CSV
+    names another entry. When no source alias holds it there is no version to re-import into, and the error says what
+    an import of the same bytes would do instead. Returns whether this entry is a source version, so the general
+    path can stop.
     """
     from tallyman_core.catalog_state import project_lock
     from tallyman_xorq.build import BuildError
     from tallyman_xorq.result_cache import _verify_self_heal
-    from tallyman_xorq.source_import import rewrite_source_snapshot, source_clone_path
+    from tallyman_xorq.source_import import import_call, rewrite_source_snapshot, source_clone_path
 
     provenance = _source_provenance(project, content_hash)
     if provenance is None:
@@ -303,12 +322,23 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
             return True
         clone = source_clone_path(project, provenance)
         if not clone.is_file():
+            held, imported = _source_names(project, content_hash, provenance)
+            lost = (
+                f"cannot be made again: {snapshot_path(project, content_hash)} is not on disk and neither is the "
+                f"clone of the imported bytes, {clone}."
+            )
+            if held is None:
+                raise BuildError(
+                    f"the data imported as {imported} (entry {content_hash}), which no source alias holds now, "
+                    f"{lost} Importing the same bytes again, "
+                    f"{import_call(provenance.path, None, provenance.reader)}, writes these rows again as a new "
+                    "version of <alias>."
+                )
+            alias, version = held
+            also = "" if f"{alias}-v{version}" == imported else f", imported as {imported}"
             raise BuildError(
-                f"the data of {provenance.alias}-v{provenance.version} (entry {content_hash}) cannot be made "
-                f"again: {snapshot_path(project, content_hash)} is not on disk and neither is the clone of the "
-                f"imported bytes, {clone}. Import them again with "
-                f"catalog_import_source({provenance.path!r}, {provenance.alias!r}, "
-                f"pinned_version={provenance.version})."
+                f"the data of {alias}-v{version} (entry {content_hash}{also}) {lost} Import them again with "
+                f"{import_call(provenance.path, alias, provenance.reader, pinned_version=version)}."
             )
         digest = rewrite_source_snapshot(project, content_hash, provenance)
         perf_log.debug("ensure_materialized re-imported %s from %s", content_hash, clone.name)
@@ -340,8 +370,8 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     1. A worthy entry whose snapshot exists is done, and no build is loaded.
     2. Otherwise load the entry's build (the plan is kept in the existing LRU) and collect every file its ``Read``
        nodes point at.
-    3. Re-create each that is missing by the rule for its class: a snapshot by recursing on the hash in its file name,
-       an ordered copy of a source from its clone, a clone from the live source while the bytes still match.
+    3. Re-create each that is missing: every one is another entry's snapshot, made by recursing on the hash in its
+       file name. A source version is re-created from the clone of its imported bytes (``_heal_a_source``).
     4. If the entry is worthy, heal its own snapshot and verify it.
 
     Every caller that composes or executes an entry goes through here, so nothing ever runs over a file that is
@@ -356,8 +386,8 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
     A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
     time gave different digests), a heal already produced different rows than were built, or it is a source
     version whose clone of the imported bytes is gone (ADR-011 D1 — with the clone it is ordinary cache, made again
-    from those bytes). The Cache page's delete leaves such a file alone and says why. ``compute_cache/`` as a whole
-    is still deletable by definition.
+    from those bytes). The Cache page's delete leaves such a file alone and says why, naming a source version by the
+    alias that holds it now (``_source_names``). ``compute_cache/`` as a whole is still deletable by definition.
     """
     from tallyman_core import read_manifest
     from tallyman_core.errors import list_errors
@@ -371,9 +401,14 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
     if manifest is not None and manifest.provenance is not None:
         clone = source_clone_path(project, manifest.provenance)
         if not clone.is_file():
+            held, imported = _source_names(project, content_hash, manifest.provenance)
+            if held is None:
+                name = f"the source version imported as {imported}, which no source alias holds now"
+            else:
+                current = f"{held[0]}-v{held[1]}"
+                name = f"the source version {current}" + ("" if current == imported else f" (imported as {imported})")
             return (
-                f"this file is the last copy of the source version {manifest.provenance.alias}-v"
-                f"{manifest.provenance.version}: the clone of the bytes imported from "
+                f"this file is the last copy of {name}: the clone of the bytes imported from "
                 f"{manifest.provenance.path} is gone from {clone}, so nothing can make it again and it is kept"
             )
     if manifest is not None and manifest.reproducible is False:

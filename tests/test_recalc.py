@@ -7,18 +7,18 @@ re-resolved to the *advanced* alias head on replay, an unchanged/pinned entry
 replays to the same hash (a no-op), and a build failure stops the walk with the
 prefix left committed.
 
-Note on staleness axes: a *cheap* child inlines its parent's recipe, so the
-parent's source is collected into the child's own ``manifest.sources`` (the
-documented cheap-chain leak) — a source edit makes such a child *directly* stale,
-not merely transitively. A pure transitive/cascade case therefore needs the
-followed-alias axis (advance the alias with ``catalog_revise``), which is what
-``test_alias_advance_cascades_to_the_follower`` exercises.
+Note on staleness: there is one axis (ADR-011 D6, the source axis is gone). A raw
+input is a source alias, so re-importing the file advances that alias and the root
+that reads it goes stale exactly the way a child of any other alias does. A child
+of the root is then carried transitively. ``test_alias_advance_cascades_to_the_follower``
+advances a catalog alias instead, which makes its follower *directly* stale.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from tallyman_cli.fixtures import write_shoe_orders
-from tallyman_core import data_dir
 from tallyman_core.aliases import get_alias
 from tallyman_core.catalog_state import current_step, reset_to
 from tallyman_core.manifest import Manifest, ParentRef, write_manifest
@@ -26,21 +26,22 @@ from tallyman_core.paths import entry_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.recalc import recalc
+from tallyman_xorq.source_import import update_and_depend
 from tallyman_xorq.staleness import scan
 
 
-def _base_code(project: str) -> str:  # root over orders.parquet
+def _base_code(project: str) -> str:  # root over the imported orders source
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
 
 
 def _base_code_v2(project: str) -> str:  # a different graph → a new content hash, same source
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order").mutate(extra=1)
 """
 
@@ -66,9 +67,15 @@ def _hash(result: dict) -> str:
     return result["hash"]
 
 
-def _edit_source(project: str) -> None:
-    """Rewrite orders.parquet in place with different content (new digest)."""
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=250, seed=7)
+def _advance_source(project: str, path: Path) -> None:
+    """Re-import the orders file with different rows, advancing the ``orders_src`` alias.
+
+    A build never opens a file (ADR-011 D2), so editing one on disk changes nothing. New raw data
+    reaches the catalog by importing it again: that mints the next source version and points the
+    alias at it, which is what makes the entries reading that alias stale.
+    """
+    write_shoe_orders(path, n_rows=250, seed=7)
+    update_and_depend(path, "orders_src", project=project)
 
 
 # ---------------------------------------------------------------------------
@@ -76,11 +83,10 @@ def _edit_source(project: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dry_run_previews_the_ordered_cone_without_building(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_dry_run_previews_the_ordered_cone_without_building(project, orders_parquet, orders_src):
     a = _hash(catalog_create("a", _base_code(project)))
     b = _hash(catalog_create("b", _child_code("a")))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     before = {e["content_hash"] for e in list_entries(project)}
     report = recalc(project, [a], dry_run=True)
@@ -105,13 +111,12 @@ def test_dry_run_previews_the_ordered_cone_without_building(project, orders_parq
 # ---------------------------------------------------------------------------
 
 
-def test_recalc_rebuilds_drifted_root_and_repoints_the_cone(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_recalc_rebuilds_drifted_root_and_repoints_the_cone(project, orders_parquet, orders_src):
     a1 = _hash(catalog_create("a", _base_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
 
-    _edit_source(project)
-    assert scan(project)[a1].stale is True  # source axis
+    _advance_source(project, orders_parquet)
+    assert scan(project)[a1].stale is True  # the alias it reads, orders_src, advanced
 
     report = recalc(project, [a1], dry_run=False)
 
@@ -129,11 +134,10 @@ def test_recalc_rebuilds_drifted_root_and_repoints_the_cone(project, orders_parq
     assert parents[0]["hash"] == a2 and parents[0]["follow"] is True
 
 
-def test_alias_advance_cascades_to_the_follower(project, orders_parquet, monkeypatch):
-    # The pure followed-alias axis: advancing a's alias (not its source) makes its
-    # follower b *directly* stale on the alias axis; recalc re-resolves b to the
-    # advanced head. b's source is unchanged, so this isolates the alias cascade.
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_alias_advance_cascades_to_the_follower(project, orders_src, monkeypatch):
+    # Advancing a's alias (not re-importing its source) makes its follower b
+    # *directly* stale; recalc re-resolves b to the advanced head. orders_src is
+    # unchanged, so this isolates the catalog-alias cascade from the import.
     # Opt out of auto-recalc-on-revise so the revise advances a WITHOUT recomputing
     # b: otherwise the cascade re-points "b" to a fresh head and b1 becomes a
     # superseded husk (never actionably stale under #154), not the *live* directly-
@@ -157,13 +161,12 @@ def test_alias_advance_cascades_to_the_follower(project, orders_parquet, monkeyp
     assert parents[0]["hash"] == a2  # now bound to the advanced a
 
 
-def test_recalc_is_one_undoable_transaction(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_recalc_is_one_undoable_transaction(project, orders_parquet, orders_src):
     a1 = _hash(catalog_create("a", _base_code(project)))
     _hash(catalog_create("b", _child_code("a")))
     step_before = current_step(project)
 
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
     report = recalc(project, [a1], dry_run=False)
     assert report.checkpoint_step == current_step(project)
     assert report.checkpoint_step > step_before
@@ -178,8 +181,7 @@ def test_recalc_is_one_undoable_transaction(project, orders_parquet, monkeypatch
 # ---------------------------------------------------------------------------
 
 
-def test_hash_pinned_child_is_left_on_its_pin(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_hash_pinned_child_is_left_on_its_pin(project, orders_src):
     a1 = _hash(catalog_create("a", _base_code(project)))
     # A version reference records follow=False — the child asked for THIS
     # revision, so a recalc that advances the alias must not advance the child.
@@ -195,8 +197,7 @@ def test_hash_pinned_child_is_left_on_its_pin(project, orders_parquet, monkeypat
     assert next(e for e in report.entries if e.content_hash == b1).action == "noop"
 
 
-def test_recalc_with_nothing_stale_is_a_noop(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_recalc_with_nothing_stale_is_a_noop(project, orders_src):
     a1 = _hash(catalog_create("a", _base_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
     step_before = current_step(project)
@@ -218,8 +219,7 @@ def test_recalc_with_nothing_stale_is_a_noop(project, orders_parquet, monkeypatc
 # ---------------------------------------------------------------------------
 
 
-def test_build_failure_stops_the_walk_and_keeps_the_prefix(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_build_failure_stops_the_walk_and_keeps_the_prefix(project, orders_parquet, orders_src):
     a1 = _hash(catalog_create("a", _base_code(project)))
     b1 = _hash(catalog_create("b", _child_code("a")))
 
@@ -228,7 +228,7 @@ def test_build_failure_stops_the_walk_and_keeps_the_prefix(project, orders_parqu
     # is the deterministic stand-in.
     (entry_dir(project, b1) / "expr.py").write_text("this is not valid python (((\n")
 
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
     report = recalc(project, [a1], dry_run=False)
 
     assert report.status == "failed"

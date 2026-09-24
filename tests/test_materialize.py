@@ -20,14 +20,15 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_companion.diff import build_diff_expr
 from tallyman_core import data_dir, entry_dir
+from tallyman_core.aliases import get_alias
 from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import compute_cache_dir, tallyman_home
+from tallyman_core.paths import compute_cache_dir
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq import result_cache
 from tallyman_xorq.build import BuildError, build_and_persist
+from tallyman_xorq.materialize import snapshot_path
 from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, snapshot_file_digest
 
 # --------------------------------------------------------------------------- #
@@ -37,16 +38,16 @@ from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, 
 
 def _agg_code(project: str) -> str:  # an Aggregate: worthy, so it has a snapshot
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _boots_agg_code(project: str) -> str:  # a second version of the same aggregate, over fewer rows
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 b = t.filter(t.category == "boots")
 expr = b.group_by("region").aggregate(total=b.price.sum(), n=b.count())
 """
@@ -68,10 +69,10 @@ expr = t.aggregate(total_share=t.share.sum(), rows=t.count())
 """
 
 
-def _root_code(project: str) -> str:  # a bare read of a source: a cheap root entry
+def _root_code(project: str) -> str:  # a bare read of an imported source: a cheap root entry
     return f"""
-from tallyman_xorq.io import read_project_file
-expr = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+expr = tracked_expr_from_alias("orders_src", project={project!r})
 """
 
 
@@ -107,18 +108,18 @@ def _no_cascade(monkeypatch):
 # --------------------------------------------------------------------------- #
 
 
-def test_a_recipe_that_calls_cache_is_a_build_error(project, orders_parquet):
+def test_a_recipe_that_calls_cache_is_a_build_error(project, orders_src):
     """ADR-007 D1 (builds carry no cache nodes): a ``CachedNode`` in a recipe would write under ~/.cache/xorq."""
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price").cache()
 """
     with pytest.raises(BuildError, match="cache"):
         build_and_persist(project, code)
 
 
-def test_a_build_carries_no_cache_node(project, orders_parquet, monkeypatch):
+def test_a_build_carries_no_cache_node(project, orders_src, monkeypatch):
     """ADR-007 D1: neither a worthy entry nor its chained child has a ``CachedNode`` in its frozen build."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     parent = _hash(catalog_create("agg", _agg_code(project)))
@@ -145,7 +146,7 @@ def test_the_xorq_cache_machinery_is_gone():
 # --------------------------------------------------------------------------- #
 
 
-def test_the_snapshot_path_is_derived_from_the_content_hash(project, orders_parquet, monkeypatch):
+def test_the_snapshot_path_is_derived_from_the_content_hash(project, orders_src, monkeypatch):
     """ADR-007 D2 (snapshot location): ``compute_cache/result_cache/<content_hash>.parquet``, written at create."""
     from tallyman_xorq.materialize import snapshot_path
 
@@ -157,14 +158,14 @@ def test_the_snapshot_path_is_derived_from_the_content_hash(project, orders_parq
     assert baked_snapshot_path(project, h) == expected
 
 
-def test_the_manifest_records_no_snapshot_key(project, orders_parquet, monkeypatch):
+def test_the_manifest_records_no_snapshot_key(project, orders_src, monkeypatch):
     """ADR-007 D2: with the path computed from the hash there is no second derivation for a tripwire to compare."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     h = _hash(catalog_create("agg", _agg_code(project)))
     assert "snapshot_key" not in json.loads((entry_dir(project, h) / "manifest.json").read_text())
 
 
-def test_a_worthy_read_is_one_memoised_bare_read_of_the_snapshot(project, orders_parquet, monkeypatch):
+def test_a_worthy_read_is_one_memoised_bare_read_of_the_snapshot(project, orders_src, monkeypatch):
     """ADR-007 D2: ``cached_result_expr`` is one bare read of the snapshot, memoised, and loads no build."""
     from tallyman_xorq.materialize import snapshot_path
 
@@ -187,7 +188,7 @@ def test_a_worthy_read_is_one_memoised_bare_read_of_the_snapshot(project, orders
 # --------------------------------------------------------------------------- #
 
 
-def test_a_child_of_a_worthy_parent_reads_the_parents_snapshot_and_is_cheap(project, orders_parquet, monkeypatch):
+def test_a_child_of_a_worthy_parent_reads_the_parents_snapshot_and_is_cheap(project, orders_src, monkeypatch):
     """ADR-007 D3 (chaining is a bare read): a filter over an aggregate's snapshot is cheap, not a second copy."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     parent = _hash(catalog_create("agg", _agg_code(project)))
@@ -200,7 +201,7 @@ def test_a_child_of_a_worthy_parent_reads_the_parents_snapshot_and_is_cheap(proj
     assert baked_snapshot_path(project, child) is None
 
 
-def test_a_child_hash_follows_the_parents_snapshot_path_not_its_bytes(project, orders_parquet, monkeypatch):
+def test_a_child_hash_follows_the_parents_snapshot_path_not_its_bytes(project, orders_src, monkeypatch):
     """ADR-007 D3: content identity goes in the path. Other bytes at the same path keep the child's hash; a new
     parent (a new path) changes it."""
     from tallyman_xorq.materialize import snapshot_path
@@ -225,7 +226,7 @@ def test_a_child_hash_follows_the_parents_snapshot_path_not_its_bytes(project, o
 # --------------------------------------------------------------------------- #
 
 
-def test_a_create_replaces_a_snapshot_that_is_already_on_disk(project, orders_parquet):
+def test_a_create_replaces_a_snapshot_that_is_already_on_disk(project, orders_src):
     """ADR-007 D4 (one writer) and D14: a create never looks for the file, it runs the query and replaces it."""
     from tallyman_xorq.materialize import snapshot_path
 
@@ -241,7 +242,17 @@ def test_a_create_replaces_a_snapshot_that_is_already_on_disk(project, orders_pa
     assert snapshot_file_digest(snap) == good
 
 
-def test_materialize_leaves_one_file_and_no_temp_files(project, orders_parquet):
+def _leftovers(snap: Path) -> list[str]:
+    """Anything in the snapshot directory that is not a finished snapshot.
+
+    A project holds one snapshot per worthy entry, including the imported source these tests build
+    over, so the directory is never down to a single file. What must never be there is a temp name
+    from an interrupted write.
+    """
+    return sorted(p.name for p in snap.parent.iterdir() if not p.name.endswith(".parquet"))
+
+
+def test_materialize_leaves_one_file_and_no_temp_files(project, orders_src):
     """ADR-007 D4: a unique temp name in the destination directory, then ``os.replace``."""
     from tallyman_xorq.materialize import materialize, snapshot_path
 
@@ -250,10 +261,10 @@ def test_materialize_leaves_one_file_and_no_temp_files(project, orders_parquet):
     snap = snapshot_path(project, h)
     assert result.path == snap
     assert result.digest == _digest_of(project, h)
-    assert sorted(p.name for p in snap.parent.iterdir()) == [snap.name]
+    assert _leftovers(snap) == []
 
 
-def test_a_failed_materialization_keeps_the_previous_file(project, orders_parquet, monkeypatch):
+def test_a_failed_materialization_keeps_the_previous_file(project, orders_src, monkeypatch):
     """ADR-007 D4: the destination only ever changes by an atomic replace of a complete file."""
     from tallyman_xorq.materialize import materialize, snapshot_path
 
@@ -268,7 +279,7 @@ def test_a_failed_materialization_keeps_the_previous_file(project, orders_parque
     with pytest.raises(OSError, match="disk full"):
         materialize(project, h)
     assert snap.read_bytes() == before
-    assert sorted(p.name for p in snap.parent.iterdir()) == [snap.name]
+    assert _leftovers(snap) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -276,7 +287,7 @@ def test_a_failed_materialization_keeps_the_previous_file(project, orders_parque
 # --------------------------------------------------------------------------- #
 
 
-def test_ensure_materialized_rewrites_a_missing_snapshot_and_verifies_it(project, orders_parquet):
+def test_ensure_materialized_rewrites_a_missing_snapshot_and_verifies_it(project, orders_src):
     """ADR-007 D5 (``ensure_materialized``): a deleted snapshot is re-created and checked against the manifest."""
     from tallyman_xorq.materialize import ensure_materialized, snapshot_path
 
@@ -290,7 +301,7 @@ def test_ensure_materialized_rewrites_a_missing_snapshot_and_verifies_it(project
     assert snapshot_file_digest(snap) == recorded
 
 
-def test_files_exist_before_anything_runs(project, orders_parquet, monkeypatch):
+def test_files_exist_before_anything_runs(project, orders_src, monkeypatch):
     """ADR-007 D5: with an ancestor's snapshot deleted, opening a descendant rewrites the ancestor first, so no plan
     is ever executed over a file that is missing. This is #76's reproduction."""
     from tallyman_xorq.materialize import snapshot_path
@@ -307,7 +318,7 @@ def test_files_exist_before_anything_runs(project, orders_parquet, monkeypatch):
     assert len(expr.execute()) > 0
 
 
-def test_building_a_child_rewrites_a_deleted_parent_snapshot_first(project, orders_parquet, monkeypatch):
+def test_building_a_child_rewrites_a_deleted_parent_snapshot_first(project, orders_src, monkeypatch):
     """ADR-007 D3 and D5: chaining at mint time makes the parent's file exist, since ``build_expr`` of a child fails
     while the parent's snapshot is absent."""
     from tallyman_xorq.materialize import snapshot_path
@@ -322,7 +333,7 @@ def test_building_a_child_rewrites_a_deleted_parent_snapshot_first(project, orde
     assert f"result_cache/{parent}.parquet" in _build_yaml(project, child)
 
 
-def test_composing_a_diff_rewrites_both_deleted_snapshots_first(project, orders_parquet, monkeypatch):
+def test_composing_a_diff_rewrites_both_deleted_snapshots_first(project, orders_src, monkeypatch):
     """ADR-007 D5 and D10 (diffs: what this set still does): both sides are read through ``cached_result_expr``, so
     both files exist before the join is composed, and the diff carries no row-order column from either side."""
     from tallyman_xorq.materialize import snapshot_path
@@ -350,7 +361,7 @@ def test_composing_a_diff_rewrites_both_deleted_snapshots_first(project, orders_
 # --------------------------------------------------------------------------- #
 
 
-def test_an_empty_compute_cache_reproduces_every_snapshot_an_entry_needs(project, orders_parquet, monkeypatch):
+def test_an_empty_compute_cache_reproduces_every_snapshot_an_entry_needs(project, orders_src, monkeypatch):
     """ADR-007 D7 (the cold seam): with ``compute_cache/`` removed the canonical read reproduces every snapshot the
     entry needs, each with its recorded digest, ordered copies of sources included."""
     from tallyman_xorq.materialize import snapshot_path
@@ -404,7 +415,7 @@ def _xorq_cache_files() -> set[str]:
     return {str(p) for p in root.rglob("*") if p.is_file()}
 
 
-def test_xorq_cache_directory_stays_untouched(project, orders_parquet, monkeypatch):
+def test_xorq_cache_directory_stays_untouched(project, orders_src, monkeypatch):
     """ADR-007 D8 (the sentinel): a build, a chained child build, a view, a delete and a reopen write nothing under
     xorq's cache directory. Fails on main: a child build re-executes its parent into ``~/.cache/xorq``."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -424,11 +435,15 @@ def test_xorq_cache_directory_stays_untouched(project, orders_parquet, monkeypat
 
 # --------------------------------------------------------------------------- #
 # D13: a file is cache only if ensure_materialized can re-create it
+#
+# The ordered copies of sources used to be the second class of file here, with their own store, their
+# own key and their own re-creation path. ADR-011 D1 folds them in: a raw input is an entry, its
+# snapshot is the copy, and re-creating it from the clone of the imported bytes is
+# ``materialize._heal_a_source``. ``tests/test_source_import.py`` owns those cases now — a deleted
+# source snapshot, a deleted clone, a CSV's recorded reader options, a child reading through a
+# source snapshot that is gone. What is left here is the part that is about an ENTRY's reach into
+# ``compute_cache/``, not about a source.
 # --------------------------------------------------------------------------- #
-
-
-def _ordered_copies(project: str) -> list[Path]:
-    return sorted((compute_cache_dir(project) / "ordered_sources").glob("*.parquet"))
 
 
 def _clones(project: str) -> list[Path]:
@@ -441,73 +456,14 @@ def _rows(project: str, content_hash: str) -> list[dict]:
     return json.loads(df.to_json(orient="records"))
 
 
-def test_the_ordered_copy_lives_under_the_compute_cache_and_is_recorded(project, orders_parquet, monkeypatch):
-    """ADR-007 D13 (ordered copies are cache): they live under ``compute_cache/``, ``csv_ordered/`` is retired, and
-    the manifest records what ``ensure_materialized`` needs to make one again."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    h = _hash(catalog_create("orders", _root_code(project)))
-    copies = _ordered_copies(project)
-    assert len(copies) == 1
-    assert not (tallyman_home() / "csv_ordered").exists()
-    record = read_manifest(entry_dir(project, h)).ordered_copies[copies[0].stem]
-    assert record["source"] == "orders.parquet"
-    assert record["reader"]["kind"] == "parquet"
-    assert record["digest"] == read_manifest(entry_dir(project, h)).sources["orders.parquet"]
-    assert record["content_digest"] == snapshot_file_digest(copies[0])
+def test_an_empty_compute_cache_is_rebuilt_for_an_entry_that_records_no_parent(project, orders_src, monkeypatch):
+    """ADR-007 D13: a file is made again from the hash in its name, whoever reads it.
 
-
-def test_a_deleted_ordered_copy_is_made_again_from_the_clone_and_checked(project, orders_parquet, monkeypatch):
-    """ADR-007 D13 and D5: opening a root entry re-creates its ordered copy from the clone."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    h = _hash(catalog_create("orders", _root_code(project)))
-    [copy] = _ordered_copies(project)
-    digest = snapshot_file_digest(copy)
-    rows = _rows(project, h)
-    copy.unlink()
-    cached_result_expr.cache_clear()
-
-    assert _rows(project, h) == rows
-    assert snapshot_file_digest(copy) == digest
-
-
-def test_a_deleted_clone_is_made_again_from_the_unchanged_live_source(project, orders_parquet, monkeypatch):
-    """ADR-007 D13: a clone can be copied again from the live source while the live bytes still hash to its name."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    h = _hash(catalog_create("orders", _root_code(project)))
-    [copy] = _ordered_copies(project)
-    [clone] = _clones(project)
-    rows = _rows(project, h)
-    copy.unlink()
-    clone.unlink()
-    cached_result_expr.cache_clear()
-
-    assert _rows(project, h) == rows
-    assert clone.is_file() and copy.is_file()
-
-
-def test_a_child_that_inlines_a_cheap_parent_can_make_the_ordered_copy_again(project, orders_parquet, monkeypatch):
-    """ADR-007 D5 and D13: a child's build reads the parent's ordered copy directly, so the child's manifest carries
-    the record that lets it be made again."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    _hash(catalog_create("orders", _root_code(project)))
-    child = _hash(catalog_create("multi", _root_child_code("orders")))
-    [copy] = _ordered_copies(project)
-    [clone] = _clones(project)
-    rows = _rows(project, child)
-    copy.unlink()
-    clone.unlink()
-    cached_result_expr.cache_clear()
-
-    assert _rows(project, child) == rows
-    assert copy.is_file()
-
-
-def test_an_ordered_copy_is_made_again_for_an_entry_whose_manifest_does_not_record_it(
-    project, orders_parquet, monkeypatch
-):
-    """ADR-007 D13: a copy is made again from the record of whichever entry wrote it, so an entry that reaches a cheap
-    entry's graph by a path that records nothing (here ``cached_result_expr`` called from the recipe) still survives
-    the loss of ``compute_cache/``."""
+    The child below reaches its parent's snapshot through ``cached_result_expr`` inside the recipe, so
+    it records no parent edge and its manifest says nothing about what it reads. Losing
+    ``compute_cache/`` entirely must still be survivable: every file under it is named by a content
+    hash, and the entry that owns that hash knows how to write it again.
+    """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     root = _hash(catalog_create("orders", _root_code(project)))
     code = f"""
@@ -516,7 +472,7 @@ t = cached_result_expr({project!r}, {root!r})
 expr = t.filter(t.qty > 1)
 """
     child = build_and_persist(project, code).content_hash
-    assert not read_manifest(entry_dir(project, child)).ordered_copies
+    assert read_manifest(entry_dir(project, child)).parents is None
     rows = _rows(project, child)
     shutil.rmtree(compute_cache_dir(project))
     cached_result_expr.cache_clear()
@@ -524,45 +480,23 @@ expr = t.filter(t.qty > 1)
     assert _rows(project, child) == rows
 
 
-def test_when_nothing_can_make_a_file_again_the_error_names_the_source(project, orders_parquet, monkeypatch):
-    """ADR-007 D13: the clone is gone and the live source has changed, so the built rows are unrecoverable and the
-    error names the source file."""
+def test_when_nothing_can_make_a_file_again_the_error_names_the_re_import(project, orders_src, monkeypatch):
+    """ADR-007 D13 through a child: the rows under it are unrecoverable, and the error says how to get them back.
+
+    A source version's snapshot is cache while the clone of its imported bytes is on disk. With both
+    gone the rows exist nowhere — the outside file is provenance and is not consulted — so reading a
+    child of that source raises, naming the missing clone and the import that repairs it.
+    """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    h = _hash(catalog_create("orders", _root_code(project)))
-    [copy] = _ordered_copies(project)
-    [clone] = _clones(project)
-    copy.unlink()
-    clone.unlink()
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=37, seed=99)  # the live source changed
+    _hash(catalog_create("orders", _root_code(project)))
+    child = _hash(catalog_create("multi", _root_child_code("orders")))
+    _rows(project, child)
+
+    src_hash = get_alias(project, "orders_src")
+    snapshot_path(project, src_hash).unlink()
+    for clone in _clones(project):
+        clone.unlink()
     cached_result_expr.cache_clear()
 
-    with pytest.raises(Exception, match=r"orders\.parquet"):
-        cached_result_expr(project, h)
-
-
-def test_a_csv_ordered_copy_is_made_again_with_the_recorded_reader_options(project, monkeypatch):
-    """ADR-007 D13: the manifest records each source's reader options, so a CSV copy is re-created with the schema and
-    the ``scan_csv`` options it was first read with."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    csv = data_dir(project) / "sample.csv"
-    csv.write_text("id;name;value\n3;charlie;30\n1;alice;10\n2;bob;20\n")
-    code = f"""
-import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import tallyman_read_csv
-schema = ibis.schema({{"id": "int64", "name": "string", "value": "int64"}})
-expr = tallyman_read_csv({str(csv)!r}, schema=schema, separator=";")
-"""
-    h = build_and_persist(project, code).content_hash
-    [copy] = _ordered_copies(project)
-    record = read_manifest(entry_dir(project, h)).ordered_copies[copy.stem]
-    assert record["reader"]["kind"] == "csv"
-    assert record["reader"]["scan_kwargs"] == {"separator": ";"}
-    rows = _rows(project, h)
-    assert [r["id"] for r in rows] == [3, 1, 2]  # file order, not sorted
-
-    copy.unlink()
-    [clone] = _clones(project)
-    clone.unlink()
-    cached_result_expr.cache_clear()
-    assert _rows(project, h) == rows
-    assert snapshot_file_digest(copy) == record["content_digest"]
+    with pytest.raises(Exception, match=r"catalog_import_source"):
+        _rows(project, child)

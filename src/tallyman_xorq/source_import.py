@@ -18,8 +18,9 @@ One import does four things:
    records the outside path, the digest and the reader options;
 4. points the source alias at it, appending a version.
 
-The **content hash of a source entry is a function of its bytes and its reader options**, and of nothing else, so two
-imports of identical bytes under two aliases mint one entry and share one file.
+The **content hash of a source entry is a function of its bytes and its reader options**, and of nothing else. One
+such entry belongs to one alias: importing bytes another alias already holds is an error that names that alias, and a
+second name for a source is a catalog entry whose recipe reads it (``_refuse_bytes_held_elsewhere``).
 
 That snapshot is **cache** in the sense of ADR-007 D13 — a file is cache if ``ensure_materialized`` can re-create it
 — because the clone holds the bytes and the entry holds the reader options. A deleted one is written again from the
@@ -74,12 +75,23 @@ def source_entry_hash(digest: str, reader: dict) -> str:
     """The content hash of the entry an import mints: its bytes and its reader options, and nothing else.
 
     Same 12-hex shape as xorq's build hash, so nothing downstream (entry directories, URLs, aliases) notices the
-    difference. Two imports of the same bytes under the same reader are the same entry.
+    difference. The same bytes under the same reader are the same entry, which is why only one alias may hold them.
     """
     from tallyman_xorq.ordered_copy import _reader_signature
 
     payload = f"source|{digest}|{_reader_signature(reader)}"
     return hashlib.md5(payload.encode()).hexdigest()[:HASH_LEN]  # noqa: S324 — an identity, not a credential
+
+
+def _readable_manifest(project: str, content_hash: str):
+    """The entry's manifest, or None when there is no entry or its manifest cannot be read."""
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        return read_manifest(entry_dir(project, content_hash))
+    except (OSError, ValueError):
+        return None
 
 
 def is_source_entry(project: str, content_hash: str) -> bool:
@@ -93,12 +105,44 @@ def is_source_entry(project: str, content_hash: str) -> bool:
         return False
 
 
-def source_entry_context(project: str) -> str | None:
-    """The source entry whose generated recipe is running on this stack, if it belongs to *project*."""
-    ctx = _SOURCE_ENTRY.get()
-    if ctx is None or ctx[0] != project:
-        return None
-    return ctx[1]
+def source_version_in(
+    history: dict[str, list[str]], kinds: dict[str, str] | None, content_hash: str, imported_as: str
+) -> tuple[str, int] | None:
+    """The source alias whose history holds *content_hash*, and its 1-based version there, or None when none does.
+
+    ``provenance.alias`` is the name a version was **imported as**: recorded once, at import, and never updated. A
+    rename carries the history and the kind to a new name (``aliases.rename_alias``) and an unalias drops them, so
+    that name is only a hint, tried first because it is usually still right. This is ``aliases.version_of_hash``
+    restricted to source aliases — an import advances nothing else, so a version held only by a catalog alias has no
+    alias an import could repair it under. *kinds* None means the kinds are not known, and every alias counts.
+    """
+    from tallyman_core.aliases import SOURCE_KIND
+
+    for name in (imported_as, *history):
+        hashes = history.get(name, [])
+        if content_hash in hashes and (kinds is None or kinds.get(name) == SOURCE_KIND):
+            return name, hashes.index(content_hash) + 1
+    return None
+
+
+def current_source_version(project: str, content_hash: str, provenance) -> tuple[str, int] | None:
+    """``(alias, version)`` of the source entry *content_hash* as the project's alias store has it now, or None.
+
+    What a message that names a source version, or advises the import that repairs one, should say: the name in
+    *provenance* is where it came from, and this is where it is (``source_version_in``).
+    """
+    from tallyman_core.aliases import load_history, load_kinds
+
+    return source_version_in(load_history(project), load_kinds(project), content_hash, provenance.alias)
+
+
+def source_entry_context() -> tuple[str, str] | None:
+    """The ``(project, content_hash)`` whose generated recipe is running on this stack, or ``None``.
+
+    The project comes from the entry being minted, not from whichever project is active: ``project=`` on an
+    import is an override, and an import must work while another project is active.
+    """
+    return _SOURCE_ENTRY.get()
 
 
 def in_source_recipe(project: str, content_hash: str):
@@ -163,7 +207,8 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
     """Decide what this import does: ``(mint, version)``, or raise.
 
     The full case table of ADR-011 D3, plus D11's rule that history is append-only and monotonic — two version
-    numbers never denote the same bytes, and a version number never moves backwards while history is intact.
+    numbers never denote the same bytes read the same way, and a version number never moves backwards while history
+    is intact.
     """
     head = len(history)  # the head's 1-based version; 0 when the alias is absent
     already = history.index(content_hash) + 1 if content_hash in history else None
@@ -176,7 +221,8 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
                 f"these bytes are already {alias}-v{already}, and {alias} is at v{head}. Version history is "
                 f"append-only: a v{head + 1} whose rows equal v{already}'s would make the version number meaningless. "
                 f"To put {alias} back on v{already}, reset the catalog to the revision before v{already + 1} "
-                f"(tallyman reset / catalog_reset_to), or import these bytes under a different alias."
+                f"(tallyman reset / catalog_reset_to). To read v{already} in a recipe without moving the head, use "
+                f"pinned_expr_from_alias('{alias}-v{already}')."
             )
         return True, head + 1
 
@@ -192,16 +238,40 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
         if claimed == content_hash:
             return False, pinned_version  # the file IS that version; the head does not move
         raise SourceImportError(
-            f"this file is not {alias}-v{pinned_version}: that version is entry {claimed}, and these bytes are "
-            f"{content_hash}. Import without pinned_version to mint the next version, or point at the file "
-            f"{alias}-v{pinned_version} was imported from."
+            f"this import is not {alias}-v{pinned_version}: that version is entry {claimed}, and this import would "
+            f"be entry {content_hash}. An entry is named by the bytes and the reader options together (ADR-011 D12), "
+            f"so either this is not the file {alias}-v{pinned_version} was imported from, or it is read with other "
+            f"reader options than that import used; the header of {alias}-v{pinned_version}'s recipe records them. "
+            f"Import without pinned_version to mint the next version."
         )
     if already is not None:  # pinned at head+1, but these bytes are already a version (D11)
         raise SourceImportError(
             f"these bytes are already {alias}-v{already}, so they cannot also be v{pinned_version}. "
-            f"Two version numbers never denote the same bytes."
+            f"Two version numbers never denote the same bytes read the same way."
         )
     return True, pinned_version
+
+
+def _refuse_bytes_held_elsewhere(project: str, alias: str, content_hash: str) -> None:
+    """Raise when another alias of *project* already has *content_hash* as one of its versions.
+
+    One set of bytes, read one way, is one source version under one alias. The likely way to get here is not knowing
+    the bytes are already in the project, so the error says where they are and how to give them a second name. The
+    check keys on the entry hash, so a CSV read two ways is still two entries (D12), and it is per project.
+    """
+    from tallyman_core.aliases import load_history
+
+    for other, hashes in sorted(load_history(project).items()):
+        if other == alias or content_hash not in hashes:
+            continue
+        held = f"{other}-v{hashes.index(content_hash) + 1}"
+        raise SourceImportError(
+            f"these bytes are already {held} in project {project!r}, so they cannot also be imported as {alias!r}: "
+            f"one set of bytes is one source version under one alias. Read them with "
+            f"tracked_expr_from_alias({other!r}). To give them a second name, create a catalog entry over the "
+            f"source — catalog_create({alias!r}, \"from tallyman_xorq.io import tracked_expr_from_alias\\n"
+            f"expr = tracked_expr_from_alias({other!r})\") — which follows {other!r} when it is re-imported."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -320,6 +390,28 @@ def source_clone_path(project: str, provenance) -> Path:
     return data_dir(project) / ".cas" / f"{provenance.digest}{provenance.suffix}"
 
 
+def import_call(path: str, alias: str | None, reader: dict, pinned_version: int | None = None) -> str:
+    """The ``catalog_import_source(...)`` call that imports *path* the way *reader* records it was read.
+
+    What an error prints when the way out is an import. A CSV's entry hash covers its reader options (D12), so a call
+    without them names another entry and a pinned one is refused; the call therefore carries the schema and the
+    ``scan_csv`` options the entry recorded, in the MCP tool's own argument shapes. *alias* None prints ``<alias>``,
+    for a version no alias holds, where the caller has to choose the name.
+    """
+    args = [repr(path), "<alias>" if alias is None else repr(alias)]
+    if pinned_version is not None:
+        args.append(f"pinned_version={pinned_version}")
+    if reader.get("kind") == "csv":
+        spec = reader.get("schema")
+        if spec is not None:
+            cells = [[name, dtype] for name, dtype in spec["cells"]]
+            schema = dict(cells) if spec["form"] == "named" else cells
+            args.append(f"schema={schema!r}")
+        if reader.get("scan_kwargs"):
+            args.append(f"reader_options={reader['scan_kwargs']!r}")
+    return f"catalog_import_source({', '.join(args)})"
+
+
 def rewrite_source_snapshot(project: str, content_hash: str, provenance) -> str:
     """Write the snapshot of the source entry *content_hash* again, from its clone; return the digest written.
 
@@ -337,9 +429,12 @@ def _recipe(outside_path: Path, alias: str, version: int, digest: str, reader: d
 
     The read resolves to this entry's own snapshot (``_SOURCE_ENTRY``), not to the path in the call — the path is
     provenance and is never read again. This is the one recipe in which a raw read is allowed (ADR-011 D2).
+
+    The recipe is written once, so the alias in its header is the one it was imported as, and says so: after a
+    rename the entry is a version of another name (``current_source_version``).
     """
     return (
-        f"# {alias}-v{version}: a source version, generated by catalog_import_source. Do not edit.\n"
+        f"# Generated by catalog_import_source when the file was imported as {alias}-v{version}. Do not edit.\n"
         "# A source version is data: its rows are the bytes imported from the path below, ordered and\n"
         "# numbered in __row_order. The path is provenance — the build reads tallyman's own copy of it.\n"
         f"#   imported from: {outside_path}\n"
@@ -386,8 +481,8 @@ def _mint(
     # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
     clone = si.ensure_cas_path(project, outside_path, digest)
 
-    # 2. The one snapshot, named by the entry hash. An existing one (a second alias over the same bytes) is kept:
-    #    the hash is a function of the bytes and the reader, so it already holds exactly these rows.
+    # 2. The one snapshot, named by the entry hash. An existing one is kept: the hash is a function of the bytes and
+    #    the reader, so it already holds exactly these rows.
     snapshot = snapshot_path(project, content_hash)
     if snapshot.exists():
         from tallyman_xorq.digest import content_digest
@@ -411,6 +506,9 @@ def _mint(
         if expr is None:
             raise BuildError(f"the generated recipe of {alias}-v{version} bound no 'expr'")
         target = entry_dir(project, content_hash)
+        # A re-import that repairs a missing snapshot writes into an entry that already exists; a failure must not
+        # take that entry with it.
+        created = not target.exists()
         target.mkdir(parents=True, exist_ok=True)
         try:
             from xorq.ibis_yaml.compiler import build_expr
@@ -461,7 +559,8 @@ def _mint(
                 ),
             )
         except Exception:
-            shutil.rmtree(target, ignore_errors=True)
+            if created:
+                shutil.rmtree(target, ignore_errors=True)
             raise
     finally:
         import sys
@@ -505,12 +604,14 @@ def update_and_depend(
     ``pinned_version`` beyond head+1                    error: versions cannot be skipped
     ``pinned_version=N`` < head, digest matches         return vN; the head does not move
     bytes match a version older than the head           error: history is append-only (D11)
+    bytes are a version of another alias                error: one set of bytes, one alias
     ==================================================  =========================================
 
     Args:
         outside_path: Any path to a parquet or CSV file. ``data/`` is not special — a file is imported from wherever
             it is, and after the import the path is provenance and is never read again.
         alias: The source alias. It may not already name a catalog alias, and a catalog alias may not later take it.
+            Bytes another alias of the project already holds are refused; the error names that alias.
         pinned_version: The version the caller claims this file is, when they want the claim checked.
         project: Project name override (defaults to the active project).
         prompt: Optional human-readable description, recorded on the entry.
@@ -520,7 +621,9 @@ def update_and_depend(
 
     Returns:
         ``{"alias", "version", "hash", "created", "path", "digest", "row_count", "schema"}``. ``created`` is False
-        when the import was a no-op.
+        when the import was a no-op. An import of bytes that are already an entry rewrites nothing of that entry; if
+        its snapshot is gone it is healed from the clone and checked against the recorded digest, exactly as
+        ``ensure_materialized`` heals one, so a repair is never a way to change a version's rows.
 
     Raises:
         SourceImportError: for every row of the table above that is an error, and for a path that is not an importable
@@ -562,12 +665,13 @@ def update_and_depend(
     with project_lock(proj):
         history = history_for(proj, alias)
         mint, version = _plan_version(alias, history, content_hash, pinned_version)
-        from tallyman_core.paths import entry_dir
+        if mint:
+            _refuse_bytes_held_elsewhere(proj, alias, content_hash)
         from tallyman_xorq.materialize import snapshot_path
 
-        # A no-op whose entry is gone is repaired here, and so is a missing snapshot: the caller has handed us the
-        # bytes, which is cheaper than going through the clone, and an entry directory is not cache at all.
-        if mint or not (entry_dir(proj, content_hash).is_dir() and snapshot_path(proj, content_hash).exists()):
+        existing = _readable_manifest(proj, content_hash)
+        if existing is None:
+            # No entry, or a directory a crash left without a manifest, which is not an entry either: write it.
             written = _mint(
                 proj,
                 src,
@@ -579,10 +683,21 @@ def update_and_depend(
                 prompt=prompt,
             )
         else:
-            from tallyman_core import entry_schema_path, read_manifest
+            # The entry exists, and its recipe, build and manifest are the record of the import that minted it: an
+            # import of the same bytes, as a repair or under a new alias, rewrites none of them. A missing snapshot
+            # is healed the way ensure_materialized heals any source snapshot, from the clone and checked against
+            # the recorded result_digest, so a reader that now parses the bytes differently is recorded as an
+            # unfaithful heal instead of becoming the version's rows. The caller's bytes restore the clone first
+            # when it is gone too; ensure_cas_path verifies them against the digest (D9).
+            if not snapshot_path(proj, content_hash).exists():
+                from tallyman_xorq.materialize import ensure_materialized
+
+                si.ensure_cas_path(proj, src, digest)
+                ensure_materialized(proj, content_hash)
+            from tallyman_core import entry_schema_path
 
             written = {
-                "row_count": read_manifest(entry_dir(proj, content_hash)).row_count,
+                "row_count": existing.row_count,
                 "schema": json.loads(entry_schema_path(proj, content_hash).read_text()),
             }
         if mint:

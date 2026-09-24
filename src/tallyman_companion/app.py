@@ -347,8 +347,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     # single-user scale; revisit if it ever paginates.
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    from tallyman_core.paths import data_dir as _data_dir  # noqa: PLC0415
-    from tallyman_xorq.dependents import dependents_index, parents_of, sources_of  # noqa: PLC0415
+    from tallyman_xorq.dependents import dependents_index, parents_of  # noqa: PLC0415
 
     manifest: dict = {}
     try:
@@ -356,18 +355,27 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     except (OSError, ValueError):
         pass
 
-    # Raw source files the recipe reads. None under source-identity mode=off —
-    # kept distinct from "reads no files" so the UI can say "not tracked".
-    src_digests = sources_of(project, content_hash)
+    # The raw bytes this entry holds, which is a question only a source version has an answer to
+    # (ADR-011 D6: a computed entry reads aliases, never a file). For one it is the clone of the
+    # imported file under data/.cas — the copy that makes the snapshot re-creatable — listed under the
+    # provenance path it came from, which may be long gone.
     sources: list[dict] = []
     source_bytes = 0
-    if src_digests is not None:
-        dd = _data_dir(project)
-        for rel in sorted(src_digests):
-            sp = dd / rel
-            sz = _path_size(sp)
-            source_bytes += sz
-            sources.append({"path": rel, "bytes": sz, "formatted": _fmt_bytes(sz), "exists": sp.exists()})
+    provenance = manifest.get("provenance")
+    if provenance:
+        from tallyman_core.manifest import SourceProvenance  # noqa: PLC0415
+        from tallyman_xorq.source_import import source_clone_path  # noqa: PLC0415
+
+        clone = source_clone_path(project, SourceProvenance.model_validate(provenance))
+        source_bytes = _path_size(clone)
+        sources.append(
+            {
+                "path": provenance["path"],
+                "bytes": source_bytes,
+                "formatted": _fmt_bytes(source_bytes),
+                "exists": clone.exists(),
+            }
+        )
 
     # Last-modified across the entry's on-disk artifacts (a snapshot self-heal
     # makes this later than created_at).
@@ -406,7 +414,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
         "diff_cache_formatted": _fmt_bytes(diff_cache_bytes),
         "source_bytes": source_bytes,
         "source_formatted": _fmt_bytes(source_bytes),
-        "source_tracked": src_digests is not None,
+        "source_tracked": bool(sources),
         "sources": sources,
         "parents": parents,
         "children": children,
@@ -1315,6 +1323,12 @@ def create_app(
         column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
         target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
+        # The generated name can already be a source alias: refuse before building the diff, as the MCP tool does.
+        from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
+
+        refusal = source_alias_refusal(project, target_alias, "the target of a promoted diff")
+        if refusal:
+            raise HTTPException(409, refusal)
         keys_repr = repr(keys)
         code = textwrap.dedent(f"""\
             # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
@@ -1649,6 +1663,12 @@ def create_app(
         prev_hash = _get_alias(project, alias)
         if prev_hash is None:
             raise HTTPException(404, f"alias {alias!r} not found")
+        # A source alias's versions are imported files: refuse before building, as catalog_revise does (ADR-011 D1).
+        from tallyman_core.aliases import source_alias_refusal as _source_alias_refusal  # noqa: PLC0415
+
+        refusal = _source_alias_refusal(project, alias, "revised")
+        if refusal:
+            raise HTTPException(409, refusal)
         code = payload.get("code", "")
         if not code.strip():
             raise HTTPException(400, "code is empty")

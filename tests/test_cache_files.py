@@ -26,16 +26,16 @@ from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, 
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _second_agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("category").aggregate(n=t.count())
 """
 
@@ -44,12 +44,12 @@ def _nonreproducible_code(project: str) -> str:
     """A recipe whose UDF returns other values on every call: a worthy entry (a UDF always is) that cannot be
     reproduced, which ADR-009 D6 finds when the entry is created by running its query twice."""
     return f"""
-from tallyman_xorq.io import read_project_file
+from tallyman_xorq.io import tracked_expr_from_alias
 from xorq.expr.udf import make_pandas_udf
 import xorq.vendor.ibis.expr.datatypes as dt
 from xorq.vendor.ibis import schema as ibis_schema
 
-t = read_project_file("orders.parquet", project={project!r})
+t = tracked_expr_from_alias("orders_src", project={project!r})
 
 
 def jitter(df):
@@ -74,7 +74,7 @@ def _cache_rows(client: TestClient, project: str) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
-def test_startup_warm_up_writes_no_file(project, orders_parquet):
+def test_startup_warm_up_writes_no_file(project, orders_src):
     """ADR-007 D12: the warm-up used to call ``cached_result_expr`` for every entry until a 3 s budget was spent,
     which heals a deleted snapshot. That undoes the Cache page's delete button, and one large heal blocks startup for
     as long as it takes. With ``compute_cache/`` emptied and no request made, starting the app leaves it empty."""
@@ -92,7 +92,7 @@ def test_startup_warm_up_writes_no_file(project, orders_parquet):
     assert not snap.exists()
 
 
-def test_verify_sweep_reports_a_missing_snapshot_as_absent_and_writes_nothing(project, orders_parquet):
+def test_verify_sweep_reports_a_missing_snapshot_as_absent_and_writes_nothing(project, orders_src):
     """ADR-007 D5 and D12: the verify sweep checks the files that exist and reports each entry that recorded a digest
     as faithful, unfaithful or absent. It is not a caller of ``ensure_materialized``: a sweep that rewrote every
     deleted snapshot in the project would undo the user's deletes. Every file that function writes is verified before
@@ -120,7 +120,7 @@ def test_verify_sweep_reports_a_missing_snapshot_as_absent_and_writes_nothing(pr
 # ---------------------------------------------------------------------------
 
 
-def test_cache_page_lists_a_reproducible_entry_as_not_pinned(project, orders_parquet):
+def test_cache_page_lists_a_reproducible_entry_as_not_pinned(project, orders_src):
     """ADR-009 D6: an entry whose query gave the same content digest twice is reproducible, so its file may be
     deleted and made again. The Cache page says so for each row: ``pinned`` is False and there is no reason."""
     h = build_and_persist(project, _agg_code(project)).content_hash
@@ -133,7 +133,7 @@ def test_cache_page_lists_a_reproducible_entry_as_not_pinned(project, orders_par
     assert not row.get("orphan")
 
 
-def test_a_non_reproducible_entry_is_pinned_and_its_delete_is_refused(project, orders_parquet):
+def test_a_non_reproducible_entry_is_pinned_and_its_delete_is_refused(project, orders_src):
     """ADR-009 D6 and ADR-007 D12: an entry whose recipe is not reproducible is recorded as such when it is created,
     and its file is never deleted by tallyman, because deleting it would end the only copy of those rows. The Cache
     page's delete answers 409, says why, and leaves the file."""
@@ -154,7 +154,7 @@ def test_a_non_reproducible_entry_is_pinned_and_its_delete_is_refused(project, o
     assert snap.exists(), "the delete removed the file of an entry that cannot be recreated"
 
 
-def test_an_entry_with_an_unfaithful_heal_record_is_pinned(project, orders_parquet):
+def test_an_entry_with_an_unfaithful_heal_record_is_pinned(project, orders_src):
     """ADR-007 D12 and ADR-006 D12 (unfaithful entries are pinned and badged): a heal that wrote different rows than
     were built leaves an ``unfaithful_heal`` record in ``errors.jsonl``. That record is what pins the entry, so the
     Cache page's delete refuses it as it refuses an entry that was found not reproducible at creation."""
@@ -172,7 +172,7 @@ def test_an_entry_with_an_unfaithful_heal_record_is_pinned(project, orders_parqu
     assert snap.exists()
 
 
-def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_deleted(project, orders_parquet):
+def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_deleted(project, orders_src):
     """ADR-007 D14: a reset no longer prunes ``compute_cache/``, so the snapshot of an entry that a reset retired stays
     on disk until the user deletes it. The Cache page lists files by entry, so it needs a row for a file whose entry is
     not in the catalog, and the delete has to accept it."""
@@ -196,7 +196,7 @@ def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_delet
     assert not orphan.exists()
 
 
-def test_a_normal_snapshot_can_still_be_deleted_and_the_next_read_re_creates_and_verifies_it(project, orders_parquet):
+def test_a_normal_snapshot_can_still_be_deleted_and_the_next_read_re_creates_and_verifies_it(project, orders_src):
     """ADR-007 D12 and D5: the delete button keeps working for an ordinary entry. The next read rewrites the file and
     checks it against the recorded digest (no ``unfaithful_heal`` record), and the entry is still not pinned."""
     h = build_and_persist(project, _agg_code(project)).content_hash

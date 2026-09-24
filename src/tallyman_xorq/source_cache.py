@@ -8,8 +8,8 @@ load, hashing and execution layer.
 The rewrite rejects:
 
 - **In-memory reads** (``read_in_memory`` or an ``ibis.memtable``). They signal that the author dropped to pandas
-  instead of reading a file through ``read_project_file`` or ``tallyman_read_csv``; the bytes would not round-trip
-  through the portable build.
+  instead of importing the file and reading the source alias; the bytes would not round-trip through the portable
+  build.
 - **A recipe that already contains a cache node.** A node with default storage would write under ``~/.cache/xorq``.
 - **A recipe that assigns to ``__row_order``**, and **a cheap entry that drops it** (ADR-008 D3, D6).
 
@@ -41,10 +41,10 @@ class CacheNodeError(RuntimeError):
 _IN_MEMORY_MSG = (
     "expression reads in-memory data (read_in_memory / ibis.memtable). This "
     "usually means the source was loaded into pandas (e.g. pd.read_csv) and "
-    "handed to xorq in memory, instead of a native reader. Read the "
-    "file with tallyman_read_csv(abs_path, schema=...) for CSVs or "
-    "read_project_file(rel_path) for parquet, so the source round-trips "
-    "through the portable build and is ingested with a stable __row_order."
+    "handed to xorq in memory, instead of entering the catalog as data. Import "
+    "the file once, catalog_import_source('<abs path>', '<alias>', schema=...), "
+    "and read it with tracked_expr_from_alias('<alias>'), so the rows are held by "
+    "tallyman, round-trip through the portable build, and carry a stable __row_order."
 )
 
 _CACHE_NODE_MSG = (

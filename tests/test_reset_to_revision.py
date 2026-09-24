@@ -32,8 +32,8 @@ SPEC = {"mark": "bar", "encoding": {"x": {"field": "region"}}}
 
 def _agg_code(project: str) -> str:
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias('orders_src', project={project!r})\n"
         "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
     )
 
@@ -191,10 +191,10 @@ def test_reset_roundtrip_over_every_kind(project):
 # ---------------------------------------------------------------------------
 
 
-def test_compute_cache_is_per_project(project, orders_parquet):
+def test_compute_cache_is_per_project(project, orders_src):
     # Tallyman's materialized files live in a per-project dir, not the global
-    # ~/.cache/xorq: a build of a worthy entry writes its snapshot (and the ordered
-    # copy of its source) under compute_cache_dir inside the project. The guarantee
+    # ~/.cache/xorq: a build of a worthy entry writes its snapshot under
+    # compute_cache_dir inside the project. The guarantee
     # is the *location*. A reset does not manage this directory (ADR-007 D14), which
     # tests/test_reset_keeps_compute_cache.py pins.
     from tallyman_xorq.result_cache import baked_snapshot_path
@@ -208,34 +208,29 @@ def test_compute_cache_is_per_project(project, orders_parquet):
     assert cdir in snap.parents
 
 
-def _read_project_file_code(project: str, rel: str) -> str:
-    return f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel!r}, project={project!r})\n"
-
-
-def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
-    # #86: under the cas default a read_project_file build clones its source into
-    # data/.cas/<digest>. That dir lives outside the catalog git repo, so the
-    # reset's `git reset --hard` can't roll it back — reset_to's _retire_cas_clones
-    # step retires clones no *surviving* entry references (into the bullpen, never
-    # deleted: ADR-007 D14), keeping those a surviving entry still does. This
-    # guards the wiring (the gc_cas unit test only covers the leaf); the
-    # post-prune live set is what matters here.
+def test_reset_reclaims_orphaned_cas_clones(project, orders_src):
+    # An import clones its bytes into data/.cas/<digest>. That dir lives outside the catalog git
+    # repo, so the reset's `git reset --hard` can't roll it back — reset_to's _retire_cas_clones
+    # step retires clones no *surviving* entry references (into the bullpen, never deleted:
+    # ADR-007 D14), keeping those a surviving entry still does. This guards the wiring (the gc_cas
+    # unit test only covers the leaf); the post-prune live set is what matters here.
     import pandas as pd
 
     from tallyman_core import data_dir
+    from tallyman_xorq.source_import import update_and_depend
 
     cs.ensure_catalog_repo(project)
     cas = data_dir(project) / ".cas"
 
-    # Baseline: an entry over orders.parquet, so its clone is live at step s1.
-    build_and_persist(project, _read_project_file_code(project, "orders.parquet"))
+    # Baseline: the orders source is imported, so its clone is live at step s1.
     s1 = cs.checkpoint_catalog(project, "baseline")
     base_clones = {p.name for p in cas.iterdir()}
-    assert base_clones, "the cas-default build should have cloned orders.parquet into .cas"
+    assert base_clones, "the import should have cloned orders.parquet into .cas"
 
-    # A second entry over a *different* source — its clone is only live after s1.
-    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
-    build_and_persist(project, _read_project_file_code(project, "extra.parquet"))
+    # A second source — its clone is only live after s1.
+    extra = data_dir(project) / "extra.parquet"
+    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(extra)
+    update_and_depend(extra, "extra_src", project=project)
     cs.checkpoint_catalog(project, "added later")
     assert {p.name for p in cas.iterdir()} > base_clones  # extra's clone is present now
 
@@ -244,21 +239,22 @@ def test_reset_reclaims_orphaned_cas_clones(project, orders_parquet):
     assert {p.name for p in cas.iterdir()} == base_clones
 
 
-def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_parquet, monkeypatch):
+def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_src, monkeypatch):
     # _retire_cas_clones is conservative: if any surviving entry's manifest can't be
     # read it skips the whole sweep rather than retire a clone on partial info.
     # An unreadable manifest must therefore leave every .cas clone in place.
     import pandas as pd
 
     from tallyman_core import data_dir
+    from tallyman_xorq.source_import import update_and_depend
 
     cs.ensure_catalog_repo(project)
     cas = data_dir(project) / ".cas"
 
-    build_and_persist(project, _read_project_file_code(project, "orders.parquet"))
     s1 = cs.checkpoint_catalog(project, "baseline")
-    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(data_dir(project) / "extra.parquet")
-    build_and_persist(project, _read_project_file_code(project, "extra.parquet"))
+    extra = data_dir(project) / "extra.parquet"
+    pd.DataFrame({"a": [1, 2, 3]}).to_parquet(extra)
+    update_and_depend(extra, "extra_src", project=project)
     cs.checkpoint_catalog(project, "added later")
     before = {p.name for p in cas.iterdir()}
 
@@ -270,6 +266,50 @@ def test_reset_keeps_cas_clones_when_a_manifest_is_unreadable(project, orders_pa
     monkeypatch.setattr("tallyman_core.manifest.read_manifest", _boom)
     cs.reset_to(project, s1)  # must still succeed; the sweep is skipped on the read failure
     assert {p.name for p in cas.iterdir()} == before  # nothing reclaimed
+
+
+def test_a_reset_keeps_the_clone_of_a_live_source_entry(project, tmp_path):
+    """The clone of an imported source is retained by its entry, not by a ``manifest.sources`` record.
+
+    ADR-011 D6 deletes that map, so the retention closure ``_retire_cas_clones`` walks is the DAG.
+    Retiring a live source version's clone is the one failure here that destroys data quietly: the
+    snapshot would still be on disk, so nothing would look wrong until it was deleted and could not be
+    made again. The reset below keeps v1's clone (its entry survives) and retires v2's (its entry does
+    not), and v1's snapshot is then re-created from the clone it kept.
+    """
+    import pandas as pd
+
+    from tallyman_core import data_dir, read_manifest
+    from tallyman_core import paths as _paths
+    from tallyman_xorq.materialize import ensure_materialized, snapshot_path
+    from tallyman_xorq.source_import import update_and_depend
+
+    cs.ensure_catalog_repo(project)
+    cas = data_dir(project) / ".cas"
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+
+    src = outside / "orders.parquet"
+    pd.DataFrame({"region": ["n", "s"], "price": [1.0, 2.0]}).to_parquet(src)
+    v1 = update_and_depend(src, "orders", project=project)
+    s1 = cs.checkpoint_catalog(project, "orders v1")
+
+    pd.DataFrame({"region": ["n", "s", "e"], "price": [1.0, 2.0, 3.0]}).to_parquet(src)
+    v2 = update_and_depend(src, "orders", project=project)
+    cs.checkpoint_catalog(project, "orders v2")
+    assert v2["hash"] != v1["hash"]
+
+    cs.reset_to(project, s1)
+
+    prov = read_manifest(_paths.entry_dir(project, v1["hash"])).provenance
+    assert prov is not None
+    kept = cas / f"{prov.digest}{prov.suffix}"
+    assert kept.is_file(), f"the live source version's clone was retired: {sorted(p.name for p in cas.iterdir())}"
+    assert v2["digest"] not in {p.stem for p in cas.iterdir()}, "the rewound version's clone should be parked"
+
+    snapshot_path(project, v1["hash"]).unlink()
+    ensure_materialized(project, v1["hash"])
+    assert snapshot_path(project, v1["hash"]).is_file()
 
 
 # ---------------------------------------------------------------------------
@@ -322,7 +362,7 @@ def test_mcp_mutating_tool_checkpoints_once(project):
     assert _steps(project) == after
 
 
-def test_mcp_multi_mutator_tool_is_one_step(project, orders_parquet):
+def test_mcp_multi_mutator_tool_is_one_step(project, orders_src):
     from tallyman_mcp.server import catalog_create
 
     base = _steps(project)
@@ -616,7 +656,7 @@ def test_reset_surfaces_pointer_without_durable_recipe(project):
 # and test_n_builds_track_n_zips.
 
 
-def test_deleted_snapshot_of_a_warmed_entry_self_heals_without_cache_clear(project, orders_parquet, monkeypatch):
+def test_deleted_snapshot_of_a_warmed_entry_self_heals_without_cache_clear(project, orders_src, monkeypatch):
     """A warmed worthy entry whose snapshot file goes away must be made again on the next read, never dangle on the
     memoised bare read of a file that no longer exists.
 

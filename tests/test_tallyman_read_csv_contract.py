@@ -1,4 +1,4 @@
-"""Contract tests for tallyman_read_csv — the intelligent-import redesign.
+"""Contract tests for tallyman's CSV reader — the intelligent-import redesign.
 
 ADR plans/ADR-005-intelligent-csv-import.md. Covers the #137-review cluster:
 
@@ -10,7 +10,11 @@ ADR plans/ADR-005-intelligent-csv-import.md. Covers the #137-review cluster:
 - #143 — no-schema inference escalates past the default window; an explicit
   pinned type that can't parse raises with a paste-ready schema suggestion.
 
-These are RED on the pre-fix tree (seen failing on CI), green after the fixes.
+ADR-011 (plans/ADR-011-sources-are-aliases.md) moved the reader out of the recipe: the DSL, the ladder and the
+error messages are unchanged, but they run when the file is imported
+(``update_and_depend(path, alias, schema=..., **reader_options)``), not when a build executes. So a schema error is
+raised by the import call rather than returned as a ``catalog_create`` error, and the types a spec produces are read
+off the source entry the import minted.
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from tallyman_core import data_dir
-from tallyman_mcp.server import catalog_create
+from tallyman_xorq.source_import import SourceImportError, update_and_depend
 
 
 # --------------------------------------------------------------------------- #
@@ -75,94 +79,84 @@ def test_polars_overrides_preserves_timestamp_tz_and_precision():
 # --------------------------------------------------------------------------- #
 # #141 — schema spec contract
 # --------------------------------------------------------------------------- #
-def _types_of(res: dict) -> dict[str, str]:
-    return {f["name"]: f["type"] for f in res["schema"]["fields"]}
+def _types_of(project: str, out: dict) -> dict[str, str]:
+    """The column types a recipe reading this source alias sees, by name.
+
+    The entry's recorded schema is arrow's spelling of the same types (``large_string`` where polars wrote a
+    string, ``double`` where it wrote a float); this reads the ibis view a recipe gets, which is what a schema
+    spec is written against.
+    """
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    return {name: str(dtype) for name, dtype in cached_result_expr(project, out["hash"]).schema().items()}
 
 
-def _build(name: str, csv: Path, schema_literal: str) -> dict:
-    code = f"""
-from tallyman_xorq.io import tallyman_read_csv
-expr = tallyman_read_csv({str(csv)!r}, schema={schema_literal})
-"""
-    return catalog_create(name, code)
+def _import(project: str, alias: str, csv: Path, schema=None, **reader_options) -> dict:
+    return update_and_depend(csv, alias, project=project, schema=schema, **reader_options)
 
 
-def test_schema_as_plain_dict_binds_by_name(project, monkeypatch):
+def test_schema_as_plain_dict_binds_by_name(project):
     """A plain dict (not just an ibis schema) binds by header name."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "dict.csv"
     p.write_text("id,name\n1,alice\n2,bob\n")
-    res = _build("dict_named", p, '{"id": "int64", "name": "string"}')
-    assert "error" not in res, res
-    types = _types_of(res)
+    out = _import(project, "dict_named", p, {"id": "int64", "name": "string"})
+    types = _types_of(project, out)
     assert types["id"] == "int64"
     assert types["name"] == "string"
 
 
-def test_schema_name_not_in_header_raises_listed_suggestion(project, monkeypatch):
+def test_schema_name_not_in_header_raises_listed_suggestion(project):
     """#141: a by-name schema whose name is absent from the header raises a
     listed, actionable error steering toward the positional tuple form."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    import xorq.vendor.ibis as ibis
+
     p = data_dir(project) / "yf.csv"
     p.write_text("Price,Close\n2020-01-01,10.0\n2020-01-02,11.0\n")
-    code = f"""
-import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import tallyman_read_csv
-schema = ibis.schema({{"Date": "date", "Close": "float64"}})
-expr = tallyman_read_csv({str(p)!r}, schema=schema)
-"""
-    res = catalog_create("yf_named", code)
-    assert "error" in res
-    err = res["error"]
+    with pytest.raises(ValueError) as exc:
+        _import(project, "yf_named", p, ibis.schema({"Date": "date", "Close": "float64"}))
+    err = str(exc.value)
     assert "Price" in err  # the actual header is listed
     assert "&rest" in err  # steered toward the positional tuple form (tallyman phrasing)
 
 
-def test_tuple_schema_renames_by_position(project, monkeypatch):
+def test_tuple_schema_renames_by_position(project):
     """#141: tuple-of-tuples binds by position — the yfinance Price->Date rename."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "yf2.csv"
     p.write_text("Price,Close\n2020-01-01,10.0\n2020-01-02,11.0\n")
-    res = _build("yf_pos", p, '(("Date", "date"), ("Close", "float64"))')
-    assert "error" not in res, res
-    types = _types_of(res)
+    out = _import(project, "yf_pos", p, (("Date", "date"), ("Close", "float64")))
+    types = _types_of(project, out)
     assert "Date" in types and "Price" not in types  # col 0 renamed positionally
-    assert types["Date"].startswith("date")  # date32[day] in the serialized schema
+    assert types["Date"].startswith("date")
 
 
-def test_tuple_schema_rest_infers_tail(project, monkeypatch):
+def test_tuple_schema_rest_infers_tail(project):
     """#141: ('&rest', 'infer') keeps the tail's names and infers their types."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "rest.csv"
     p.write_text("a,b,c\n2020-01-01,5,xy\n2020-01-02,6,zz\n")
-    res = _build("rest_tail", p, '(("when", "date"), ("&rest", "infer"))')
-    assert "error" not in res, res
-    types = _types_of(res)
-    assert types["when"].startswith("date")  # col 0 renamed + pinned (date32[day])
+    out = _import(project, "rest_tail", p, (("when", "date"), ("&rest", "infer")))
+    types = _types_of(project, out)
+    assert types["when"].startswith("date")  # col 0 renamed + pinned
     assert types["b"] == "int64"  # tail kept name, inferred int
     assert types["c"] == "string"  # tail kept name, inferred string
 
 
-def test_dict_schema_rest_infers_others(project, monkeypatch):
+def test_dict_schema_rest_infers_others(project):
     """#141: dict '&rest' pins some columns by name and infers the rest."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "drest.csv"
     p.write_text("id,amount\n01,5\n02,6\n")
-    res = _build("drest", p, '{"id": "string", "&rest": "infer"}')
-    assert "error" not in res, res
-    types = _types_of(res)
+    out = _import(project, "drest", p, {"id": "string", "&rest": "infer"})
+    types = _types_of(project, out)
     assert types["id"] == "string"  # pinned string keeps leading zeros
     assert types["amount"] == "int64"  # inferred
 
 
-def test_partial_spec_without_rest_raises(project, monkeypatch):
+def test_partial_spec_without_rest_raises(project):
     """#141: a partial spec with no wildcard is non-total and must raise."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "partial.csv"
     p.write_text("a,b,c\n1,2,3\n4,5,6\n")
-    res = _build("partial", p, '(("a", "int64"), ("b", "int64"))')
-    assert "error" in res
-    err = res["error"]
+    with pytest.raises(ValueError) as exc:
+        _import(project, "partial", p, (("a", "int64"), ("b", "int64")))
+    err = str(exc.value)
     assert "&rest" in err or "total" in err.lower()
 
 
@@ -183,33 +177,20 @@ def late_poison_csv(project: str) -> Path:
     return p
 
 
-def test_no_schema_escalates_past_default_window(project, late_poison_csv, monkeypatch):
+def test_no_schema_escalates_past_default_window(project, late_poison_csv):
     """#143: no-schema inference escalates the window and resolves the messy tail."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    code = f"""
-from tallyman_xorq.io import tallyman_read_csv
-expr = tallyman_read_csv({str(late_poison_csv)!r})
-"""
-    res = catalog_create("escal", code)
-    assert "error" not in res, res
-    types = _types_of(res)
+    out = _import(project, "escal", late_poison_csv)
+    types = _types_of(project, out)
     assert types["v"] == "string"  # whole-file infer fell it back to string
 
 
-def test_explicit_type_failure_suggests_schema(project, late_poison_csv, monkeypatch):
+def test_explicit_type_failure_suggests_schema(project, late_poison_csv):
     """#143: a pinned int64 that can't parse raises with a paste-ready suggestion."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    code = f"""
-import xorq.vendor.ibis as ibis
-from tallyman_xorq.io import tallyman_read_csv
-schema = ibis.schema({{"k": "int64", "v": "int64"}})
-expr = tallyman_read_csv({str(late_poison_csv)!r}, schema=schema)
-"""
-    res = catalog_create("explicit_fail", code)
-    assert "error" in res
-    err = res["error"]
-    # tallyman emits a paste-ready suggestion (absent pre-fix; "schema=" alone
-    # would false-match the recipe code echoed in the traceback).
+    import xorq.vendor.ibis as ibis
+
+    with pytest.raises(ValueError) as exc:
+        _import(project, "explicit_fail", late_poison_csv, ibis.schema({"k": "int64", "v": "int64"}))
+    err = str(exc.value)
     assert "suggested schema" in err.lower()
     assert "'v'" in err or '"v"' in err  # names the failing column
     assert "string" in err  # suggests string for the unparseable column
@@ -219,33 +200,28 @@ expr = tallyman_read_csv({str(late_poison_csv)!r}, schema=schema)
 # #148-review — reserved scan kwargs must not collide with the internal ones
 # --------------------------------------------------------------------------- #
 @pytest.mark.parametrize("bad_kwarg", ["infer_schema_length", "schema_overrides"])
-def test_reserved_scan_kwarg_raises_clear_error(project, monkeypatch, bad_kwarg):
+def test_reserved_scan_kwarg_raises_clear_error(project, bad_kwarg):
     """``infer_schema_length`` and ``schema_overrides`` are managed internally — the
     former by the escalation ladder, the latter by the ``schema=`` parameter — so
-    forwarding one as a ``**kwargs`` reader option must raise a clear ValueError, not
+    forwarding one as a reader option must raise a clear SourceImportError, not
     the raw polars ``TypeError: got multiple values for keyword argument`` (or, for
-    ``schema_overrides`` with no schema, silently bypass the schema system)."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    from tallyman_xorq.io import tallyman_read_csv
+    ``schema_overrides`` with no schema, silently bypass the schema system).
 
+    The import decides the reader (``source_import._reader_for``), so that is where the guard has to be: it must
+    reject the call before any bytes are copied into the arena.
+    """
     p = data_dir(project) / "kw.csv"
     p.write_text("a,b\n1,x\n2,y\n")
     kwargs = {bad_kwarg: 1000 if bad_kwarg == "infer_schema_length" else {"a": "int64"}}
-    with pytest.raises(ValueError, match="managed internally"):
-        tallyman_read_csv(str(p), **kwargs)
+    with pytest.raises(SourceImportError, match="managed internally"):
+        _import(project, "kw_src", p, **kwargs)
 
 
-def test_ordinary_reader_kwarg_still_forwarded(project, monkeypatch):
+def test_ordinary_reader_kwarg_still_forwarded(project):
     """The guard must reject only the two reserved keys — a genuine reader option
     such as ``separator`` still reaches polars.scan_csv and parses correctly."""
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
     p = data_dir(project) / "semi.csv"
     p.write_text("a;b\n1;x\n2;y\n")
-    code = f"""
-from tallyman_xorq.io import tallyman_read_csv
-expr = tallyman_read_csv({str(p)!r}, separator=";")
-"""
-    res = catalog_create("semicsv", code)
-    assert "error" not in res, res
-    types = _types_of(res)
+    out = _import(project, "semicsv", p, separator=";")
+    types = _types_of(project, out)
     assert "a" in types and "b" in types  # split into two columns, not one "a;b"

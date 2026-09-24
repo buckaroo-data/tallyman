@@ -1,18 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from tallyman_core import entry_dir
 from tallyman_xorq import build_and_persist
 
 
-def _build_one(project: str, parquet: Path) -> str:
-    # The parquet sits in the project's data dir and enters a recipe through read_project_file (ADR-008 D12).
+def _build_one(project: str, src_alias: str) -> str:
+    # The orders data entered the catalog as a source alias, and the recipe reads that alias (ADR-011 D1).
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file({parquet.name!r}, project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src_alias!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
     return build_and_persist(project, code, prompt="by region").content_hash
@@ -48,8 +46,8 @@ def test_api_entries_empty(fresh_companion_app, project: str):
     assert r.json() == {"project": project, "entries": []}
 
 
-def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_parquet: Path):
-    h = _build_one(project, orders_parquet)
+def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_src: str):
+    h = _build_one(project, orders_src)
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entries")
     assert r.status_code == 200
@@ -60,8 +58,8 @@ def test_catalog_renders_after_build(fresh_companion_app, project: str, orders_p
     assert "by region" in prompts
 
 
-def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_parquet: Path):
-    h = _build_one(project, orders_parquet)
+def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_src: str):
+    h = _build_one(project, orders_src)
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{h}")
     assert r.status_code == 200
@@ -77,7 +75,7 @@ def test_entry_detail_renders_table(fresh_companion_app, project: str, orders_pa
 
 
 def test_api_data_cheap_entry_serves_page_without_materialising(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     """#90: a paginated read comes off cached_result_expr, not a full result.parquet.
 
@@ -88,8 +86,8 @@ def test_api_data_cheap_entry_serves_page_without_materialising(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
@@ -108,7 +106,7 @@ expr = t.select("region", "price", "__row_order")
 
 
 def test_api_data_expensive_entry_paginates_without_per_entry_parquet(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     """#90: pages off an expensive entry read the baked snapshot, not a duplicate.
 
@@ -118,8 +116,8 @@ def test_api_data_expensive_entry_paginates_without_per_entry_parquet(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.order_by("order_id").select("order_id", "region", "price")
 """
     h = build_and_persist(project, code, prompt="ordered").content_hash
@@ -139,7 +137,7 @@ expr = t.order_by("order_id").select("order_id", "region", "price")
 
 
 def test_api_data_cheap_entry_paginates_consistently_across_pages(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     """#90: a cheap (unsorted) entry tiles consistently across pages.
 
@@ -153,8 +151,8 @@ def test_api_data_cheap_entry_paginates_consistently_across_pages(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("order_id", "region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cheap").content_hash
@@ -173,7 +171,7 @@ expr = t.select("order_id", "region", "price", "__row_order")
 
 
 def test_api_data_missing_manifest_serves_page_without_500(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     """#90: a missing manifest must not 500 the row read.
 
@@ -185,8 +183,8 @@ def test_api_data_missing_manifest_serves_page_without_500(
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
@@ -202,7 +200,7 @@ expr = t.select("region", "price", "__row_order")
 
 
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     """Entries API returns named/forensic/scratch entries with correct flags."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -211,15 +209,15 @@ def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(
     catalog_create(
         "shoe_sales",
         f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
     )
     scratch = catalog_run(
         f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.order_by("region")
 """,
         prompt="exploratory",
@@ -235,9 +233,9 @@ expr = t.order_by("region")
     assert any(e["content_hash"] == scratch["hash"] for e in scratches)
 
 
-def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_shows_build_artifacts(fresh_companion_app, project: str, orders_src: str):
     """Build artifacts (expr.yaml etc) appear in the entry JSON."""
-    h = _build_one(project, orders_parquet)
+    h = _build_one(project, orders_src)
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{h}")
     assert r.status_code == 200

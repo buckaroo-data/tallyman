@@ -1,42 +1,29 @@
-"""Tallyman-side source-content identity for catalog entries.
+"""The clone store: tallyman's frozen copy of every byte that was ever imported.
 
-xorq's build hash is tokenized under SnapshotStrategy, whose
-``snapshot_normalize_read`` keys a Read on its *path string only* — neither
-file stat nor file content reaches ``content_hash`` (verified empirically by
-``tests/test_cache_lab.py::test_append_invalidates``: changing a source file
-in place keeps the hash and dedups to the stale entry). xorq is a frozen
-upstream for us, so content sensitivity has to be restored on our side. Two
-candidate strategies, switchable at runtime so the cache lab can benchmark
-them head to head:
+An import copies the file it was given to ``data/.cas/<digest><suffix>``, named by the md5 of its
+content, and verifies the copy against that name before publishing it (ADR-011 D9). The clone is what
+makes a source version durable: the outside path is provenance and may be gone, the snapshot under
+``compute_cache/`` is cache anyone may delete, and the clone is what re-creates the snapshot and what
+ADR-005's suggestion-and-retry contract re-reads when a CSV was imported under the wrong schema.
 
-``TALLYMAN_SOURCE_IDENTITY`` env:
+There is one mode (ADR-011 D8). ADR-002 made this switchable — ``off`` (path identity only), ``cas``
+(read through the clone) and ``salt`` (mix the digest into the entry hash) — so the cache lab could
+benchmark them against each other. Import always digests and always clones now, because a raw input is
+an entry and an entry's identity is its bytes; there is no configuration under which a raw input is
+unversioned, so the env switch, the two other modes and ``salted_hash`` are gone.
 
-- ``off`` (default): current behavior, path-identity only.
-- ``cas``: ``read_project_file`` reads through a content-addressed clone at
-  ``data/.cas/<digest><suffix>``. The path xorq hashes then *is* the content
-  identity, every xorq-level key (build hash, snapshot cache keys) becomes
-  content-honest for free, and because the clone is a copy-on-write snapshot
-  (APFS clonefile), an old entry's recompute still reads the bytes it was
-  built from even after the user edits the source in place.
-- ``salt``: ``read_project_file`` records each source's digest during user-code
-  import, and ``build_and_persist`` mixes the digests into the entry's
-  ``content_hash``. Builds keep their human-readable ``data/`` paths, but
-  xorq-level keys stay path-only — see ``result_cache`` for the snapshot-key
-  collision this forces us to route around.
+Nothing memoizes a digest either. The memo existed so a build did not re-hash an unchanged source on
+every run, and it keyed on ``(mtime_ns, size, inode)``, which a same-stat in-place swap defeats. A file
+is digested once now, at the moment it is imported, so the memo has nothing to save and its hole is not
+worth keeping.
 
-Digests are md5 over file content, memoized per ``(mtime_ns, size, inode)``
-in ``artifacts/source_digests.json`` so an unchanged file is hashed once,
-not once per build. The memo reintroduces a stat-keyed shortcut: a swap
-that preserves all three stat fields serves the stale digest (the same hole
-git's index accepts). ``TALLYMAN_SOURCE_REHASH=1`` bypasses the memo.
+``gc_cas`` retires a clone no live entry needs. Liveness is the DAG: a source version's clone is alive
+exactly while its entry is (``catalog_state._live_source_digests`` over ``manifest.provenance``).
 """
 
 from __future__ import annotations
 
-import contextvars
 import hashlib
-import json
-import logging
 import os
 import shutil
 import subprocess
@@ -44,12 +31,8 @@ import sys
 import uuid
 from pathlib import Path
 
-from tallyman_core import artifacts_dir, data_dir
+from tallyman_core import data_dir
 
-# Shares tallyman.perf with result_cache so the one branch where reconstruction
-# can't be content-faithful surfaces on the same namespace as the #83 self-heal
-# faithfulness warning.
-_log = logging.getLogger("tallyman.perf")
 
 class CloneDigestMismatch(ValueError):
     """The clone tallyman just wrote does not hash to the name it was given (ADR-011 D9)."""
@@ -59,20 +42,8 @@ class LostSourceVersion(FileNotFoundError):
     """A version tallyman promised is gone: no clone, and the live file no longer has those bytes (ADR-011 D9)."""
 
 
-_MODE_ENV = "TALLYMAN_SOURCE_IDENTITY"
-_REHASH_ENV = "TALLYMAN_SOURCE_REHASH"
-_MODES = ("off", "cas", "salt")
-
-
-def mode() -> str:
-    m = os.environ.get(_MODE_ENV, "cas")
-    if m not in _MODES:
-        raise ValueError(f"{_MODE_ENV}={m!r}; expected one of {_MODES}")
-    return m
-
-
 # ---------------------------------------------------------------------------
-# Digests (memoized on stat)
+# Digests
 # ---------------------------------------------------------------------------
 
 
@@ -81,37 +52,8 @@ def _digest_file(path: Path) -> str:
         return hashlib.file_digest(fh, hashlib.md5).hexdigest()
 
 
-def _index_path(project: str) -> Path:
-    return artifacts_dir(project) / "source_digests.json"
-
-
-def digest_for(project: str, path: Path) -> str:
-    """Content digest of *path*, memoized per (mtime_ns, size, inode)."""
-    st = path.stat()
-    key = str(path)
-    stat_sig = [st.st_mtime_ns, st.st_size, st.st_ino]
-    idx_path = _index_path(project)
-    index: dict = {}
-    if not os.environ.get(_REHASH_ENV) and idx_path.exists():
-        try:
-            index = json.loads(idx_path.read_text())
-        except (OSError, json.JSONDecodeError):
-            index = {}
-        hit = index.get(key)
-        if hit and hit.get("stat") == stat_sig:
-            return hit["digest"]
-    digest = _digest_file(path)
-    index[key] = {"stat": stat_sig, "digest": digest}
-    try:
-        idx_path.parent.mkdir(parents=True, exist_ok=True)
-        idx_path.write_text(json.dumps(index, indent=2))
-    except OSError:
-        pass  # the memo is an optimization; never fail a build over it
-    return digest
-
-
 # ---------------------------------------------------------------------------
-# cas: content-addressed source clones
+# the clone store
 # ---------------------------------------------------------------------------
 
 
@@ -166,23 +108,16 @@ def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
 
 
 def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
-    """The frozen ``.cas`` clone named by *digest*, for digest-pinned reconstruction (#115).
+    """The frozen ``.cas`` clone named by *digest*, without re-digesting *live_src*.
 
-    Returns ``data/.cas/<digest><suffix>`` — the bytes the entry was built from —
-    WITHOUT re-digesting the live source, so a cold read after an in-place edit serves
-    what was built, not the edited file. The clone is normally already on disk: the
-    ``.cas`` GC (``gc_cas``) preserves any clone a live entry's ``manifest.sources``
-    references.
+    Returns ``data/.cas/<digest><suffix>`` — the bytes as they were imported. The clone is normally
+    already on disk: ``gc_cas`` keeps any clone a live entry's ``manifest.provenance`` names.
 
-    If the clone is absent — manually deleted, or a fresh cross-machine catalog clone,
-    since ``.cas`` lives under ``data/`` outside the catalog git repo — re-materialise
-    it from the live source IFF the live bytes still hash to *digest*. The check hashes
-    file *content* (``_digest_file``), never ``digest_for``, so the stat-keyed memo
-    can't certify an in-place edit that preserved ``(mtime_ns, size, inode)`` as the
-    original (the documented memo hole). When the clone is gone AND the live source has
-    drifted, the original bytes are unrecoverable and this raises ``LostSourceVersion``
-    (ADR-011 D9): a version tallyman promised and then lost is a failure, not a
-    downgrade to whatever is on disk now.
+    If the clone is absent — manually deleted, or a fresh cross-machine catalog clone, since ``.cas``
+    lives under ``data/`` outside the catalog git repo — re-materialise it from the live file IFF the
+    live bytes still hash to *digest*. When the clone is gone AND the live file has drifted, the
+    original bytes are unrecoverable and this raises ``LostSourceVersion`` (ADR-011 D9): a version
+    tallyman promised and then lost is a failure, not a downgrade to whatever is on disk now.
     """
     cas_dir = data_dir(project) / ".cas"
     dst = cas_dir / f"{digest}{live_src.suffix}"
@@ -200,8 +135,10 @@ def recon_cas_path(project: str, live_src: Path, digest: str) -> Path:
 def gc_cas(project: str, live_digests: set[str], *, bullpen: Path | None = None) -> int:
     """Retire ``.cas`` clones whose digest no live entry references.
 
-    ``live_digests`` is the union of every live entry's ``manifest.sources``
-    values — the md5 the clone is named by (``<digest><suffix>``). Returns the
+    ``live_digests`` is every surviving source version's ``manifest.provenance.digest`` — the md5 the
+    clone is named by (``<digest><suffix>``). That set IS the retention closure now (ADR-011 D6): a
+    clone is alive exactly while the entry whose bytes it holds is, which the DAG already records, so
+    there is no separate ``manifest.sources`` map to walk. Returns the
     number of files retired; a no-op when the ``.cas`` dir is absent. ``.cas``
     lives under ``data/``, outside the catalog git repo, so a reset's
     ``git reset`` never reclaims it — this is the explicit sweep, called from
@@ -231,36 +168,3 @@ def gc_cas(project: str, live_digests: set[str], *, bullpen: Path | None = None)
             except OSError:
                 pass  # best-effort sweep; never fail a reset over it
     return retired
-
-
-# ---------------------------------------------------------------------------
-# salt: collect source digests during user-code import
-# ---------------------------------------------------------------------------
-
-_collector: contextvars.ContextVar[dict[str, str] | None] = contextvars.ContextVar(
-    "tallyman_source_collector", default=None
-)
-
-
-def begin_collect() -> contextvars.Token:
-    return _collector.set({})
-
-
-def note_source(rel_path: str, digest: str) -> None:
-    bag = _collector.get()
-    if bag is not None:
-        bag[rel_path] = digest
-
-
-def end_collect(token: contextvars.Token) -> dict[str, str]:
-    bag = _collector.get() or {}
-    _collector.reset(token)
-    return dict(bag)
-
-
-def salted_hash(xorq_hash: str, sources: dict[str, str]) -> str:
-    """Mix source digests into the entry identity; same 12-hex shape as
-    xorq's build hash so nothing downstream (dir names, URLs, aliases)
-    notices the difference."""
-    parts = "|".join(f"{rel}={digest}" for rel, digest in sorted(sources.items()))
-    return hashlib.md5(f"{xorq_hash}|{parts}".encode()).hexdigest()[: len(xorq_hash)]

@@ -21,16 +21,16 @@ from tallyman_xorq.result_cache import cached_result_expr
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
 """
@@ -41,7 +41,7 @@ expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filte
 # ---------------------------------------------------------------------------
 
 
-def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: Path):
+def test_build_compare_expr_has_sentinel_columns(project: str, orders_src: str):
     from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -62,7 +62,7 @@ def test_build_compare_expr_has_sentinel_columns(project: str, orders_parquet: P
     assert "n_abs_delta" in schema
 
 
-def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet: Path):
+def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_src: str):
     from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -79,7 +79,7 @@ def test_build_compare_expr_delta_columns_follow_v2(project: str, orders_parquet
         assert cols[v2_idx + 2] == f"{prefix}_abs_delta"
 
 
-def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet: Path):
+def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_src: str):
     from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -95,7 +95,7 @@ def test_build_compare_expr_overrides_hide_raw_cols(project: str, orders_parquet
     assert "total_abs_delta" not in overrides
 
 
-def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, orders_parquet: Path):
+def test_build_compare_expr_numeric_col_uses_diverging_colormap(project: str, orders_src: str):
     # The base overrides (used by promoted diff entries, which render without
     # the diff display klasses) color numeric value columns by pct_delta. The
     # live /diff route strips this via strip_live_diff_color so the per-view
@@ -145,7 +145,7 @@ def test_strip_live_diff_color_drops_numeric_keeps_categorical():
     assert stripped["region"]["color_map_config"]["color_rule"] == "color_categorical"
 
 
-def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orders_parquet: Path):
+def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orders_src: str):
     from tallyman_companion.diff import build_compare_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -163,7 +163,7 @@ def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orde
 # ---------------------------------------------------------------------------
 
 
-def test_build_diff_expr_returns_ibis_expr(project: str, orders_parquet: Path):
+def test_build_diff_expr_returns_ibis_expr(project: str, orders_src: str):
     from tallyman_companion.diff import build_diff_expr
 
     a = build_and_persist(project, _agg_code(project))
@@ -172,7 +172,7 @@ def test_build_diff_expr_returns_ibis_expr(project: str, orders_parquet: Path):
     assert "membership" in expr.schema()
 
 
-def test_build_diff_expr_writes_no_result_parquet(project: str, orders_parquet: Path, monkeypatch):
+def test_build_diff_expr_writes_no_result_parquet(project: str, orders_src: str, monkeypatch):
     """build_diff_expr composes the two entries' cache-resolving expressions
     directly. It must not materialise an on-demand ``result.parquet`` for
     either side — those parquets are the layer #73 began retiring and are never
@@ -195,7 +195,7 @@ def test_build_diff_expr_writes_no_result_parquet(project: str, orders_parquet: 
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_promote_diff_creates_entry(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_creates_entry(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -207,7 +207,7 @@ def test_catalog_promote_diff_creates_entry(project: str, orders_parquet: Path, 
     assert out["row_count"] > 0
 
 
-def test_catalog_promote_diff_auto_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_auto_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -215,7 +215,7 @@ def test_catalog_promote_diff_auto_alias(project: str, orders_parquet: Path, mon
     assert out["alias"] == "diff_shoe_sales_v1_v2"
 
 
-def test_catalog_promote_diff_custom_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_custom_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -223,7 +223,7 @@ def test_catalog_promote_diff_custom_alias(project: str, orders_parquet: Path, m
     assert out["alias"] == "my_diff"
 
 
-def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_stores_display_config(project: str, orders_src: str, monkeypatch):
     from tallyman_core.display_configs import get_display_config
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -240,7 +240,7 @@ def test_catalog_promote_diff_stores_display_config(project: str, orders_parquet
     assert cfg["column_config_overrides"]["membership"]["merge_rule"] == "hidden"
 
 
-def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_repoint_cascades_to_follower_atomically(project: str, orders_src: str, monkeypatch):
     # D5: catalog_promote_diff re-pointing an EXISTING alias is an auto-recalc
     # trigger. Re-promoting onto the same target advances it, so its followers must
     # cascade-recompute in the SAME revision (the walk runs before promote_diff's
@@ -291,14 +291,14 @@ def test_catalog_promote_diff_no_history_returns_error(project: str, monkeypatch
     assert "error" in out
 
 
-def test_catalog_promote_diff_out_of_range_returns_error(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_out_of_range_returns_error(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_promote_diff("shoe_sales", va=1, vb=5)
     assert "error" in out
 
 
-def test_catalog_promote_diff_negative_indices(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_promote_diff_negative_indices(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -312,7 +312,7 @@ def test_catalog_promote_diff_negative_indices(project: str, orders_parquet: Pat
 # ---------------------------------------------------------------------------
 
 
-def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -328,7 +328,38 @@ def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orde
     assert body["row_count"] > 0
 
 
-def test_http_promote_diff_sets_display_config(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_http_promote_diff_refuses_a_source_alias_as_its_target(
+    fresh_companion_app, project: str, orders_src: str, tmp_path: Path, monkeypatch
+):
+    """The generated target name can already be a source alias; the route refuses before building, as the tool does.
+
+    It used to build the diff entry, fail to point the source alias at it, and answer 500 with the entry left behind.
+    """
+    import pandas as pd
+
+    from tallyman_core import entry_dir, get_alias
+    from tallyman_xorq.source_import import update_and_depend
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+    other = tmp_path / "outside" / "other.parquet"
+    other.parent.mkdir(parents=True)
+    pd.DataFrame({"x": [1, 2, 3]}).to_parquet(other)
+    update_and_depend(str(other), "diff_shoe_sales_v1_v2", project=project)
+    head = get_alias(project, "diff_shoe_sales_v1_v2")
+    entries = sorted(p.name for p in entry_dir(project, head).parent.iterdir())
+
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.post(f"/{project}/api/promote_diff/shoe_sales/1/2")
+
+    assert r.status_code == 409, r.text
+    assert "source alias" in r.json()["detail"]
+    assert get_alias(project, "diff_shoe_sales_v1_v2") == head
+    assert sorted(p.name for p in entry_dir(project, head).parent.iterdir()) == entries
+
+
+def test_http_promote_diff_sets_display_config(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     from tallyman_core.display_configs import get_display_config
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -350,7 +381,7 @@ def test_http_promote_diff_unknown_alias_404(fresh_companion_app, project: str):
     assert r.status_code == 404
 
 
-def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
 
@@ -360,7 +391,7 @@ def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, o
 
 
 def test_http_entry_detail_diff_has_display_config(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
@@ -383,7 +414,7 @@ def test_http_entry_detail_diff_has_display_config(
 # ---------------------------------------------------------------------------
 
 
-def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_parquet: Path, monkeypatch):
+def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_src: str, monkeypatch):
     from tallyman_core import notebook as nb_mod
     from tallyman_core.display_configs import set_display_config
     from tallyman_core.marimo_export import notebook_to_marimo
@@ -420,7 +451,7 @@ def test_marimo_export_diff_entry_inlines_source_code(project: str, orders_parqu
     assert "b_expr = expr" in nb_source
 
 
-def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parquet: Path, monkeypatch):
+def test_marimo_export_diff_entry_includes_overrides(project: str, orders_src: str, monkeypatch):
     from tallyman_core import notebook as nb_mod
     from tallyman_core.display_configs import set_display_config
     from tallyman_core.marimo_export import notebook_to_marimo
@@ -457,12 +488,12 @@ def test_marimo_export_diff_entry_includes_overrides(project: str, orders_parque
 
 
 def test_marimo_export_loads_in_marimo_without_collisions(
-    project: str, orders_parquet: Path, monkeypatch, tmp_path: Path
+    project: str, orders_src: str, monkeypatch, tmp_path: Path
 ):
     """The exported notebook must load in marimo without a MultipleDefinitionError.
 
     Each code cell inlines an ``expr.py`` that binds ``expr`` and imports
-    ``os`` / ``xo`` / ``read_project_file``. With more than one entry those names
+    ``os`` / ``xo`` / ``tracked_expr_from_alias``. With more than one entry those names
     used to leak into marimo's global dataflow graph and collide; the closure
     wrapper in ``marimo_export`` keeps them cell-local. String assertions
     alone never caught this — we have to actually build the marimo graph.

@@ -3,7 +3,30 @@
 - **Status:** Accepted (2026-06-18 — default flipped `off` → `cas` in #86, with
   `cp --reflink=auto` on Linux and `.cas` GC wired into `reset_to`; supersedes
   the 2026-06-10 Proposed draft below. See the reconstruction caveat under
-  Consequences.)
+  Consequences.) **Narrowed by `plans/ADR-011-sources-are-aliases.md`
+  (2026-09-22, PR #218), which keeps the clone store and deletes the rest of
+  the machinery around it:**
+  - The mode switch is gone. `TALLYMAN_SOURCE_IDENTITY`, its `off` and `salt`
+    modes and `salted_hash` are deleted (ADR-011 D8). There is one behaviour:
+    an import digests the bytes and clones them. "Identity off" and "every
+    input is versioned" cannot both be true.
+  - `manifest.sources` is gone (ADR-011 D6). It was written as the retention
+    closure `gc_cas` walks and read by the staleness scan as a freshness
+    record, and that second reading is the defect ADR-011 exists to remove.
+    Retention is now the DAG: a source version is an entry, so its clone is
+    alive exactly while that entry is, and `catalog_state._live_source_digests`
+    collects `manifest.provenance.digest` instead.
+  - `digest_for` and its `source_digests.json` stat memo are gone. Nothing
+    digests a file outside an import any more, so the memo has no callers and
+    the scan touches no file at all.
+  - The reconstruction caveat under Consequences is resolved rather than
+    inherited: `recon_cas_path` no longer falls back to serving live bytes when
+    the clone is missing and the file has drifted. That branch is an error
+    (ADR-011 D9), because the live file is no longer a build input in the first
+    place.
+  What survives unchanged is the substance of this ADR: content-addressed
+  clones under `data/.cas/<digest><suffix>`, written copy-on-write where the
+  filesystem offers it, parked in the bullpen by a reset rather than unlinked.
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),

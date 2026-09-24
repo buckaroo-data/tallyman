@@ -198,6 +198,86 @@ def _reader_for(path: Path, schema, reader_options: dict) -> dict:
     )
 
 
+def _types_without_ibis(path: str, typ, nullable: bool) -> list[tuple[str, object]]:
+    """``[(path, arrow type)]`` for each field at or under *path* that ``PyArrowType.to_ibis`` has no ibis type for.
+
+    A nested field is named by its path: ``meta.key`` in a struct, ``ids[]`` for a list's items, ``m.key`` and
+    ``m.value`` in a map. A container is named itself only when none of its children is the cause.
+    """
+    import pyarrow as pa
+    from xorq.vendor.ibis.formats.pyarrow import PyArrowType
+
+    try:
+        PyArrowType.to_ibis(typ, nullable)
+        return []
+    except Exception:  # a KeyError for a type it has no entry for, a ValueError for an interval
+        pass
+    if pa.types.is_struct(typ):
+        inner = [hit for f in typ for hit in _types_without_ibis(f"{path}.{f.name}", f.type, f.nullable)]
+    elif pa.types.is_list(typ) or pa.types.is_large_list(typ) or pa.types.is_fixed_size_list(typ):
+        inner = _types_without_ibis(f"{path}[]", typ.value_type, typ.value_field.nullable)
+    elif pa.types.is_map(typ):
+        inner = [
+            *_types_without_ibis(f"{path}.key", typ.key_type, False),
+            *_types_without_ibis(f"{path}.value", typ.item_type, typ.item_field.nullable),
+        ]
+    elif pa.types.is_dictionary(typ):
+        inner = _types_without_ibis(path, typ.value_type, nullable)
+    else:
+        inner = []
+    return inner or [(path, typ)]
+
+
+def _cast_for(typ) -> str:
+    """What to cast a column of arrow type *typ* to so that it imports."""
+    import pyarrow as pa
+
+    if isinstance(typ, pa.UuidType):
+        return "string"
+    if isinstance(typ, pa.BaseExtensionType):  # pyarrow's own (JSON, bool8) and a Python-defined one alike
+        return str(typ.storage_type)
+    if pa.types.is_fixed_size_binary(typ):
+        return "binary, or string if it holds UUIDs" if typ.byte_width == 16 else "binary"
+    return "a type xorq reads, such as string"
+
+
+def _refuse_types_the_read_cannot_take(src: Path) -> None:
+    """Raise, naming each one, when a column of the parquet file *src* has no ibis type (#224).
+
+    The generated recipe reads the snapshot with ``deferred_read_parquet``, which asks xorq's DataFusion backend for
+    the file's arrow schema and converts each field with ``PyArrowType.to_ibis``. A type the conversion has no entry
+    for, ``fixed_size_binary`` and so a UUID, failed there with a KeyError that named no column, after the clone and
+    the snapshot were written. This registers the file with the same backend, takes the arrow schema it reports and
+    runs the same conversion field by field, before anything is written.
+
+    It asks DataFusion rather than ``pq.read_schema`` because their schemas differ where it matters: DataFusion gives a
+    top-level extension column its storage type (a JSON column reads as a string, and imports) and keeps a nested one
+    (a JSON field in a struct does not), so pyarrow's schema would refuse files that import and pass files that fail.
+    Nothing is executed. The snapshot keeps the file's types, so its schema is the file's plus ``__row_order``.
+    """
+    from xorq.backends.xorq_datafusion import connect
+
+    from tallyman_xorq.row_order import ROW_ORDER
+
+    context = connect().con
+    name = f"tallyman_import_{uuid.uuid4().hex}"
+    try:
+        context.register_parquet(name, [str(src)], file_extension=src.suffix)
+        schema = context.catalog().database().table(name).schema
+    except Exception as exc:
+        raise SourceImportError(f"catalog_import_source cannot read {src} as a parquet file: {exc}") from exc
+    finally:
+        context.deregister_table(name)
+    unreadable = [hit for f in schema if f.name != ROW_ORDER for hit in _types_without_ibis(f.name, f.type, f.nullable)]
+    if unreadable:
+        columns = "\n".join(f"  - {path!r} is {typ}: cast it to {_cast_for(typ)}" for path, typ in unreadable)
+        raise SourceImportError(
+            f"catalog_import_source cannot import {src}: xorq, which reads every entry, has no type for "
+            f"{'this column' if len(unreadable) == 1 else 'these columns'}, so nothing was imported:\n{columns}\n"
+            "Write the file again with those columns cast, and import that file."
+        )
+
+
 # ---------------------------------------------------------------------------
 # the version table (D3, D11)
 # ---------------------------------------------------------------------------
@@ -659,6 +739,8 @@ def update_and_depend(
         )
 
     reader = _reader_for(src, schema, reader_options)
+    if reader["kind"] == "parquet":
+        _refuse_types_the_read_cannot_take(src)
     digest = si._digest_file(src)
     content_hash = source_entry_hash(digest, reader)
 

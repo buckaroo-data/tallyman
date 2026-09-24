@@ -1839,3 +1839,41 @@ def test_a_re_import_restores_a_lost_clone_while_the_snapshot_exists(
     assert clone.read_bytes() == src.read_bytes()
     assert pinned_reason(project, out["hash"]) is None
     assert _arena(project)["cas"] == [clone.name]
+
+
+def test_the_type_check_passes_every_type_the_read_takes(project: str, tmp_path: Path, monkeypatch):
+    """#224's check refuses only what the read refuses. These types all imported before it, including three
+    extension types whose pyarrow schema ``PyArrowType.to_ibis`` has no entry for: DataFusion, which the read asks for
+    the schema, gives a top-level extension column its storage type. A check over ``pq.read_schema`` would refuse
+    them."""
+    import datetime
+
+    import numpy as np
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "typed.parquet"
+    table = pa.table(
+        {
+            "binary": pa.array([b"ab"], type=pa.binary()),
+            "large_binary": pa.array([b"ab"], type=pa.large_binary()),
+            "dictionary": pa.array(["a"]).dictionary_encode(),
+            "fixed_size_list": pa.array([[1, 2]], type=pa.list_(pa.int64(), 2)),
+            "duration": pa.array([1], type=pa.duration("s")),
+            "float16": pa.array([np.float16(1.5)], type=pa.float16()),
+            "null": pa.array([None], type=pa.null()),
+            "uint64": pa.array([2**63], type=pa.uint64()),
+            "time64": pa.array([1], type=pa.time64("ns")),
+            "tz": pa.array([datetime.datetime(2026, 1, 1)], type=pa.timestamp("us", tz="America/New_York")),
+            "json": pa.ExtensionArray.from_storage(pa.json_(), pa.array(['{"a": 1}'])),
+            "bool8": pa.ExtensionArray.from_storage(pa.bool8(), pa.array([1], type=pa.int8())),
+            "tensor": pa.FixedShapeTensorArray.from_numpy_ndarray(np.zeros((1, 2, 2))),
+        }
+    )
+    pq.write_table(table, src)
+
+    out = source_import.update_and_depend(str(src), "typed")
+
+    assert out["created"] is True
+    assert [f["name"] for f in out["schema"]["fields"]] == [*table.column_names, ROW_ORDER]

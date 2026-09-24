@@ -463,6 +463,17 @@ def test_set_alias_refuses_a_source_alias_onto_a_computed_entry(project: str, tm
     assert history_for(project, "orders") == [imported["hash"]]
 
 
+def test_set_alias_does_not_check_a_hash_with_no_entry(project: str):
+    """With no manifest there is nothing to match the kind against, so either kind is accepted."""
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind
+
+    set_alias(project, "a_catalog", "aaaaaaaaaaaa")
+    set_alias(project, "a_source", "bbbbbbbbbbbb", kind=SOURCE_KIND)
+
+    assert alias_kind(project, "a_catalog") == "catalog"
+    assert alias_kind(project, "a_source") == SOURCE_KIND
+
+
 def test_renaming_a_source_alias_keeps_its_kind(project: str, tmp_path: Path, monkeypatch):
     """Rename and unalias behave as they do for catalog aliases (D1)."""
     from tallyman_core.aliases import SOURCE_KIND, alias_kind

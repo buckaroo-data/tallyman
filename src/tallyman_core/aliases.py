@@ -13,6 +13,12 @@ no recipe to revise and no diff to promote onto it. Both live in the same store
 with the same head-plus-history shape, so ``orders-v2`` resolves through the one
 ``VERSION_REF_RE``, and a name is one kind or the other but never both.
 
+The kind is recorded here, on the alias; whether an entry is a *source entry* (a
+version of an imported file) is recorded on the entry, by its manifest carrying
+``provenance``. ``set_alias`` ties the two together: **an alias's kind matches the
+kind of the entries it points at**, so a catalog name never heads an import and a
+source name never heads a recipe's result, whichever route set it.
+
 All three live in a tracked ``aliases.jsonl`` in the catalog repo — one line per
 alias, ``{"alias", "latest", "history": [...], "kind"}``. The native store tracks the
 file directly, so alias state clones and versions with the catalog and
@@ -32,7 +38,8 @@ import json
 import re
 
 from tallyman_core.fsutil import atomic_write_text
-from tallyman_core.paths import catalog_dir, ensure_project
+from tallyman_core.manifest import read_manifest
+from tallyman_core.paths import catalog_dir, ensure_project, entry_dir
 
 
 class AliasExists(ValueError):
@@ -44,7 +51,8 @@ class AliasNotFound(KeyError):
 
 
 class AliasKindMismatch(ValueError):
-    """A name already belongs to the other kind of alias (ADR-011 D1)."""
+    """An alias of one kind aimed at the other kind: a name that already belongs to the other kind of alias, or an
+    entry whose kind is not the alias's (ADR-011 D1)."""
 
 
 # A catalog alias names a computation; a source alias names an imported dataset.
@@ -220,6 +228,46 @@ def previous_version(project: str, content_hash: str, alias: str | None = None) 
     return hist[idx] if 0 <= idx < len(hist) else None
 
 
+def _entry_kind(project: str, content_hash: str) -> str | None:
+    """The kind of alias the entry *content_hash* may take, or None when there is no readable manifest to tell.
+
+    ``SOURCE_KIND`` for a source entry (its manifest records ``provenance``: it is a version of an imported file),
+    ``CATALOG_KIND`` for any other entry, which a recipe computed. None when the entry directory or its manifest is
+    missing or unreadable, which ``set_alias`` treats as "do not check": the alias bookkeeping is used, and tested,
+    with hashes that name no entry.
+    """
+    try:
+        manifest = read_manifest(entry_dir(project, content_hash))
+    except (OSError, ValueError):  # no entry, no manifest yet, or one that does not parse
+        return None
+    return SOURCE_KIND if manifest.provenance is not None else CATALOG_KIND
+
+
+def _entry_kind_refusal(project: str, name: str, content_hash: str, entry_kind: str) -> str:
+    """The ``AliasKindMismatch`` message for pointing *name* at an entry of the other kind, *entry_kind*."""
+    if entry_kind == SOURCE_KIND:
+        held = version_of_hash(project, content_hash)
+        if held is None:  # imported, but its source alias has since been removed
+            return (
+                f"{content_hash!r} is a source entry (a version of an imported file) that no source alias holds, so "
+                f"the catalog alias {name!r} cannot point at it: a source version has no recipe to revise. To name "
+                f"it, import its file again with catalog_import_source(<path>, {name!r})."
+            )
+        src, version = held
+        steer = f"from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias({src!r})"
+        return (
+            f"{content_hash!r} is {src}-v{version}, a version of the source alias {src!r} (an imported file, not a "
+            f"computation), so the catalog alias {name!r} cannot point at it: a source version has no recipe to "
+            f"revise. To give the source a second name, create a catalog entry that reads it: "
+            f"catalog_create({name!r}, {steer!r}). That entry follows {src!r} when it is imported again."
+        )
+    return (
+        f"{content_hash!r} is a computed entry (a recipe's result), so the source alias {name!r} cannot point at it: "
+        f"a source alias's versions are imported files, and it advances only by catalog_import_source(<path>, "
+        f"{name!r}). To name this entry, give it a catalog alias under another name."
+    )
+
+
 def set_alias(
     project: str,
     name: str,
@@ -239,6 +287,15 @@ def set_alias(
     default, so every existing caller keeps its meaning) or ``SOURCE_KIND`` for a
     version of an imported dataset. A name that already belongs to the other kind
     raises ``AliasKindMismatch`` — the collision is refused both ways (ADR-011 D1).
+
+    So does an entry of the other kind: a catalog alias may not point at a source
+    entry (one whose manifest records ``provenance``), since it would then offer
+    ``catalog_revise`` on a version with no recipe, and a source alias may not
+    point at a computed entry, since its versions are imported files. The check
+    is here rather than in each tool so that every route that names an entry
+    (``catalog_alias``, a revise, a promoted diff, a recalc, an import)
+    keeps the alias's kind and its entries' kind the same. A hash whose manifest
+    cannot be read is not checked.
     """
     if kind not in _KINDS:
         raise ValueError(f"alias kind {kind!r}; expected one of {_KINDS}")
@@ -255,6 +312,9 @@ def set_alias(
             f"{name!r} is a {kinds.get(name, CATALOG_KIND)} alias and cannot be set as a {kind} alias; "
             "a name is one kind or the other"
         )
+    entry_kind = _entry_kind(project, content_hash)
+    if entry_kind is not None and entry_kind != kind:
+        raise AliasKindMismatch(_entry_kind_refusal(project, name, content_hash, entry_kind))
 
     aliases[name] = content_hash
     kinds[name] = kind

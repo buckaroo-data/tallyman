@@ -1576,3 +1576,266 @@ def test_a_re_import_in_one_project_does_not_stale_the_other(two_projects, tmp_p
 
     assert scan(alpha)[child_a].stale is False
     assert scan(beta)[child_b].stale is True
+
+
+# ---------------------------------------------------------------------------
+# import hardening: what a failed import says, records and leaves behind (#224, #225, #227, #234, #239)
+# ---------------------------------------------------------------------------
+
+
+def _arena(project: str) -> dict[str, list[str]]:
+    """The files in ``result_cache/`` and ``data/.cas/``, the two places an import writes before its entry."""
+    from tallyman_xorq.materialize import snapshots_dir
+
+    def names(d: Path) -> list[str]:
+        return sorted(p.name for p in d.iterdir()) if d.is_dir() else []
+
+    return {"result_cache": names(snapshots_dir(project)), "cas": names(data_dir(project) / ".cas")}
+
+
+def test_a_parquet_column_with_no_ibis_type_is_refused_before_anything_is_written(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """#224. A fixed_size_binary column, and a UUID column, which is stored as fixed_size_binary(16), have no ibis
+    type. The generated recipe's read of the snapshot failed on them with a KeyError that named no column, after the
+    clone and the snapshot were written. The import checks the types the read will see before it writes anything,
+    and names every such column, a nested one by its path, with the cast that makes the file importable."""
+    import uuid
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "ids.parquet"
+    table = pa.table(
+        {
+            "id": pa.array([b"a" * 16, b"b" * 16], type=pa.binary(16)),
+            "meta": pa.array([{"key": b"k1k1"}, {"key": b"k2k2"}], type=pa.struct([("key", pa.binary(4))])),
+            "guid": pa.array([uuid.UUID(int=1).bytes, uuid.UUID(int=2).bytes], type=pa.uuid()),
+            "n": pa.array([1, 2]),
+        }
+    )
+    pq.write_table(table, src)
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(src), "ids")
+
+    message = str(exc.value)
+    for column in ("'id'", "'meta.key'", "'guid'"):
+        assert column in message, message
+    assert "'n'" not in message, message
+    assert "binary" in message and "string" in message, message  # the casts: to binary, and a UUID to string
+    assert str(src) in message, message
+    assert "read_project_file" not in message and "Traceback" not in message, message
+    assert _arena(project) == {"result_cache": [], "cas": []}
+    assert get_alias(project, "ids") is None
+
+
+def test_an_import_that_fails_in_its_generated_recipe_leaves_the_arena_as_it_was(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """#225. The clone and the snapshot are written before the generated recipe runs, and a failure there removed
+    the entry directory and nothing else. Nothing lists the clone, and a retry reused the orphan snapshot."""
+    from tallyman_xorq import build, source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    before = _arena(project)
+
+    def fails(code):
+        raise build.BuildError("executing user code raised: KeyError")
+
+    monkeypatch.setattr(build, "_import_script", fails)
+    with pytest.raises(build.BuildError):
+        source_import.update_and_depend(str(src), "orders")
+
+    assert _arena(project) == before
+    assert get_alias(project, "orders") is None
+
+
+def test_a_csv_that_fails_to_parse_leaves_no_clone(project: str, tmp_path: Path, monkeypatch):
+    """#225. The snapshot of a CSV that does not parse goes to a temporary name that is removed, but the clone was
+    written first, and every CSV import that failed left one, one per distinct set of bytes tried."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1), ("west", 2)])
+
+    with pytest.raises(ValueError):
+        source_import.update_and_depend(str(src), "orders", schema={"region": "int64", "n": "int64"})
+
+    assert _arena(project) == {"result_cache": [], "cas": []}
+
+
+@pytest.fixture
+def notified(monkeypatch) -> list:
+    """What the MCP server announces to the companion, captured here instead of posted to it."""
+    import tallyman_mcp.server as server
+
+    sent: list = []
+    monkeypatch.setattr(server, "_notify", lambda kind, content_hash=None, **extra: sent.append((kind, extra)))
+    return sent
+
+
+def _call_import(args: dict):
+    """``catalog_import_source`` called through fastmcp's client, the way an agent calls it."""
+    import asyncio
+
+    from fastmcp import Client
+
+    from tallyman_mcp.server import mcp
+
+    async def go():
+        async with Client(mcp) as client:
+            return await client.call_tool("catalog_import_source", args, raise_on_error=False)
+
+    return asyncio.run(go())
+
+
+def _assert_recorded(project: str, reply, notified: list) -> dict:
+    """The reply is the tool's error dict, and the failure is in errors.jsonl, the activity log and a notification."""
+    from tallyman_core.errors import list_errors
+    from tallyman_core.events import read_events
+
+    assert reply.is_error is False, reply
+    out = reply.data
+    assert {"error", "error_id"} <= set(out), out
+    records = list_errors(project, limit=1000)
+    assert [(r["id"], r["tool"]) for r in records] == [(out["error_id"], "catalog_import_source")], records
+    events = [e for e in read_events(project) if e.get("kind") == "build_error"]
+    assert [e.get("error_id") for e in events] == [out["error_id"]], events
+    assert ("build_failed", {"error_id": out["error_id"], "tool": "catalog_import_source"}) in notified, notified
+    return out
+
+
+_UNREADABLE_CSVS = {
+    "a value that does not fit a pinned type": (b"a,b\n1,2\nx,3\n", {"schema": {"a": "int64", "b": "int64"}}),
+    "a ragged row": (b"a,b\n1,2\n3,4,5\n", {"schema": {"a": "int64", "b": "int64"}}),
+    "invalid utf-8": (b"a,b\n1,\xff\xfe\n", {"schema": {"a": "int64", "b": "string"}}),
+    "a dtype that does not parse": (b"a,b\n1,2\n", {"schema": {"a": "i64", "b": "int64"}}),
+    "a two-byte separator": (b"a,b\n1,2\n", {"reader_options": {"separator": "ab"}}),
+    "an unknown reader option": (b"a,b\n1,2\n", {"reader_options": {"frobnicate": 1}}),
+    "an empty file": (b"", {}),
+}
+
+
+@pytest.mark.parametrize("body, options", list(_UNREADABLE_CSVS.values()), ids=list(_UNREADABLE_CSVS))
+def test_a_csv_the_reader_refuses_is_a_recorded_import_error(
+    project: str, tmp_path: Path, monkeypatch, notified, body: bytes, options: dict
+):
+    """#227. polars' errors are ValueError, TypeError, parsy's ParseError and NoDataError, and the tool caught only
+    SourceImportError, BuildError and OSError, so they reached the agent as a raw tool error with no error_id and no
+    record. The message named the clone under data/.cas and ``tallyman_read_csv``, which a recipe may not call."""
+    import hashlib
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.csv"
+    src.write_bytes(body)
+
+    out = _assert_recorded(project, _call_import({"outside_path": str(src), "alias": "orders", **options}), notified)
+
+    message = out["error"]
+    assert str(src) in message, message
+    assert "catalog_import_source" in message, message
+    assert "tallyman_read_csv" not in message, message
+    assert hashlib.md5(body).hexdigest() not in message and ".cas" not in message, message
+
+
+def test_a_csv_parse_failure_gives_the_retry_in_the_tools_argument_shape(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227. The message keeps the column polars reports, drops polars' advice (``infer_schema_length`` and
+    ``schema_overrides`` are refused by the import), and ends with the retry as a ``catalog_import_source`` call that
+    works when run as written: the suggested schema as a list of lists, which the tool takes, not a tuple of tuples."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.csv"
+    src.write_text("a,b\n1,2\nx,3\n")
+
+    reply = _call_import({"outside_path": str(src), "alias": "orders", "schema": {"a": "int64", "b": "int64"}})
+
+    message = _assert_recorded(project, reply, notified)["error"]
+    assert "column 'a'" in message, message
+    for refused in ("infer_schema_length", "schema_overrides"):
+        assert refused not in message, message
+    args, kwargs = _advised_import(message)
+    assert args == [str(src), "orders"], message
+    assert kwargs == {"schema": [["a", "string"], ["b", "int64"]]}, message
+
+    retried = _call_import({"outside_path": args[0], "alias": args[1], **kwargs}).data
+
+    assert "error" not in retried, retried
+    assert (retried["version"], retried["created"]) == (1, True)
+
+
+def test_a_clone_that_fails_its_digest_check_is_a_recorded_import_error(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227, from its comment. ``CloneDigestMismatch`` (ADR-011 D9, ingest verifies what it wrote) subclasses
+    ValueError, so it escaped the tool's handler as well."""
+    from tallyman_xorq import source_identity as si
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+
+    def changed_while_copying(source: Path, dest: Path) -> None:
+        dest.write_bytes(source.read_bytes() + b"appended while the copy ran")
+
+    monkeypatch.setattr(si, "_clone", changed_while_copying)
+
+    out = _assert_recorded(project, _call_import({"outside_path": str(src), "alias": "orders"}), notified)
+
+    assert str(src) in out["error"], out
+    assert f"catalog_import_source({str(src)!r}, 'orders')" in out["error"], out
+    assert _arena(project) == {"result_cache": [], "cas": []}
+
+
+def test_the_append_only_refusal_names_reset_commands_that_exist(project: str, tmp_path: Path, monkeypatch):
+    """#234. The refusal sent the user to ``tallyman reset`` and ``catalog_reset_to``, and neither exists: the CLI
+    has ``tallyman revisions`` and ``tallyman reset-to <step>``, and the MCP server has no reset tool."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.parquet"
+    _write_parquet(src, 10)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 10)  # back to v1's bytes
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(src), "orders")
+
+    message = str(exc.value)
+    assert "tallyman revisions" in message, message
+    assert "tallyman reset-to <step>" in message, message
+    assert "shell" in message, message
+    assert "catalog_reset_to" not in message, message
+    assert "tallyman reset " not in message, message
+
+
+@pytest.mark.parametrize("suffix", [".parquet", ".pq"], ids=["the same suffix", "another suffix"])
+def test_a_re_import_restores_a_lost_clone_while_the_snapshot_exists(
+    project: str, tmp_path: Path, monkeypatch, suffix: str
+):
+    """#239. Without its clone a source snapshot is the last copy of its rows, so it is pinned, and re-importing the
+    bytes is the documented repair. The existing-entry branch restored the clone only when the snapshot was gone
+    too, so the version stayed pinned. The clone restored is the one the entry names, whatever the suffix of the
+    file the bytes come from this time."""
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import pinned_reason
+    from tallyman_xorq.source_import import source_clone_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "orders")
+    clone = source_clone_path(project, read_manifest(entry_dir(project, out["hash"])).provenance)
+    clone.unlink()
+    assert pinned_reason(project, out["hash"]) is not None
+    again = _outside(tmp_path) / f"orders_again{suffix}"
+    again.write_bytes(src.read_bytes())
+
+    repaired = source_import.update_and_depend(str(again), "orders", pinned_version=1)
+
+    assert (repaired["hash"], repaired["version"], repaired["created"]) == (out["hash"], 1, False)
+    assert clone.read_bytes() == src.read_bytes()
+    assert pinned_reason(project, out["hash"]) is None
+    assert _arena(project)["cas"] == [clone.name]

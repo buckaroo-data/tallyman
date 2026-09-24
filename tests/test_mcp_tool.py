@@ -100,3 +100,53 @@ def test_catalog_import_source_records_no_project_argument(project: str, orders_
     code = (entry_dir(project, out["hash"]) / "expr.py").read_text()
     assert "project=" not in code
     assert "read_project_file(" in code
+
+
+def _docstrings(tree) -> set[int]:
+    """The ids of the string constants that are module, class or function docstrings."""
+    import ast
+
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, owners)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+
+
+def test_every_catalog_name_a_message_in_src_quotes_is_a_tool_or_a_python_name():
+    """#234: an import refusal sent agents to ``catalog_reset_to``, which is no tool. A ``catalog_*`` name in a string
+    the code builds (a message, not a docstring) is either a registered MCP tool or a name defined in ``src/``, such
+    as the ``catalog_state`` module. Docstrings are left out, since they may name functions that were deleted."""
+    import ast
+    import asyncio
+    import re
+
+    from tallyman_mcp.server import mcp
+
+    tools = {tool.name for tool in asyncio.run(mcp.list_tools())}
+    src = Path(__file__).resolve().parent.parent / "src"
+    defined: set[str] = set()
+    quoted: dict[str, list[str]] = {}
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        defined.add(path.stem)
+        docstrings = _docstrings(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Name):
+                defined.add(node.id)
+            elif isinstance(node, ast.Attribute):
+                defined.add(node.attr)
+            elif isinstance(node, ast.arg):
+                defined.add(node.arg)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                for name in re.findall(r"\bcatalog_[a-z_]+\b", node.value):
+                    quoted.setdefault(name, []).append(f"{path.relative_to(src)}:{node.lineno}")
+
+    unknown = {name: where for name, where in quoted.items() if name not in tools | defined}
+    assert unknown == {}, unknown

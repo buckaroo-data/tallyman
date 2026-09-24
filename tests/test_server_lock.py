@@ -195,19 +195,14 @@ def test_the_claim_of_a_sigkilled_server_is_gone_and_its_record_is_not_believed(
 def test_the_claim_descriptor_is_not_inherited(isolated_home, hold_data_dir):
     """A child of the server (Buckaroo) must not inherit the claim, or a child that outlives a killed server would
     keep the data dir claimed. The holder spawns its child with close_fds=False, so only non-inheritance protects it."""
-    from tallyman_core.server_lock import claim_data_dir, claim_fd, release_data_dir
+    from tallyman_core.server_lock import claim_data_dir, release_data_dir
 
     holder = hold_data_dir(isolated_home, port=17869, spawn_child=True)
     holder.sigkill()
     assert _alive(holder.child_pid)
 
-    claim_data_dir(port=17870, bind_host="127.0.0.1")
-    try:
-        fd = claim_fd()
-        assert fd is not None
-        assert os.get_inheritable(fd) is False
-    finally:
-        release_data_dir()
+    claim_data_dir(port=17870, bind_host="127.0.0.1")  # the child is alive and does not hold the claim
+    release_data_dir()
 
 
 # ---------------------------------------------------------------------------

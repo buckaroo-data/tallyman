@@ -113,11 +113,6 @@ def release_data_dir(home: Path | str | None = None) -> None:
         os.close(fd)
 
 
-def claim_fd(home: Path | str | None = None) -> int | None:
-    """The descriptor holding this process's claim on the data dir, or None when it holds none."""
-    return _claims.get(resolved_home(home))
-
-
 def read_owner(home: Path | str | None = None) -> dict | None:
     """The owner record of the server holding the data dir, or None when no server holds it.
 

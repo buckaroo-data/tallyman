@@ -32,24 +32,26 @@ from tallyman_xorq.result_cache import (
     snapshot_file_digest,
     verify_result_faithful,
 )
+from tallyman_xorq.source_import import update_and_depend
 
 _HEALS = 3
+_SOURCE = "orders_big_src"
 
 
 def _big_agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders_big.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({_SOURCE!r}, project={project!r})
 expr = t.group_by("order_id").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
-def test_parquet_bake_digest_stable_across_heals(project, monkeypatch, caplog):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_parquet_bake_digest_stable_across_heals(project, caplog):
     src = write_shoe_orders(data_dir(project) / "orders_big.parquet", n_rows=250_000, seed=7)
     # A sanity floor only: the file is well below the 10 MiB scan-split threshold (see the module docstring), and the
     # group-by over 250,000 order ids is what exercises the aggregate's repartitioning.
     assert src.stat().st_size > 1_048_576, "fixture too small to be a meaningful aggregate input"
+    update_and_depend(src, _SOURCE, project=project)
 
     h = catalog_create("big_by_order", _big_agg_code(project))["hash"]
     recorded = read_manifest(entry_dir(project, h)).result_digest

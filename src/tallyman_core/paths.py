@@ -205,10 +205,11 @@ def entry_view_build_dir(project: str, content_hash: str) -> Path:
 
 
 def compute_cache_dir(project: str) -> Path:
-    """Per-project directory of files tallyman can make again: snapshots and ordered copies of sources.
+    """Per-project directory of files tallyman can make again: one snapshot per worthy entry.
 
-    ``result_cache/<content_hash>.parquet`` holds each worthy entry's snapshot and
-    ``ordered_sources/<key>.parquet`` each source's ordered copy (ADR-007 D2, D13).
+    ``result_cache/<content_hash>.parquet`` holds each worthy entry's snapshot (ADR-007 D2, D13),
+    including a source version's, whose rows are an imported file rather than a computation and whose
+    snapshot is re-created from the clone of those bytes (ADR-011 D1).
     Lives inside the catalog dir so it travels with the project, and is untracked by git
     (content-addressed parquet). Everything in it is cache, so anything may delete it:
     ``ensure_materialized`` makes a missing file again and checks it. A reset leaves it

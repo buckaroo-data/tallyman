@@ -26,16 +26,16 @@ def _hash(res: dict) -> str:
 
 
 @pytest.fixture
-def corpus(project, orders_parquet, isolated_home, monkeypatch) -> dict[str, tuple[str, int]]:
-    """A cheap root entry and a worthy aggregate over the same source: alias -> (hash, rows)."""
+def corpus(project, orders_src, isolated_home, monkeypatch) -> dict[str, tuple[str, int]]:
+    """A cheap root entry and a worthy aggregate over the same source alias: alias -> (hash, rows)."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     monkeypatch.setenv("TALLYMAN_AUTO_RECALC", "0")
     orders = _hash(
         catalog_create(
             "orders",
             f"""
-from tallyman_xorq.io import read_project_file
-expr = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+expr = tracked_expr_from_alias({orders_src!r})
 """,
         )
     )
@@ -43,15 +43,19 @@ expr = read_project_file("orders.parquet", project={project!r})
         catalog_create(
             "agg",
             f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """,
         )
     )
+    # The source version is an ordinary entry (ADR-011 D1), so the corpus is three entries, not two:
+    # the profiler measures the imported rows the same way it measures anything built from them.
+    from tallyman_core.aliases import get_alias
+
     return {
         alias: (h, int(cached_result_expr(project, h).count().execute()))
-        for alias, h in (("orders", orders), ("agg", agg))
+        for alias, h in (("orders", orders), ("agg", agg), (orders_src, get_alias(project, orders_src)))
     }
 
 

@@ -11,8 +11,8 @@ connection, so a float aggregate merges its partial sums in one order (ADR-009 D
 that fixes the layout of the file (ADR-009 D3) and numbers them in a last column, ``__row_order`` (ADR-008 D2), and
 returns the content digest of the file it wrote, read back (ADR-009 D2).
 
-``ensure_materialized`` is the one entry point that makes files exist: every snapshot, ordered copy and clone an
-entry's plan reads is on disk before anything executes (ADR-007 D5).
+``ensure_materialized`` is the one entry point that makes files exist: every snapshot an entry's plan reads is on
+disk before anything executes (ADR-007 D5).
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ perf_log = logging.getLogger("tallyman.perf")
 # The snapshot format (ADR-009 D3). The row-group size decides the batch boundaries an entry built on this file sees,
 # and an ungrouped float total depends on them (#187), so the row-group size and the materialization connection's batch
 # size are part of the reproducibility contract: changing either is a corpus rebuild, and the version below stands for
-# both (and for the layout of the ordered copies of sources, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
+# both (and for the row groups a source snapshot is written in, ``ordered_copy.ORDERED_COPY_ROW_GROUP_ROWS``).
 SNAPSHOT_ROW_GROUP_ROWS = 1_048_576
 SNAPSHOT_BATCH_SIZE = 8192
 SNAPSHOT_FORMAT_VERSION = 1
@@ -104,6 +104,43 @@ class Materialized:
     differing_columns: list[str] = field(default_factory=list)
 
 
+def row_groups(batches, rows: int):
+    """The rows of *batches*, in order, as tables of *rows* rows each; the last one may be shorter.
+
+    The one place a stream is cut into row groups, so a file's layout is a function of its rows and not of how the
+    producer batched them (ADR-009 D3). Memory is bounded by one row group.
+    """
+    pending: list[pa.RecordBatch] = []
+    pending_rows = 0
+    for batch in batches:
+        if not batch.num_rows:
+            continue
+        pending.append(batch)
+        pending_rows += batch.num_rows
+        while pending_rows >= rows:
+            table = pa.Table.from_batches(pending)
+            yield table.slice(0, rows)
+            tail = table.slice(rows)
+            pending, pending_rows = tail.to_batches(), tail.num_rows
+    if pending_rows:
+        yield pa.Table.from_batches(pending)
+
+
+def write_pinned_parquet(batches, schema: pa.Schema, dest: Path, *, row_group_rows: int) -> None:
+    """Write *batches*, in order, to *dest* in the pinned parquet settings of ``_PARQUET_OPTIONS`` (ADR-009 D3).
+
+    Every file under ``compute_cache/`` goes through here or through ``_stream_to_parquet``, so ``result_cache/``
+    holds one shape of parquet: the same format version, page index and compression, whether the rows were computed
+    by an entry's build or parsed out of an imported file (ADR-011 D1). Each row group is combined into contiguous
+    arrays first, so the bytes do not depend on the producer's chunking.
+    """
+    with pq.ParquetWriter(dest, schema, **_PARQUET_OPTIONS) as writer:
+        for table in row_groups(batches, row_group_rows):
+            if not table.schema.equals(schema, check_metadata=False):
+                table = table.cast(schema)
+            writer.write_table(table.combine_chunks(), row_group_size=row_group_rows)
+
+
 def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     """Write the rows of *expr* to *dest* in the snapshot format, numbering them in a last ``__row_order`` column.
 
@@ -120,9 +157,7 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     written = 0
 
     with pq.ParquetWriter(dest, out_schema, **_PARQUET_OPTIONS) as writer:
-
-        def flush(table: pa.Table) -> None:
-            nonlocal written
+        for table in row_groups(reader, SNAPSHOT_ROW_GROUP_ROWS):
             n = table.num_rows
             numbered = table.select(names).append_column(
                 pa.field(ROW_ORDER, pa.int64()), pa.array(np.arange(written, written + n, dtype=np.int64))
@@ -131,21 +166,6 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
                 numbered = numbered.cast(out_schema)
             writer.write_table(numbered.combine_chunks(), row_group_size=SNAPSHOT_ROW_GROUP_ROWS)
             written += n
-
-        pending: list[pa.RecordBatch] = []
-        pending_rows = 0
-        for batch in reader:
-            if not batch.num_rows:
-                continue
-            pending.append(batch)
-            pending_rows += batch.num_rows
-            while pending_rows >= SNAPSHOT_ROW_GROUP_ROWS:
-                table = pa.Table.from_batches(pending)
-                flush(table.slice(0, SNAPSHOT_ROW_GROUP_ROWS))
-                tail = table.slice(SNAPSHOT_ROW_GROUP_ROWS)
-                pending, pending_rows = tail.to_batches(), tail.num_rows
-        if pending_rows:
-            flush(pa.Table.from_batches(pending))
     return written, out_schema
 
 
@@ -222,8 +242,12 @@ def _heal(project: str, content_hash: str) -> None:
 
 
 def _recreate(project: str, owner_hash: str, path: Path) -> None:
-    """Make a missing file the owner's plan reads again, by the rule for its class (ADR-007 D13)."""
-    from tallyman_xorq import ordered_copy as oc
+    """Make a missing file the owner's plan reads again (ADR-007 D13).
+
+    There is one class of file to make again: another entry's snapshot, named by its content hash, made
+    by recursing on it. A source's ordered copy was the second class and is gone — a source is an entry,
+    so its rows come back through this same path (``_heal_a_source`` under ``_ensure``), ADR-011 D1.
+    """
     from tallyman_xorq.build import BuildError
 
     if path.parent == snapshots_dir(project):
@@ -236,14 +260,90 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
                 "catalog, so it cannot be made again"
             )
         ensure_materialized(project, parent)
-    elif oc.is_ordered_copy_path(project, path):
-        oc.recreate_ordered_copy(project, owner_hash, path)
     else:
         raise BuildError(
             f"entry {owner_hash} in {project!r} reads {path}, which tallyman did not write and cannot make again"
         )
     if not path.exists():
         raise BuildError(f"entry {owner_hash} in {project!r}: {path} is still missing after it was made again")
+
+
+def _source_provenance(project: str, content_hash: str):
+    """The import recorded on the entry, or None when it is not a source version."""
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        return read_manifest(entry_dir(project, content_hash)).provenance
+    except (OSError, ValueError):
+        return None
+
+
+def _source_names(project: str, content_hash: str, provenance) -> tuple[tuple[str, int] | None, str]:
+    """``(held, imported)``: how a message names a source version (ADR-011 D1).
+
+    ``held`` is ``(alias, version)`` as the alias store has it now, or None when no source alias holds the entry
+    (``source_import.current_source_version``). ``imported`` is the ``<alias>-v<N>`` the version was imported as,
+    from ``provenance``: history, which a rename or an unalias leaves behind. A message names the version by
+    ``held``, and mentions ``imported`` only where the two differ.
+    """
+    from tallyman_xorq.source_import import current_source_version
+
+    return current_source_version(project, content_hash, provenance), f"{provenance.alias}-v{provenance.version}"
+
+
+def _heal_a_source(project: str, content_hash: str) -> bool:
+    """Re-create a source version's snapshot from the clone of the bytes it was imported from (ADR-011 D1).
+
+    A source snapshot is cache in the sense of ADR-007 D13 — ``ensure_materialized`` can re-create it — because the
+    clone under ``data/.cas`` holds the imported bytes and the entry records the reader options that read them. It
+    cannot go through ``materialize``: the entry's build reads the very snapshot that is missing, so the rows come
+    from the clone instead. What is written is then verified against the recorded ``result_digest`` like any other
+    re-created snapshot.
+
+    Only a clone that is gone as well makes the version unrecoverable, and then the error names the file that is
+    missing and the re-import that repairs it: the alias and version that hold the entry now (``_source_names``), so
+    the advised call re-imports into the version it names rather than minting an alias under the name the version
+    was imported as, and the reader options the entry recorded (``source_import.import_call``), without which a CSV
+    names another entry. When no source alias holds it there is no version to re-import into, and the error says what
+    an import of the same bytes would do instead. Returns whether this entry is a source version, so the general
+    path can stop.
+    """
+    from tallyman_core.catalog_state import project_lock
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.result_cache import _verify_self_heal
+    from tallyman_xorq.source_import import import_call, rewrite_source_snapshot, source_clone_path
+
+    provenance = _source_provenance(project, content_hash)
+    if provenance is None:
+        return False
+    with project_lock(project):
+        if snapshot_path(project, content_hash).exists():  # a peer healed it while we waited
+            return True
+        clone = source_clone_path(project, provenance)
+        if not clone.is_file():
+            held, imported = _source_names(project, content_hash, provenance)
+            lost = (
+                f"cannot be made again: {snapshot_path(project, content_hash)} is not on disk and neither is the "
+                f"clone of the imported bytes, {clone}."
+            )
+            if held is None:
+                raise BuildError(
+                    f"the data imported as {imported} (entry {content_hash}), which no source alias holds now, "
+                    f"{lost} Importing the same bytes again, "
+                    f"{import_call(provenance.path, None, provenance.reader)}, writes these rows again as a new "
+                    "version of <alias>."
+                )
+            alias, version = held
+            also = "" if f"{alias}-v{version}" == imported else f", imported as {imported}"
+            raise BuildError(
+                f"the data of {alias}-v{version} (entry {content_hash}{also}) {lost} Import them again with "
+                f"{import_call(provenance.path, alias, provenance.reader, pinned_version=version)}."
+            )
+        digest = rewrite_source_snapshot(project, content_hash, provenance)
+        perf_log.debug("ensure_materialized re-imported %s from %s", content_hash, clone.name)
+        _verify_self_heal(project, content_hash, digest)
+    return True
 
 
 def _ensure(project: str, content_hash: str) -> bool:
@@ -253,6 +353,8 @@ def _ensure(project: str, content_hash: str) -> bool:
     worthy = cache_worthy(project, content_hash)
     if worthy and snapshot_path(project, content_hash).exists():
         return True
+    if _heal_a_source(project, content_hash):
+        return worthy
     plan = _resolve_result_plan(project, content_hash)
     for path in plan.reads:
         if not path.exists():
@@ -268,8 +370,8 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     1. A worthy entry whose snapshot exists is done, and no build is loaded.
     2. Otherwise load the entry's build (the plan is kept in the existing LRU) and collect every file its ``Read``
        nodes point at.
-    3. Re-create each that is missing by the rule for its class: a snapshot by recursing on the hash in its file name,
-       an ordered copy of a source from its clone, a clone from the live source while the bytes still match.
+    3. Re-create each that is missing: every one is another entry's snapshot, made by recursing on the hash in its
+       file name. A source version is re-created from the clone of its imported bytes (``_heal_a_source``).
     4. If the entry is worthy, heal its own snapshot and verify it.
 
     Every caller that composes or executes an entry goes through here, so nothing ever runs over a file that is
@@ -282,17 +384,33 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
     """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
 
     A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
-    time gave different digests), or a heal already produced different rows than were built. The Cache page's delete
-    leaves such a file alone and says why. ``compute_cache/`` as a whole is still deletable by definition.
+    time gave different digests), a heal already produced different rows than were built, or it is a source
+    version whose clone of the imported bytes is gone (ADR-011 D1 — with the clone it is ordinary cache, made again
+    from those bytes). The Cache page's delete leaves such a file alone and says why, naming a source version by the
+    alias that holds it now (``_source_names``). ``compute_cache/`` as a whole is still deletable by definition.
     """
     from tallyman_core import read_manifest
     from tallyman_core.errors import list_errors
     from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import source_clone_path
 
     try:
         manifest = read_manifest(entry_dir(project, content_hash))
     except (OSError, ValueError):
         manifest = None
+    if manifest is not None and manifest.provenance is not None:
+        clone = source_clone_path(project, manifest.provenance)
+        if not clone.is_file():
+            held, imported = _source_names(project, content_hash, manifest.provenance)
+            if held is None:
+                name = f"the source version imported as {imported}, which no source alias holds now"
+            else:
+                current = f"{held[0]}-v{held[1]}"
+                name = f"the source version {current}" + ("" if current == imported else f" (imported as {imported})")
+            return (
+                f"this file is the last copy of {name}: the clone of the bytes imported from "
+                f"{manifest.provenance.path} is gone from {clone}, so nothing can make it again and it is kept"
+            )
     if manifest is not None and manifest.reproducible is False:
         columns = ", ".join(manifest.nonreproducible_columns or [])
         return (

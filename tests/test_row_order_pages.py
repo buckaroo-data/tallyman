@@ -12,21 +12,21 @@ positions in the file, computed independently with pandas from the source.
 
 from __future__ import annotations
 
-import shutil
 from pathlib import Path
 
 import pyarrow.parquet as pq
 import pytest
 from fastapi.testclient import TestClient
 
-from tallyman_core import data_dir
 from tallyman_xorq.build import build_and_persist
+from tallyman_xorq.source_import import update_and_depend
 from tests.big_parquet import write_big_parquet
 
 ROW_ORDER = "__row_order"
 OFFSET, LIMIT, REQUESTS = 1_000_000, 50, 8
+BIG_SRC = "big_src"
 
-_PRELUDE = "from tallyman_xorq.io import read_project_file\n"
+_PRELUDE = "from tallyman_xorq.io import tracked_expr_from_alias\n"
 
 
 @pytest.fixture(scope="module")
@@ -41,14 +41,14 @@ def big_frame(big_source):
 
 
 @pytest.fixture
-def big(project, big_source) -> Path:
-    dest = data_dir(project) / "big.parquet"
-    shutil.copyfile(big_source, dest)
-    return dest
+def big_src(project, big_source) -> str:
+    """The 26 MB file imported as a source alias (ADR-011 D1), and the alias name a recipe reads."""
+    update_and_depend(big_source, BIG_SRC, project=project)
+    return BIG_SRC
 
 
 def _recipe(project: str, body: str) -> str:
-    return f"{_PRELUDE}t = read_project_file('big.parquet', project={project!r})\nexpr = {body}\n"
+    return f"{_PRELUDE}t = tracked_expr_from_alias({BIG_SRC!r}, project={project!r})\nexpr = {body}\n"
 
 
 def _requests(client: TestClient, project: str, content_hash: str) -> list[list[dict]]:
@@ -72,7 +72,9 @@ def _requests(client: TestClient, project: str, content_hash: str) -> list[list[
         pytest.param("t.filter(t.g < 150)", 150, id="cheap entry that drops rows"),
     ],
 )
-def test_a_deep_page_is_exactly_the_rows_at_those_positions(fresh_companion_app, project, big, big_frame, body, max_g):
+def test_a_deep_page_is_exactly_the_rows_at_those_positions(
+    fresh_companion_app, project, big_src, big_frame, body, max_g
+):
     """ADR-008 D5: eight identical requests each return the rows at positions offset..offset+limit-1.
 
     ``id`` is the file position, so for the entries that keep every row ``__row_order`` equals ``id``. A cheap entry

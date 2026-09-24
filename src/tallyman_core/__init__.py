@@ -1,12 +1,17 @@
 from tallyman_core import notebook
 from tallyman_core.aliases import (  # noqa: I001 (keep notebook import first)
+    CATALOG_KIND,
+    SOURCE_KIND,
     AliasExists,
+    AliasKindMismatch,
     AliasNotFound,
     alias_for_hash,
+    alias_kind,
     get_alias,
     history_for,
     load_aliases,
     load_history,
+    load_kinds,
     remove_alias,
     rename_alias,
     set_alias,
@@ -78,7 +83,12 @@ from tallyman_core.summary_stats import (
 
 __all__ = [
     "AliasExists",
+    "AliasKindMismatch",
     "AliasNotFound",
+    "CATALOG_KIND",
+    "SOURCE_KIND",
+    "alias_kind",
+    "load_kinds",
     "CellNotFound",
     "ChartSpecError",
     "Manifest",

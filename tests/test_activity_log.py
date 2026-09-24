@@ -16,15 +16,15 @@ from tallyman_mcp.server import catalog_create, catalog_revise, catalog_run
 _BAD = "x = 5  # never binds `expr` → BuildError"
 
 
-def _ok_code(project: str, cols: str = '"region", "price", "__row_order"') -> str:
+def _ok_code(project: str, src: str, cols: str = '"region", "price", "__row_order"') -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.select({cols})
 """
 
 
-def test_build_error_records_event_with_traceback(project, orders_parquet, monkeypatch):
+def test_build_error_records_event_with_traceback(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run(_BAD)
     assert "error" in out
@@ -40,10 +40,10 @@ def test_build_error_records_event_with_traceback(project, orders_parquet, monke
     assert e["code"] == _BAD
 
 
-def test_alias_create_and_revise_record_alias_events(project, orders_parquet, monkeypatch):
+def test_alias_create_and_revise_record_alias_events(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("shoes", _ok_code(project))
-    catalog_revise("shoes", _ok_code(project, cols='"region", "__row_order"'))  # different projection → V2
+    catalog_create("shoes", _ok_code(project, orders_src))
+    catalog_revise("shoes", _ok_code(project, orders_src, cols='"region", "__row_order"'))  # different projection → V2
 
     aliases = [e for e in read_events(project, categories=["alias"]) if e["alias"] == "shoes"]
     assert len(aliases) >= 2
@@ -52,10 +52,10 @@ def test_alias_create_and_revise_record_alias_events(project, orders_parquet, mo
     assert min(a["version"] for a in aliases) == 1
 
 
-def test_api_log_filters_by_category_and_lists_sessions(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_api_log_filters_by_category_and_lists_sessions(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_run(_BAD)  # mcp build_error
-    catalog_create("good", _ok_code(project))  # alias_set
+    catalog_create("good", _ok_code(project, orders_src))  # alias_set
     record_event(project, "buckaroo", origin="companion", status="ok", hash="deadbeef", load_ms=12.3)
 
     c = TestClient(fresh_companion_app)
@@ -72,7 +72,7 @@ def test_api_log_filters_by_category_and_lists_sessions(fresh_companion_app, pro
     assert ts == sorted(ts, reverse=True)
 
 
-def test_events_are_session_filterable(project, orders_parquet, monkeypatch):
+def test_events_are_session_filterable(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     record_event(project, "build_ok", session="aaa", tool="catalog_run", hash="h1")
     record_event(project, "build_ok", session="bbb", tool="catalog_run", hash="h2")
@@ -80,7 +80,7 @@ def test_events_are_session_filterable(project, orders_parquet, monkeypatch):
     assert got and all(e["session"] == "aaa" for e in got)
 
 
-def test_api_log_backfills_errors_from_errors_jsonl(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_api_log_backfills_errors_from_errors_jsonl(fresh_companion_app, project, orders_src, monkeypatch):
     # The Log tab must show build failures even when no event was recorded for
     # them — e.g. an older MCP that wrote errors.jsonl but not events.jsonl.
     # /api/log backfills build_error from errors.jsonl (#log), marked history.
@@ -99,7 +99,7 @@ def test_api_log_backfills_errors_from_errors_jsonl(fresh_companion_app, project
     assert any(e.get("error_id") == rec["id"] for e in only_mcp)
 
 
-def test_api_log_dedups_error_present_in_both_stores(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_api_log_dedups_error_present_in_both_stores(fresh_companion_app, project, orders_src, monkeypatch):
     # When the new MCP recorded a build_error event AND errors.jsonl has the
     # same id, it must appear once — the rich event wins over the backfill.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)

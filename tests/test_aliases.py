@@ -30,16 +30,16 @@ from tallyman_xorq import build_and_persist
 
 def _agg_code(project_name: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project_name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project_name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _filter_code(project_name: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project_name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project_name!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
@@ -52,7 +52,7 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
 
 def test_set_alias_first_time(project: str):
     info = set_alias(project, "x", "h1")
-    assert info == {"name": "x", "hash": "h1", "version": 1}
+    assert info == {"name": "x", "hash": "h1", "version": 1, "kind": "catalog"}
     assert load_aliases(project) == {"x": "h1"}
     assert load_history(project) == {"x": ["h1"]}
 
@@ -160,7 +160,7 @@ def test_rename_alias_collision(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_create_assigns_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_assigns_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg_code(project), prompt="sales by region")
     assert "error" not in out
@@ -169,7 +169,7 @@ def test_catalog_create_assigns_alias(project: str, orders_parquet: Path, monkey
     assert get_alias(project, "shoe_sales") == out["hash"]
 
 
-def test_catalog_create_rejects_duplicate(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_rejects_duplicate(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_create("shoe_sales", _agg_code(project))
@@ -177,7 +177,7 @@ def test_catalog_create_rejects_duplicate(project: str, orders_parquet: Path, mo
     assert "already exists" in out["error"]
 
 
-def test_catalog_revise_bumps_version(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_bumps_version(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     v1 = catalog_create("shoe_sales", _agg_code(project))
     v2 = catalog_revise("shoe_sales", _filter_code(project))
@@ -187,14 +187,14 @@ def test_catalog_revise_bumps_version(project: str, orders_parquet: Path, monkey
     assert get_alias(project, "shoe_sales") == v2["hash"]
 
 
-def test_catalog_revise_rejects_missing_alias(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_rejects_missing_alias(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_revise("nonexistent", _agg_code(project))
     assert "error" in out
     assert "does not exist" in out["error"]
 
 
-def test_catalog_alias_promotes_scratch(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_promotes_scratch(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project), prompt="exploratory")
     out = catalog_alias(scratch["hash"], "shoe_sales")
@@ -209,7 +209,7 @@ def test_catalog_alias_rejects_missing_hash(project: str, monkeypatch):
     assert "error" in out
 
 
-def test_catalog_alias_rejects_taken_name(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_rejects_taken_name(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project))
     catalog_alias(scratch["hash"], "shoe_sales")
@@ -218,7 +218,7 @@ def test_catalog_alias_rejects_taken_name(project: str, orders_parquet: Path, mo
     assert "error" in out
 
 
-def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_rename(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("foo", _agg_code(project))
     out = catalog_rename("foo", "bar")
@@ -233,7 +233,7 @@ def test_catalog_rename(project: str, orders_parquet: Path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_run_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_run_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run(_agg_code(project), prompt="url check")
     assert "url" in out
@@ -241,7 +241,7 @@ def test_catalog_run_returns_url(project: str, orders_parquet: Path, monkeypatch
     assert project in out["url"]
 
 
-def test_catalog_create_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg_code(project), prompt="url check")
     assert "url" in out
@@ -249,7 +249,7 @@ def test_catalog_create_returns_url(project: str, orders_parquet: Path, monkeypa
     assert project in out["url"]
 
 
-def test_catalog_revise_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_revise("shoe_sales", _filter_code(project), prompt="url check")
@@ -258,7 +258,7 @@ def test_catalog_revise_returns_url(project: str, orders_parquet: Path, monkeypa
     assert project in out["url"]
 
 
-def test_catalog_alias_returns_url(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_returns_url(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project))
     out = catalog_alias(scratch["hash"], "shoe_sales")
@@ -272,7 +272,7 @@ def test_catalog_alias_returns_url(project: str, orders_parquet: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, orders_parquet: Path):
+def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, orders_src: str):
     build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", build_and_persist(project, _filter_code(project)).content_hash)
     c = TestClient(fresh_companion_app)
@@ -283,7 +283,7 @@ def test_catalog_renders_named_with_vchip(fresh_companion_app, project: str, ord
     assert entries["shoe_sales"]["version"] == 1
 
 
-def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, orders_parquet: Path):
+def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, orders_src: str):
     v1 = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", v1.content_hash)
     v2 = build_and_persist(project, _filter_code(project))
@@ -300,7 +300,7 @@ def test_catalog_includes_forensic_versions(fresh_companion_app, project: str, o
     assert current[0]["version"] == 2
 
 
-def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, orders_src: str):
     res = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", res.content_hash)
     c = TestClient(fresh_companion_app)
@@ -311,7 +311,7 @@ def test_entry_detail_resolves_alias_lookup(fresh_companion_app, project: str, o
     assert body["alias"] == "shoe_sales"
 
 
-def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, orders_parquet: Path):
+def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, orders_src: str):
     v1 = build_and_persist(project, _agg_code(project))
     set_alias(project, "shoe_sales", v1.content_hash)
     v2 = build_and_persist(project, _filter_code(project))
@@ -325,7 +325,7 @@ def test_entry_detail_shows_forensic_history(fresh_companion_app, project: str, 
     assert len(body["forensic_history"]) == 2
 
 
-def test_catalog_renders_section_headers(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_renders_section_headers(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """T-13: entries API groups named/forensic/scratch with correct flags."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_revise, catalog_run
@@ -355,3 +355,133 @@ def test_api_aliases_returns_history(fresh_companion_app, project: str):
     assert names["a"]["hash"] == "h2"
     assert names["a"]["history"] == ["h1", "h2"]
     assert names["b"]["hash"] == "x1"
+
+
+# ---------------------------------------------------------------------------
+# ADR-011 D1 — a source alias is a distinct kind. Its versions are raw input
+# datasets, so there is no recipe to revise and no diff to promote onto it,
+# and a name can be one kind or the other but never both.
+# ---------------------------------------------------------------------------
+
+
+def _import(project: str, tmp_path: Path, alias: str, n_rows: int = 5) -> dict:
+    import pandas as pd
+
+    from tallyman_xorq import source_import
+
+    src = tmp_path / "outside" / f"{alias}.parquet"
+    src.parent.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame({"region": [f"r{i}" for i in range(n_rows)]}).to_parquet(src)
+    return source_import.update_and_depend(str(src), alias, project=project)
+
+
+def _over_source(alias: str, project: str) -> str:
+    return (
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({alias!r}, project={project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n"
+    )
+
+
+def test_source_alias_kind_is_recorded(project: str, tmp_path: Path, monkeypatch):
+    """catalog_list has to be able to separate inputs from computations."""
+    from tallyman_core.aliases import CATALOG_KIND, SOURCE_KIND, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+    assert "error" not in catalog_create("by_region", _over_source("orders", project))
+
+    assert alias_kind(project, "orders") == SOURCE_KIND
+    assert alias_kind(project, "by_region") == CATALOG_KIND
+    assert alias_kind(project, "nope") is None
+
+
+def test_a_catalog_alias_cannot_take_a_source_alias_name(project: str, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+
+    out = catalog_create("orders", _over_source("orders", project))
+
+    assert "error" in out
+    assert "source alias" in out["error"]
+
+
+def test_an_import_cannot_take_a_catalog_alias_name(project: str, tmp_path: Path, monkeypatch):
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+    assert "error" not in catalog_create("by_region", _over_source("orders", project))
+    other = tmp_path / "outside" / "orders.parquet"
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(other), "by_region", project=project)
+
+    assert "catalog alias" in str(exc.value)
+
+
+def test_set_alias_refuses_to_change_an_alias_kind(project: str):
+    from tallyman_core.aliases import SOURCE_KIND, AliasKindMismatch
+
+    set_alias(project, "orders", "aaaaaaaaaaaa", kind=SOURCE_KIND)
+
+    with pytest.raises(AliasKindMismatch):
+        set_alias(project, "orders", "bbbbbbbbbbbb")
+
+
+# An alias's kind matches the kind of the entries it points at. The kind lives on the alias (aliases.jsonl); whether an
+# entry is a *source entry* — a version of an imported file, recognised by its manifest carrying ``provenance`` — lives
+# on the entry. set_alias is the one writer every route goes through, so it is where the two are tied together.
+
+
+def test_set_alias_refuses_a_catalog_alias_onto_a_source_entry(project: str, tmp_path: Path, monkeypatch):
+    """A catalog name over an import would let catalog_revise "revise" a version that has no recipe (D1)."""
+    from tallyman_core.aliases import AliasKindMismatch, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    imported = _import(project, tmp_path, "orders")
+
+    with pytest.raises(AliasKindMismatch) as exc:
+        set_alias(project, "looks_like_catalog", imported["hash"])
+
+    assert "orders" in str(exc.value)
+    assert get_alias(project, "looks_like_catalog") is None
+    assert alias_kind(project, "looks_like_catalog") is None
+
+
+def test_set_alias_refuses_a_source_alias_onto_a_computed_entry(project: str, tmp_path: Path, monkeypatch):
+    """A source alias advances only by an import, so its head is always an imported file, never a recipe's result."""
+    from tallyman_core.aliases import SOURCE_KIND, AliasKindMismatch
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    imported = _import(project, tmp_path, "orders")
+    computed = build_and_persist(project, _over_source("orders", project))
+
+    with pytest.raises(AliasKindMismatch):
+        set_alias(project, "orders", computed.content_hash, kind=SOURCE_KIND)
+
+    assert history_for(project, "orders") == [imported["hash"]]
+
+
+def test_set_alias_does_not_check_a_hash_with_no_entry(project: str):
+    """With no manifest there is nothing to match the kind against, so either kind is accepted."""
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind
+
+    set_alias(project, "a_catalog", "aaaaaaaaaaaa")
+    set_alias(project, "a_source", "bbbbbbbbbbbb", kind=SOURCE_KIND)
+
+    assert alias_kind(project, "a_catalog") == "catalog"
+    assert alias_kind(project, "a_source") == SOURCE_KIND
+
+
+def test_renaming_a_source_alias_keeps_its_kind(project: str, tmp_path: Path, monkeypatch):
+    """Rename and unalias behave as they do for catalog aliases (D1)."""
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    _import(project, tmp_path, "orders")
+
+    catalog_rename("orders", "raw_orders")
+
+    assert alias_kind(project, "raw_orders") == SOURCE_KIND
+    assert alias_kind(project, "orders") is None

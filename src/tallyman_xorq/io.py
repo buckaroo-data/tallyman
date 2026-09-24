@@ -19,12 +19,44 @@ class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
+def _source_entry_read(fn: str, path: str):
+    """The expression a raw read resolves to (ADR-011 D2).
+
+    A file enters the catalog by an explicit import and by nothing else, so a raw read is a build error in an
+    authored recipe. It survives in exactly one place: the recipe the importer generates for a source entry, where
+    it resolves to that entry's own snapshot.
+
+    The entry being minted names its own project, and the read follows it rather than the ambient active project:
+    ``update_and_depend(path, alias, project=X)`` is an override, so an import must work whichever project happens
+    to be active. Resolving the ambient one instead made the importer's own recipe hit the refusal below.
+    """
+    from tallyman_xorq.source_import import source_entry_context
+
+    ctx = source_entry_context()
+    if ctx is not None:
+        from xorq.expr.api import deferred_read_parquet
+
+        from tallyman_xorq.materialize import snapshot_path
+
+        owner, content_hash = ctx
+        return deferred_read_parquet(str(snapshot_path(owner, content_hash)))
+    from tallyman_xorq.build import BuildError
+
+    raise BuildError(
+        f"{fn}({path!r}) reads a file tallyman does not own, which is not allowed in a recipe: the entry's rows "
+        "would depend on a file anyone can edit or delete, and nothing would record which bytes it was built from. "
+        f"Import the file first — catalog_import_source({path!r}, '<alias>') — and then read it in the recipe with "
+        "tracked_expr_from_alias('<alias>'), which follows the alias, or pinned_expr_from_alias('<alias>-v<N>') to "
+        "pin one version of it."
+    )
+
+
 def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
     """Resolve `rel_path` against the project's data dir. Raises if absent.
 
-    Pass ``must_exist=False`` for digest-pinned reconstruction: it serves the frozen
-    ``.cas`` clone (``recon_cas_path``) and must not require the live source to still
-    be present. The traversal guard still applies regardless.
+    Pass ``must_exist=False`` to name a file that may not be there. The traversal
+    guard still applies regardless. Nothing in a build calls this: a recipe reads
+    aliases, and ``data/`` stopped being special with ADR-011 D2.
     """
     proj = resolve_project(project)
     base = data_dir(proj)
@@ -40,45 +72,17 @@ def project_path(rel_path: str, project: str | None = None, must_exist: bool = T
 
 
 def read_project_file(rel_path: str, project: str | None = None):
-    """Load a raw data file from `<project>/data/<rel_path>` as a xorq expression.
+    """The raw read of a parquet file, which only a source entry's own recipe may do (ADR-011 D2).
 
-    Use this to bring raw input files (parquet, csv, etc.) into the catalog's
-    expression layer. This is the root of the dependency DAG — the file has no
-    catalog hash, no recipe, no lineage entry. Everything built on top of it
-    flows through tracked_expr_from_alias.
+    In an authored recipe this raises a ``BuildError`` naming the import to use instead. A file enters the
+    catalog through ``catalog_import_source`` / ``update_and_depend`` and by no other route, and a recipe
+    reads the resulting source alias with ``tracked_expr_from_alias``.
 
-    The file is never read directly (ADR-008 D2). It goes through source
-    identity (tallyman_xorq.source_identity): its content digest is taken, in
-    `cas` mode it is cloned to `data/.cas/<digest><suffix>`, and in `salt` mode
-    the digest is recorded for build_and_persist to mix into the entry hash.
-    Then an *ordered copy* of it is written under the project's `compute_cache/`
-    (tallyman_xorq.ordered_copy): the same rows in file order plus a last column,
-    `__row_order`, `0..N-1`, which pages sort by. The returned expression is a
-    plain read of that copy, so the entry's hash covers the source's content
-    (the copy's name is a function of the digest) and editing the file forks it.
+    It survives as a callable because the recipe the importer generates for a source entry calls it, and
+    a contextvar (``source_import._SOURCE_ENTRY``) resolves that call to the entry's own snapshot. The
+    path in the generated recipe is provenance; nothing opens it.
     """
-    from xorq.expr.api import deferred_read_parquet
-
-    from tallyman_xorq import ordered_copy as oc
-    from tallyman_xorq import source_identity as si
-
-    proj = resolve_project(project)
-    reader = oc.parquet_reader()
-    recorded = _reconstructing_source_digest(proj, rel_path)
-    if recorded is not None:
-        # Reconstruction (#115): this read_project_file is re-running an already-built entry's recipe (expr.py), not
-        # authoring a new entry. Resolve to the copy of the bytes the entry was BUILT from, named by the digest in its
-        # manifest.sources, instead of re-digesting the live file, which may have been edited in place since. Note
-        # that same frozen digest so a child build reconstructing this entry records it.
-        si.note_source(rel_path, recorded)
-        return deferred_read_parquet(str(oc.existing_ordered_copy(proj, digest=recorded, reader=reader)))
-    path = project_path(rel_path, proj)
-    digest = si.digest_for(proj, path)
-    if si.mode() != "off":
-        si.note_source(rel_path, digest)
-    source = si.ensure_cas_path(proj, path, digest) if si.mode() == "cas" else path
-    copy = oc.ensure_ordered_copy(proj, source, digest=digest, rel=rel_path, reader=reader)
-    return deferred_read_parquet(str(copy))
+    return _source_entry_read("read_project_file", rel_path)
 
 
 # ibis primitive -> polars dtype, for reading a CSV with an explicit schema.
@@ -372,7 +376,7 @@ def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] 
     return repr(pairs)
 
 
-def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
+def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *, write) -> None:
     """Read *src* (a CSV) into a row-order-stable parquet at *tmp_path* (#143).
 
     Inference mode (no schema, or a spec with inferred columns) escalates the
@@ -385,10 +389,13 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     The last column is ``__row_order`` (ADR-008 D2). A CSV that already has a
     column of that name has it overwritten, which is the right outcome for a
     file tallyman exported.
+
+    *write* takes the parsed LazyFrame of one rung of the ladder and puts it on
+    disk. There is one caller, the import, and it passes a writer that streams
+    the rows into pyarrow so a source snapshot has the layout every other
+    snapshot has (ADR-011 D1).
     """
     import polars as pl
-
-    from tallyman_xorq.ordered_copy import _WRITE
 
     # Header (names only) drives the schema plan; infer_schema_length=0 reads
     # just the header line, no type sampling.
@@ -434,7 +441,7 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     last_exc = None
     for infer_len in ladder:
         try:
-            _ordered(infer_len).sink_parquet(str(tmp_path), **_WRITE)
+            write(_ordered(infer_len), tmp_path)
             return
         except pl.exceptions.ComputeError as exc:
             last_exc = exc
@@ -445,42 +452,24 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
 
 
 def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwargs):
-    """Read a CSV into a xorq expression with a stable ``__row_order``.
+    """The raw read of a CSV, refused for the same reason ``read_project_file`` is (ADR-011 D2).
 
-    Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. The CSV
-    goes through source identity like a parquet source (``read_project_file``):
-    its content digest is taken, it is cloned to ``data/.cas/``, and an ordered
-    copy of the clone is written under the project's ``compute_cache/``. polars
-    reads the clone (``scan_csv -> with_row_index -> sink_parquet``), which
-    preserves the file's row order (unlike datafusion's parallel scan, whose row
-    order is nondeterministic above the repartition threshold, about 10 MB) and
-    numbers the rows in a last column, ``__row_order``, ``0..N-1``. See
-    ``plans/ADR-008-row-order-of-reads.md``.
+    D2 names ``read_project_file``; this one goes with it, because both open a file the catalog does not
+    own and leaving the CSV reader open would be a hole in the rule. Import the CSV instead —
+    ``catalog_import_source(path, alias, separator=..., schema=...)`` — and read the source alias. The
+    reader options move to the import call and are recorded on the entry (ADR-011 D12), so the file is
+    read one way forever; to read it a second way, import it again under a second alias.
 
-    The CSV is read exactly once, at ingest, and the returned expression is a
-    plain ``deferred_read_parquet`` of the copy: no sort, one row-order column.
-    Because the copy is named by the CSV's content and the reader options,
-    editing the CSV and running the same recipe gives a new content hash, and the
-    earlier entry keeps the rows it was built from (#168).
+    The CSV reader itself did not go anywhere: the schema DSL, the inference ladder and the row-order
+    guarantee of ADR-005 and ADR-008 D2 all run at import time now (``source_import._write_csv_snapshot``
+    over ``_materialize_ordered``).
 
     Args:
         path: Absolute path to the CSV file.
-        schema: Optional ibis schema for the columns (same as deferred_read_csv).
-            When omitted, polars infers types.
+        schema: Accepted and unused; the import takes it.
         project: Project name override (defaults to the active project).
-        **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
-            ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
-            ``has_header``, ``encoding``. They participate in the copy's key,
-            so changing one re-ingests. ``infer_schema_length`` and
-            ``schema_overrides`` are managed internally (see ``_RESERVED_SCAN_KWARGS``)
-            and rejected — they would collide with the values every internal
-            ``scan_csv`` call already sets.
+        **kwargs: Accepted and unused; the import takes them.
     """
-    from xorq.expr.api import deferred_read_parquet
-
-    from tallyman_xorq import ordered_copy as oc
-    from tallyman_xorq import source_identity as si
-
     reserved = [k for k in _RESERVED_SCAN_KWARGS if k in kwargs]
     if reserved:
         raise ValueError(
@@ -489,74 +478,7 @@ def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwar
             "(100 -> 10k -> whole-file); to pin column types pass schema= (an ibis schema, "
             "plain dict, or tuple-of-tuples), never schema_overrides."
         )
-    proj = resolve_project(project)
-    reader = oc.csv_reader(schema, kwargs)
-    src = Path(path)
-    rel = _relative_to_data(proj, src)
-    recorded = _reconstructing_source_digest(proj, rel)
-    if recorded is not None:
-        si.note_source(rel, recorded)
-        return deferred_read_parquet(str(oc.existing_ordered_copy(proj, digest=recorded, reader=reader)))
-    digest = si.digest_for(proj, src)
-    if si.mode() != "off":
-        si.note_source(rel, digest)
-    source = si.ensure_cas_path(proj, src, digest) if si.mode() == "cas" else src
-    copy = oc.ensure_ordered_copy(proj, source, digest=digest, rel=rel, reader=reader)
-    return deferred_read_parquet(str(copy))
-
-
-def _relative_to_data(proj: str, path: Path) -> str:
-    """The name a source is recorded under in ``manifest.sources``: relative to the project's data dir when it sits
-    there, the absolute path otherwise (a CSV can live anywhere)."""
-    try:
-        return str(path.resolve().relative_to(data_dir(proj).resolve()))
-    except ValueError:
-        return str(path)
-
-
-def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
-    """The digest *rel_path* was built with, if a recipe for *proj* is being
-    reconstructed on this call stack (#115); otherwise None.
-
-    Reads the per-entry ``{rel_path: digest}`` map ``result_cache._recipe_expr``
-    threads through ``_RECON_SOURCES``. Returns None outside reconstruction (the build
-    path), when the reconstructing entry belongs to a different project, or when this
-    source was not recorded — read_project_file then falls through to its live-file path.
-    """
-    from tallyman_xorq.result_cache import _RECON_SOURCES
-
-    ctx = _RECON_SOURCES.get()
-    if ctx is None:
-        return None
-    recon_proj, sources = ctx
-    if recon_proj != proj:
-        return None
-    return sources.get(rel_path)
-
-
-def _note_parent_records(proj: str, content_hash: str) -> None:
-    """Fold the parent's recorded source digests, and its ordered copies when its graph is inlined, into the build.
-
-    The child's ``manifest.sources`` is the closure record ``gc_cas`` walks to keep clones alive, so it carries every
-    digest its parent recorded, and the child keeps its own leaves alive even if the parent entry is later evicted.
-    A CHEAP parent's graph is inlined into the child's build (a worthy parent is a bare read of its snapshot), so the
-    child reads that parent's ordered copies directly and needs the records that let ``ensure_materialized`` make a
-    deleted one again (ADR-007 D13). ``note_source`` and ``note_ordered_copy`` are no-ops outside a build's collect
-    window, so this costs nothing on a plain read.
-    """
-    from tallyman_core import read_manifest
-    from tallyman_xorq import ordered_copy as oc
-    from tallyman_xorq import source_identity as si
-
-    try:
-        manifest = read_manifest(entry_dir(proj, content_hash))
-    except (OSError, ValueError):
-        return
-    for rel_path, digest in (manifest.sources or {}).items():
-        si.note_source(rel_path, digest)
-    if manifest.cache_worthy is False:
-        for key, record in (manifest.ordered_copies or {}).items():
-            oc.note_ordered_copy(key, record)
+    return _source_entry_read("tallyman_read_csv", path)
 
 
 def tracked_expr_from_alias(alias: str, project: str | None = None):
@@ -606,7 +528,6 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=alias, follow=True)
-    _note_parent_records(proj, content_hash)
     return cached_result_expr(proj, content_hash)
 
 
@@ -618,31 +539,47 @@ def pinned_expr_from_alias(ref: str, project: str | None = None):
     not advance it when the parent alias moves. Use this when you want to stay on
     a specific version of a parent rather than following alias changes.
 
-    Accepts a content hash or an explicit version reference ``"<alias>-v<N>"``
-    (1-based into the alias history — the V1…Vn the UI shows). A bare alias is
-    rejected (#166): it reads like a pin but resolves to whatever the head
-    happens to be when the recipe is built, so the recipe text under-determines
-    the entry. A pinned reference must denote the same entry forever.
+    Accepts an explicit version reference ``"<alias>-v<N>"`` only (1-based into the
+    alias history — the V1…Vn the UI shows). Two other forms are rejected:
+
+    - a bare alias (#166), which reads like a pin but resolves to whatever the head
+      happens to be when the recipe is built, so the recipe text under-determines
+      the entry. A pinned reference must denote the same entry forever;
+    - a bare content hash (ADR-011 D5). Every parent edge names an alias, followed
+      or pinned at a version, so no opaque hash appears in a recipe or in
+      ``manifest.parents``. An entry with no alias — one built by ``catalog_run`` —
+      must be named (``catalog_alias``) before anything can build on it.
 
     The parent edge is suppressed during reconstruction (same as tracked_expr_from_alias)
     so re-running a child's recipe doesn't accidentally write to the manifest.
 
     Args:
-        ref: A content hash, or a version reference like "shoe_sales-v2".
+        ref: A version reference like "shoe_sales-v2".
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref
+    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref, version_of_hash
     from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
     if entry_dir(proj, ref).exists():
-        content_hash = ref
+        named = version_of_hash(proj, ref)
+        steer = (
+            f"Pin it as {named[0] + '-v' + str(named[1])!r} instead."
+            if named
+            else f"Entry {ref} heads no alias history, so there is no version to name: give it a name with "
+            "catalog_alias first, then pin it as '<alias>-v<N>'."
+        )
+        raise ProjectDataNotFound(
+            f"pinned_expr_from_alias({ref!r}) is a bare content hash, which a recipe may not name (ADR-011 D5): "
+            f"a parent edge names an alias and a version of it, so the DAG is readable and a hash never leaks into "
+            f"a recipe. {steer}"
+        )
     elif get_alias(proj, ref) is not None:
         raise ProjectDataNotFound(
             f"pinned_expr_from_alias({ref!r}) is a bare alias, which would silently pin "
             f"whatever the head happens to be right now (#166). Pin an exact version — "
-            f"a content hash, or {ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) "
-            "to follow the alias."
+            f"{ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) to follow the "
+            "alias. A bare content hash is not the way either (ADR-011 D5)."
         )
     else:
         content_hash = resolve_version_ref(proj, ref)
@@ -662,5 +599,4 @@ def pinned_expr_from_alias(ref: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=ref, follow=False)
-    _note_parent_records(proj, content_hash)
     return cached_result_expr(proj, content_hash)

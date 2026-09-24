@@ -10,10 +10,10 @@ from tallyman_core import entry_dir, project_dir, set_alias
 from tallyman_xorq import build_and_persist
 
 
-def _code(project_name: str) -> str:
+def _code(project_name: str, src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project_name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project_name!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -26,8 +26,8 @@ def test_read_only_mode_rejects_notify(fresh_companion_app, project: str):
     assert r.status_code == 403
 
 
-def test_read_only_mode_serves_get_routes(built_spa, project: str, orders_parquet: Path):
-    res = build_and_persist(project, _code(project))
+def test_read_only_mode_serves_get_routes(built_spa, project: str, orders_src: str):
+    res = build_and_persist(project, _code(project, orders_src))
     set_alias(project, "shoe_sales", res.content_hash)
     app = create_app(project, read_only=True)
     c = TestClient(app)
@@ -146,13 +146,13 @@ def test_notify_recalc_publishes_normalized_event(project: str, monkeypatch):
 
 
 def test_project_path_override_relocates_project(
-    project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch
+    project: str, orders_src: str, isolated_home: Path, tmp_path: Path, monkeypatch
 ):
     """The full hand-off scenario: copy the project to a random location,
     point TALLYMAN_PROJECT_PATH at it, and verify the catalog still loads
     and entries still execute through the portability layer.
     """
-    res = build_and_persist(project, _code(project), prompt="region totals")
+    res = build_and_persist(project, _code(project, orders_src), prompt="region totals")
     set_alias(project, "shoe_sales", res.content_hash)
 
     # Simulate untarring the project dir somewhere arbitrary (NOT under TALLYMAN_HOME).

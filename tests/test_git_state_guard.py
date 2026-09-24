@@ -139,10 +139,10 @@ def segfault_git_repo(tmp_path: Path, monkeypatch) -> Path:
     return repo
 
 
-def _agg_code(parquet_path: Path) -> str:
+def _agg_code(src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file({parquet_path.name!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
@@ -164,10 +164,10 @@ def test_installed_guard_dispatches_git_fork_free(guard_env, spawn_spy, temp_git
     _assert_provenance_fork_free(spawn_spy, "guarded get_git_state")
 
 
-def test_build_dispatches_git_provenance_fork_free(project, orders_parquet, spawn_spy):
+def test_build_dispatches_git_provenance_fork_free(project, orders_src, spawn_spy):
     """End-to-end: a real catalog write, through real xorq build_expr ->
     compiler.py:507 -> lu.get_git_state, must capture provenance fork-free."""
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="fork-safety")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="fork-safety")
     assert res.content_hash
 
     _assert_provenance_fork_free(spawn_spy, "build_and_persist")

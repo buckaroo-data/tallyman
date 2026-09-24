@@ -94,7 +94,7 @@ git revision. A non-empty cascade emits a `recalc` SSE event.
 | Tool | Checkpoints | SSE notify | Auto-recalc |
 |---|---|---|---|
 | `catalog_run` | yes | `new_entry`, `build_failed` | no |
-| `catalog_load_parquet` | yes | `new_entry`, `build_failed`, `notebook_changed`¹ | no |
+| `catalog_import_source` | yes | `new_entry`, `build_failed`, `notebook_changed`¹, `recalc` | yes |
 | `catalog_create` | yes | `new_entry`, `build_failed`, `notebook_changed` | no |
 | `catalog_revise` | yes | `new_entry`, `build_failed`, `recalc` | yes |
 | `catalog_alias` | yes | `alias_changed`, `notebook_changed` | no |
@@ -181,16 +181,34 @@ default authoring tool for a one-off run.
   `events.jsonl`.
 - **Promote** a scratch entry to a name afterward with `catalog_alias`.
 
-### `catalog_load_parquet(rel_path, prompt="", name="") -> dict`
-Register a parquet under `<project>/data/` as an entry by synthesizing a
-`read_project_file(rel_path)` recipe — the no-code "load this file" path. With
-`name`, behaves like `catalog_create` (names the entry, appends a notebook cell).
-- **Params:** `rel_path` (required) — path under `data/`; `prompt` — optional
-  intent / cell markdown; `name` — optional alias.
-- **Returns:** same as `catalog_run`, plus `alias` and `version` when named.
-  `{error}` if the alias already exists; `{error, error_id}` on a missing file.
-- Unlike `catalog_run`, it does **not** emit a `build_ok` event; success shows
-  only via the notifies.
+### `catalog_import_source(outside_path, alias, pinned_version=None, prompt="", schema=None, reader_options=None) -> dict`
+Import a parquet or CSV into the catalog and point the source alias `alias` at
+it (ADR-011). The only way a file enters: the bytes are copied into the arena,
+one snapshot of them is written in file order with a `__row_order` column, and
+a version of `alias` is minted. Recipes then read
+`tracked_expr_from_alias(alias)`; the original path is provenance and is never
+read again.
+- **Params:** `outside_path` (required) — any path, `data/` is not special;
+  `alias` (required) — the source alias, which may not name a catalog alias;
+  `pinned_version` — the version you claim the file is, checked rather than
+  assumed; `prompt` — optional intent / cell markdown; `schema` and
+  `reader_options` — CSV column types and `polars.scan_csv` options, recorded on
+  the entry and never re-derived (ADR-011 D12).
+- **Returns:** `hash`, `alias`, `version`, `created`, `row_count`, `schema`,
+  `path`, `digest`, `url`, plus `recalc` when advancing the alias cascaded.
+  `{error, error_id}` for a missing path, an alias collision, bytes another
+  alias already holds (the error names that alias and version), or any row of
+  the ADR-011 D3 table that is an error.
+- Re-running it on **unchanged** bytes is a no-op that returns the current
+  version, so it is safe in a script. If that version's snapshot is gone, the
+  no-op heals it from the clone and checks it against the recorded digest; it
+  never rewrites the version. Re-running it on **changed** bytes mints the next
+  version and cascades like a revise.
+- **One set of bytes is one version under one alias** (ADR-011 D1). To give a
+  source a second name, `catalog_create` an entry whose recipe is
+  `tracked_expr_from_alias("<source alias>")`; it follows the source when it is
+  re-imported. A CSV read with other reader options is a different entry and
+  may be imported under its own alias (ADR-011 D12).
 
 ### `catalog_create(name, code, prompt="") -> dict`
 Execute and persist as a **named** entry (alias) and append a notebook cell.
@@ -229,7 +247,9 @@ cell. Used after a `catalog_run` when a scratch entry earns a permanent name.
 - **Params:** `hash` (required) — must name an on-disk entry; `name` (required)
   — must be free.
 - **Returns:** `{hash, alias, version, url}`. `{error}` if the hash has no entry
-  or the name is taken.
+  or the name is taken, and if the entry is a source version: a source entry
+  belongs to its source alias, and the error names the `catalog_create` over
+  `tracked_expr_from_alias` that gives the source a second name (ADR-011 D1).
 
 ### `catalog_rename(old_name, new_name) -> dict`
 Rename an alias, preserving its full version history and notebook position.

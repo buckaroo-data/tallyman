@@ -67,36 +67,6 @@ _RECONSTRUCTING: contextvars.ContextVar[frozenset] = contextvars.ContextVar("_re
 # machine-locking memory blowup into a fast, clear error instead.
 _MAX_RECON_DEPTH = 64
 
-# The source digests ({rel_path: digest} from manifest.sources) the entry being
-# reconstructed on this stack was BUILT from, threaded into read_project_file so a cold
-# read resolves each source to the frozen data/.cas/<digest> clone it was built from —
-# not a re-digest of the (possibly edited-in-place) live file (#115). Set per-entry in
-# _recipe_expr alongside _RECONSTRUCTING and OVERWRITTEN (then restored) by each nested
-# reconstruction, so a grandparent's read_project_file sees the grandparent's recorded
-# sources. Carries the project so a read_project_file resolving a *different* project falls
-# through to the live path. None outside reconstruction (the build path); an entry that
-# recorded no sources (mode=off / pre-#86) yields an empty map, so read_project_file also
-# falls through.
-_RECON_SOURCES: contextvars.ContextVar[tuple[str, dict] | None] = contextvars.ContextVar(
-    "_recon_sources", default=None
-)
-
-
-def _recorded_sources(project: str, content_hash: str) -> dict:
-    """The entry's recorded ``manifest.sources`` ({rel_path: digest}), or ``{}``.
-
-    Empty when the manifest is unreadable or the entry recorded no sources (mode=off,
-    or a build predating #86); read_project_file then falls through to its live-file path.
-    """
-    from tallyman_core import read_manifest
-    from tallyman_core.paths import entry_dir
-
-    try:
-        return read_manifest(entry_dir(project, content_hash)).sources or {}
-    except (OSError, ValueError):
-        return {}
-
-
 def _resolve_noncyclic_hash(project: str, requested: str, content_hash: str) -> str:
     """The hash ``tracked_expr_from_alias`` should load, stepped out of any reconstruction cycle.
 
@@ -137,16 +107,16 @@ _RECIPE_VAR = "expr"
 def _recipe_expr(project: str, content_hash: str):
     """Re-import the entry's persisted recipe (``expr.py``) as a live expression.
 
-    Symmetric with the original build's ``_import_script`` — same source code,
-    same source-identity handling — so the reconstructed expression is
-    structurally identical to what was built. The recipe's ``read_project_file`` /
+    Symmetric with the original build's ``_import_script`` — same source code — so the
+    reconstructed expression is structurally identical to what was built. The recipe's
     deferred readers bind to the in-process *default* backend, so the returned
-    expression roots there and composes with ``read_project_file`` and other
-    ``tracked_expr_from_alias`` results as a single backend (#75).
+    expression roots there and composes with other ``tracked_expr_from_alias`` results
+    as a single backend (#75).
     """
     from tallyman_core.paths import entry_dir, project_dir
     from tallyman_xorq.build import BuildError, _import_script
     from tallyman_xorq.portable import PLACEHOLDER
+    from tallyman_xorq.source_import import in_source_recipe, is_source_entry, release_source_recipe
 
     active = _RECONSTRUCTING.get()
     if len(active) >= _MAX_RECON_DEPTH:
@@ -158,17 +128,18 @@ def _recipe_expr(project: str, content_hash: str):
     code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
     # Mark this entry in-flight for the duration of the recipe exec, so any
     # tracked_expr_from_alias the recipe issues can step back out of a self-reference (#74).
-    # In the SAME window, pin this entry's recorded sources so any read_project_file the
-    # recipe issues resolves to the frozen .cas clone it was built from, not a
-    # re-digest of the edited-in-place live file (#115). Both contextvars must wrap
-    # _import_script — that is where the recipe's tracked_expr_from_alias / read_project_file run —
-    # and reset in this finally, NOT the sys.modules-cleanup finally below.
+    # The contextvar must wrap _import_script — that is where the recipe's
+    # tracked_expr_from_alias calls run — and reset in this finally, NOT the
+    # sys.modules-cleanup finally below.
     token = _RECONSTRUCTING.set(active | {(project, content_hash)})
-    recon_token = _RECON_SOURCES.set((project, _recorded_sources(project, content_hash)))
+    # A source entry's recipe is the one the importer generated, and its read_project_file is the one raw read
+    # tallyman allows (ADR-011 D2): mark it so the read resolves to this entry's own snapshot.
+    source_token = in_source_recipe(project, content_hash) if is_source_entry(project, content_hash) else None
     try:
         module, tmp = _import_script(code)
     finally:
-        _RECON_SOURCES.reset(recon_token)
+        if source_token is not None:
+            release_source_recipe(source_token)
         _RECONSTRUCTING.reset(token)
     try:
         expr = getattr(module, _RECIPE_VAR, None)
@@ -242,8 +213,8 @@ def _profile_content_token(backend) -> str:
 def rebind_onto(expr, target):
     """Collapse every backend in a loaded build onto *target*.
 
-    ``load_expr`` mints fresh backend objects per profile, so two loaded builds — or a loaded build and a recipe's
-    ``read_project_file`` — span distinct backend objects and composition raises "Multiple backends found". The
+    ``load_expr`` mints fresh backend objects per profile, so two loaded builds — or a loaded build and a source
+    entry's snapshot read — span distinct backend objects and composition raises "Multiple backends found". The
     contract allows the collapse because every profile in a tallyman build is content-identical no-arg
     ``xorq_datafusion``; that assumption is enforced here (ADR-006 D3): more than one distinct content profile fails
     loudly rather than misbinding a node onto the wrong kind of connection. A raw ``DatabaseTable`` (bundled data that

@@ -101,7 +101,7 @@ def test_write_does_not_create_disabled_dir_on_active_listing(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_session_includes_project_root_in_load_expr_body(project: str, orders_parquet: Path, monkeypatch):
+def test_ensure_session_includes_project_root_in_load_expr_body(project: str, orders_src: str, monkeypatch):
     """The /load_expr POST must carry the project's absolute path so
     buckaroo's load_project_stat_klasses (PR #784) can scan its stats/
     directory."""
@@ -109,8 +109,8 @@ def test_ensure_session_includes_project_root_in_load_expr_body(project: str, or
     from tallyman_xorq import build_and_persist
 
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
     res = build_and_persist(project, code)

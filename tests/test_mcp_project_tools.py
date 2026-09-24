@@ -184,16 +184,16 @@ def test_project_new_returns_error_on_409(isolated_home: Path, monkeypatch):
 
 
 def test_existing_tool_response_includes_project(project: str, orders_parquet: Path):
-    from tallyman_mcp.server import catalog_load_parquet
+    from tallyman_mcp.server import catalog_import_source
 
-    out = catalog_load_parquet("orders.parquet", prompt="raw")
+    out = catalog_import_source(str(orders_parquet), "orders", prompt="raw")
     assert out.get("project") == project
 
 
 def test_list_returning_tool_wrapped_with_project_and_items(project: str, orders_parquet: Path):
-    from tallyman_mcp.server import catalog_list, catalog_load_parquet
+    from tallyman_mcp.server import catalog_import_source, catalog_list
 
-    catalog_load_parquet("orders.parquet", prompt="raw")
+    catalog_import_source(str(orders_parquet), "orders", prompt="raw")
     out = catalog_list()
     # catalog_list previously returned a bare list; the decorator now wraps it.
     assert isinstance(out, dict)
@@ -206,9 +206,9 @@ def test_catalog_list_includes_compact_columns(project: str, orders_parquet: Pat
     # The model should be able to look up an entry's columns before writing an
     # expression against it, without a build. catalog_list carries a compact
     # "name:type, name:type" summary the LLM can scan at a glance.
-    from tallyman_mcp.server import catalog_list, catalog_load_parquet
+    from tallyman_mcp.server import catalog_import_source, catalog_list
 
-    catalog_load_parquet("orders.parquet", prompt="raw")
+    catalog_import_source(str(orders_parquet), "orders", prompt="raw")
     entry = catalog_list()["items"][0]
     cols = entry["columns"]
     assert isinstance(cols, str)

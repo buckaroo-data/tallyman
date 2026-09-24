@@ -120,7 +120,7 @@ def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
     assert r.json()["error"]["tool"] == "catalog_run"
 
 
-def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Entries and error APIs return independent data for the React sidebar."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create
@@ -128,8 +128,8 @@ def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project
     catalog_create(
         "shoe_sales",
         f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
     )

@@ -128,7 +128,8 @@ it. To remove it later: `claude mcp remove tallyman -s project`.
 With the companion running (step 5) and the MCP server approved (step 6), the
 `mcp__tallyman__*` tools are available in chat. Try:
 
-> Use `catalog_load_parquet` to load `orders.parquet`.
+> Use `catalog_import_source` to import `orders.parquet` from the project's
+> `data/` directory under the alias `orders`.
 >
 > Now use `catalog_create` to make a named entry `shoe_sales` that groups orders
 > by region and totals the price.

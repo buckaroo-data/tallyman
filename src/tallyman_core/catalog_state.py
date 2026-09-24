@@ -173,7 +173,12 @@ def _cas_bullpen(project: str) -> Path:
 
 
 def _live_source_digests(project: str) -> set[str] | None:
-    """The union of every surviving entry's ``manifest.sources`` digests, or None when a manifest can't be read.
+    """Every clone digest a surviving entry needs, or None when a manifest can't be read.
+
+    One way an entry refers to a clone: ``manifest.provenance.digest``, the bytes an import copied in (ADR-011 D1).
+    The clone is the only record of the file as imported and a re-import is the only way back, so the retention
+    closure is simply which source versions survive — which is the DAG, and the reason ADR-011 D6 could delete
+    ``manifest.sources``, the map a build used to fold up from everything it read.
 
     An unreadable manifest means the sweep would run on partial information, and a clone wrongly retired is the only
     frozen copy of somebody's bytes, so callers skip the sweep.
@@ -184,11 +189,11 @@ def _live_source_digests(project: str) -> set[str] | None:
     live: set[str] = set()
     for h in read_tallyman_state(project)["entry_hashes"]:
         try:
-            sources = read_manifest(entry_dir(project, h)).sources
+            manifest = read_manifest(entry_dir(project, h))
         except Exception:
             return None
-        if sources:
-            live.update(sources.values())
+        if manifest.provenance is not None:
+            live.add(manifest.provenance.digest)
     return live
 
 
@@ -384,8 +389,8 @@ def _retire_cas_clones(project: str) -> int:
 
     ``.cas`` lives under ``data/`` — outside the catalog git repo — so the ``git reset`` above cannot roll it back.
     A clone is data, the only frozen copy of the bytes an entry was built from once the live file is edited, so
-    nothing deletes one: a reset forward brings it back (``restore_from_bullpen``). Liveness is the union of every
-    surviving entry's ``manifest.sources`` digests. Conservative and best-effort: if any entry's manifest can't be
+    nothing deletes one: a reset forward brings it back (``restore_from_bullpen``). Liveness is every surviving
+    source version's ``manifest.provenance.digest``. Conservative and best-effort: if any entry's manifest can't be
     read we skip the sweep, and a failure here never aborts the reset.
     """
     from tallyman_xorq import source_identity  # lazy: avoid a core->xorq import cycle

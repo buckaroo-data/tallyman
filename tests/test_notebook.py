@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,16 +22,16 @@ from tallyman_mcp.server import (
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
@@ -130,7 +129,7 @@ def test_load_raises_on_malformed_line(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_create_appends_cell(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_create_appends_cell(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="seed text")
     cells = notebook.load(project)["cells"]
@@ -139,7 +138,7 @@ def test_catalog_create_appends_cell(project: str, orders_parquet: Path, monkeyp
     assert cells[0]["markdown"] == "seed text"
 
 
-def test_catalog_revise_does_not_duplicate_cell(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_revise_does_not_duplicate_cell(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="seed")
     catalog_revise("shoe_sales", _filter_code(project), prompt="revised")
@@ -149,7 +148,7 @@ def test_catalog_revise_does_not_duplicate_cell(project: str, orders_parquet: Pa
     assert cells[0]["markdown"] == "seed"
 
 
-def test_catalog_alias_appends_cell(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_alias_appends_cell(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project), prompt="exploratory")
     catalog_alias(scratch["hash"], "shoe_sales")
@@ -158,7 +157,7 @@ def test_catalog_alias_appends_cell(project: str, orders_parquet: Path, monkeypa
     assert cells[0]["alias"] == "shoe_sales"
 
 
-def test_catalog_rename_renames_cell_in_place(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_rename_renames_cell_in_place(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("old", _agg_code(project))
     catalog_rename("old", "new")
@@ -167,7 +166,7 @@ def test_catalog_rename_renames_cell_in_place(project: str, orders_parquet: Path
     assert cells[0]["alias"] == "new"
 
 
-def test_catalog_unalias_drops_cell(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_unalias_drops_cell(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("dropme", _agg_code(project))
     out = catalog_unalias("dropme")
@@ -175,7 +174,7 @@ def test_catalog_unalias_drops_cell(project: str, orders_parquet: Path, monkeypa
     assert notebook.load(project) == {"cells": []}
 
 
-def test_notebook_reorder_tool(project: str, orders_parquet: Path, monkeypatch):
+def test_notebook_reorder_tool(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     catalog_create("b", _filter_code(project))
@@ -185,7 +184,7 @@ def test_notebook_reorder_tool(project: str, orders_parquet: Path, monkeypatch):
     assert after == ["b", "a"]
 
 
-def test_notebook_remove_tool(project: str, orders_parquet: Path, monkeypatch):
+def test_notebook_remove_tool(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     cells = notebook.load(project)["cells"]
@@ -193,7 +192,7 @@ def test_notebook_remove_tool(project: str, orders_parquet: Path, monkeypatch):
     assert notebook.load(project) == {"cells": []}
 
 
-def test_notebook_edit_markdown_tool(project: str, orders_parquet: Path, monkeypatch):
+def test_notebook_edit_markdown_tool(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project), prompt="original")
     cell = notebook.load(project)["cells"][0]
@@ -223,7 +222,7 @@ def test_notebook_route_empty(fresh_companion_app, project: str):
     assert r.json()["cells"] == []
 
 
-def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project), prompt="region totals")
     c = TestClient(fresh_companion_app)
@@ -235,7 +234,7 @@ def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_
     assert cells[0]["entry_meta"]["prompt"] == "region totals"
 
 
-def test_api_notebook_reorder(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_api_notebook_reorder(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     catalog_create("b", _filter_code(project))
@@ -249,7 +248,7 @@ def test_api_notebook_reorder(fresh_companion_app, project: str, orders_parquet:
     assert [x["alias"] for x in notebook.load(project)["cells"]] == ["b", "a"]
 
 
-def test_api_notebook_remove(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_api_notebook_remove(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))
     cells = notebook.load(project)["cells"]
@@ -262,7 +261,7 @@ def test_api_notebook_remove(fresh_companion_app, project: str, orders_parquet: 
     assert notebook.load(project) == {"cells": []}
 
 
-def test_api_markdown_put(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_api_markdown_put(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project), prompt="seed")
     cell = notebook.load(project)["cells"][0]
@@ -287,7 +286,7 @@ def test_api_notebook_unknown_action(fresh_companion_app, project: str):
     assert r.status_code == 400
 
 
-def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create as _cc
     from tallyman_mcp.server import notebook_edit_markdown as _em
@@ -305,7 +304,7 @@ def test_notebook_renders_markdown_as_html(fresh_companion_app, project: str, or
 
 
 def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
-    fresh_companion_app, project: str, orders_parquet, monkeypatch
+    fresh_companion_app, project: str, orders_src, monkeypatch
 ):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create as _cc
@@ -319,7 +318,7 @@ def test_notebook_empty_markdown_shows_placeholder_in_edit_mode(
     assert not cell_data["markdown"]
 
 
-def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, orders_src, monkeypatch):
     """T-10: in-place updates need the server to send back rendered HTML
     so the client can swap it in without a reload."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -335,7 +334,7 @@ def test_put_markdown_returns_rendered_html(fresh_companion_app, project: str, o
     assert body["markdown"] == "## Hello\n\nworld"
 
 
-def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, orders_src, monkeypatch):
     """T-09: drag-reorder is handled by dnd-kit in the React SPA; API must accept reorder."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create as _cc
@@ -348,7 +347,7 @@ def test_notebook_page_includes_sortable_js(fresh_companion_app, project: str, o
     assert any(cell["alias"] == "shoe_sales" for cell in cells)
 
 
-def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch):
+def test_serve_mode_omits_sortable_js(project: str, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_companion import create_app
     from tallyman_mcp.server import catalog_create as _cc
@@ -362,7 +361,7 @@ def test_serve_mode_omits_sortable_js(project: str, orders_parquet, monkeypatch)
     assert r.status_code == 403
 
 
-def test_notebook_uses_buckaroo_embed_when_session_available(project: str, orders_parquet, monkeypatch):
+def test_notebook_uses_buckaroo_embed_when_session_available(project: str, orders_src, monkeypatch):
     """notebook_full API returns buckaroo_session when Buckaroo is running."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_companion import create_app
@@ -408,7 +407,7 @@ def test_notebook_uses_buckaroo_embed_when_session_available(project: str, order
     assert sr.json()["ws_url"].startswith("ws://127.0.0.1:8700/ws/sess-")
 
 
-def test_notebook_falls_back_to_html_when_no_buckaroo(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_notebook_falls_back_to_html_when_no_buckaroo(fresh_companion_app, project: str, orders_src, monkeypatch):
     """notebook_full API signals buckaroo unavailable when no manager is configured."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create as _cc

@@ -1,10 +1,11 @@
 // @vitest-environment happy-dom
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { SSEProvider, useSSE } from "./SSEContext";
 import { api } from "./api";
+import { NewEntryPill } from "./components/NewEntryPill";
 import { CachePage } from "./pages/CachePage";
 import { CatalogPage } from "./pages/CatalogPage";
 import { NotebookPage } from "./pages/NotebookPage";
@@ -22,6 +23,8 @@ vi.mock("./api", () => ({
     errors: vi.fn(async () => ({ project: "p1", errors: [] })),
     resultCache: vi.fn(async () => ({ project: "p1", entries: [], total_bytes: 0, total_formatted: "0 B" })),
     notebookFull: vi.fn(async () => ({ project: "p1", cells: [], buckaroo_available: false })),
+    // The entry pane stays on its spinner; these tests only watch the URL.
+    entryDetail: vi.fn(() => new Promise(() => {})),
   },
 }));
 // The notebook page imports the grid and chart embeds; an empty notebook renders neither.
@@ -79,23 +82,28 @@ const REFETCH_KINDS = [
 ];
 
 let root: Root | null = null;
+let container: HTMLDivElement | null = null;
 let seen: ReturnType<typeof useSSE> | null = null;
+let where = "";
 
 function Probe() {
   seen = useSSE();
+  where = useLocation().pathname;
   return null;
 }
 
 async function mount(path: string) {
-  const container = document.createElement("div");
+  container = document.createElement("div");
   root = createRoot(container);
   await act(async () => {
     root!.render(
       <MemoryRouter initialEntries={[path]}>
         <SSEProvider project="p1">
           <Probe />
+          <NewEntryPill project="p1" />
           <Routes>
             <Route path="/:project/catalog" element={<CatalogPage />} />
+            <Route path="/:project/catalog/:hash" element={<CatalogPage />} />
             <Route path="/:project/notebook" element={<NotebookPage />} />
             <Route path="/:project/cache" element={<CachePage />} />
             <Route path="*" element={null} />
@@ -116,11 +124,13 @@ beforeEach(() => {
   vi.spyOn(console, "log").mockImplementation(() => {});
   vi.clearAllMocks();
   seen = null;
+  where = "";
 });
 
 afterEach(async () => {
   await act(async () => root?.unmount());
   root = null;
+  container = null;
   FakeEventSource.last = null;
   vi.unstubAllGlobals();
   vi.restoreAllMocks();
@@ -169,5 +179,38 @@ describe("pages refetch", () => {
     await act(async () => es.emit(kind, { hash: "abc", step: 3 }));
 
     expect(fetcher.mock.calls.length).toBe(before + 1);
+  });
+});
+
+// The companion can send two events back to back: its promote route publishes
+// `recalc` and then `entry_added` when it re-points an existing alias, and MCP
+// `catalog_create` posts `new_entry` and then `notebook_changed`. When both are
+// dispatched before React renders, each must still reach the consumers that
+// act on its kind. act() batches the two emits into one render, as a browser
+// does when both arrive before React's render task runs.
+describe("events sent in the same tick", () => {
+  it("a recalc followed by entry_added still moves a background view to the recalculated entry", async () => {
+    vi.spyOn(document, "hasFocus").mockReturnValue(false);
+    const es = await mount("/p1/catalog/oldhash00001");
+
+    await act(async () => {
+      es.emit("recalc", { remap: { oldhash00001: "newhash00002" }, step: null });
+      es.emit("entry_added", { hash: "diffhash0003" });
+    });
+
+    expect(seen!.version).toBe(2);
+    expect(where).toBe("/p1/catalog/newhash00002");
+  });
+
+  it("a new_entry followed by notebook_changed still shows the new-entry pill", async () => {
+    const es = await mount("/p1/none");
+
+    await act(async () => {
+      es.emit("new_entry", { hash: "e7f9f88f364b", alias: "by_region", version: 1 });
+      es.emit("notebook_changed");
+    });
+
+    expect(seen!.version).toBe(2);
+    expect(container!.textContent).toContain("new expression: by_region");
   });
 });

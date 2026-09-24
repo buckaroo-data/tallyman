@@ -996,3 +996,148 @@ def test_the_ordered_copy_store_is_gone(project: str, tmp_path: Path, monkeypatc
 
     assert snapshot_path(project, out["hash"]).is_file()
     assert [d.name for d in sorted(compute_cache_dir(project).iterdir())] == [RESULT_CACHE_DIRNAME]
+
+
+# ---------------------------------------------------------------------------
+# a second name for a source is an expression over it, not a second import
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_name_for_a_source_is_a_catalog_entry_over_it(project: str, tmp_path: Path, monkeypatch):
+    """What the duplicate-import error tells the user to do instead, and why it needs nothing to force the hash apart.
+
+    A source entry's hash is an md5 of its bytes and reader options; a recipe's hash is xorq's hash of the expression.
+    An expression that only reads the source is therefore a different entry already, with a followed parent edge, so a
+    re-import of the source advances it like any other follower.
+    """
+    from tallyman_mcp.server import catalog_create
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    source = source_import.update_and_depend(str(src), "orders")
+
+    out = catalog_create(
+        "orders_eu", "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('orders')\n"
+    )
+
+    assert "error" not in out, out
+    assert out["hash"] != source["hash"]
+    parents = read_manifest(entry_dir(project, out["hash"])).parents
+    assert [(p.ref, p.hash, p.follow) for p in parents] == [("orders", source["hash"], True)]
+
+
+# ---------------------------------------------------------------------------
+# two projects importing one file share nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_projects(isolated_home: Path) -> tuple[str, str]:
+    from tallyman_core import ensure_project, set_active_project
+
+    for name in ("alpha", "beta"):
+        ensure_project(name)
+    set_active_project("alpha")
+    return "alpha", "beta"
+
+
+def test_two_projects_importing_one_file_each_get_their_own_copy(two_projects, tmp_path: Path):
+    """Same bytes, same entry hash, but each project holds its own entry, snapshot and clone."""
+    from tallyman_xorq import source_import
+    from tallyman_xorq.source_import import source_clone_path
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+
+    a = source_import.update_and_depend(str(src), "orders", project=alpha)
+    b = source_import.update_and_depend(str(src), "orders", project=beta)
+
+    assert a["hash"] == b["hash"]
+    assert a["created"] and b["created"], "the second project's import is not a no-op on the first's entry"
+    for proj in (alpha, beta):
+        manifest = read_manifest(entry_dir(proj, a["hash"]))
+        assert manifest.project == proj
+        assert snapshot_path(proj, a["hash"]).is_file()
+        assert source_clone_path(proj, manifest.provenance).is_file()
+        assert get_alias(proj, "orders") == a["hash"]
+    assert snapshot_path(alpha, a["hash"]) != snapshot_path(beta, b["hash"])
+
+
+def test_the_duplicate_import_check_is_per_project(two_projects, tmp_path: Path):
+    """One file under different alias names in two projects is two unrelated imports, not a duplicate."""
+    from tallyman_xorq import source_import
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+
+    source_import.update_and_depend(str(src), "orders", project=alpha)
+    out = source_import.update_and_depend(str(src), "sales", project=beta)
+
+    assert out["created"] is True
+    assert history_for(beta, "sales") == [out["hash"]]
+    assert history_for(beta, "orders") == []
+
+
+def test_deleting_and_healing_one_projects_snapshot_leaves_the_others_alone(two_projects, tmp_path: Path):
+    from tallyman_xorq import source_import
+    from tallyman_xorq.build import build_and_persist
+    from tallyman_xorq.digest import content_digest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    h = source_import.update_and_depend(str(src), "orders", project=alpha)["hash"]
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    child_a = build_and_persist(alpha, _child_code("orders", alpha)).content_hash
+    child_b = build_and_persist(beta, _child_code("orders", beta)).content_hash
+    beta_snapshot = snapshot_path(beta, h)
+    beta_digest, beta_mtime = content_digest(beta_snapshot), beta_snapshot.stat().st_mtime_ns
+
+    snapshot_path(alpha, h).unlink()
+    ensure_materialized(alpha, h)
+
+    assert snapshot_path(alpha, h).is_file()
+    assert (content_digest(beta_snapshot), beta_snapshot.stat().st_mtime_ns) == (beta_digest, beta_mtime)
+    assert len(cached_result_expr(alpha, child_a).execute()) == 3
+    assert len(cached_result_expr(beta, child_b).execute()) == 3
+
+
+def test_retiring_one_projects_clones_leaves_the_others(two_projects, tmp_path: Path):
+    """``.cas`` lives under each project's ``data/``; a sweep in one project never reaches another's."""
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq import source_import
+    from tallyman_xorq.source_import import source_clone_path
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    h = source_import.update_and_depend(str(src), "orders", project=alpha)["hash"]
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    beta_clone = source_clone_path(beta, read_manifest(entry_dir(beta, h)).provenance)
+
+    assert si.gc_cas(alpha, set(), bullpen=tmp_path / "bullpen") == 1
+
+    assert beta_clone.is_file()
+
+
+def test_a_re_import_in_one_project_does_not_stale_the_other(two_projects, tmp_path: Path):
+    from tallyman_core.aliases import set_alias
+    from tallyman_xorq import source_import
+    from tallyman_xorq.build import build_and_persist
+    from tallyman_xorq.staleness import scan
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    source_import.update_and_depend(str(src), "orders", project=alpha)
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    child_a = build_and_persist(alpha, _child_code("orders", alpha)).content_hash
+    child_b = build_and_persist(beta, _child_code("orders", beta)).content_hash
+    for proj, child in ((alpha, child_a), (beta, child_b)):
+        set_alias(proj, "totals", child)  # the scan judges live alias heads (#154)
+
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders", project=beta)
+
+    assert scan(alpha)[child_a].stale is False
+    assert scan(beta)[child_b].stale is True

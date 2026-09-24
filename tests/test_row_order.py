@@ -547,3 +547,56 @@ def test_a_raw_parquet_read_of_a_file_outside_the_project_is_a_build_error(proje
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, code)
     _assert_names_the_import(str(exc.value), outside)
+
+
+# --------------------------------------------------------------------------- #
+# #228: a read under compute_cache is allowed only when tallyman handed it out
+# --------------------------------------------------------------------------- #
+_AGG = 't.group_by("region").aggregate(total=t.price.sum(), n=t.count())'
+
+
+def _raw_read(path: Path, body: str) -> str:
+    """A recipe that opens *path* with ``xo.deferred_read_parquet``: ``t`` is that read and ``expr`` is *body*."""
+    return f"import xorq.api as xo\nt = xo.deferred_read_parquet({str(path)!r})\nexpr = {body}\n"
+
+
+def test_a_raw_read_of_an_entry_snapshot_is_a_build_error_naming_its_version(project, orders_src):
+    """#228: reading ``agg-v1``'s snapshot by its path names the entry by a bare content hash (ADR-011 D5).
+
+    The build would record no parent edge, so the entry would not go stale when ``agg`` moves. The refusal names
+    the alias version to read instead.
+    """
+    agg = _create(project, "agg", _orders(project, _AGG))
+    snapshot = _snapshot_path(project, agg)
+    assert snapshot.exists()
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(snapshot, "t.filter(t.n > 0)"))
+    assert "pinned_expr_from_alias('agg-v1')" in str(exc.value), str(exc.value)
+
+
+def test_a_raw_read_of_a_source_version_snapshot_is_a_build_error_naming_the_source_alias(project, orders_src):
+    """#228: a source version's snapshot read by its path skips the source alias, so a re-import is never followed."""
+    from tallyman_core import get_alias
+
+    snapshot = _snapshot_path(project, get_alias(project, ORDERS_SRC))
+    assert snapshot.exists()
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(snapshot, 't.filter(t.category == "boots")'))
+    assert f"pinned_expr_from_alias('{ORDERS_SRC}-v1')" in str(exc.value), str(exc.value)
+
+
+def test_a_raw_read_of_a_parquet_file_copied_under_compute_cache_is_a_build_error(project, orders_parquet):
+    """#228: a file copied into the snapshot directory is not a snapshot of any entry, so it enters by an import.
+
+    Accepted, it had no digest and no clone, and once deleted nothing could make it again.
+    """
+    import shutil
+
+    from tallyman_xorq.materialize import snapshots_dir
+
+    copied = snapshots_dir(project) / "copied.parquet"
+    copied.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(orders_parquet, copied)
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(copied, 't.group_by("region").aggregate(n=t.count())'))
+    _assert_names_the_import(str(exc.value), copied)

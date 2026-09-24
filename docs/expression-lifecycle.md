@@ -131,19 +131,20 @@ at a time. In order:
    depends on the verdict. A **worthy** entry is materialized: `materialize`
    loads the entry's frozen build (which writes the expanded build,
    `<entry>/.xorq_build_expanded/`), rebinds it onto a single-partition
-   connection, and streams the rows through the snapshot writer into
-   `compute_cache/result_cache/<content_hash>.parquet`, numbering them in a
-   last `__row_order` column. It runs the query twice and compares the content
+   connection, and streams the rows through the snapshot writer, numbering
+   them in a last `__row_order` column. The file stays at a temporary name
+   beside `compute_cache/result_cache/<content_hash>.parquet` until step 6
+   moves it into place. It runs the query twice and compares the content
    digests of the two files, so a recipe that is not reproducible is known from
    the start (`reproducible: false`, and the file is pinned). A **cheap** entry
    streams its frozen plan once, through `stream_row_count`, which forces
    row-level evaluation (a bad cast fails here, in tallyman's process; any UDF
    makes an entry worthy, so a UDF fails in `materialize`) and yields the exact
    row count, but keeps no rows. No `result.parquet` is written either way. If
-   anything from step 4 on fails, the build removes the entry directory. For a
-   worthy entry whose query had started, it also removes the snapshot file at
-   the entry's path, even one that was on disk before the build began, for
-   example one a reset left behind (#193).
+   anything from step 4 on fails, the build removes the entry directory it
+   created and its own temporary file, and nothing else: a file already at the
+   snapshot's path, such as one a reset left behind, stays as it was (#193,
+   fixed in #222).
 6. **Derive metadata**: the row count and the `result_digest` (an
    `arrow-sha256:` content digest of the snapshot, worthy entries only) come
    from the execute above. A worthy entry's schema is read from the file
@@ -155,8 +156,11 @@ at a time. In order:
    (`cache_worthy`, `cache_worthy_why`), `compile_seconds` and `cache_bytes`
    (the snapshot's size, or `None` for a cheap entry), `result_digest`,
    `reproducible`, `snapshot_format`, `engine_versions` and `parents`, and is
-   written last and atomically, so its presence means the entry is complete.
-   (Only a source entry's manifest has `provenance`, written by the import.)
+   the entry directory's last write, atomic, so its presence means the entry
+   is complete. (Only a source entry's manifest has `provenance`, written by
+   the import.) Then, for a worthy entry, `publish_snapshot` moves the staged
+   file into place with one atomic replace. That is the build's last write, so
+   the snapshot's path changes only once the entry is complete.
 7. **Mark persisted; the checkpoint commits.** `build_and_persist` sets
    `catalog_registered = True`, meaning the entry dir is fully on disk — it does
    not write git itself. Durability is the *checkpoint's* job: when the MCP tool
@@ -173,7 +177,7 @@ at a time. In order:
 |---|---|---|
 | Build recipe | `<entry>/xorq_build/` (portable) | step 4 |
 | User source | `<entry>/expr.py` | step 4 |
-| **Snapshot** (worthy only) | `<catalog>/compute_cache/result_cache/<content_hash>.parquet` | `materialize`, step 5 |
+| **Snapshot** (worthy only) | `<catalog>/compute_cache/result_cache/<content_hash>.parquet` | `materialize` at a temporary name, step 5; `publish_snapshot`, step 6 |
 | Expanded build (worthy only) | `<entry>/.xorq_build_expanded/` and its `.complete` marker | `materialize` loading the build, step 5 |
 | Schema / manifest | `<entry>/schema.json`, `<entry>/manifest.json` | step 6 |
 | Prompt history | `<catalog>/prompts/<hash>.jsonl` | step 6 |
@@ -182,13 +186,15 @@ at a time. In order:
 | Recipe zip + pointers + commit | `<catalog>/entries/<hash>.zip`, `entries.jsonl` + a git commit | the checkpoint, step 7 |
 
 `xorq_build/`, `manifest.json`, and `schema.json` are `ENTRY_ARTIFACT_NAMES` in
-`paths.py` — immutable build outputs, partitioned from the regenerable
-`ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`, `.xorq_build_expanded`,
-`.xorq_view_build`). The perf overlay symlinks the artifacts read-only and omits
-the caches, which is the operational proof of the split: nothing ever rewrites
-an artifact. There is no `result.parquet` in this list — none is written. The
-single materialized copy of a worthy entry's rows is its snapshot (§6), and a
-cheap entry keeps no copy at all.
+`paths.py` — build outputs, partitioned from the regenerable `ENTRY_CACHE_NAMES`
+(`.buckaroo_stat_cache`, `.xorq_build_expanded`, `.xorq_view_build`). The perf
+overlay symlinks the artifacts read-only and omits the caches, which is the
+operational proof of the split. One artifact is written again after create: an
+unfaithful heal records `unfaithful_heal_digest` in `manifest.json`, by an
+atomic replace that swaps an overlay's link for a file and leaves the original
+alone. There is no `result.parquet` in this list — none is written. The single
+materialized copy of a worthy entry's rows is its snapshot (§6), and a cheap
+entry keeps no copy at all.
 
 The entry directory is gitignored; its git-tracked durable form is the recipe
 zip `entries/<hash>.zip` that the checkpoint commits (step 7). So the build dir
@@ -328,20 +334,21 @@ first, and then:
   backend, recomputed on read over files that exist.
 
 If a snapshot is missing, `ensure_materialized` re-creates it under the project
-lock, after re-checking that it is still missing, by running the frozen build once
-through the same writer, and verifies the result against the `result_digest`
-recorded at build. Missing files it reads are made first, each a parent's
-snapshot, by recursing on the hash in its name. A source entry's snapshot is made
-again from its clone with the reader options in its manifest, and checked the
-same way; if the clone is gone too, the error names it and the import call that
-repairs the version.
-A mismatch is still served, but never silently: `_verify_self_heal` records a
-durable `unfaithful_heal` error (which also pins the file), wipes the entry's
-stat cache, and fires the hooks. In the companion the hook posts a forced reload
-of the entry's grid to Buckaroo and publishes an `unfaithful_heal` SSE event,
-which the SPA has no listener for; the error shows in the catalog page's error
-banner. The checks and the hook run while the heal holds the project lock
-(#203), and cheap entries that read the healed snapshot are not flagged (#208).
+lock, after re-checking that it is still missing, by running the frozen build
+once through the same writer, and verifies the result against the
+`result_digest` recorded at build. Missing files it reads are made first, each a
+parent's snapshot, by recursing on the hash in its name. A source entry's
+snapshot is made again from its clone with the reader options in its manifest,
+and checked the same way; if the clone is gone too, the error names it and the
+import call that repairs the version. A mismatch is still served, but never
+silently: `_verify_self_heal` pins the file by recording the digest it wrote in
+the manifest's `unfaithful_heal_digest`, records a durable `unfaithful_heal`
+error for the error banner, wipes the entry's stat cache, and fires the hooks.
+In the companion the hook posts a forced reload of the entry's grid to Buckaroo
+and publishes an `unfaithful_heal` SSE event, which the SPA has no listener for;
+the error shows in the catalog page's error banner. The checks and the hook run
+while the heal holds the project lock (#203), and cheap entries that read the
+healed snapshot are not flagged (#208).
 
 Every reader takes this path: the paginated viewer (`api_data` pages the entry
 with `row_order.page`, `ORDER BY __row_order` and then `LIMIT/OFFSET`, so the same
@@ -437,16 +444,17 @@ restart never does.
   build (worthy entry). No session record is written anywhere.
 - **First primary-key scan**: `<entry>/primary_key.json`.
 
-Everything keyed on the content hash is immutable, and a deleted file is made
-again and verified the next time something reads it. The only invalidations are
-a klass-changing edit, a reset or recalc, or an unfaithful heal (all of them
-the stat cache). Only the user deletes a file (the Cache page; a pinned snapshot
-is refused), apart from a failed build, which deletes the snapshot at its
-entry's path (#193). A `reset_to`
-leaves `compute_cache/` alone, and moves the `data/.cas` clones that no surviving
-source entry's `manifest.provenance` names into `<catalog>/bullpen/cas/` instead
-of deleting them, so a reset forward brings them back. A clone therefore stays
-as long as the source version that imported it survives. See `caching.md` for
-the full invalidation table. (The cold-reconstruction staleness
-hole this section used to reference — #74/#115 — is closed: reads load the
-frozen build, so a cold read cannot see a post-build edit of a data file.)
+Everything keyed on the content hash is immutable (apart from the pin an
+unfaithful heal adds to a manifest), and a deleted file is made again and
+verified the next time something reads it. The only invalidations are a
+klass-changing edit, a reset or recalc, or an unfaithful heal (all of them the
+stat cache). Only the user deletes a file (the Cache page; a pinned snapshot is
+refused), and a failed build leaves the file at its entry's path alone. A
+`reset_to` leaves `compute_cache/` alone, and moves the `data/.cas` clones that
+no surviving source entry's `manifest.provenance` names into
+`<catalog>/bullpen/cas/` instead of deleting them, so a reset forward brings
+them back. A clone therefore stays as long as the source version that imported
+it survives. See `caching.md` for the full invalidation table. (The
+cold-reconstruction staleness hole this section used to reference — #74/#115 —
+is closed: reads load the frozen build, so a cold read cannot see a post-build
+edit of a data file.)

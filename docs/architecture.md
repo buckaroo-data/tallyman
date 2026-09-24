@@ -282,19 +282,23 @@ build), `.buckaroo_stat_cache/` (Buckaroo's summary statistics) and
 Key formats, and what is tracked:
 
 - **Recipe zip** (`entries/<hash>.zip`) is the committed, durable form of an
-  entry. The checkpoint writes it, deterministically, and nothing else does.
+  entry. The checkpoint writes it, deterministically, once per entry, and
+  nothing else does, so it keeps the manifest as it was at create.
 - **Manifest** (`manifest.json`) records `content_hash`, `project`,
   `created_at`, `prompt`, `row_count`, `execute_seconds`, `compile_seconds`,
   `cache_worthy` and `cache_worthy_why` (the cheap-or-worthy verdict and its
   reason), `cache_bytes` (the snapshot's size), `result_digest`, `reproducible`
   and `nonreproducible_columns`, `snapshot_format` and `engine_versions`,
-  `parents` (`[{hash, ref, follow}]`) and, on a source entry only,
-  `provenance` (`{alias, version, path, digest, suffix, reader, imported_at}`,
-  where `alias` and `version` are the name it was imported as). It is written
-  last and atomically, and its presence means the entry is complete: the entry
+  `parents` (`[{hash, ref, follow}]`), `unfaithful_heal_digest` (set by an
+  unfaithful heal, and a pin) and, on a source entry only, `provenance`
+  (`{alias, version, path, digest, suffix, reader, imported_at}`, where `alias`
+  and `version` are the name it was imported as). It is the entry directory's
+  last write, atomic, and its presence means the entry is complete: the entry
   list, the checkpoint, recalc and the build skip or rebuild a directory that
-  has none. A page read still serves such a directory, and #204 describes
-  what that means for a worthy entry.
+  has none. A page read still serves such a directory, and #204 describes what
+  that means for a worthy entry. After create only an unfaithful heal rewrites
+  the manifest, to record `unfaithful_heal_digest`, atomically, under the
+  project lock.
 - **`compute_cache/`** holds the files tallyman writes and can make again:
   snapshots, a source entry's included. It is untracked, a reset leaves it
   alone, and anything may delete it: the next read makes what it needs again.
@@ -302,7 +306,10 @@ Key formats, and what is tracked:
   them is a source entry's snapshot once its clone is gone.
 - **Logs** (`errors.jsonl`, `events.jsonl`, `telemetry.jsonl`) live in
   `artifacts/`, outside the catalog repository, so a reset does not rewind
-  them and a recorded failure survives it.
+  them and a recorded failure survives it. Dismissing the error banner deletes
+  `errors.jsonl`, which pins nothing (a pin is in the manifest), and the
+  readers of `errors.jsonl` skip a line that is not a JSON object, so one torn
+  append does not break the banner or the error page.
 - **Display klasses** (`artifacts/display/`) are also outside the catalog
   repository, so no checkpoint commits them and no reset rewinds them.
   Summary stats and post-processing functions are inside it.
@@ -388,43 +395,46 @@ and the error shows the corrected select.
 ### Materialization
 
 A worthy entry is materialized when it is created, by one routine,
-`materialize`, which every heal of a computed entry also uses. (A source
-entry's snapshot is written by the import, and made again from its clone, with
-the same writer settings.) `materialize` runs the entry's build
-on a single-partition connection (so a float total is merged in one order),
-streams the rows through a writer with a pinned layout (zstd, row groups of
-1,048,576 rows, a page index), numbers them in a last `__row_order` column,
-writes a temporary file and renames it over the snapshot, all under the
-project lock, and returns the content digest of the file it wrote. At create it
-runs the query twice and compares the two digests. If they differ, the entry
-still builds, the manifest records `reproducible: false` with the columns that
-differed, and the snapshot is pinned. A cheap entry writes nothing: its plan is
-streamed once in full at create, so an error in it fails the tool call. Every
-file that holds a result is tallyman's; no build contains a xorq cache node,
-and xorq's own cache is not used. [caching.md](caching.md) has the details.
+`materialize`, which every heal of a computed entry also uses. (A source entry's
+snapshot is written by the import, and made again from its clone, with the same
+writer settings.) `materialize` runs the entry's build on a single-partition
+connection (so a float total is merged in one order), streams the rows through a
+writer with a pinned layout (zstd, row groups of 1,048,576 rows, a page index),
+numbers them in a last `__row_order` column, writes a temporary file and renames
+it over the snapshot, all under the project lock, and returns the content digest
+of the file it wrote. A heal renames at once; a create leaves the file at its
+temporary name and renames it after the manifest is written, so a failed build
+never touches the file already at the path. At create it runs the query twice
+and compares the two digests. If they differ, the entry still builds, the
+manifest records `reproducible: false` with the columns that differed, and the
+snapshot is pinned. A cheap entry writes nothing: its plan is streamed once in
+full at create, so an error in it fails the tool call. Every file that holds a
+result is tallyman's; no build contains a xorq cache node, and xorq's own cache
+is not used. [caching.md](caching.md) has the details.
 
 ### Reads: `cached_result_expr` and `ensure_materialized`
 
-Every consumer reads an entry's result through `cached_result_expr`:
-`/api/data` pages, charts, diffs, post-processing, and a child recipe chaining
-off the entry. It
-first calls `ensure_materialized`, which makes every file the entry's plan
-reads exist before anything runs: a missing snapshot is made again by running
-its entry's build, or, for a source entry, by parsing its clone again with the
-reader options it recorded (`_heal_a_source`). No plan reads a clone, and
-nothing in a read makes one again. With the clone gone the source entry's
+Every consumer reads an entry's result through `cached_result_expr`: `/api/data`
+pages, charts, diffs, post-processing, and a child recipe chaining off the
+entry. It first calls `ensure_materialized`, which makes every file the entry's
+plan reads exist before anything runs: a missing snapshot is made again by
+running its entry's build, or, for a source entry, by parsing its clone again
+with the reader options it recorded (`_heal_a_source`). No plan reads a clone,
+and nothing in a read makes one again. With the clone gone the source entry's
 snapshot is the last copy of its rows, so it is pinned; if it is gone too, the
 read fails with an error naming the missing clone and the
-`catalog_import_source` call, reader options included, that repairs the
-version. The Buckaroo hand-off calls `ensure_materialized` too. A
-worthy entry then reads as one bare read of its snapshot, without loading its
-build when the file exists, and a cheap entry as its frozen plan, re-run over
-files that exist. A healed snapshot is checked against the recorded
-`result_digest`. A mismatch is still served, since the rows are the honest
-output of the frozen build, but it is recorded as an `unfaithful_heal` error
-(which also pins the file) and the entry's Buckaroo statistics are wiped; when
-the heal runs in the companion, Buckaroo is also told to reload the entry's
-grid.
+`catalog_import_source` call, reader options included, that repairs the version.
+The Buckaroo hand-off calls `ensure_materialized` too. A worthy entry then reads
+as one bare read of its snapshot, without loading its build when the file
+exists, and a cheap entry as its frozen plan, re-run over files that exist. A
+healed snapshot is checked against the recorded `result_digest`. A mismatch is
+still served, since the rows are the honest output of the frozen build, but the
+heal records the digest it wrote in the manifest's `unfaithful_heal_digest`,
+which pins the file, logs an `unfaithful_heal` error for the error banner, and
+wipes the entry's Buckaroo statistics; when the heal runs in the companion,
+Buckaroo is also told to reload the entry's grid. The pin is part of the
+manifest, so it moves with the entry through a reset and survives dismissing the
+banner, which deletes the error log.
 
 ### Sources: imports and source aliases
 
@@ -540,21 +550,24 @@ carries the expanded directories along keeps reading the old location (#209).
 ### Checkpoint and reset
 
 A checkpoint takes the project lock, records the complete entry directories in
-`entries.jsonl`, zips any entry that has no
-recipe zip yet, runs `git add -A`, commits once and tags `step-NNN`. The MCP
-server checkpoints after each tool, and the companion after each mutating
-request; a recalc and a diff promotion checkpoint themselves, once each.
-`reset_to` takes the lock, runs `git reset --hard` to the step, and reconciles
-the files git does not track. Entry directories the step does not list move to
-the bullpen; listed ones that are missing are copied back from it. Source clones
-that no surviving entry refers to move to `bullpen/cas/`, never deleted, and
-clones a restored entry needs are copied back. A reset leaves `compute_cache/`
-alone: its files are named by content hash, a leftover cannot be served for
-another entry, and a file that is missing afterwards is healed like any other.
-Live operations never read the bullpen. A reset after re-adding a
-non-reproducible entry can pair its older manifest with its newer snapshot
-(#194), and after a reset back, such an entry's snapshot shows on the Cache
-page as an unpinned orphan (#195).
+`entries.jsonl`, zips any entry that has no recipe zip yet, runs `git add -A`,
+commits once and tags `step-NNN`. The MCP server checkpoints after each tool,
+and the companion after each mutating request; a recalc and a diff promotion
+checkpoint themselves, once each. `reset_to` takes the lock, runs
+`git reset --hard` to the step, and reconciles the files git does not track. Entry
+directories the step does not list move to the bullpen; listed ones that are
+missing are copied back from it. Source clones that no surviving entry refers to
+move to `bullpen/cas/`, never deleted, and clones a restored entry needs are
+copied back. A reset leaves `compute_cache/` alone: its files are named by
+content hash, a leftover cannot be served for another entry, and a file that is
+missing afterwards is healed like any other. An entry directory retired a second
+time replaces the copy already parked under its name, since the live one is the
+one that agrees with the snapshot on disk; a live directory with no manifest (an
+interrupted build's) is dropped instead. The one live reader of the bullpen is
+the Cache page: it lists a retired entry's snapshot as `retired` and decides its
+pin from the manifest parked in the bullpen, counting a retired source version's
+clone as present when it is parked in `bullpen/cas/`, since a reset forward
+brings both back.
 
 ### The project lock
 
@@ -612,17 +625,20 @@ Sources: `SSEContext.tsx` in the browser; the `/{project}/api/sse` route and the
    build stops and returns it.
 4. It writes the entry directory (`xorq_build/` with portable paths,
    `expr.py`) and runs the query: a worthy entry is materialized, twice, and its
-   snapshot written; a cheap entry is streamed once and nothing is kept.
+   snapshot written at a temporary name; a cheap entry is streamed once and
+   nothing is kept.
 5. It writes `schema.json` (read from the snapshot for a worthy entry) and then
-   `manifest.json`, last and atomically.
+   `manifest.json`, atomically. Only then is a worthy entry's snapshot moved
+   into place, as the build's last write.
 6. `catalog_create` sets the alias and adds a notebook cell. The tool notifies
    the companion, and as it returns the dispatch wrapper commits a checkpoint,
    which zips the recipe.
 7. The companion publishes `new_entry`, and the SPA refetches the entry list.
 
 If the build fails after it has created the entry directory, the directory is
-removed. For a worthy entry whose query had started, so is the snapshot file at
-the entry's path, even one that was there before the build started (#193).
+removed, along with the snapshot's temporary file. The file at the snapshot's
+path is untouched, so a snapshot that was already there, such as one a reset
+left behind, survives a failed re-add.
 
 ### catalog_import_source: bring a file in
 
@@ -735,23 +751,12 @@ the issue where it matters.
 
 Writes, the lock and processes:
 
-- #193: a failed build deletes the snapshot already on disk for its hash, for
-  example one a reset left behind.
 - #186: the project lock is one blocking lock with no timeout, so slow work in
   one process blocks page reads in the other.
 - #190: `PUT /code` and `POST /promote_diff` build on the companion's event
   loop, which freezes the UI while they wait for the lock or build.
 - #183: two tallyman servers on one project are unsupported, and nothing
   detects it.
-
-Pins and resets:
-
-- #194: a reset after re-adding a non-reproducible entry can restore its older
-  manifest over its newer snapshot.
-- #195: after a reset back, a non-reproducible entry's snapshot is listed as an
-  unpinned orphan and can be deleted.
-- #196: the pin from an unfaithful heal lives in `errors.jsonl`, so clearing the
-  error banner unpins the snapshot.
 
 Row order and diffs:
 
@@ -802,6 +807,12 @@ the copies left behind by source edits; ordered copies no longer exist), #191
 files), and the two staleness defects the first version of this list named (the
 scan wiping the source-digest memo, and a hash-pinned child stale for good on
 the source axis).
+
+Fixed on this branch: #193 by #222 (a failed build deleted the snapshot already
+on disk for its hash), and #194, #195 and #196 by #223 (a reset could pair a
+non-reproducible entry's older manifest with its newer snapshot, a retired
+entry's snapshot lost its pin, and the pin from an unfaithful heal lived in
+`errors.jsonl`, so dismissing the error banner lifted it).
 
 ## Related documentation
 

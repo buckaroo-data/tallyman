@@ -5,8 +5,8 @@
   set, and accepted on 2026-09-22, when `plans/ADR-010-immutable-store-one-owner.md` (a proposal to replace
   this set) was rejected and #189 was chosen as the direction. Where this text says a decision is "not yet
   confirmed" or "Proposed", it was implemented as written; the differences between the text and the code
-  are under "Implementation notes" below. The defects the review of #189 found are open as #193 to #211;
-  `docs/architecture.md` ("Known defects") lists them.
+  are under "Implementation notes" below. The defects the review of #189 found were filed as #193 to #211;
+  #193 to #196 are fixed (#222, #223), and `docs/architecture.md` ("Known defects") lists the rest.
   Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, which added the governing rule, decisions D10 to D12, and the resolution recorded under D5, and again the same day after a review of PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's session-ending clause was dropped, and D12's rule was restated, and a third time that day after a second review of PR #184: two kinds of entry were confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass reload, and D13 and D14 are new). Awaiting Paddy's review; nothing here is implemented. Supersedes two decisions of `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the parent's cache node) and its D8 (the manifest records the snapshot key and reads assert it). Five other ADR-006 decisions keep their intent: D5 (the canonical sort), D6 (a missing build is a hard error), D7 (verification runs in production and is loud), D10 (an unfaithful heal wipes the entry's Buckaroo state) and D12 (unfaithful entries are pinned and badged). The last three attach to `ensure_materialized`, which is this ADR's D5.
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
@@ -858,6 +858,13 @@ What the implementation does that the text above does not say, or says different
   file no entry names `orphan`; the delete route answers 409 with the reason.
 - **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
   the whole build, including the recipe import, so a chained build waits for its parent's materialization.
+- **A create publishes its snapshot last (D4, #193, fixed in #222).** The build calls `materialize(..., publish=False)`,
+  which leaves the file complete at its temp name, and moves it into place with `publish_snapshot` after the manifest
+  is written. A build that fails before then removes only its temp file, so a file already at the path, such as the
+  one a reset left on disk (D14), is kept. A heal publishes at once. A crash between the manifest write and the
+  publish leaves a complete entry over the file that was there before, or over none, which a heal then makes, and
+  leaves the temp file behind. A source entry's import needs no staging: it keeps a snapshot already at its path,
+  which holds the same rows, since that path is named by the bytes and the reader options.
 - **Clones (D13, D14).** `ensure_cas_path` clones to a unique temp name, since two builders cloning one source shared
   one. `gc_cas` moves clones into `<catalog>/bullpen/cas/` when given a bullpen.
 - **Not done here.** The independent bugs listed under D9 step 3 (the chart error loop, eager notebook sessions, the

@@ -78,7 +78,8 @@ What's working:
     drag-reorder, inline markdown editor, × remove), **Diff** (code diff, schema
     diff, per-column stats, key-joined side-by-side, head() side-by-side, and a
     promote button), **Cache** (the result snapshots on disk, with a delete
-    button; pinned snapshots cannot be deleted), **Log** (linear, filterable
+    button; pinned snapshots cannot be deleted, and a snapshot whose entry a
+    reset retired is labelled as such), **Log** (linear, filterable
     activity view), and the project list.
   - JSON: `/{project}/api/{entries,entry/<hash>,entry_cache/<hash>,
     session/<hash>,aliases,notebook,notebook_full,errors,error/<id>,log,

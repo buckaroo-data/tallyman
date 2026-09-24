@@ -338,11 +338,15 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 | `cache_worthy`, `cache_worthy_why`, `cache_bytes` | whether the entry is materialized, decided once at build, and the evidence |
 | `result_digest` | `arrow-sha256:` digest of the snapshot's content (worthy entries) — the output identity |
 | `reproducible`, `nonreproducible_columns` | whether two runs at create gave the same digest, and the columns that differed |
+| `unfaithful_heal_digest` | the digest the last unfaithful heal wrote; set, it pins the snapshot. The only field written after create |
 | `snapshot_format`, `engine_versions` | the format version and the xorq, xorq-datafusion and pyarrow versions at build |
 | `row_count`, `execute_seconds`, `compile_seconds`, timings | build measurements |
 
-The manifest is written last, atomically: its presence is the "this entry is
-complete" sentinel. An entry directory without one is treated as absent by the
+The manifest is the entry directory's last write, atomic: its presence is the
+"this entry is complete" sentinel. After that only an unfaithful heal rewrites
+it, to record `unfaithful_heal_digest`, by an atomic replace under the project
+lock. The recipe zip, written by the first checkpoint, keeps the manifest as it
+was at create. An entry directory without a manifest is treated as absent by the
 entry list, the checkpoint, recalc and the build, which builds it again. A page
 read still serves such a directory, with the snapshot's existence standing in
 for the missing `cache_worthy` (#90, #204).
@@ -457,12 +461,23 @@ total is merged in one order and is bit-stable on any machine), streams the rows
 through a writer with a pinned layout (zstd, row groups of 1,048,576 rows, a
 parquet page index, `__row_order` last), writes to a unique temp name and
 replaces the final file atomically, all under the project's write lock, and
-returns the content digest of the file it wrote, read back. A create runs the
-query twice and compares the digests; if they differ the recipe is not
+returns the content digest of the file it wrote, read back. A heal replaces the
+file at once. A create leaves the finished file at its temp name
+(`materialize(..., publish=False)`), and the build moves it into place
+(`publish_snapshot`) after the manifest is written, so a build that fails
+removes only its temp file and never the file already at the path. A create runs
+the query twice and compares the digests; if they differ the recipe is not
 reproducible, the entry still builds, and its file is **pinned**: the Cache
 page's delete leaves it alone. A snapshot changes only by an atomic replace of a
-complete file; a failed build that deletes the file already at its path breaks
-that today (#193).
+complete file.
+
+**Pins are read from the manifest alone** (`pinned_reason`): a snapshot is pinned
+when the manifest says `reproducible: false`, when it holds
+`unfaithful_heal_digest`, or when it is a source entry whose clone is gone. So a
+pin moves with its entry through a reset, and nothing outside the entry, such as
+the error log, can lift it. A snapshot whose entry a reset retired is judged by
+the manifest parked in the bullpen, and a retired source version's clone counts
+as present when a reset parked it there too.
 
 `ensure_materialized(project, hash)` is the one entry point that makes files
 exist, and every consumer that composes or executes an entry goes through it
@@ -544,9 +559,12 @@ with the failing one deleting the winner's directory):
 5. **Execute** — a worthy entry is materialized (Part 2, "Materialization"),
    which runs its query twice, writes the snapshot and yields its digest, and
    the build records the digest, the reproducibility verdict and the schema
-   read from the written file. A cheap entry is streamed once in full and keeps
-   nothing (honest evaluation, fails fast).
-6. **Record** — schema, manifest (written last, atomic).
+   read from the written file. The snapshot stays at its temp name. A cheap
+   entry is streamed once in full and keeps nothing (honest evaluation, fails
+   fast).
+6. **Record** — schema, manifest (atomic, the entry directory's last write), and
+   then the snapshot, moved into place from its temp name. A build that fails
+   before that leaves any file already at the snapshot's path as it was.
 7. **Checkpoint** — when the MCP tool returns: recipe zip, tracked pointers,
    one git commit.
 
@@ -698,10 +716,14 @@ are named by content hash, and a file that is missing afterwards is made again
 and verified like any other. It moves the clones no surviving source entry names
 in its `provenance` into the bullpen and never deletes them, and a reset forward
 copies back the clones a restored source entry names. Source aliases rewind with
-every other alias, since `aliases.jsonl` is a tracked file. Two cases involving
-an entry that is not reproducible do not hold yet: the bullpen can hand back an
-older manifest beside a newer snapshot (#194), and a retired entry's snapshot
-loses its pin (#195).
+every other alias, since `aliases.jsonl` is a tracked file. An entry directory
+retired when the bullpen already holds one under its name replaces the parked
+copy, because the live one agrees with the snapshot on disk; one with no
+manifest, left by an interrupted build, is dropped instead. So a reset forward
+brings back the manifest that matches the file. The bullpen has one live reader
+besides `reset_to`, the Cache page, which reads a retired entry's parked
+manifest (and a retired source version's parked clone) to keep its snapshot's
+pin.
 
 ## Staleness and recalc
 
@@ -752,15 +774,15 @@ not only in tests:
   verify sweep reads and never writes: a snapshot that is missing is reported as
   `absent` and checked at the moment it next exists.
 
-A failure is surfaced loudly, never only as a log line: a durable
-`unfaithful_heal` record in `errors.jsonl` (shown in the catalog page's error
-banner, and the pin: the Cache page's delete leaves the file alone), a stat
-cache wipe, and in the companion a forced reload of the entry's Buckaroo grid
-and an `unfaithful_heal` SSE event. Today the SPA has no listener for that event,
-the pin lasts only until the error log is cleared (#196), the forced reload is
-sent even when no grid is open (#203), and cheap entries that read the healed
-snapshot are not flagged (#208). Its attribution has four classes with four
-different fixes:
+A failure is surfaced loudly, never only as a log line: the pin, the digest the
+heal wrote recorded as `unfaithful_heal_digest` in the manifest (the Cache
+page's delete leaves the file alone), a durable `unfaithful_heal` record in
+`errors.jsonl` (shown in the catalog page's error banner), a stat cache wipe,
+and in the companion a forced reload of the entry's Buckaroo grid and an
+`unfaithful_heal` SSE event. Today the SPA has no listener for that event, the
+forced reload is sent even when no grid is open (#203), and cheap entries that
+read the healed snapshot are not flagged (#208). Its attribution has four
+classes with four different fixes:
 
 | class | detector | meaning | response |
 |---|---|---|---|
@@ -837,14 +859,6 @@ wrong even if every test passes.
 Where the code breaks a rule above today. Each is an open issue; none is a
 change of the rule.
 
-- **Materialization and deletion.** A failed build deletes the snapshot already
-  at its entry's path, so a snapshot changes other than by an atomic replace,
-  and a file is deleted without a user action (#193).
-- **Pins.** The pin of a non-reproducible entry is lost across a reset back
-  (#195), the pin from an unfaithful heal is lost when the error log is cleared
-  (#196), and a reset after re-adding a non-reproducible entry can restore an
-  older manifest over a newer snapshot, which breaks I1 without any record
-  (#194).
 - **Worthiness from the manifest.** With the manifest missing, the snapshot's
   existence stands in for the verdict, so a worthy entry that has lost both is
   read as cheap (#204).
@@ -904,8 +918,13 @@ proposed replacing them and was rejected.
 made a raw input a source alias whose versions are entries, which removed the
 source axis of staleness, the identity modes, `manifest.sources` and the ordered
 copy, and with them the defects listed here before it (#191, #197, #198, #207,
-#211, and the two staleness defects that had no issue). The wider audit of the
-same bug class is
+#211, and the two staleness defects that had no issue). Four deviations this
+section listed were fixed on the same branch: a failed build deleted the
+snapshot already at its path (#193, fixed in #222), and a reset could pair a
+non-reproducible entry's older manifest with its newer snapshot, a retired
+entry's snapshot lost its pin, and dismissing the error banner lifted an
+unfaithful heal's pin (#194, #195 and #196, fixed in #223). The wider audit of
+the same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes
 too.

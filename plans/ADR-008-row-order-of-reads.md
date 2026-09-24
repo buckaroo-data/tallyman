@@ -5,7 +5,7 @@
   set, and accepted on 2026-09-22, when `plans/ADR-010-immutable-store-one-owner.md` (a proposal to replace
   this set) was rejected and #189 was chosen as the direction. Where this text says a decision is "not yet
   confirmed" or "Proposed", it was implemented as written; the differences between the text and the code
-  are under "Implementation notes" below. The defects the review of #189 found are open as #193 to #211;
+  are under "Implementation notes" below. The defects the review of #189 found were filed as #193 to #211;
   those touching this ADR are #199, #200, #205 and #206. Three more, #197, #198 and #211, were about the
   ordered copy of D2, which `plans/ADR-011-sources-are-aliases.md` replaced with the source entry's snapshot,
   so they no longer apply.

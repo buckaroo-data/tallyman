@@ -148,21 +148,33 @@ every heal (a **heal** re-creates a snapshot that is missing from disk):
 - it writes to a unique temporary name in the destination directory and then
   replaces the destination with `os.replace`, under the project's write lock.
 
-A create always runs the query and replaces whatever file is at the path. A
-create of a worthy entry runs it twice through the writer and compares the
-content digests of the two files (`check_reproducible`), since at create time
-nothing is recorded to compare against. If they differ the build still
-succeeds, and the manifest records `reproducible: false` with the columns that
-differed. The file is then **pinned**: the Cache page will not delete it, since
-it cannot be re-created faithfully. A heal runs the query once and checks the
-result against the recorded digest.
+A create always runs the query, and what it writes replaces whatever file is at
+the path. A create of a worthy entry runs it twice through the writer and
+compares the content digests of the two files (`check_reproducible`), since at
+create time nothing is recorded to compare against. If they differ the build
+still succeeds, and the manifest records `reproducible: false` with the columns
+that differed. The file is then **pinned**: the Cache page will not delete it,
+since it cannot be re-created faithfully. A heal runs the query once, replaces
+the file at once, and checks the result against the recorded digest.
 
-Two defects weaken this. A worthy entry's build that fails once its query has
-started removes the file at the snapshot's path, whoever wrote it, so a failed
-re-add deletes a snapshot a reset left behind (#193). And a pin holds only as long as its
-evidence can be found: `pinned_reason` reads the live entry's manifest, which a
-reset back moves to the bullpen (#195), and the log record of an unfaithful
-heal, which clearing the error banner deletes (#196).
+A create does not replace the file straight away. It calls
+`materialize(..., publish=False)`, which leaves the finished file at its
+temporary name, and the build moves it into place (`publish_snapshot`) as its
+last step, after the manifest is written. A build that fails before then removes
+only its temporary file, so a file already at the path is kept, such as one a
+reset left on disk, which for an entry that is not reproducible is the only copy
+of its rows (#193, fixed in #222). A source entry needs no such staging: the
+import keeps a snapshot already at its path, which holds the same rows, since
+the path is named by the bytes and the reader options.
+
+**Pins.** `pinned_reason` decides from the entry's manifest alone. A snapshot is
+pinned when the manifest says `reproducible: false`, when it holds
+`unfaithful_heal_digest` (the digest an unfaithful heal wrote, below), or when
+it is a source entry whose clone is gone. Because the pin is part of the
+manifest, it moves with the entry through a reset and survives the error
+banner's dismiss, which deletes `errors.jsonl` (#196, fixed in #223). For a file
+whose entry a reset retired, the manifest parked in the bullpen speaks for it
+(`snapshot_manifest`), so the pin holds while the entry is retired (#195).
 
 The row-group size and the batch size decide the batch boundaries that an entry
 built on the file sees, and an ungrouped float total depends on them (#187), so
@@ -268,26 +280,29 @@ longer be read (#204).
 | Snapshot of a source entry, same directory | the import | parse the clone again with the recorded reader options, and verify the digest; with the clone gone too, raise an error naming the clone and the import that repairs it |
 | Clone, `data/.cas/<digest><suffix>` | the import (`ensure_cas_path`) | nothing in a read makes it again; the snapshot is pinned while it exists, and a re-import of the same bytes writes the clone back |
 
-A healed snapshot is checked against the recorded `result_digest`. A mismatch
-is still served, since the rows are the honest output of the frozen build, but
+A healed snapshot is checked against the recorded `result_digest`. A mismatch is
+still served, since the rows are the honest output of the frozen build, but
 never silently (`_verify_self_heal`). It logs a warning that attributes the
 change: an engine version that differs from the manifest's `engine_versions`, a
 recipe that re-derives a different graph hash (#88), or a fixed graph that runs
-differently each time (#83). It records a durable `unfaithful_heal` error,
-which also pins the file, wipes the entry's Buckaroo stat cache, and fires the
-registered hooks. In the companion the hook posts a forced reload of the
-entry's grid to Buckaroo and publishes an `unfaithful_heal` SSE event. The SPA
-has no listener for that event; the error appears in the catalog page's error
-banner the next time the page refetches. All of this runs while the heal still
-holds the project lock, and the forced reload is posted whether or not a grid
-is open, without a promoted diff's colouring (#203). Only the healed entry is
-flagged: a cheap child of it reads the same snapshot, so the child's rows change
-under its hash with no record and no reload (#208). The MCP server registers no
-hook, so a heal that runs there records the error and wipes the stat cache
-only. A source entry's snapshot made again from its clone goes through the same
-check, so if a reader now parses the bytes differently, the difference is
-recorded as an unfaithful heal and the manifest keeps the digest of the rows
-that were imported.
+differently each time (#83). It records the digest it wrote in the manifest's
+`unfaithful_heal_digest`, which pins the file, records a durable
+`unfaithful_heal` error for the error banner, wipes the entry's Buckaroo stat
+cache, and fires the registered hooks. That field is the only one written after
+create: an unfaithful heal is the one thing that rewrites a manifest,
+atomically, under the heal's lock. In the companion the hook posts a forced
+reload of the entry's grid to Buckaroo and publishes an `unfaithful_heal` SSE
+event. The SPA has no listener for that event; the error appears in the catalog
+page's error banner the next time the page refetches. All of this runs while the
+heal still holds the project lock, and the forced reload is posted whether or
+not a grid is open, without a promoted diff's colouring (#203). Only the healed
+entry is flagged: a cheap child of it reads the same snapshot, so the child's
+rows change under its hash with no record and no reload (#208). The MCP server
+registers no hook, so a heal that runs there records the pin and the error and
+wipes the stat cache only. A source entry's snapshot made again from its clone
+goes through the same check, so if a reader now parses the bytes differently,
+the difference is recorded as an unfaithful heal and the manifest keeps the
+digest of the rows that were imported.
 
 Both shapes are single-backend expressions, so two entries compose (`union`,
 `join`, a diff) without tripping xorq's "multiple backends" guard. Chaining
@@ -358,11 +373,12 @@ else (#185).
 Files are deleted only by an explicit user action, and written only because
 something is about to read them. The startup warm-up writes nothing here, the
 verify sweep (`catalog_scan_staleness(verify_results=True)`) reads and never
-writes, and a reset leaves the directory alone. The Cache page's delete is meant
-to be the one deleter; a failed build is the other (#193). The page answers 409 with
-the reason for a pinned snapshot, and it lists a snapshot whose entry is no
-longer in the catalog as an orphan row, so that it can be deleted. A source
-entry's snapshot is listed like any other.
+writes, and a reset leaves the directory alone. The Cache page's delete is the
+one deleter. The page answers 409 with the reason for a pinned snapshot. It
+lists a snapshot whose entry a reset retired as a `retired` row, whose pin comes
+from the manifest parked in the bullpen, and a snapshot that no entry names,
+live or retired, as an `orphan` row, so that the user can delete either. A
+source entry's snapshot is listed like any other.
 
 The project's write lock (`catalog_state.project_lock`) is taken by a build
 (for its whole length), an import, a materialization or heal, a checkpoint and
@@ -393,11 +409,17 @@ So `reset_to` moves the clones that no surviving source entry's
 clones a restored entry names. A reset that cannot read every surviving
 manifest skips the sweep. `compute_cache.jsonl` no longer exists.
 
-Two defects affect entries that are not reproducible. The bullpen keeps the
-first copy of an entry directory it receives, so a reset after re-adding such
-an entry can bring back its older manifest beside its newer snapshot (#194).
-And while the entry is retired, its snapshot shows on the Cache page as an
-unpinned orphan, which the page lets you delete (#195).
+When a reset retires an entry whose directory the bullpen already holds (an
+entry retired once, restored, and retired again), the live directory replaces
+the parked one, since it is the one that agrees with the snapshot on disk: a
+create always rewrites the snapshot, and an entry that is not reproducible
+records another `result_digest` each time (#194, fixed in #223). A live
+directory with no manifest, which an interrupted build leaves, never replaces a
+parked one and is dropped instead. The bullpen has one live reader besides
+`reset_to`: the Cache page reads a retired entry's parked manifest to decide its
+snapshot's pin, and for a retired source version it counts a clone parked in
+`bullpen/cas/` as present, since a reset forward brings the entry and the clone
+back together (#195).
 
 ### In-memory caches in the companion
 
@@ -494,21 +516,25 @@ it is never stale. There is no session file.
 
 ### Per-entry immutable records
 
-Not caches in the eviction sense — immutable build outputs, valid forever
-because the entry they describe never changes. `paths.py` draws the line
-explicitly: `ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `manifest.json`,
-`schema.json`) are the immutable artifacts; the write-isolated perf overlay
-symlinks them read-only — safe because nothing ever rewrites them — and omits
+Not caches in the eviction sense — build outputs, valid forever because the
+entry they describe never changes. `paths.py` draws the line explicitly:
+`ENTRY_ARTIFACT_NAMES` (`xorq_build/`, `manifest.json`, `schema.json`) are the
+artifacts; the write-isolated perf overlay symlinks them read-only — safe
+because the only later write, an unfaithful heal recording
+`unfaithful_heal_digest` in `manifest.json`, is an atomic replace that swaps
+the overlay's link for a file and leaves the original alone — and omits
 `ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`, `.xorq_build_expanded`,
 `.xorq_view_build`) so a benchmark starts honestly cold.
 
 The entry directory itself is gitignored. Its durable, git-tracked form is the
 recipe zip `entries/<hash>.zip` — a deterministic archive of `expr.py`,
-`xorq_build/`, `manifest.json`, and `schema.json`, written by the checkpoint
-(`tallyman_core/catalog.py`). So the build dir is untracked-but-durable: the
-recipe zip carries it across a clone, and `entries.jsonl` records which dirs
-should exist so `reset_to` can reconcile them from the bullpen. (See the native
-catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
+`xorq_build/`, `manifest.json`, and `schema.json`, written once, by the first
+checkpoint after create (`tallyman_core/catalog.py`), so its manifest does not
+carry an `unfaithful_heal_digest` recorded later. So the build dir is
+untracked-but-durable: the recipe zip carries it across a clone, and
+`entries.jsonl` records which dirs should exist so `reset_to` can reconcile them
+from the bullpen. (See the native catalog store, `catalog.py` /
+`catalog_state.py`, for the full tracked surface.)
 
 - **Primary key** (`src/tallyman_xorq/primary_key.py`) —
   `<entry>/primary_key.json` saves a full-table cardinality scan. A cheap
@@ -533,9 +559,9 @@ catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
   `compile_seconds`, `cache_worthy`, `cache_worthy_why`, `cache_bytes`), the
   `result_digest` (a content digest of the snapshot, worthy entries only),
   `reproducible` and `nonreproducible_columns`, `snapshot_format` and
-  `engine_versions`, `parents`, and on a source entry `provenance` (where the
-  file came from, its digest, the reader options and the name it was imported
-  as).
+  `engine_versions`, `parents`, `unfaithful_heal_digest` once an unfaithful
+  heal has pinned the file, and on a source entry `provenance` (where the file
+  came from, its digest, the reader options and the name it was imported as).
   A worthy entry's schema is read from the file `materialize` wrote, which is
   why a `timestamp[s]` column is recorded as `timestamp[ms]`. Every entry's
   schema ends in `__row_order`. All of it is fixed at build so later reads
@@ -612,32 +638,31 @@ Most of the stack never invalidates because it never can be stale: tallyman
 entry hashes (a source entry's named by its bytes and reader options), snapshot
 paths (named by content hash), primary-key files, and manifests all rely on
 "same key, same rows, forever". Cleanup for those is a space concern.
-Only the user deletes a file (apart from a failed build, #193), and a deleted
-file is made again and verified the next time something reads it.
+Only the user deletes a file, and a deleted file is made again and verified
+the next time something reads it.
 
 One documented hole breaks "never stale": execution nondeterminism. An entry
 whose recipe calls `now()` / `random()` / an unseeded `sample()` or an impure
-UDF produces different rows each run under one content hash, so a cold
-recompute can disagree with what was built (#88). The build flags `now()`,
-`today()`, `random()`, `uuid()` and an unseeded `sample()` as advisory lint
-warnings (`_nondeterminism_warnings`, `build.py`); an impure UDF is not flagged,
-since purity cannot be read off the graph. A worthy entry is also run twice when
-it is created, so a recipe that is not
-reproducible is known from the start: the manifest records
-`reproducible: false`, the build result names the columns that differed, and the
-snapshot is pinned. That check cannot see `today()`, since both runs agree (the
-lint does), or what an entry inherits from a non-reproducible parent, since both
-runs read the same parent file (#185). The runtime backstop is `result_digest`:
-every heal verifies the repopulated snapshot against it before serving
-(`_verify_self_heal`), and an unfaithful heal wipes the entry's stat cache,
-records a durable error, pins the file, and, in the companion, forces Buckaroo
-to reload the entry's grid. It does not reach the cheap entries that read the
-healed snapshot, whose rows change with it (#208). An engine or writer upgrade
-that changes results is attributed to the versions in `engine_versions`, and
-the remedy is a corpus rebuild. The second
-hole this section used to document — cold reads re-running `expr.py` and
-re-digesting live sources, serving edited bytes under the original hash
-(#115/#163) — is closed: reads load the frozen build, whose leaves are bare
+UDF produces different rows each run under one content hash, so a cold recompute
+can disagree with what was built (#88). The build flags `now()`, `today()`,
+`random()`, `uuid()` and an unseeded `sample()` as advisory lint warnings
+(`_nondeterminism_warnings`, `build.py`); an impure UDF is not flagged, since
+purity cannot be read off the graph. A worthy entry is also run twice when it is
+created, so a recipe that is not reproducible is known from the start: the
+manifest records `reproducible: false`, the build result names the columns that
+differed, and the snapshot is pinned. That check cannot see `today()`, since
+both runs agree (the lint does), or what an entry inherits from a
+non-reproducible parent, since both runs read the same parent file (#185). The
+runtime backstop is `result_digest`: every heal verifies the repopulated
+snapshot against it before serving (`_verify_self_heal`), and an unfaithful heal
+pins the file in its manifest, wipes the entry's stat cache, records a durable
+error, and, in the companion, forces Buckaroo to reload the entry's grid. It
+does not reach the cheap entries that read the healed snapshot, whose rows
+change with it (#208). An engine or writer upgrade that changes results is
+attributed to the versions in `engine_versions`, and the remedy is a corpus
+rebuild. The second hole this section used to document — cold reads re-running
+`expr.py` and re-digesting live sources, serving edited bytes under the original
+hash (#115/#163) — is closed: reads load the frozen build, whose leaves are bare
 reads of snapshots named by content hash and inlined cheap parent graphs, and a
 data file enters only by an import, so a cold read cannot see a post-build edit
 at all.

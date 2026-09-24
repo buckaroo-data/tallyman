@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from tallyman_core import (
     AliasExists,
+    AliasKindMismatch,
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
@@ -834,6 +835,12 @@ def catalog_alias(hash: str, name: str) -> dict:
 
     Use this when an entry was created via `catalog_run` and you decide
     post-hoc that it deserves a name. Errors if the alias already exists.
+
+    The entry must be a computed one. A source entry (a version of an imported
+    file) belongs to its source alias and cannot take a catalog name (ADR-011
+    D1); to give a source a second name, `catalog_create` an entry whose recipe
+    is `tracked_expr_from_alias("<source alias>")`, which follows the source
+    when it is imported again.
     """
     project = _resolve_active_project()
     refusal = _source_alias_refusal(project, name, "given to another entry")
@@ -843,7 +850,10 @@ def catalog_alias(hash: str, name: str) -> dict:
         return {"error": f"no catalog entry for hash {hash!r}"}
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists"}
-    info = set_alias(project, name, hash, expect_exists=False)
+    try:
+        info = set_alias(project, name, hash, expect_exists=False)
+    except AliasKindMismatch as exc:  # a source entry: the message names its source alias-version and the steer
+        return {"error": str(exc)}
     notebook.append(project, name)
     _notify("alias_changed", content_hash=hash, alias=name, version=info["version"])
     _notify("notebook_changed")

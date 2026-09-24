@@ -302,31 +302,82 @@ def _csv_direct_read_check(expr) -> None:
         )
 
 
-def _raw_parquet_read_check(expr, project: str) -> None:
-    """Raise BuildError if the recipe reads a parquet file that tallyman did not write (ADR-008 D12).
+def _raw_parquet_read_check(expr, project: str, handed_out: frozenset[Path]) -> None:
+    """Raise BuildError if the recipe reads a parquet file that tallyman did not hand it (ADR-008 D12, #228).
 
-    Such a read has no digest and no clone, so an entry built on it has no ``__row_order`` to page by and no record
-    of which bytes it was built from. Tallyman's own files are the snapshots under the project's ``compute_cache/``;
-    everything else enters by an import (ADR-011 D2).
+    *handed_out* is every file behind a result tallyman gave the recipe while it ran: ``cached_result_expr`` records
+    them (``parent_capture.note_reads``), and ``tracked_expr_from_alias``, ``pinned_expr_from_alias`` and a promoted
+    diff's ``build_diff_expr`` all read through it. A worthy parent is a read of its snapshot, and a cheap parent's
+    plan reads its own parents' snapshots. Any other ``deferred_read_parquet`` is refused:
+
+    - a file outside ``compute_cache/`` has no digest and no clone, so an entry built on it has no ``__row_order`` to
+      page by and no record of which bytes it was built from. It enters by an import (ADR-011 D2);
+    - an entry's snapshot read by its path names the entry by a bare content hash, which ADR-011 D5 refuses: no parent
+      edge is recorded, so the entry would not go stale when the parent's alias moves;
+    - any other file under ``compute_cache/`` is not a snapshot tallyman can make again, so it enters by an import too.
     """
     from xorq.common.utils.graph_utils import walk_nodes
     from xorq.expr.relations import Read
 
     from tallyman_core.paths import compute_cache_dir
 
+    allowed = {p.resolve() for p in handed_out}
     root = compute_cache_dir(project).resolve()
     for node in walk_nodes(Read, expr):
         if node.method_name != "read_parquet":
             continue
         path = dict(node.read_kwargs).get("hash_path")
-        if path is None or Path(str(path)).resolve().is_relative_to(root):
+        if path is None:
             continue
+        resolved = Path(str(path)).resolve()
+        if resolved in allowed:
+            continue
+        if resolved.is_relative_to(root):
+            raise BuildError(_cache_read_refusal(project, resolved, str(path)))
         raise BuildError(
             f"the recipe reads {path} with xo.deferred_read_parquet, which is not allowed: the file gets no "
             "content digest and no clone, so the entry would have no __row_order to page by and no record of "
             f"which bytes it was built from. Import the file first — catalog_import_source({str(path)!r}, "
             "'<alias>') — and read it, like any other parent, with tracked_expr_from_alias('<alias>')."
         )
+
+
+def _cache_read_refusal(project: str, resolved: Path, path: str) -> str:
+    """The message for a ``deferred_read_parquet`` of a file under ``compute_cache/`` that tallyman did not hand out.
+
+    A snapshot is named by its entry's content hash, so the message names the alias version that holds the entry
+    (``aliases.version_of_hash``), the read to write instead. Any other file there is named by the import.
+    """
+    from tallyman_core.aliases import version_of_hash
+    from tallyman_xorq.materialize import snapshots_dir
+
+    said = f"the recipe reads {path} with xo.deferred_read_parquet, which is not allowed"
+    content_hash = resolved.stem
+    is_snapshot = (
+        resolved.suffix == ".parquet"
+        and resolved.parent == snapshots_dir(project).resolve()
+        and entry_manifest_path(project, content_hash).is_file()
+    )
+    if not is_snapshot:
+        return (
+            f"{said}: the file is under compute_cache/, tallyman's cache, but it is not the snapshot of any entry, so "
+            "it has no content digest and no clone and nothing could make it again. Import it first — "
+            f"catalog_import_source({path!r}, '<alias>') — and read it with tracked_expr_from_alias('<alias>')."
+        )
+    named = version_of_hash(project, content_hash)
+    if named is None:
+        return (
+            f"{said}: it is the snapshot of entry {content_hash}, which heads no alias history. Reading it by its "
+            "path names that entry by a bare content hash (ADR-011 D5), so the build would record no parent edge. "
+            "Give the entry a name with catalog_alias first, then read it with pinned_expr_from_alias('<alias>-v<N>')."
+        )
+    alias, version = named
+    return (
+        f"{said}: it is the snapshot of {alias}-v{version} (entry {content_hash}). Reading it by its path names that "
+        "entry by a bare content hash (ADR-011 D5), so the build would record no parent edge and the new entry would "
+        f"not go stale when {alias} moves. Read it with pinned_expr_from_alias('{alias}-v{version}'), or with "
+        f"tracked_expr_from_alias('{alias}') to follow the alias."
+    )
 
 
 def _nondeterminism_warnings(expr) -> list[str]:
@@ -446,9 +497,11 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
     from tallyman_xorq import parent_capture as pc
 
     parent_token = pc.begin_collect()
+    reads_token = pc.begin_reads()
     try:
         module, tmp_script = _import_script(code)
     finally:
+        handed_out = pc.end_reads(reads_token)
         parents = pc.end_collect(parent_token)
     expr_obj = getattr(module, expr_name, None)
     if expr_obj is None:
@@ -460,9 +513,10 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
 
     # Fatal: raw reads are banned. A file enters the catalog by an import and a recipe reads the source alias
     # (ADR-011 D2); read_project_file and tallyman_read_csv refuse in io.py, and these two catch the xorq readers
-    # that would otherwise go straight to a file with no digest, no clone and no __row_order.
+    # that would otherwise go straight to a file with no digest, no clone and no __row_order, or to another entry's
+    # snapshot by its content hash (#228). A read tallyman handed the recipe (handed_out) is allowed.
     _csv_direct_read_check(expr_obj)
-    _raw_parquet_read_check(expr_obj, project)
+    _raw_parquet_read_check(expr_obj, project, handed_out)
 
     # Whether the entry is materialized is decided ONCE, here, on the expression the author wrote (ADR-008 D4), and
     # recorded in the manifest. The rewrite below then adds the canonical sort to a worthy entry and checks that a

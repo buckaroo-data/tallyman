@@ -554,12 +554,23 @@ def cached_result_expr(project: str, content_hash: str):
       * Cheap entry: the loaded build's graph, rebound onto the default backend (ADR-006 D3). Its small plan re-runs on
         every read over files that exist, and the graph is frozen, so the rows are the entry's recorded result and
         never today's alias heads.
+
+    During a build the files the returned expression reads are recorded (``parent_capture.note_reads``): they are the
+    only files the recipe's graph may read with ``deferred_read_parquet`` (#228). A reconstruction (``_RECONSTRUCTING``)
+    records nothing, the same way it records no parent edge: its reads belong to the recipe it re-runs, not to the
+    one being built.
     """
-    from tallyman_xorq.materialize import _ensure
+    from tallyman_xorq import parent_capture as pc
+    from tallyman_xorq.materialize import _ensure, snapshot_path
 
     if _ensure(project, content_hash):
-        return _snapshot_read(project, content_hash)
-    return _resolve_result_plan(project, content_hash).graph
+        expr, reads = _snapshot_read(project, content_hash), (snapshot_path(project, content_hash),)
+    else:
+        plan = _resolve_result_plan(project, content_hash)
+        expr, reads = plan.graph, plan.reads
+    if not _RECONSTRUCTING.get():
+        pc.note_reads(reads)
+    return expr
 
 
 def preload_plan(project: str, content_hash: str) -> None:

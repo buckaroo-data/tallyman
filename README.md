@@ -58,7 +58,7 @@ companion via SSE.
 What's working:
 
 - **MCP tools** (FastMCP over stdio, 31 tools):
-  - Catalog: `catalog_run`, `catalog_load_parquet`, `catalog_create`,
+  - Catalog: `catalog_import_source`, `catalog_run`, `catalog_create`,
     `catalog_revise`, `catalog_alias`, `catalog_rename`, `catalog_unalias`,
     `catalog_list`, `catalog_diff`, `catalog_promote_diff`, `catalog_chart`,
     `catalog_chart_errors`, `catalog_scan_staleness`, `catalog_recalc`,
@@ -143,7 +143,8 @@ In another terminal, launch Claude Code from this directory; it picks up
 
 Recommended prompts:
 
-> Use catalog_load_parquet to load `orders.parquet`.
+> Use catalog_import_source to import
+> `~/.tallyman-notebooks/projects/spike/data/orders.parquet` as `orders`.
 >
 > Now use catalog_create to make a named entry `shoe_sales` that groups orders
 > by region and totals the price.
@@ -174,17 +175,20 @@ project's cheap entries read from the original location; see
 
 ## Conventions worth knowing
 
-- Recipes read data with `read_project_file` (parquet under `data/`),
-  `tallyman_read_csv` (CSV) and `tracked_expr_from_alias` /
-  `pinned_expr_from_alias` (catalog entries). `xo.deferred_read_parquet` on a
-  file outside the project's `compute_cache/` is a build error, since the file
-  would get no content digest and no `__row_order` column, and `xo.read_parquet`
-  resolves through ibis's backend loader and fails. Use
-  `import xorq.api as xo` and `import xorq.vendor.ibis as ibis`. Do NOT
-  `import ibis` directly.
-- Prefer `from tallyman_xorq.io import read_project_file; t = read_project_file("name.parquet")`
-  over absolute paths — the catalog records project-relative intent and the
-  build is portable across machines/users.
+- A file enters the catalog only through `catalog_import_source(path, alias)`,
+  which copies its bytes into the project and makes each version of it an entry
+  under a **source alias**; the path can be anywhere and is never read again.
+  Import it again to bring in new data: different bytes mint the next version,
+  and the entries downstream are recalculated. A CSV takes its `schema` and
+  reader options in the import call, and they are fixed there.
+- Recipes read entries by alias, never files:
+  `tracked_expr_from_alias("orders")` follows an alias and
+  `pinned_expr_from_alias("orders-v2")` pins one version. `read_project_file`,
+  `tallyman_read_csv`, `xo.deferred_read_csv` and `xo.deferred_read_parquet` on a
+  file outside the project's `compute_cache/` are build errors that name the
+  import to use, and `xo.read_parquet` resolves through ibis's backend loader and
+  fails. Use `import xorq.api as xo` and `import xorq.vendor.ibis as ibis`. Do
+  NOT `import ibis` directly.
 - Content hash is xorq's build hash — same code + same inputs → same hash → same
   entry dir (idempotent).
 - All catalog state lives on disk. The MCP server and the companion keep only

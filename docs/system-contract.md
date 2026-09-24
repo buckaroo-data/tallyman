@@ -13,6 +13,10 @@
   accepted on 2026-09-22 and implemented in #189.
   `plans/ADR-010-immutable-store-one-owner.md`, a later proposal to replace
   those three, was rejected the same day.
+  `plans/ADR-011-sources-are-aliases.md` (a raw input is a source alias whose
+  versions are entries, a file enters only by an explicit import, recipes name
+  aliases and never bare hashes, and staleness has one axis), accepted the same
+  day and implemented in #217, #218 and #219.
 - **Audience:** no prior xorq knowledge assumed. The xorq section below covers
   exactly as much of xorq as the rest of the doc needs, and no more.
 
@@ -110,7 +114,7 @@ Three properties matter:
   (build artifacts should be reproducible from what the expression *is*), and
   it is the single most consequential xorq design choice for tallyman: **if
   you want content identity, you must put the content in the path.** Tallyman
-  does (Part 2, CAS).
+  does (Part 2, "Project, imports and source entries").
 
 `load_expr(build_dir)` is the inverse: it reads the yaml and mints **fresh
 backend objects** from the profiles (nothing is memoized — two loads of the
@@ -157,81 +161,103 @@ adds the output axis itself (Part 2, `result_digest`).
     answer to new — built to serve the current file's answer fast, nothing
     more. Tallyman needs the opposite: entries are history, so identity must
     hold still while data moves (that is what makes V3-vs-V4 meaningful), and
-    change is handled explicitly instead — the manifest records what the
-    world *was* (source digests, parent hashes), the staleness scan detects
-    by comparing that record against the live world, recalc mints new entries
-    and advances aliases, and old entries keep serving their old bytes
-    forever. A key whose job is to move when data moves has nothing to hang
-    that on. Bolting it under tallyman's caches would also collide with
-    identity mechanically: the expression hash is hardwired to path-only
-    normalization (measured in the source-identity ADR), so mtime-keyed
-    caches would move while entry hashes stood still — fresh bytes under an
-    old name, the #163 failure shape. CAS serves both needs with one
-    mechanism: content in the path gives the hash and every cache key an
-    identity that moves exactly when content moves, and the recorded digests
-    give staleness something durable to compare. (One stat use survives, as
-    an accelerator: the source-digest memo skips re-hashing files whose stat
-    is unchanged; content stays the truth.)
+    change is handled explicitly instead — new data is imported as a new
+    version of a source alias, the manifest records which version of each
+    parent an entry was built on, the staleness scan compares that record with
+    the alias heads, recalc mints new entries and advances aliases, and old
+    entries keep serving their old bytes forever. A key whose job is to move
+    when data moves has nothing to hang that on. Bolting it under tallyman's
+    caches would also collide with identity mechanically: the expression hash
+    is hardwired to path-only normalization (measured in the source-identity
+    ADR), so mtime-keyed caches would move while entry hashes stood still —
+    fresh bytes under an old name, the #163 failure shape. Content-named files
+    serve both needs with one mechanism: the hash and every cache key move
+    exactly when content moves, and an import is the one event that moves
+    them.
 
 ---
 
 # Part 2 — The tallyman primitives
 
-## Project, sources, and CAS
+## Project, imports and source entries
 
 A **project** is a directory (`~/.tallyman-notebooks/projects/<name>/`) holding
-user data files (`data/`) and the catalog (`artifacts/catalog/`, a git repo).
+the catalog (`artifacts/catalog/`, a git repo) and the clone store
+(`data/.cas/`).
 
-A **source** is a user-provided data file. Sources are mutable on disk — the
-user can overwrite `trips.parquet` any time — so tallyman never lets an entry
-depend on a live source path. At build time each source is:
+**A recipe names aliases. A build reads only files tallyman owns.** A data file
+the user has is mutable and outside tallyman's control, so no build ever reads
+one. It enters the catalog by one explicit act, an **import**
+(`catalog_import_source`, `source_import.update_and_depend`), which:
 
-1. digested (md5, memoized on stat so unchanged files hash once),
-2. cloned copy-on-write to `data/.cas/<digest><suffix>` (the **clone**),
-3. read through the clone.
+1. digests the file (md5) and clones its bytes, copy-on-write where the
+   filesystem offers it, to `data/.cas/<digest><suffix>` (the **clone**),
+   digesting the clone again and refusing it if it does not match its name;
+2. writes one parquet file of its rows, in file order plus a last `__row_order`
+   column, `0..N-1`, to `compute_cache/result_cache/<content_hash>.parquet`:
+   pyarrow copies a parquet file, keeping its types, and polars parses a CSV
+   under the schema and `scan_csv` options the call names;
+3. writes an entry, the **source entry**, with a generated recipe, a frozen
+   build, a schema and a manifest whose `provenance` records the outside path,
+   the digest, the reader options and the name it was imported as;
+4. appends that entry to a **source alias**, as its next version.
 
-This is **CAS** (content-addressed sources, the default `cas` identity mode),
-and it is the answer to xorq's path-only hashing: the path *is* the digest, so
-every xorq-level key (the expression hash, and the name of every file tallyman
-writes) becomes content-honest for free. Edit a source and rebuild: the digest
-changes, the path changes, the hash changes, a new entry forks. The clone is the
-entry's immutable input forever; the live file is merely where the *next* build
-will look. The other identity modes, `salt` and `off`, skip the clone and read
-the live file at build time.
+The outside path is provenance from then on and is never read again: editing,
+moving or deleting the file changes no build. To bring in new data, import the
+file again under the same alias. Different bytes mint the next version, and the
+entries that follow the alias go stale exactly as after a revise. The same bytes
+are a no-op.
 
-A recipe never reads the source or its clone directly. Ingest writes an
-**ordered copy** of the clone under the project's `compute_cache/ordered_sources/`:
-polars reads the clone in file order and writes a parquet file with the same
-columns and one more at the end, `__row_order`, `0..N-1`. The copy is named by
-the source's digest and the reader options (the schema and `scan_csv` options
-of a CSV), in every identity mode, and the recipe reads that file. So a
-recipe's reads are all files tallyman wrote, each carrying the column that
-pages sort by (Part 2, "Row order"). The copy should have the source's column
-types; for a few Arrow types it does not yet (#197).
+A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
+truncated to 12 hex characters: the bytes and the reader options, and nothing
+else. That is the answer to xorq's path-only hashing. Every file a recipe's
+expression reads is a snapshot, named by the content hash of the entry it holds,
+so every xorq-level key (the expression hash, and the name of every file
+tallyman writes) is content-honest, and the chain of names ends at hashes of
+bytes. The reader options are fixed at import (a CSV read two ways is two
+imports under two aliases), and they must be plain values that the entry can
+record: a callable option is refused.
+
+The import's outcomes form a table (ADR-011 D3). With no `pinned_version`: a new
+alias mints v1, bytes that differ from the head mint the next version, and bytes
+equal to the head are a no-op. With `pinned_version=N`: the file must be version
+N (a no-op) or, as N = head + 1, new bytes; anything else is an error, and
+versions cannot be skipped. History is append-only, so bytes equal to a version
+older than the head are refused, naming `reset_to` as the way back. And **one set
+of bytes, read one way, is one version under one alias**: bytes another alias of
+the project already holds are refused, naming that alias; a second name for them
+is a catalog entry whose recipe reads `tracked_expr_from_alias("<that alias>")`.
+The rule is per project: two projects importing one file each hold their own
+entry, snapshot and clone under the same hash.
 
 ## Recipe
 
 A **recipe** (`expr.py`) is the LLM-authored Python that defines a
 computation. It must bind a variable `expr`, built from:
 
-- `read_project_file("trips.parquet")` — read a parquet source under `data/`
-  (through CAS and an ordered copy);
-- `tallyman_read_csv("/path/to/trips.csv", schema=...)` — read a CSV source
-  the same way; the only CSV reader a recipe may use;
-- `tracked_expr_from_alias("trips")` — build on another entry, named by alias,
-  recording a `follow=True` parent edge: this expression depends on the parent
-  alias, and when that alias advances, recalc mints a new version of this
-  expression;
-- `pinned_expr_from_alias(<hash or "name-vN">)` — same, but `follow=False`:
-  recalc never touches this expression when the parent moves. Pins name an
-  exact version — a hash, or an explicit `"trips-v3"` version reference; a
-  bare alias is rejected as ambiguous (it would silently pin whatever the
-  head happened to be when the recipe was built — #166).
+- `tracked_expr_from_alias("trips")` — build on another entry, named by alias
+  (a source alias or a catalog alias), recording a `follow=True` parent edge:
+  this expression depends on the parent alias, and when that alias advances,
+  recalc mints a new version of this expression;
+- `pinned_expr_from_alias("trips-v3")` — same, but `follow=False`: recalc never
+  touches this expression when the parent moves. A pin names an exact version
+  with an explicit version reference. A bare alias is rejected as ambiguous (it
+  would silently pin whatever the head happened to be when the recipe was built,
+  #166), and so is a bare content hash (ADR-011 D5), so every parent edge names
+  an alias and no opaque hash appears in a recipe. An entry with no alias has to
+  be named before anything can build on it.
 
-The defining property of a recipe: **it binds by name.** "trips.parquet"
-means whatever bytes sit there right now; "trips" means whatever entry that
-alias points at right now. A recipe therefore has a different meaning at
-different moments. That is exactly what you want when *authoring* — and
+A recipe never opens a file. `read_project_file`, `tallyman_read_csv`,
+`xo.deferred_read_csv`, and `xo.deferred_read_parquet` of a file outside
+`compute_cache/` are build errors, each naming the import to use. The one recipe
+that calls `read_project_file` is the one the importer generates for a source
+entry, where a context variable resolves the call to that entry's own snapshot;
+the path it names is provenance.
+
+The defining property of a recipe: **it binds by name.** "trips" means whatever
+entry that alias points at right now, and for a source alias that is whichever
+version of the file was imported last. A recipe therefore has a different
+meaning at different moments. That is exactly what you want when *authoring* — and
 exactly what you must never consult again afterward.
 
 ## Entry
@@ -253,7 +279,7 @@ authority**:
 
 | | `expr.py` (recipe) | `xorq_build/` (build) |
 |---|---|---|
-| binds inputs by | name (aliases, live paths) | value (ordered copies named by source digest, a worthy parent's snapshot path, a cheap parent's graph inlined) |
+| binds inputs by | name (aliases) | value (a worthy parent's snapshot path, a source version's included; a cheap parent's graph inlined) |
 | meaning over time | drifts as names move | fixed forever |
 | authoritative for | authoring: revise, display, the *next* build | semantics: every read, forever |
 
@@ -266,6 +292,10 @@ resolving names to current heads is the point. (#163 is what happens when
 this rule is broken: reads re-ran recipes, so historical entries silently
 re-bound to today's parents.)
 
+A source entry has both representations too, and the rule holds for it
+trivially: its recipe is generated by the import and never re-run to make
+anything, and its build is one read of its own snapshot.
+
 ## Content hash
 
 An entry's `content_hash` is xorq's expression hash (Part 1 §3), taken at
@@ -273,24 +303,27 @@ build time. Two details determine what it covers:
 
 - the expression hashed is the one after the rewrite (below), which adds the
   canonical sort to a worthy entry and adds no cache node to anything;
-- every file read in the graph is a file tallyman wrote under a name that
-  carries content: an ordered copy named by its source's digest, or a worthy
-  parent's snapshot named by the parent's content hash. So the hash covers the
-  input bytes, and a child's hash is a function of its parent's.
+- every file read in the graph is a worthy parent's snapshot, named by the
+  parent's content hash, so a child's hash is a function of its parent's.
 
-The hash therefore names "this computation over these exact input bytes."
+A source entry's hash is the exception, and the base of every chain: it is
+computed from the imported bytes and the reader options (Part 2, "Project,
+imports and source entries") rather than taken from xorq, because its generated
+recipe reads the snapshot that the hash names.
+
+So the hash names "this computation over these exact input bytes."
 That one property makes builds idempotent and history append-only. Rebuild
 the same computation over unchanged inputs and you land on the existing
 entry: the build recognizes the hash and stops. Change anything that alters
-the computation or its inputs — the recipe's logic, a source's bytes, a
-parent's identity — and a new entry forks under a new hash, while every existing
-entry keeps its name and its meaning.
+the computation or its inputs — the recipe's logic, a parent's identity, and
+through a new source version the imported bytes — and a new entry forks under a
+new hash, while every existing entry keeps its name and its meaning.
 
 Two limits are deliberate. The hash cannot see execution behavior (Part 1
 §5): a recipe calling `sample()` or `now()` hashes identically run to run,
 which is the gap `result_digest` (below) exists to police. And it makes no
-attempt at cross-machine portability: absolute path prefixes participate in the
-hash.
+attempt at cross-machine portability: absolute path prefixes participate in a
+computed entry's hash. (A source entry's hash has no path in it.)
 
 ## Manifest: the closure record
 
@@ -301,8 +334,7 @@ itself doesn't state, so that no later operation ever needs to resolve a name:
 |---|---|
 | `content_hash` | the entry's identity |
 | `parents` | `[{hash, ref, follow}]` — each alias reference, **resolved to the exact hash it meant at build time** |
-| `sources` | `{rel_path: digest}` — each source, pinned to the bytes read, including every source its parents recorded (a CSV outside `data/` is keyed by its absolute path); `null` under the `off` identity mode, and whenever nothing was recorded (a promoted diff, which reads its two entries without recording them) |
-| `ordered_copies` | `{key: {source, digest, suffix, reader, content_digest}}` — each ordered copy the plan reads, with the reader options and the digest that let it be made again |
+| `provenance` | a source entry only: `{alias, version, path, digest, suffix, reader, imported_at}` — the name it was imported as, the outside path (never read again), the digest of the bytes, and the reader options that let its snapshot be made again from the clone; its presence is what makes an entry a source entry |
 | `cache_worthy`, `cache_worthy_why`, `cache_bytes` | whether the entry is materialized, decided once at build, and the evidence |
 | `result_digest` | `arrow-sha256:` digest of the snapshot's content (worthy entries) — the output identity |
 | `reproducible`, `nonreproducible_columns` | whether two runs at create gave the same digest, and the columns that differed |
@@ -317,10 +349,22 @@ for the missing `cache_worthy` (#90, #204).
 
 ## Alias
 
-An **alias** is a mutable name: `{alias, latest, history}` in a git-tracked
-file. `latest` is the head; `history` is every hash it has pointed at (V1…Vn,
-oldest first). Revising an alias mints a new entry, advances `latest`, appends
-to `history`. Old entries remain, immutable, as the version history.
+An **alias** is a mutable name: `{alias, latest, history, kind}` in a
+git-tracked file. `latest` is the head; `history` is every hash it has pointed
+at (V1…Vn, oldest first). Revising an alias mints a new entry, advances
+`latest`, appends to `history`. Old entries remain, immutable, as the version
+history.
+
+An alias has a **kind**. A **catalog alias** names computations and advances by
+revise, promote and recalc. A **source alias** names imported data and advances
+only by an import: there is no recipe to revise and nothing to promote onto it,
+and every surface that offers those refuses a source alias before building
+anything. A name is one kind or the other, never both. **An alias's kind
+matches its entries' kind**: `set_alias` never points a catalog alias at a
+source entry or a source alias at a computed one, whichever route asks.
+A source version is named by the alias that holds it now: `provenance` keeps
+the name it was imported as, and a rename or an unalias does not rewrite it, so
+a message that names a version or advises an import asks the alias store.
 
 **Where alias resolution is legal** — names resolve in exactly three
 situations, all of them *about* choosing or minting, never about serving:
@@ -329,9 +373,8 @@ situations, all of them *about* choosing or minting, never about serving:
    hashes in the new entry's manifest.
 2. **Selecting** (UI, diff version arithmetic): resolve "by_hour" or "V-1" to
    a hash, *then* serve that hash.
-3. **Judging** (staleness scan): compare recorded parent hashes and source
-   digests against current heads and current files — read-only, executing
-   nothing.
+3. **Judging** (staleness scan): compare recorded parent hashes against
+   current heads — read-only, executing nothing and opening no data file.
 
 Once an entry is selected, serving it consults no name again. `follow` is a
 **recalc** policy (should a parent's advance mint a new version of this
@@ -368,9 +411,10 @@ The canonical sort, described next, is added only to a worthy entry.
 
 Every file tallyman writes ends in an `int64` column named `__row_order` holding
 `0..N-1` in the file's physical row order. It is the last column, and it is
-visible in every table. Two writers produce it: ingest (an ordered copy of a
-source) and `materialize` (a snapshot), and each materialization overwrites an
-inherited one with positions in its own file. It is what makes a page of an
+visible in every table. Two writers produce it: the import (a source entry's
+snapshot, numbered in the imported file's order) and `materialize` (every other
+snapshot), and each overwrites an inherited one with positions in its own
+file. It is what makes a page of an
 entry a function of `(content_hash, sort, offset, limit)`: with no user sort a
 page is `ORDER BY __row_order`, and with one the user's keys come first and
 `__row_order` is the last key, which breaks every tie.
@@ -402,18 +446,22 @@ page is `ORDER BY __row_order`, and with one the user's keys come first and
 
 ## Materialization
 
-`materialize(project, hash)` is the one routine that writes a snapshot. The
-build calls it and so does every **heal** (the re-creation of a snapshot that is
-missing from disk), so result bytes are manufactured in one place. It runs the entry's frozen build on a **single-partition** connection
-(so a float total is merged in one order and is bit-stable on any machine),
-streams the rows through a writer with a pinned layout (zstd, row groups of
-1,048,576 rows, a parquet page index, `__row_order` last), writes to a unique
-temp name and replaces the final file atomically, all under the project's write
-lock, and returns the content digest of the file it wrote, read back. A create
-runs the query twice and compares the digests; if they differ the recipe is not
+`materialize(project, hash)` is the one routine that writes a computed entry's
+snapshot. The build calls it and so does every **heal** of one (the re-creation
+of a snapshot that is missing from disk), so result bytes are manufactured in
+one place. A source entry's snapshot is not a result: it is written by the
+import, and made again from the clone by the same code the import used
+(`source_import.rewrite_source_snapshot`), through the same pinned writer. It
+runs the entry's frozen build on a **single-partition** connection (so a float
+total is merged in one order and is bit-stable on any machine), streams the rows
+through a writer with a pinned layout (zstd, row groups of 1,048,576 rows, a
+parquet page index, `__row_order` last), writes to a unique temp name and
+replaces the final file atomically, all under the project's write lock, and
+returns the content digest of the file it wrote, read back. A create runs the
+query twice and compares the digests; if they differ the recipe is not
 reproducible, the entry still builds, and its file is **pinned**: the Cache
-page's delete leaves it alone. A snapshot changes only by an atomic replace of
-a complete file; a failed build that deletes the file already at its path breaks
+page's delete leaves it alone. A snapshot changes only by an atomic replace of a
+complete file; a failed build that deletes the file already at its path breaks
 that today (#193).
 
 `ensure_materialized(project, hash)` is the one entry point that makes files
@@ -422,24 +470,26 @@ exist, and every consumer that composes or executes an entry goes through it
 
 1. A worthy entry whose snapshot exists is done, and no build is loaded.
 2. Otherwise load the build and collect every file its `Read` nodes point at.
-3. Re-create each that is missing by the rule for its class. A snapshot is made
-   again by recursing on the hash in its file name. An ordered copy is made again
-   from its source's clone with the reader options in the manifest, and checked
-   against the digest recorded when it was first written. A clone is copied again
-   from the live source while the live bytes still hash to its name.
+3. Re-create each that is missing. Every one is another entry's snapshot, made
+   again by recursing on the hash in its file name.
 4. If the entry is worthy, materialize it and verify the result against
-   `result_digest`.
+   `result_digest`. A source entry skips steps 2 and 3: its snapshot is written
+   again from its clone with the reader options in its manifest, and verified
+   the same way.
 
 Whether the entry is worthy is read from the manifest, never derived again.
 (With the manifest missing, the code guesses from whether a snapshot exists,
 #204.)
 
 A file is cache only if this function can re-create it from files that are not
-cache. Snapshots and ordered copies satisfy that and live under
-`compute_cache/`, which anything may delete. Clones are data: once the live
-source is edited a clone is the only copy of the bytes an entry was built from,
-so nothing deletes one. When nothing can re-create a file (the clone is gone and
-the live source has changed) the error names the source file.
+cache. Snapshots satisfy that, a source entry's included, and live under
+`compute_cache/`, which anything may delete. Clones are data: a clone is the
+only copy tallyman has of bytes it imported, so nothing deletes one (a reset
+moves a clone no surviving source entry names into the bullpen). A source entry
+whose clone is gone is the one case where a snapshot is the last copy of its
+rows, so that snapshot is pinned; if it is deleted anyway, the read fails with
+an error naming the missing clone and the import call, reader options included,
+that repairs the version.
 
 Files are deleted only by an explicit user action, and a file is written only
 because something is about to read it. The startup warm-up, the verify sweep and
@@ -447,12 +497,14 @@ a reset write and delete nothing under `compute_cache/`.
 
 ## Result digest
 
-For worthy entries, the build records `result_digest`: `arrow-sha256:<hex>`, a
+For worthy entries, the build (for a source entry, the import) records
+`result_digest`: `arrow-sha256:<hex>`, a
 SHA-256 over the snapshot's ordered Arrow data, computed from the file read
 back. It is independent of the row-group size, the codec, the writer's version,
 whether a text column is `string` or `large_string`, and what a null slot holds;
 it depends on every value, on which slots are null, on the order of the rows
-(fixed by the canonical sort) and on the column names and types. It is the
+(fixed by the canonical sort, or for a source entry by the file's order) and on
+the column names and types. It is the
 **output** identity axis, and it has exactly one job: witnessing that a later
 rematerialization reproduced the original result. It is never a staleness input
 (an entry whose recompute differs is *nondeterministic*, not stale — recomputing
@@ -474,11 +526,10 @@ build (one build at a time per project, so two builds of one entry cannot end
 with the failing one deleting the winner's directory):
 
 1. **Import the recipe** — the single moment of name resolution. During the
-   import, `read_project_file` and `tallyman_read_csv` digest each source, clone
-   it (CAS), write its ordered copy and record `{rel_path: digest}` and the copy's
-   reader options; `tracked_expr_from_alias` resolves each alias to its current
-   head, records the parent edge, and returns the parent's result (below), and
-   `pinned_expr_from_alias` does the same for a hash or version reference.
+   import, `tracked_expr_from_alias` resolves each alias to its current head,
+   records the parent edge, and returns the parent's result (below), and
+   `pinned_expr_from_alias` does the same for a version reference. A raw file
+   read, a bare hash and a bare alias raise here.
 2. **Check and rewrite** — reject what cannot become a sound entry (an in-memory
    read, a `.cache()` call, a raw parquet or CSV read, an assignment to
    `__row_order`, a cheap entry that drops it, a join chain over three entries
@@ -502,6 +553,37 @@ with the failing one deleting the winner's directory):
 The build's obligation in one line: **record everything a reader will ever
 need, because the reader is forbidden from resolving anything.**
 
+## The import path
+
+`update_and_depend(outside_path, alias, pinned_version=None, schema=None,
+**reader_options)`, behind the `catalog_import_source` tool, is the only way a
+source alias advances. It fixes the reader from the file's suffix and the
+options, digests the file, computes the entry hash, and then, under the project
+lock, decides the case (Part 2, "Project, imports and source entries"):
+
+- **Mint:** clone the bytes and verify the clone, write the snapshot, write the
+  entry (generated `expr.py`, frozen build, schema, manifest with `provenance`,
+  written last), and append it to the alias. A failure removes the entry
+  directory the import created, and nothing else.
+- **The version already exists** (a no-op, or a repair): the entry's recipe,
+  build and manifest are the record of the import that minted it, and none of
+  them is rewritten. If its snapshot is gone, the clone is restored from the
+  given file when it is gone too (verified against the digest), and the
+  snapshot is healed exactly as `ensure_materialized` heals it: from the clone,
+  verified against `result_digest`. If a reader now parses the bytes
+  differently, the healed file is served but recorded as an unfaithful heal
+  (which pins it), and the manifest keeps the digest of the rows the version
+  was imported with: a repair never re-records a version's rows. A directory a
+  crash left without a manifest is not an entry, and is written again.
+- **Refuse:** a directory, a name that is a catalog alias, a file that is not
+  parquet or CSV, a CSV option that does not survive JSON, and every error row
+  of the case table, each with a message saying what to do instead.
+
+A minted version is a catalog operation like a revise: the tool records the
+same events, notifies the companion, runs auto-recalc for the alias's followers
+when the project enables it, and lands the import and its cascade as one
+checkpoint.
+
 ## The read path
 
 One canonical read, used by every consumer:
@@ -516,16 +598,18 @@ read(project, content_hash):
 - **Worthy entry:** a bare read of `compute_cache/result_cache/<content_hash>.parquet`,
   served without loading the entry's build when the file exists. If the file is
   missing, `ensure_materialized` re-runs the *frozen* build (whose reads are
-  ordered copies and parents' snapshots, all made to exist first), writes the
-  snapshot, and verifies it against `result_digest` before it is served.
+  parents' snapshots, all made to exist first), writes the snapshot, and
+  verifies it against `result_digest` before it is served. For a source entry
+  it parses the clone again instead.
 - **Cheap entry:** execution re-runs the frozen graph, reading files that exist.
   Same rows every time, by construction.
 - **The cold state is an empty `compute_cache/`:** any entry can be read after
   it is deleted, and must produce the same result as the warm read. That property
   is the standing regression test for every read-path change. The known
-  exception is an entry recorded as not reproducible, whose snapshot is pinned
+  exceptions are an entry recorded as not reproducible, whose snapshot is pinned
   because it cannot be made again faithfully, and the entries built on it
-  (#185, #208).
+  (#185, #208), and a source entry whose clone is gone, whose snapshot is the
+  last copy of its rows.
 
 `cached_result_expr(project, hash)` is the function every in-process consumer
 calls. It is `ensure_materialized` plus the read above, and it memoizes the loaded
@@ -534,13 +618,13 @@ backend) per `(project, content_hash)`. Removing the memo must change latency an
 nothing else. The per-call existence check stays outside the memo, because file
 existence is the one input that remains mutable.
 
-**Chaining** (`tracked_expr_from_alias` at build time) uses the same read. A worthy
-parent is a bare read of its snapshot, so the child's build holds the literal path
-of that file, which contains the parent's content hash: the child's identity is a
-function of its parent's. A filter over an aggregate's snapshot is therefore a
-cheap entry. A cheap parent's graph is inlined. The parent's snapshot is made to
-exist before the child is composed, since a child cannot be built over a file
-that is missing.
+**Chaining** (`tracked_expr_from_alias` at build time) uses the same read. A
+worthy parent, a source entry included, is a bare read of its snapshot, so the
+child's build holds the literal path of that file, which contains the parent's
+content hash: the child's identity is a function of its parent's. A filter over
+an aggregate's snapshot is therefore a cheap entry. A cheap parent's graph is
+inlined. The parent's snapshot is made to exist before the child is composed,
+since a child cannot be built over a file that is missing.
 
 The recipe-reconstruction machinery survives only as a diagnostic. An entry
 whose build is missing or unloadable is a **hard error** naming the entry and
@@ -606,32 +690,34 @@ process and never inside a grid query.
 
 ## Reset
 
-`reset_to` returns the catalog to an earlier step. It restores every tracked file
-with `git reset --hard`, and reconciles the untracked entry directories through the
-**bullpen**, the directory a reset moves retired files into so a reset forward can
-bring them back. It leaves `compute_cache/` alone: snapshots and ordered copies are
-named by content, and a file that is missing afterwards is made again and verified
-like any other. It moves the source clones no surviving entry refers to into the
-bullpen and never deletes them, and a reset forward copies back the clones a
-restored entry refers to. Two cases involving an entry that is not reproducible
-do not hold yet: the bullpen can hand back an older manifest beside a newer
-snapshot (#194), and a retired entry's snapshot loses its pin (#195).
+`reset_to` returns the catalog to an earlier step. It restores every tracked
+file with `git reset --hard`, and reconciles the untracked entry directories
+through the **bullpen**, the directory a reset moves retired files into so a
+reset forward can bring them back. It leaves `compute_cache/` alone: snapshots
+are named by content hash, and a file that is missing afterwards is made again
+and verified like any other. It moves the clones no surviving source entry names
+in its `provenance` into the bullpen and never deletes them, and a reset forward
+copies back the clones a restored source entry names. Source aliases rewind with
+every other alias, since `aliases.jsonl` is a tracked file. Two cases involving
+an entry that is not reproducible do not hold yet: the bullpen can hand back an
+older manifest beside a newer snapshot (#194), and a retired entry's snapshot
+loses its pin (#195).
 
-## Staleness and recalc (unchanged, stated for completeness)
+## Staleness and recalc
 
-**Staleness** is a read-only judgment: an entry is stale on the alias axis
-when a `follow=True` parent's recorded hash no longer equals that alias's
-head, and on the source axis when a recorded digest no longer matches the
-live file's digest. Computing staleness executes nothing and changes no
-catalog state. (Today it rewrites the source-digest memo; see Known
-deviations.)
-Only an entry that is the current head of an alias is actionably stale; a
-superseded version is reported with `live=False` (#154). The source axis is
-`unknown` for an entry built under the `off` identity mode, and today for a
-CSV recorded outside `data/`, which the scan cannot resolve (#191).
+**Staleness** is a read-only judgment with one axis: an entry is stale when a
+`follow=True` parent's recorded hash no longer equals that alias's head, and
+for no other reason. A pinned parent never makes its child stale. A data file
+that changed outside tallyman is not a reason: until it is imported again
+nothing has changed in the catalog, and the import moves a source alias, which
+is the one axis. Computing staleness executes nothing, opens no data file and
+changes no catalog state. Only an entry that is the current head of an alias is
+actionably stale; a superseded version is reported with `live=False` (#154). A
+parent alias that no longer exists is reported under `unknown_axes`.
 
 **Recalc** is the one sanctioned re-execution of recipes. When an alias head
-advances (a revise), the entries that followed it by name are directly stale;
+advances (a revise, or an import that mints a new version of a source alias),
+the entries that followed it by name are directly stale;
 they are the roots, and the entries that may be affected form their **cone**:
 the roots and every current alias head reachable from them through recorded
 parent edges, followers of followers and so on. It runs automatically after a
@@ -643,8 +729,8 @@ name resolution is the point, since the goal is a new version against the
 new heads — builds the result as an ordinary new entry, and advances the
 member's alias before any of its children replay, so each child chains off
 its parent's fresh head. A member whose inputs did not move, such as a child
-that pins its parent by hash (`follow=False`), replays to the same hash and is
-left alone. Old entries are untouched; a member that rebuilds gains a version,
+that pins a version of its parent (`follow=False`), replays to the same hash and
+is left alone. Old entries are untouched; a member that rebuilds gains a version,
 and none loses one.
 
 Two disciplines keep it predictable. **Scope:** recalc touches only followers
@@ -679,7 +765,7 @@ different fixes:
 | class | detector | meaning | response |
 |---|---|---|---|
 | engine | the xorq, xorq-datafusion or pyarrow version, or the snapshot format, differs from the one recorded at build | a library upgrade changed the result | rebuild the entry; the recipe is not implicated |
-| structural (#88) | recipe re-derives a different hash, sources unchanged | author-time value baked into the graph (`pd.Timestamp.now()`) | lint; rewrite recipe |
+| structural (#88) | recipe re-derives a different hash, inputs unchanged | author-time value baked into the graph (`pd.Timestamp.now()`) | lint; rewrite recipe |
 | execution (#83) | fixed graph, digest moves across runs | `sample()`, `now()`, impure UDF | lint; the file is pinned |
 | lineage (#163) | a read resolved a name post-build | machinery bug | impossible by construction under this contract |
 
@@ -691,15 +777,16 @@ design: with reads going through the build, lineage drift has no mechanism left.
 [^recon]: The subsystem the fix demoted: `_recipe_expr` re-imports an entry's
     `expr.py` to recover its expression, patching over the recipe's
     name-binding with context variables for the duration of the import.
-    `_RECON_SOURCES` carries the entry's recorded `{path: digest}` map so
-    that `read_project_file`, when called inside such a re-import, resolves
-    each source to its frozen `.cas/<digest>` clone instead of re-digesting
-    the live file (#115), and `_resolve_noncyclic_hash` walks a
-    self-referencing alias back to its previous version to break re-import
-    cycles (#74). Each hook re-derives a binding the frozen build already
-    contains, which is why the fix retired their read-time role (and #162's
-    proposed `_RECON_PARENTS` sibling was never built) rather than adding a
-    fourth. The diagnostic use stays, and is the only reason the machinery
+    `_resolve_noncyclic_hash` walks a self-referencing alias back to its
+    previous version to break re-import cycles (#74). A second hook,
+    `_RECON_SOURCES`, once resolved each raw file read to its frozen
+    `.cas/<digest>` clone (#115); ADR-011 deleted it with `manifest.sources`,
+    since a recipe no longer reads files at all, and a source entry's own
+    generated recipe resolves its one read to its snapshot (`_SOURCE_ENTRY`).
+    Each hook re-derives a binding the frozen build already contains, which is
+    why the fix retired their read-time role (and #162's proposed
+    `_RECON_PARENTS` sibling was never built) rather than adding another. The
+    diagnostic use stays, and is the only reason the machinery
     still exists: `recipe_is_structurally_nondeterministic` re-derives the
     hash from the recipe on purpose, because re-running the recipe is exactly
     how you detect that a recipe fails to reproduce its own graph.
@@ -731,7 +818,9 @@ wrong even if every test passes.
   the manifest; after that the entry is closed. Aliases at read time select
   *which* entry to serve, never *what* an entry means. (Grep-able form:
   `get_alias`/`previous_version`/`version_of_hash` appear only in minting,
-  selecting, and judging code — never in materializing code.)
+  selecting, and judging code — never in materializing code. The one alias
+  lookup near materializing code names a source version in the text of an
+  error or a pin reason, `current_source_version`, and decides no rows.)
 - **I5 — One question, one path.** Any question answerable two ways (grid vs
   API bytes, manifest row count vs live count) either shares one canonical
   path or carries an explicit check tying the two together; disagreement is
@@ -764,10 +853,6 @@ change of the rule.
   (#208), and the purity of an entry is not passed on to entries built on it,
   so a child of a non-reproducible parent is recorded as reproducible (#185).
   Both are gaps in I1 and I2.
-- **Ordered copies.** The copy of a parquet source can change column types
-  (#197), a CSV's reader options are rewritten before the first ingest (#198),
-  a build can record an empty content digest for a copy (#211), and copies no
-  entry reads any more are never listed or removed (#207).
 - **Row order.** The canonical sort's tie-break leaves out nested columns
   (#205); the snapshot writer drops any column named `__row_order_right` (#206);
   the three-way join check refuses semi and anti joins (#199); `full_diff` keeps
@@ -789,17 +874,11 @@ change of the rule.
   display-config and `config.json` writes replace their file atomically without
   it, so an MCP edit and a browser edit of the same file at the same moment can
   lose one of the two (no issue filed yet).
-- **Staleness writes.** The scan forces a re-hash of every recorded source, and
-  each forced re-hash rewrites `artifacts/source_digests.json` holding only that
-  one file, so a scan wipes the digest memo (no issue filed yet). A child that
-  pins its parent by hash inherits the parent's sources, so after an upstream
-  source edit it is stale on the source axis and its replay gives the same hash,
-  which leaves it stale for good (no issue filed yet).
-- **Names resolve once, in the right project.** A recipe's `read_project_file`
-  and alias readers resolve the project from the `active_project` file, while
-  the MCP tool builds into the session's own project; after another session
-  switches projects the two differ and the build fails with a misleading
-  raw-read error (related to #39).
+- **Names resolve once, in the right project.** A recipe's alias readers
+  (`tracked_expr_from_alias`, `pinned_expr_from_alias`) resolve the project from
+  the `active_project` file, while the MCP tool builds into the session's own
+  project; after another session switches projects the two differ, and the
+  recipe looks its aliases up in the other project (related to #39).
 - **Portability.** An expanded build does not record the project path it was
   filled in with, so a copied project reads the old location (#209).
 - **Float totals.** An ungrouped float `SUM` depends on the row-group layout of
@@ -820,7 +899,13 @@ added `__row_order` and redefined the digest is in
 [`plans/ADR-009-digest-stability.md`](../plans/ADR-009-digest-stability.md),
 accepted on 2026-09-22 and implemented in #189.
 [`plans/ADR-010-immutable-store-one-owner.md`](../plans/ADR-010-immutable-store-one-owner.md)
-proposed replacing them and was rejected. The wider audit of the same bug class is
+proposed replacing them and was rejected.
+[`plans/ADR-011-sources-are-aliases.md`](../plans/ADR-011-sources-are-aliases.md)
+made a raw input a source alias whose versions are entries, which removed the
+source axis of staleness, the identity modes, `manifest.sources` and the ordered
+copy, and with them the defects listed here before it (#191, #197, #198, #207,
+#211, and the two staleness defects that had no issue). The wider audit of the
+same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes
 too.

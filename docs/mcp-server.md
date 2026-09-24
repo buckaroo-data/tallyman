@@ -90,8 +90,9 @@ on-disk `active_project` file, so switching once is sticky for the rest of the
 session regardless of what another session writes to disk. The first tool call
 seeds it. `SESSION_ID` (an 8-hex uuid) tags this process in `events.jsonl`.
 
-**Auto-recalc.** `catalog_revise` and `catalog_promote_diff` advance an existing
-alias head, which can make followers stale. Both route through
+**Auto-recalc.** `catalog_revise`, `catalog_promote_diff` and
+`catalog_import_source` (when it mints a new version) advance an existing alias
+head, which can make followers stale. All three route through
 `_auto_recalc_after_head_advance` (when the project's `auto_recalc` switch is on):
 a checkpoint-free cascade rebuilds the followers in dependency order and leaves
 them in the working tree, so the head advance and the whole cascade land as one
@@ -154,18 +155,16 @@ The compile-and-persist family. The `code` argument is a self-contained Python
 script that binds a top-level `expr` to a xorq/ibis expression;
 `catalog_run`'s docstring is the canonical cookbook for writing it (namespaces,
 the datafusion-only backend, data sourcing, and the `xorq.ml` MODELING section).
-Data sourcing inside `code` uses four helpers from `tallyman_xorq.io`:
-`tracked_expr_from_alias` (a catalog entry, recorded as a lineage parent),
-`pinned_expr_from_alias` (a catalog entry by hash or `"name-vN"` version
-reference, no following — a bare alias is rejected, #166),
-`read_project_file` (a raw parquet under `data/`), and `tallyman_read_csv` (CSV
-ingest; use it for all CSV reads instead of `xo.deferred_read_csv`, #137). Both
-read the file through an **ordered copy** (the source's rows in file order, plus a
-last column `__row_order` holding `0..N-1`), so editing a source and re-running
-the same recipe creates a new entry and the old one keeps its rows. Reading a
-parquet file any other way (`xo.deferred_read_parquet`) is a build error. The
-copy of a parquet source can change a few column types, such as `date64` to a
-timestamp (#197).
+Data sourcing inside `code` uses two helpers from `tallyman_xorq.io`:
+`tracked_expr_from_alias` (a catalog entry by alias, recorded as a lineage parent
+that the entry follows) and `pinned_expr_from_alias` (one version of an alias, by
+`"name-vN"` version reference, no following; a bare alias is rejected, #166, and
+so is a bare content hash, ADR-011 D5). A recipe never opens a file: data files
+come in through `catalog_import_source` (below) as **source aliases**, and a
+recipe reads one like any other alias. `read_project_file`, `tallyman_read_csv`,
+`xo.deferred_read_csv`, and `xo.deferred_read_parquet` on a file outside the
+project's `compute_cache/` are build errors whose message names the import to
+use.
 
 Every entry's result ends in `__row_order`, and pages are ordered by it. A recipe
 that only filters, selects or adds columns is *cheap* and must keep the column:
@@ -190,10 +189,9 @@ default authoring tool for a one-off run.
   false` with `nonreproducible_columns` when a worthy entry's query gave
   different results on its two runs at create time. `{error, error_id}` on a
   `BuildError`.
-- **Writes:** the entry build dir under `catalog/entries/<hash>/`; the ordered
-  copy of each source and, for a worthy entry, its snapshot under
-  `catalog/compute_cache/`; a `build_ok` or `build_error` event to
-  `events.jsonl`.
+- **Writes:** the entry build dir under `catalog/entries/<hash>/`; for a worthy
+  entry, its snapshot under `catalog/compute_cache/result_cache/`; a `build_ok`
+  or `build_error` event to `events.jsonl`.
 - **Promote** a scratch entry to a name afterward with `catalog_alias`.
 
 ### `catalog_import_source(outside_path, alias, pinned_version=None, prompt="", schema=None, reader_options=None) -> dict`
@@ -363,10 +361,9 @@ marimo-exportable.
 ### `catalog_scan_staleness(verify_results=False) -> dict`
 **Read-only** scan of every complete entry (current alias heads and superseded
 versions alike; only heads can be directly stale) for staleness against its
-recorded inputs. Purely diagnostic — never rebuilds, repoints, or checkpoints.
-It does rewrite the source-digest memo, `artifacts/source_digests.json`, and
-today leaves it holding only the last file it hashed. Call it first to see what
-is stale.
+recorded inputs. Purely diagnostic — never rebuilds, repoints, or checkpoints,
+and opens no data file: an entry is stale only when an alias it follows has
+moved (ADR-011 D6, one staleness axis). Call it first to see what is stale.
 - **Params:** `verify_results` — also check that each snapshot on disk still has
   its recorded `result_digest`. It reads the files that exist and writes nothing,
   so a snapshot that was deleted is reported and stays deleted.
@@ -561,7 +558,7 @@ Create a new project on disk (the companion runs `ensure_project` + genesis
 baseline) and switch to it.
 - **Params:** `name` (required) — `^[a-z0-9][a-z0-9_-]{0,31}$`, not reserved, not
   colliding; `with_fixture` — when `True`, the companion seeds the shoe-orders
-  demo parquet into `data/`.
+  demo parquet into `data/`, where `catalog_import_source` can import it.
 - **Returns:** `{name, active}`. On failure `{error}` (sticky unchanged): same
   shapes as `project_switch`, with 409 on a name collision.
 
@@ -569,12 +566,13 @@ baseline) and switch to it.
 
 ### `ds_modeling_workflow(dataset, target="") -> str`
 An `@mcp.prompt()` (not a tool) that returns a static guidance string scaffolding
-a modeling workflow: load → engineer features → split → fit via `xorq.ml` →
+a modeling workflow: import → engineer features → split → fit via `xorq.ml` →
 score → chart. Pure function — no side effects, no I/O, not routed through the
 checkpoint or tagging wrappers.
-- **Params:** `dataset` (required) — a parquet under `data/`, interpolated into
-  the text; `target` — column to predict (empty renders as `<target column>` for
-  unsupervised work).
+- **Params:** `dataset` (required) — the data file, interpolated into the text;
+  the workflow's first step imports it with `catalog_import_source`. `target` —
+  column to predict (empty renders as `<target column>` for unsupervised
+  work).
 - It encodes the hard constraints the model must follow: fit the model *as a
   catalog entry* with `xorq.ml` (never in a post-processing sandbox, which blocks
   sklearn/scipy/numpy); copy exact fit/predict signatures from the MODELING

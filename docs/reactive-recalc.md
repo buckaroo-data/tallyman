@@ -1,28 +1,29 @@
 # The reactive system: revise an alias, recompute its dependents
 
-A tallyman catalog is a closed system. Nothing reads a database, and no source
-file changes underneath you without your knowing. The thing that moves is *you*:
-you revise an alias (a named pointer to the latest version of an entry, such as
-a source projection or an aggregation) to a new recipe, and now everything built
-on top of the old version is out of date. The reactive system is what notices
+A tallyman catalog is a closed system. Nothing reads a database, and no data
+file changes underneath you: a file enters the catalog only when you import it,
+and every build reads tallyman's copy. The thing that moves is *you*: you revise
+an alias (a named pointer to the latest version of an entry, such as an
+aggregation) to a new recipe, or import a new version of a data file under its
+source alias, and now everything built on top of the old version is out of
+date. The reactive system is what notices
 that and recomputes the followers (the entries that read that alias by name), in
 dependency order. Terms follow [architecture.md](architecture.md#terms).
 
 This doc starts with the two things you actually do — build a small catalog, then
 revise an alias and recompute its dependents — and then documents the surfaces
-(MCP tools and the companion's HTTP API) and the edges (the staleness axes,
+(MCP tools and the companion's HTTP API) and the edges (the staleness rule,
 checkpoints, failure handling) underneath.
 
 The short version of how it works today:
 
 - Building an alias does not recompute anything downstream; it advances that one
-  alias. *Revising* an alias, by default, recomputes its stale followers in the
-  same atomic checkpoint (auto-recalc — see *Trigger model*). The switch is
-  per-project and env-overridable; turn it off for the explicit path below.
+  alias. *Revising* an alias, or importing new data under a source alias, by
+  default recomputes its stale followers in the same atomic checkpoint
+  (auto-recalc — see *Trigger model*). The switch is per-project and
+  env-overridable; turn it off for the explicit path below.
 - A scan tells you which followers are stale. With auto-recalc off, a separate
-  explicit recalc recomputes them and re-points their aliases — and that explicit
-  recalc is still the path for source-file drift, which the revise trigger doesn't
-  cover.
+  explicit recalc recomputes them and re-points their aliases.
 - A recalc that rebuilds an entry advances that entry's alias to a **new
   revision** (the alias history is append-only), and takes **one** catalog
   checkpoint for the whole walk.
@@ -32,25 +33,24 @@ The short version of how it works today:
 Every catalog entry is content-addressed: its `content_hash` is a function of its
 recipe and its resolved inputs. An *alias* is a mutable name that points at the
 latest hash for a concept and keeps the full history of hashes it has pointed at
-(`aliases.jsonl`, one line per alias: `{"alias", "latest", "history": [...]}`).
+(`aliases.jsonl`, one line per alias: `{"alias", "latest", "history": [...],
+"kind"}`). The kind is `source` for an alias whose versions are imported files
+and `catalog` for one whose versions are computations.
 
 A recipe is a self-contained Python script that binds a top-level `expr`. It
-reads a raw file with `read_project_file(...)` and reads another catalog entry with
-`tracked_expr_from_alias(...)`. Build a three-node chain — a source projection, an
-aggregation over it, and a filter over that:
+reads other catalog entries, by alias, with `tracked_expr_from_alias(...)`; it
+never opens a file. Data enters through `catalog_import_source`, which makes each
+version of a file an entry of its own under a source alias. Build a three-node
+chain — an imported file, an aggregation over it, and a filter over that:
 
 ```python
-from tallyman_mcp.server import catalog_create
+from tallyman_mcp.server import catalog_create, catalog_import_source
 
-# Node 1 — a source alias: project some columns out of a raw parquet. It only
-# selects columns, so it is a cheap entry and must keep __row_order (the column
-# its pages are ordered by); leaving it out of the select is a build error.
-catalog_create("orders", '''
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet")
-expr = t.select("region", "price", "__row_order")
-''')
-# -> {"hash": <orders_v1>, "alias": "orders", "version": 1, ...}
+# Node 1 — a source alias: import a parquet file. The import copies the bytes into
+# the project and writes them, in file order with a last __row_order column, as
+# the snapshot of a new entry. The path is recorded and never read again.
+catalog_import_source("/path/to/orders.parquet", "orders")
+# -> {"hash": <orders_v1>, "alias": "orders", "version": 1, "created": True, ...}
 
 # Node 2 — an aggregation alias that FOLLOWS orders by name.
 catalog_create("by_region", '''
@@ -73,21 +73,22 @@ expr = t.filter(t.total > 1000)
 the alias at **version 1**. It errors if the alias already exists (use
 `catalog_revise` for an existing name). There is no `project` argument on the
 tool: it operates on the session's active project (set by `project_switch`). The
-optional `project=` kwarg on `read_project_file`/`tracked_expr_from_alias`
+optional `project=` kwarg on `tracked_expr_from_alias`/`pinned_expr_from_alias`
 defaults to the project named in the `active_project` file, which is the
 session's project unless another session has switched projects since; then the
-two differ and the build fails with a misleading raw-read error (related to
+two differ and the recipe looks its aliases up in the other project (related to
 #39). Recipes omit the kwarg.
 
-A recipe pulls in data through one of four functions in `tallyman_xorq.io`, and
+A recipe pulls in data through one of two functions in `tallyman_xorq.io`, and
 which one you call is what records the dependency edge:
 
 | Function | Reads | Records | Goes stale when |
 |---|---|---|---|
-| `read_project_file("orders.parquet")` | a raw parquet file under `<project>/data/` | a **source** leaf (`rel_path → digest`) | the file's bytes change on disk |
-| `tallyman_read_csv("/abs/orders.csv", schema=...)` | a CSV file | a **source** leaf (its path under `data/`, or its absolute path) | the file's bytes change on disk (for a CSV outside `data/` the scan cannot tell yet, #191) |
-| `tracked_expr_from_alias("orders")` | a catalog entry, by **alias** | a **parent** edge, `follow=True` | the alias advances to a new head |
-| `pinned_expr_from_alias("<hash>")` or `pinned_expr_from_alias("orders-v1")` | a catalog entry, by hash or version reference | a **parent** edge, `follow=False` | never on the alias axis (it pinned that exact revision); see the note below on the source axis |
+| `tracked_expr_from_alias("orders")` | a catalog entry, by **alias** (a source alias or a catalog alias) | a **parent** edge, `follow=True` | the alias advances to a new head |
+| `pinned_expr_from_alias("orders-v1")` | a catalog entry, by version reference | a **parent** edge, `follow=False` | never (it pinned that exact revision) |
+
+`read_project_file`, `tallyman_read_csv`, and a raw `xo.deferred_read_*` of a
+file tallyman did not write are build errors that name the import to use.
 
 The follow relationship is the whole game:
 
@@ -96,47 +97,42 @@ The follow relationship is the whole game:
   follow — resolves to the alias's current head at build time, and records
   **follow=True**. The child goes stale and recomputes when `orders` advances.
   This is normal chaining.
-- `pinned_expr_from_alias("<hash>")` or `pinned_expr_from_alias("orders-v1")` is
-  the deliberate opt-out. It accepts a content hash or a version reference
-  (`"<alias>-v<N>"`, 1-based into the alias's history), and refuses a bare alias,
-  which would pin whatever the head happened to be (#166). It records
-  **follow=False**, and the child stays on that exact revision: it never goes
-  stale on the alias axis, and recalc finds it but leaves it alone. It does
-  record its parent's source digests, though, so after an upstream source edit
-  it is stale on the source axis, and a recalc replays it to the same hash,
-  which leaves it stale (no issue filed yet).
-- `read_project_file` and `tallyman_read_csv` are the roots of every chain: a
-  raw file with no catalog identity, the leaf the graph bottoms out in.
+- `pinned_expr_from_alias("orders-v1")` is the deliberate opt-out. It accepts
+  only a version reference (`"<alias>-v<N>"`, 1-based into the alias's history).
+  It refuses a bare alias, which would pin whatever the head happened to be
+  (#166), and a bare content hash (ADR-011 D5), so every edge names an alias. It
+  records **follow=False**, and the child stays on that exact revision: it never
+  goes stale, and recalc finds it but leaves it alone.
+- Source aliases are the roots of every chain. Each version is a source entry,
+  an ordinary entry whose snapshot holds an imported file's rows, and the graph
+  bottoms out in them.
 
 So after these three calls: `orders → by_region → top_regions`, each aliased at
 version 1, each following its parent by name (`tracked_expr_from_alias`).
 
 ## Revising an alias and recomputing its dependents
 
-This is the core workflow. You revise an alias — it does not matter whether it is
-a source projection (`orders`) or an aggregation (`by_region`) — and then you
-recompute whatever followed it. The walk-through below is the explicit path,
+This is the core workflow. You advance an alias — by importing new data under a
+source alias (`orders`) or by revising a catalog alias (`by_region`) — and then
+you recompute whatever followed it. The walk-through below is the explicit path,
 which runs when auto-recalc is off (`TALLYMAN_AUTO_RECALC=0`, or
 `"auto_recalc": false` in the catalog's `config.json`). With auto-recalc on, the
-default, `catalog_revise` does steps 1 to 3 itself (see *Trigger model*).
+default, the import (or `catalog_revise`) does steps 1 to 3 itself (see *Trigger
+model*).
 
 ```python
-from tallyman_mcp.server import catalog_revise, catalog_scan_staleness, catalog_recalc
+from tallyman_mcp.server import catalog_import_source, catalog_scan_staleness, catalog_recalc
 
-# Revise the source alias: keep an extra column this time.
-catalog_revise("orders", '''
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet")
-expr = t.select("region", "price", "qty", "__row_order")
-''')
-# -> {"hash": <orders_v2>, "alias": "orders", "version": 2, ...}
+# The file has new rows: import it again under the same alias.
+catalog_import_source("/path/to/orders.parquet", "orders")
+# -> {"hash": <orders_v2>, "alias": "orders", "version": 2, "created": True, ...}
 ```
 
-`catalog_revise(name, code)` advances `orders` to a new hash and **version 2**.
-The previous hash stays in the catalog as a forensic artifact and in
-`orders`'s alias history. Nothing downstream has moved: `by_region` and
-`top_regions` still point at their version-1 builds, which were computed against
-`orders` v1. They are now stale.
+The bytes differ from `orders` v1, so the import mints **version 2** of the
+source alias under a new hash. (Importing unchanged bytes is a no-op that returns
+v1.) The previous version stays in the catalog and in `orders`'s alias history.
+Nothing downstream has moved: `by_region` and `top_regions` still point at their
+version-1 builds, which were computed against `orders` v1. They are now stale.
 
 Step 1 — scan to see what moved:
 
@@ -147,11 +143,11 @@ catalog_scan_staleness()
 ```
 
 `by_region` followed `orders` by name, and `orders`'s head no longer matches the
-hash `by_region` recorded at build, so `by_region` is **directly stale** on the
-alias axis. `top_regions` followed `by_region`, whose head has *not* moved yet, so
-it is not directly stale — but it is **transitively stale**: a recalc rooted at
-the stale set will carry it along. `orders` is the fresh head you just built, so
-nothing it reads has moved.
+hash `by_region` recorded at build, so `by_region` is **directly stale**.
+`top_regions` followed `by_region`, whose head has *not* moved yet, so it is not
+directly stale — but it is **transitively stale**: a recalc rooted at the stale
+set will carry it along. `orders` is the fresh head you just imported, and it
+reads no other entry.
 
 Step 2 — preview the recalc (always a dry run first):
 
@@ -178,20 +174,19 @@ The walk replays `by_region` first. Because dependency order re-points
 `tracked_expr_from_alias("by_region")` reads the advanced parent and rebuilds against it.
 Both aliases now point at fresh, version-2 hashes; a re-scan is clean.
 
-The same flow drives a revision of an *aggregation* alias. Revise `by_region` and
-`top_regions` goes stale and recomputes; `orders` (its parent) is untouched. The
-direction is always downstream: revising an alias makes its **followers** stale,
-never its parents.
+The same flow drives a revision of a catalog alias. Revise `by_region` with
+`catalog_revise` and `top_regions` goes stale and recomputes; `orders` (its
+parent) is untouched. The direction is always downstream: advancing an alias
+makes its **followers** stale, never its parents. A source alias cannot be
+revised, since there is no recipe to change: new data is a new import.
 
-This three-step flow (revise, scan, recalc) is the explicit path — the one that
-runs when auto-recalc is **off**. By default it is **on**, and `catalog_revise`
-folds the recalc into itself: it advances the alias *and* recomputes its stale
-followers in the same atomic checkpoint, so the scan-and-recalc dance above
-collapses to a single `catalog_revise` call. See *Trigger model* for the switch
-and what the auto path reports. The scan stays passive either way: it rebuilds
-nothing and changes no catalog state. (It does rewrite the source-digest memo,
-`artifacts/source_digests.json`, and today leaves it holding only the last file
-it hashed, so the next build hashes every source again.)
+This three-step flow (advance, scan, recalc) is the explicit path — the one that
+runs when auto-recalc is **off**. By default it is **on**, and the import or
+`catalog_revise` folds the recalc into itself: it advances the alias *and*
+recomputes its stale followers in the same atomic checkpoint, so the
+scan-and-recalc dance above collapses to a single call. See *Trigger model* for
+the switch and what the auto path reports. The scan stays passive either way: it
+rebuilds nothing, opens no data file and changes no catalog state.
 
 ## When are new alias revisions created
 
@@ -201,9 +196,12 @@ moves the head (`alias_map[name] = hash`) and appends to the history
 that history. So a new alias revision is created exactly when an alias head
 advances to a hash it was not already pointing at:
 
-- **On create** — `catalog_create("orders", ...)` writes version 1.
-- **On revise** — `catalog_revise("orders", ...)` appends version 2 for the one
-  alias you edited.
+- **On create** — `catalog_create("by_region", ...)` writes version 1, and so
+  does the first `catalog_import_source(..., "orders")`.
+- **On revise** — `catalog_revise("by_region", ...)` appends version 2 for the
+  one alias you edited.
+- **On import** — `catalog_import_source(..., "orders")` with bytes that differ
+  from the head appends the next version of the source alias.
 - **On recalc** — each dependent that **rebuilds to a new hash** has its alias
   advanced to a new revision. In the example above, the single committed recalc
   appended `by_region` v2 and `top_regions` v2. This is the "new alias revisions
@@ -220,8 +218,9 @@ Three edges make that precise:
   in `roots`. A named root with no alias on it (an unnamed scratch entry, say)
   produces a new hash and a `remap` entry but **zero** alias revisions. A head
   carrying two aliases advances both.
-- A **hash-pinned** child (`pinned_expr_from_alias("<hash>")`) re-resolves to the same
-  parent and is a `noop`, so it neither rebuilds nor advances its alias.
+- A **version-pinned** child (`pinned_expr_from_alias("orders-v1")`) re-resolves
+  to the same parent and is a `noop`, so it neither rebuilds nor advances its
+  alias.
 
 This per-alias revision is distinct from the catalog-level checkpoint. The alias
 head advancing is bookkeeping inside `aliases.jsonl`; the checkpoint is the single
@@ -239,31 +238,29 @@ each query (cheap for a notebook-sized catalog — one small JSON read per entry
 
 ### Where the edges live
 
-Each entry has a `manifest.json` with two fields that carry the graph:
+Each entry has a `manifest.json`, and one field in it carries the graph:
 
 - **`manifest.parents`** — the resolved cross-entry edges, a list of
   `{hash, ref, follow}`. `hash` is the parent's build-time content hash, `ref` the
-  original argument (alias or hash), `follow` its read-intent. Empty for a root (an
-  entry that reads no other entry).
-- **`manifest.sources`** — the raw-file leaves, `{rel_path: digest}`: the files the
-  recipe read via `read_project_file` or `tallyman_read_csv`, each with the content
-  digest it was built against, plus every source its parents recorded. `None`
-  (`null`) when the entry was built under `off` identity mode, and also whenever
-  nothing was recorded, as for a promoted diff, which reads its two entries
-  without recording them; either way the source axis can't be evaluated. (The
-  build stores an empty map as `null`, so `{}` does not occur.)
+  original argument (an alias or a version reference), `follow` its read-intent.
+  Empty for a root (an entry that reads no other entry).
 
-`tracked_`/`pinned_expr_from_alias` write `parents`; `read_project_file` and
-`tallyman_read_csv` write `sources`. Together they are the only record of the
-graph.
+`tracked_`/`pinned_expr_from_alias` write it, and it is the only record of the
+graph. A source entry's manifest also records `provenance` (the path the file
+was imported from, its digest, the reader options and the name it was imported
+as), which says where its data came from and is not an edge: the file is never
+read again. There used to be a second field, `manifest.sources`, a per-file digest
+map that children inherited from their parents; ADR-011 D6 deleted it once every
+input became an entry, since the parent edges then record everything.
 
 ### Roots, leaves, and direction
 
 This doc uses the **data-flow** convention (as in Airflow, dbt, Spark lineage):
 edges point downstream, the direction data moves.
 
-- A **source / root** has no incoming edges — nothing it depends on: a
-  `read_project_file` raw input, or an entry with empty `manifest.parents`.
+- A **source / root** has no incoming edges — nothing it depends on: a source
+  entry (a version of an imported file), or any entry with empty
+  `manifest.parents`.
 - A **leaf / sink** has no outgoing edges — nothing depends on it: a final
   aggregation nobody chains off.
 
@@ -271,14 +268,15 @@ A recalc starts at the changed roots and flows down to the leaves. (Build-system
 tools — Make, Bazel — point the arrows the other way and swap these names, which is
 the usual source of confusion.)
 
-### Cheap vs worthy parents — and what lands in `manifest.sources`
+### Cheap vs worthy parents
 
 When a recipe reads a parent with `tracked_expr_from_alias`, what comes back
 depends on whether the parent was classified **worthy** or **cheap** at build.
 This is the materialized-vs-not distinction:
 
 - A **worthy** parent (an aggregate, join, sort, window function, union, distinct,
-  unnest, a second file, a non-pure operation, or a UDF) is materialized: its
+  unnest, a second file, a non-pure operation, or a UDF, and every source entry)
+  is materialized: its
   result was written to a snapshot file when it was built. A child reading it gets
   a *bare read of that snapshot* — the parent's work is computed once and shared,
   and the child does not re-run it. The snapshot's path contains the parent's
@@ -287,15 +285,12 @@ This is the materialized-vs-not distinction:
 - A **cheap** parent (row-preserving over one file: select, filter, mutate) has no
   file of its own. A child reading it gets the parent's *frozen graph inlined* —
   pushdown makes re-running it ~free — so the parent's expression, down to the
-  ordered copy of its source, is composed into the child.
+  snapshot it reads, is composed into the child.
 
-Either way, building the child folds the parent's recorded `sources` into the
-child's own `manifest.sources`, so the source digests a child depends on are
-recorded on the child and its clones stay referenced as long as it survives. When
-the parent is cheap the child also records the parent's `ordered_copies`, since
-the child's build reads those copies itself. Editing a raw file that anywhere up
-the chain feeds the child therefore makes the child **directly** stale on the
-source axis, not merely transitively stale.
+Either way the child records one edge, to the parent it named, and nothing about
+the parent's own inputs. New data reaches it through the aliases: an import
+advances the source alias, the entries that follow it go directly stale, and the
+entries built on those are transitively stale.
 
 Which work is materialized is otherwise an implementation detail you don't see:
 `tracked_expr_from_alias` returns an expression either way, and the child never
@@ -307,13 +302,11 @@ it has to.
 ### Build-time capture, not live introspection
 
 The edges are captured the moment a recipe runs, not by walking the built
-expression afterward. While `build_and_persist` imports the recipe, three
-collectors are armed, and each loader announces itself as it executes:
-`read_project_file` and `tallyman_read_csv` note the source digest and the
-ordered copy they read, and `tracked_`/`pinned_expr_from_alias` note the resolved
-parent hash (and fold in the parent's recorded sources). After the import those
-bags are written into the manifest. The capture happens once, at build; nothing
-re-derives it later.
+expression afterward. While `build_and_persist` imports the recipe, one
+collector is armed (`parent_capture`), and `tracked_`/`pinned_expr_from_alias`
+note the resolved parent hash in it as they execute. After the import the
+collected edges are written into the manifest. The capture happens once, at
+build; nothing re-derives it later.
 
 This is a **tallyman** mechanism, not an xorq one. xorq's unit is a single
 expression and its content hash; it has no concept of a catalog, an alias, an
@@ -340,7 +333,7 @@ pins, and those live only in the manifest too.
 All graph reads go through `tallyman_xorq.dependents`, which scans the manifests
 and assembles the views the reactive system needs:
 
-- `parents_of(hash)` / `sources_of(hash)` — one entry's recorded inputs.
+- `parents_of(hash)` — one entry's recorded parent edges.
 - `build_dag()` — forward edges for every complete entry (one with a
   `manifest.json`), `{child: [parents]}`.
 - `dependents_index()` — the reverse index, `{parent: {children}}`: how a recalc
@@ -352,70 +345,43 @@ Both `staleness` and `recalc` go through this module rather than touching manife
 fields directly, so it is the single seam over the recorded graph: swapping the
 implementation (a persistent index, say) is a change to `dependents` alone.
 
-One consequence, and a candidate future check: because a cheap parent's
-edge is gone from xorq's flattened expression, you can't fully reconcile tallyman's
-recorded parents against xorq's graph. What you *can* reconcile is the source leaves — a
-child's `sources` should equal its own raw-file reads plus the union of `sources`
-over its parents. That invariant is checkable; the parent edges are only as
-good as what the side-channel captured at build.
+One consequence: because a cheap parent's edge is gone from xorq's flattened
+expression, you can't fully reconcile tallyman's recorded parents against xorq's
+graph, and the parent edges are only as good as what the side-channel captured
+at build.
 
-## The two staleness axes
+## One staleness axis
 
-The workflow above drives the **alias axis**. There is a second axis for source
-files that change on disk, which a closed notebook catalog mostly doesn't hit, but
-it exists and is worth knowing.
+An entry is stale when a `follow=True` parent — recorded when the recipe
+referenced a parent by alias name, `tracked_expr_from_alias("orders")` — now
+resolves to a different hash than the one recorded at build, and for no other
+reason (ADR-011 D6, `plans/ADR-011-sources-are-aliases.md`). This is what fires
+when you revise an upstream alias or import new data under a source alias. A
+`follow=False` parent (a `pinned_expr_from_alias("orders-v1")` reference) is
+never stale: the recipe asked for *that* revision and still gets it.
 
-An entry is judged on two independent axes, each tied to a kind of recorded input:
-
-- **alias** — a `follow=True` parent (recorded when the recipe referenced a parent
-  by alias name, `tracked_expr_from_alias("orders")`) is stale when that alias now resolves to
-  a different hash than the one recorded at build. This is what fires when you
-  revise an upstream alias. A `follow=False` parent (a `pinned_expr_from_alias`
-  reference, by hash or version reference) is never stale on this axis: the
-  recipe asked for *that* revision and still gets it.
-- **source** — a recorded `(rel_path, digest)` is stale when the file on disk no
-  longer digests to the recorded value. The check forces a faithful re-read so an
-  in-place content swap can't be masked by a cached digest, which means the scan
-  reads every recorded source file in full, once per entry that records it. In a
-  closed catalog you don't expect this to fire; it covers the case where a raw
-  file under `data/` is replaced. A CSV that `tallyman_read_csv` recorded by an
-  absolute path outside `data/` cannot be resolved by the scan, so it is reported
-  under `unknown_axes` on every scan and an edit to it is never flagged (#191).
+A data file that changes outside tallyman is not a reason. Until it is imported
+again nothing in the catalog has changed, and the builds read tallyman's copy of
+the bytes, never the file. So the scan opens no data file; it reads
+`aliases.jsonl` and the manifests. There used to be a second axis, a recorded
+source digest no longer matching the file on disk. It could not tell how an
+entry had come to depend on a file, so a child pinned to its parent by hash read
+as stale forever, and the import model removed it.
 
 Only an entry that is the current head of an alias can be directly stale (#154).
 A superseded version still records inputs that have since moved, but it heads no
 alias, so recomputing it would re-point nothing; the scan reports it with
 `live: false` and `stale: false`, and keeps its `reasons` for the record.
 
-A note on chains: a child's `manifest.sources` carries the source files its parents
-recorded, whether each parent is cheap or worthy (see *Cheap vs worthy parents*
-above). Editing such a source makes the child **directly** stale on the source
-axis, not merely transitively stale. This is expected.
+A note on chains: an entry records only its own parent edges, so an import makes
+the direct followers of the source alias **directly** stale and everything built
+on them **transitively** stale, whether the parents in between are cheap or
+worthy.
 
 `result_digest` is deliberately not a staleness input. An entry that recomputes to
 the same `content_hash` but a different result is *nondeterministic*, not stale,
 and recompute can't make it fresh. That is the #83/#121 concern, separate from
 this system.
-
-### Prerequisite: a source identity mode that records digests (source axis only)
-
-Source-axis staleness needs the manifest to record each source's digest, which
-the `cas` mode (the default) and the `salt` mode do. `source_identity.mode()`
-reads `TALLYMAN_SOURCE_IDENTITY` and falls back to `"cas"`. In `cas` mode,
-`read_project_file` and `tallyman_read_csv` take the source's content digest,
-clone it copy-on-write to `data/.cas/<digest><suffix>`, and read an ordered copy
-of the clone whose file name is a function of the digest. The path xorq hashes is
-therefore the content identity: editing a source in place yields a different
-digest, the manifest records that digest at build time, and a later scan can tell
-the file moved. The clone also means an old entry's copy can be made again from
-the bytes it was built from after you edit the source. `salt` records the
-digests too, and mixes them into the entry hash, but keeps no clone.
-
-Under the legacy `off` mode the manifest records no source digests, so the source
-axis cannot be evaluated. A scan reports it as `unknown` rather than silently
-fresh. If you have a corpus built under `off`, rebuild it — there is no migration
-path and none is wanted (single-user repo). The **alias axis is unaffected** by
-this mode; it works regardless.
 
 ## Detecting staleness (the scan)
 
@@ -453,11 +419,11 @@ Read-only, takes no checkpoint. It returns:
 }
 ```
 
-Each `reason` names the axis, the `ref` (alias name or source rel_path), the value
-`was` at build time, and the value `now`. An axis
-that can't be evaluated — alias deleted, source file removed, a CSV outside
-`data/` (#191), or the entry was built under `off` mode — lands in `unknown_axes`
-and never forces `stale: true`. `catalog_scan_staleness(verify_results=True)`
+Each `reason` names the axis (always `"alias"`; the field is kept so a reason
+has the same shape everywhere), the `ref` (the alias name), the parent hash that
+`was` recorded at build, and the alias head `now`. A parent alias that no longer
+exists can't be evaluated; it lands in `unknown_axes` as `alias:<name>` and never
+forces `stale: true`. `catalog_scan_staleness(verify_results=True)`
 also checks every snapshot on disk against its recorded `result_digest`; see
 [mcp-server.md](mcp-server.md).
 
@@ -500,7 +466,7 @@ Dry-run actions:
 - `rebuild` — directly stale, its own inputs moved.
 - `cascade` — clean, but a followed parent inside the cone will advance.
 - `unchanged` — not stale itself, and no followed parent inside the cone: a child
-  that pins its parent by hash, or a root that isn't stale.
+  that pins a version of its parent, or a root that isn't stale.
 
 A real run (`dry_run=False`) replays for real and reports:
 
@@ -641,12 +607,14 @@ scan-then-recalc path. The scan surfaces (`catalog_scan_staleness` /
 ### Auto-recalc on revise (default)
 
 Revising an alias recomputes its stale followers in the **same** checkpoint as the
-head advance. Every surface that re-points an *existing* alias triggers it —
-`catalog_revise`, the companion `PUT …/api/code/{alias}`, and a diff promotion
-(`catalog_promote_diff` or the companion's promote route) when it re-points an
-existing target. The cascade is scoped to *this* revise's followers: roots are the
-entries the advance made directly stale on the alias axis, and the descendant cone
-expands from there. Pre-existing staleness from any other cause is left untouched.
+head advance. Every surface that advances an *existing* alias to a new version
+triggers it — `catalog_revise`, the companion `PUT …/api/code/{alias}`, a diff
+promotion (`catalog_promote_diff` or the companion's promote route) when it
+re-points an existing target, and `catalog_import_source` when it mints a new
+version of a source alias. `catalog_alias`, which points a name at an entry that
+already exists, does not. The cascade is scoped to *this* advance's followers:
+roots are the entries it made directly stale, and the descendant cone expands
+from there. Pre-existing staleness from any other cause is left untouched.
 The companion's two routes build the new entry on its event loop, so the whole
 UI stops answering until that build (and any wait for the project lock) is over
 (#190); the cascade itself runs on a worker thread.
@@ -660,8 +628,8 @@ the rest are skipped.
 
 The revise reply carries a `recalc` sub-report — `catalog_recalc`'s shape (`cone`,
 `entries`, `remap`, `status`) plus `orphan_stale`. `orphan_stale` lists every entry
-that was directly stale but *not* a follower of this revise (a drifted source, a
-different alias not yet recalced, or an invariant break): not recomputed, logged at
+that was directly stale but *not* a follower of this revise (a different alias
+not yet recalced, or an invariant break): not recomputed, logged at
 WARNING, and classified against the durable error store — "explained by error
 `<id>`" when a recorded recalc/build failure carries that hash, else "UNEXPLAINED
 … file a bug." Cascade failures are persisted to `errors.jsonl` (keyed by the
@@ -678,5 +646,6 @@ path below.
 With the switch off, advancing an alias marks its followers stale but recomputes
 nothing. `catalog_recalc` / `POST …/api/recalc` is then the deliberate action that
 writes — preview with a dry run, commit with `dry_run=False`. This is also the path
-for staleness the auto trigger never sees: a drifted source file, or any alias
-left stale because auto-recalc was off when it was revised.
+for staleness the auto trigger never sees: an alias moved by `catalog_alias`, or
+any alias left stale because auto-recalc was off when it was revised or
+imported.

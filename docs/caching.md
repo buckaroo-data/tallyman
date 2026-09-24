@@ -15,13 +15,14 @@ built on it, and because it explains what the design replaced.
 
 Terms follow [architecture.md](architecture.md#terms). An **entry** is one
 catalog computation, stored under its **content hash**, xorq's hash of the
-entry's expression. Because every file the expression reads is named by what
-decides its content (a source's digest, or a parent entry's content hash), the
-hash also covers the bytes of every source and the identity of every parent.
+entry's expression. Every file the expression reads is a snapshot named by the
+content hash of the entry it holds, and a **source entry** (one version of an
+imported file) is hashed from the md5 of its bytes and its reader options, so
+the hash also covers the bytes of every input and the identity of every parent.
 
 The dominant pattern everywhere is content-addressing: keys are derived
 from immutable inputs (an expression's structure, an entry's content
-hash, a source file's digest), so entries never go stale and "invalidation"
+hash, an imported file's digest), so entries never go stale and "invalidation"
 is usually a space decision, not a correctness one. The exceptions are
 called out as they appear and collected at the end. Where an open issue says
 tallyman does not yet behave as described, the paragraph says so and cites it.
@@ -59,9 +60,9 @@ Snapshot's blindness to data changes is deliberate (reproducible build
 artifacts keyed on what the expression *is*, not on what the source file
 happened to contain), but it is the one real footgun in the stack:
 `ParquetSnapshotCache`'s own docstring notes it does not re-key when
-source files change. Tallyman puts a source's content in the path of the
-file a recipe reads, so xorq's path-only keys are content-honest without
-tallyman using either strategy; see below.
+source files change. Tallyman names every file a recipe reads by a content
+hash, so xorq's path-only keys are content-honest without tallyman using
+either strategy; see below.
 
 ### Storage backends
 
@@ -89,14 +90,15 @@ would mask filesystem changes within one long-lived process.
 
 ## tallyman
 
-Tallyman writes its own result files. It decides at build time whether an
-entry is worth materializing, writes the file once when the entry is created,
-makes sure every file an entry reads exists before anything executes, and
-reads sources through copies that carry a row-order column. xorq's own
-cache is not in that path. ADR-007 (`plans/ADR-007-tallyman-owned-materialization.md`)
-records the problems that led there: cache files landing under
-`~/.cache/xorq` outside the project, a writer that races on a fixed temporary
-file, and a build that re-ran an expensive parent whenever a child was built.
+Tallyman writes its own result files. It decides at build time whether an entry
+is worth materializing, writes the file once when the entry is created, makes
+sure every file an entry reads exists before anything executes, and lets a data
+file in only by an import, as a source entry whose snapshot carries a row-order
+column. xorq's own cache is not in that path. ADR-007
+(`plans/ADR-007-tallyman-owned-materialization.md`) records the problems that
+led there: cache files landing under `~/.cache/xorq` outside the project, a
+writer that races on a fixed temporary file, and a build that re-ran an
+expensive parent whenever a child was built.
 
 ### Worthy and cheap entries (`src/tallyman_xorq/worthiness.py`)
 
@@ -162,12 +164,12 @@ evidence can be found: `pinned_reason` reads the live entry's manifest, which a
 reset back moves to the bullpen (#195), and the log record of an unfaithful
 heal, which clearing the error banner deletes (#196).
 
-The row-group size and the batch size decide the batch boundaries that an
-entry built on the file sees, and an ungrouped float total depends on them
-(#187), so they are part of the reproducibility contract. `SNAPSHOT_FORMAT_VERSION`
-stands for both, and for the layout of ordered copies; the manifest records it
-as `snapshot_format`, next to the xorq, xorq-datafusion and pyarrow versions in
-`engine_versions`. Changing any of them is a corpus rebuild.
+The row-group size and the batch size decide the batch boundaries that an entry
+built on the file sees, and an ungrouped float total depends on them (#187), so
+they are part of the reproducibility contract. `SNAPSHOT_FORMAT_VERSION` stands
+for both, and for the row groups of a source entry's snapshot; the manifest
+records it as `snapshot_format`, next to the xorq, xorq-datafusion and pyarrow
+versions in `engine_versions`. Changing any of them is a corpus rebuild.
 
 `result_digest` in the manifest is `arrow-sha256:<hex>`, a SHA-256 over the
 file's Arrow data read back (`src/tallyman_xorq/digest.py`). It does not depend
@@ -177,50 +179,52 @@ on every value, on which slots are null, on the order of the rows, and on the
 column names and types. Per-column digests name the columns that differ
 between two runs.
 
-### Ordered copies of sources (`src/tallyman_xorq/ordered_copy.py`)
+### Source entries (`src/tallyman_xorq/source_import.py`)
 
-A recipe never reads a source file directly. `read_project_file` and
-`tallyman_read_csv` take the source's content digest (md5, memoized on the
-file's stat). In the default `cas` mode they also clone the source
-copy-on-write where the filesystem supports it (a plain copy elsewhere) to
-`<project>/data/.cas/<digest><suffix>`, the **clone**. Then
-polars writes an **ordered copy**: `<compute_cache>/ordered_sources/<key>.parquet`,
-holding the source's rows in file order plus a last column `__row_order`, in
-row groups of 122,880 rows. The recipe reads the copy. `<key>` is an md5 of the
-digest and the reader options (for a CSV, the schema and the `scan_csv`
-options), so the copy's name, and with it the entry's content hash, follows
-the source's content in every identity mode. Editing a source and running the
-same recipe forks a new entry, and the old entry keeps the rows it was built
-from (#168).
+A recipe never reads a data file. A file enters the catalog only through
+`catalog_import_source` (`update_and_depend`), which makes it a **source
+entry**, a version of a **source alias** (ADR-011,
+`plans/ADR-011-sources-are-aliases.md`). The import:
 
-The copy does not always keep the source's column types. Polars turns a
-`date64` column into a timestamp and a map into a list of structs, and a
-`decimal256` column makes it panic with an exception the build does not catch
-(#197). A CSV's reader options are stored in a JSON-safe form, and the first
-ingest already uses that form, so an option that is a function fails (#198).
+- digests the file (md5) and clones its bytes, copy-on-write where the
+  filesystem supports it and a plain copy elsewhere, to
+  `<project>/data/.cas/<digest><suffix>`, the **clone**. The copy is digested
+  again after it is written and refused if it does not match its name;
+- writes the entry's snapshot, `<compute_cache>/result_cache/<content_hash>.parquet`,
+  holding the file's rows in file order plus a last column `__row_order`. A
+  parquet file is copied by pyarrow, so its column types survive; a CSV is parsed
+  by polars under the schema and `scan_csv` options named in the import call,
+  and its batches go to the same pyarrow writer. Either way the file has the
+  pinned layout of every snapshot, in row groups of 122,880 rows;
+- writes the entry: a generated recipe, a frozen build, a schema, and a manifest
+  whose `provenance` records the outside path, the digest, the reader options and
+  the name it was imported as.
 
-The manifest records each copy under `ordered_copies`: the source path, its
-digest, the file suffix, the reader options, and the content digest of the copy
-when it was first written. That record is what lets `ensure_materialized` make
-a deleted copy again. It is looked up in the reading entry's manifest first and
-then in any manifest in the catalog, since a copy's key depends only on the
-source digest and the reader options. A `<key>.digest` file next to a copy
-caches its content digest. It is rewritten in place (truncated, then written),
-and a build reads it without the lock, so a build that reads it in the middle of
-that write can record an empty digest (#211).
-Nothing lists or removes an ordered copy that no entry reads any more, so each
-edit of a large source leaves another full copy on disk (#207).
+The entry's content hash is `md5("source|<digest>|<reader signature>")`, cut to
+12 hex characters, so it is a function of the bytes and the reader options and
+nothing else. The reader options are fixed at import and must be plain values: a
+callable, whose `repr` would carry a memory address, is refused. The outside path
+is provenance and is never read again, so editing or deleting the original file
+changes nothing. New data arrives by importing again under the same alias, which
+mints the next version under a new hash; the old versions keep their rows.
 
-`TALLYMAN_SOURCE_IDENTITY` (default `cas`) now decides what else is recorded.
-`cas` keeps the clone and records `manifest.sources`. `salt` records
-`manifest.sources`, mixes the digests into the entry hash, and reads the live
-file when it writes a copy. `off` records no `sources`, so the source axis of
-staleness reports `unknown`, and also reads the live file. `rewrite_for_build`
-no longer branches on the mode.
+A source entry is worthy, and its snapshot is cache in the sense of ADR-007 D13
+(a file is cache only if it can be made again): the clone holds the bytes and the
+manifest holds the reader options, so a deleted snapshot is written again from
+the clone (`_heal_a_source`) and checked against the recorded `result_digest`
+like any other heal. Nothing in a read writes a clone. With the clone gone, the
+snapshot is the last copy of those rows, so `pinned_reason` pins it; if the
+snapshot is gone as well, the read fails with an error naming the missing clone
+and the `catalog_import_source` call, reader options included, that restores
+it. Importing the same bytes again under the alias that holds them rewrites
+nothing of the entry: it writes the clone back from the given file, verified
+against the digest, and heals the snapshot.
 
-A recipe that calls `xo.deferred_read_parquet` on a file that is not under
-`compute_cache/`, or `xo.deferred_read_csv`, is a build error: such a read gets
-no digest, no clone and no ordered copy.
+Every other way of reading a file is a build error: `read_project_file`,
+`tallyman_read_csv`, `xo.deferred_read_csv`, and `xo.deferred_read_parquet` of a
+file outside `compute_cache/`. `read_project_file` is still called by the recipe
+the importer generates, where a context variable (`_SOURCE_ENTRY`) resolves it to
+the entry's own snapshot.
 
 ### Reads (`cached_result_expr` and `ensure_materialized`)
 
@@ -243,12 +247,11 @@ content_hash)` and then returns:
 its own snapshot, is on disk before anything executes:
 
 1. A worthy entry whose snapshot exists is done, and no build is loaded.
-2. Otherwise it loads the frozen build and collects the file each `Read` node
-   points at.
-3. It re-creates each missing file by the rule for its class (table below).
-   No plan reads a clone directly, so a missing clone is made again only when
-   an ordered copy that needs it is re-created. When nothing can re-create a
-   file, the error names the source file.
+2. A source entry whose snapshot is missing is healed from its clone, and
+   nothing else is needed: its own build reads the very file that is missing.
+3. Otherwise it loads the frozen build and collects the file each `Read` node
+   points at. Every one is another entry's snapshot, and a missing one is made
+   again by recursing on the hash in its name.
 4. For a worthy entry it then heals the entry's own snapshot, under the
    project lock and after re-checking that the file is still missing, and
    verifies it.
@@ -261,9 +264,9 @@ longer be read (#204).
 
 | File | Written by | If it is missing |
 |---|---|---|
-| Snapshot, `compute_cache/result_cache/<hash>.parquet` | `materialize` | re-run the entry's build, and verify the digest |
-| Ordered copy, `compute_cache/ordered_sources/<key>.parquet` | polars, at ingest | re-run ingest on the clone with the recorded reader options, and check it |
-| Clone, `data/.cas/<digest><suffix>` | `ensure_cas_path` | when an ordered copy made from it is re-created: copy the live source again, but only while its bytes still hash to the digest |
+| Snapshot of a computed entry, `compute_cache/result_cache/<hash>.parquet` | `materialize` | re-run the entry's build, and verify the digest |
+| Snapshot of a source entry, same directory | the import | parse the clone again with the recorded reader options, and verify the digest; with the clone gone too, raise an error naming the clone and the import that repairs it |
+| Clone, `data/.cas/<digest><suffix>` | the import (`ensure_cas_path`) | nothing in a read makes it again; the snapshot is pinned while it exists, and a re-import of the same bytes writes the clone back |
 
 A healed snapshot is checked against the recorded `result_digest`. A mismatch
 is still served, since the rows are the honest output of the frozen build, but
@@ -281,8 +284,10 @@ is open, without a promoted diff's colouring (#203). Only the healed entry is
 flagged: a cheap child of it reads the same snapshot, so the child's rows change
 under its hash with no record and no reload (#208). The MCP server registers no
 hook, so a heal that runs there records the error and wipes the stat cache
-only. A re-created ordered copy is checked the same way against its recorded
-content digest, and a mismatch records an `unfaithful_ordered_copy` error.
+only. A source entry's snapshot made again from its clone goes through the same
+check, so if a reader now parses the bytes differently, the difference is
+recorded as an unfaithful heal and the manifest keeps the digest of the rows
+that were imported.
 
 Both shapes are single-backend expressions, so two entries compose (`union`,
 `join`, a diff) without tripping xorq's "multiple backends" guard. Chaining
@@ -292,10 +297,11 @@ snapshot by its literal path, which contains the parent's content hash: the
 child's identity is a function of the parent's, and does not change when the
 file's bytes do. The parent's snapshot is made to exist before the child is
 built, since a bare read cannot be composed over a missing file. A cheap
-parent's graph is inlined instead. The child's manifest records every source
-digest its parent recorded, and the parent's ordered-copy records as well when
-the parent is cheap, because the child's build then reads those copies itself.
-The viewer's paginated reads, diffs, and post-processing all go through
+parent's graph is inlined instead. The child's manifest records only its parent
+edges: a source version is an entry, so the parent edges are the whole record of
+what the child depends on (ADR-011 D6 deleted `manifest.sources`, the per-file
+digest map children used to inherit). The viewer's paginated reads, diffs, and
+post-processing all go through
 `cached_result_expr`.
 
 ### Row order (`src/tallyman_xorq/row_order.py`)
@@ -338,14 +344,16 @@ pinned version, ignores the hint, so the grid's pages are not yet ordered by it
 
 ### Compute cache (`compute_cache_dir` in `src/tallyman_core/paths.py`)
 
-`<project>/artifacts/catalog/compute_cache/` holds two directories of files
-that tallyman writes: `result_cache/` (snapshots) and `ordered_sources/`
-(ordered copies and their `.digest` files). By rule everything in it is cache:
-a file lives here only if `ensure_materialized` can re-create it and check what
-it made, so the cold state is an empty `compute_cache/`, and reading any entry
-then re-creates every file it needs. The exception is the snapshot of an entry
-recorded as not reproducible, which cannot be made again faithfully; its pin
-protects it from the Cache page and from nothing else (#185).
+`<project>/artifacts/catalog/compute_cache/` holds one directory of files that
+tallyman writes: `result_cache/`, the snapshots of worthy entries, source
+entries included. By rule everything in it is cache: a file lives here only if
+`ensure_materialized` can re-create it and check what it made, so the cold state
+is an empty `compute_cache/`, and reading any entry then re-creates every file it
+needs. Two kinds of snapshot are exceptions, and are pinned: the snapshot of an
+entry recorded as not reproducible, which cannot be made again faithfully, and
+the snapshot of a source entry whose clone is gone, which is the last copy of
+the imported rows. A pin protects the file from the Cache page and from nothing
+else (#185).
 
 Files are deleted only by an explicit user action, and written only because
 something is about to read them. The startup warm-up writes nothing here, the
@@ -353,12 +361,12 @@ verify sweep (`catalog_scan_staleness(verify_results=True)`) reads and never
 writes, and a reset leaves the directory alone. The Cache page's delete is meant
 to be the one deleter; a failed build is the other (#193). The page answers 409 with
 the reason for a pinned snapshot, and it lists a snapshot whose entry is no
-longer in the catalog as an orphan row, so that it can be deleted. It lists
-only snapshots: ordered copies cannot be seen or deleted there (#207).
+longer in the catalog as an orphan row, so that it can be deleted. A source
+entry's snapshot is listed like any other.
 
 The project's write lock (`catalog_state.project_lock`) is taken by a build
-(for its whole length), a materialization or heal, an ordered-copy write, a
-checkpoint and a reset. Other writes take no lock: alias and notebook updates,
+(for its whole length), an import, a materialization or heal, a checkpoint and
+a reset. Other writes take no lock: alias and notebook updates,
 chart and display configs and `config.json` each replace a whole file
 atomically, the logs append a line, and the Cache page's delete unlinks the
 file. The lock is a file
@@ -377,12 +385,13 @@ bring them back), but it does not manage `compute_cache/` (ADR-007 D14, a
 reset leaves `compute_cache/` alone). Snapshots are named by content hash, so
 one left behind by a retired entry cannot be served for another entry: it is
 unreferenced disk until that entry comes back or the user deletes it. A clone
-is data, the only frozen copy of the bytes an entry was built from once the
-live file is edited, and `<project>/data/.cas` lives outside the catalog git
-repo. So `reset_to` moves the clones no surviving entry's `manifest.sources`
-refers to into `<catalog>/bullpen/cas/` and never deletes one
-(`source_identity.gc_cas` with a bullpen), and a reset forward copies them
-back. `compute_cache.jsonl` no longer exists.
+is data, the only copy tallyman has of bytes it imported (the outside file is
+never read again), and `<project>/data/.cas` lives outside the catalog git repo.
+So `reset_to` moves the clones that no surviving source entry's
+`manifest.provenance` names into `<catalog>/bullpen/cas/` and never deletes one
+(`source_identity.gc_cas` with a bullpen), and a reset forward copies back the
+clones a restored entry names. A reset that cannot read every surviving
+manifest skips the sweep. `compute_cache.jsonl` no longer exists.
 
 Two defects affect entries that are not reproducible. The bullpen keeps the
 first copy of an entry directory it receives, so a reset after re-adding such
@@ -524,13 +533,16 @@ catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
   `compile_seconds`, `cache_worthy`, `cache_worthy_why`, `cache_bytes`), the
   `result_digest` (a content digest of the snapshot, worthy entries only),
   `reproducible` and `nonreproducible_columns`, `snapshot_format` and
-  `engine_versions`, the `ordered_copies` records, `sources` and `parents`.
+  `engine_versions`, `parents`, and on a source entry `provenance` (where the
+  file came from, its digest, the reader options and the name it was imported
+  as).
   A worthy entry's schema is read from the file `materialize` wrote, which is
   why a `timestamp[s]` column is recorded as `timestamp[ms]`. Every entry's
   schema ends in `__row_order`. All of it is fixed at build so later reads
   don't re-walk the expression.
 - **Alias history** — `<catalog>/aliases.jsonl`, one line per alias holding
-  its current head and the append-only version log (`aliases.py`). It is a
+  its current head, the append-only version log and its kind, `catalog` or
+  `source` (`aliases.py`). It is a
   git-tracked file in the catalog repo, not a per-entry artifact, so it rolls
   back with `git reset` on a `reset_to`.
 - **Per-hash config** — `<catalog>/chart_specs/<hash>.vl.json` and
@@ -597,9 +609,9 @@ catalog store, `catalog.py` / `catalog_state.py`, for the full tracked surface.)
 ## Invalidation, in one view
 
 Most of the stack never invalidates because it never can be stale: tallyman
-entry hashes, snapshot paths (named by content hash), ordered copies (named by
-a source's digest and its reader options), primary-key files, and manifests all
-rely on "same key, same rows, forever". Cleanup for those is a space concern.
+entry hashes (a source entry's named by its bytes and reader options), snapshot
+paths (named by content hash), primary-key files, and manifests all rely on
+"same key, same rows, forever". Cleanup for those is a space concern.
 Only the user deletes a file (apart from a failed build, #193), and a deleted
 file is made again and verified the next time something reads it.
 
@@ -625,18 +637,16 @@ that changes results is attributed to the versions in `engine_versions`, and
 the remedy is a corpus rebuild. The second
 hole this section used to document — cold reads re-running `expr.py` and
 re-digesting live sources, serving edited bytes under the original hash
-(#115/#163) — is closed: reads load the frozen build, whose leaves are ordered
-copies named by the source digest, bare reads of parent snapshots, and inlined
-cheap parent graphs, so a cold read cannot see a post-build edit at all.
+(#115/#163) — is closed: reads load the frozen build, whose leaves are bare
+reads of snapshots named by content hash and inlined cheap parent graphs, and a
+data file enters only by an import, so a cold read cannot see a post-build edit
+at all.
 
 Where staleness is actually possible, it is handled explicitly:
 
 - **mtime tracking** — Buckaroo's file cache invalidates automatically when the
-  source file changes, and tallyman's source-digest memo
-  (`source_identity.digest_for`) skips re-hashing a file whose mtime, size and
-  inode are unchanged. Content stays the truth: the staleness scan forces a
-  re-hash. (Each forced re-hash also rewrites the memo holding only the file it
-  just hashed, so after a scan the next build hashes every source again.)
+  source file changes. Tallyman keeps no stat-keyed memo: a file is digested
+  once, when it is imported, and the staleness scan reads no file at all.
 - **TTL** — xorq's `ParquetTTLStorage` (default one day), the
   companion's 3-second disk-usage cache, and Buckaroo's eviction of a session
   idle for an hour are the only clocks in the system.
@@ -647,13 +657,12 @@ Where staleness is actually possible, it is handled explicitly:
   a recalc.
 
 The one rule to remember: a cache keyed on a path does not notice upstream data
-changes, so tallyman puts the content in the path. In every identity mode the
-file a recipe reads is an ordered copy named by the source's digest and reader
-options. An edited source therefore forks the entry hash at build instead of
-deduping to the stale entry, and reads — warm, cold, or healing — resolve
-through the frozen build to the copy the entry was built from, never the live
-file. `cas` also keeps the clone, the only frozen copy of the bytes once the
-live file is edited, which is what lets `ensure_materialized` make a deleted
-ordered copy again. Under `off` and `salt` there is no clone, so a deleted copy
-can be made again only while the live file still has the recorded bytes;
-otherwise the error names the source file.
+changes, so tallyman puts the content in the path. Every file a recipe reads is
+a snapshot named by a content hash, and a source entry's hash is a function of
+the bytes it imported and the reader options. New data arrives only as an
+import, which mints a new source version under a new hash and makes the entries
+following that alias stale, and reads — warm, cold, or healing — resolve through
+the frozen build to the snapshot the entry was built from, never the outside
+file. The clone is what lets `ensure_materialized` make a deleted source
+snapshot again; with the clone gone the snapshot is pinned, and once both are
+gone the error names the clone and the import that restores it.

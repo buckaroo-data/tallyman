@@ -28,14 +28,15 @@ view-time work against caches that survived on disk. Other terms follow
 | MCP server | `src/tallyman_mcp/server.py` | receives code + alias, calls the builder |
 | Builder | `src/tallyman_xorq/build.py` | imports the recipe, materializes a worthy entry, persists the entry |
 | xorq compiler | `build_expr` / `load_expr` | tokenizes to a content hash, runs the graph |
-| Ingest | `src/tallyman_xorq/io.py`, `ordered_copy.py` | reads a source through its clone into an ordered copy that ends in `__row_order` |
+| Import | `src/tallyman_xorq/source_import.py`, `source_identity.py` | `catalog_import_source`: clones a file's bytes and writes a source entry, whose snapshot ends in `__row_order` |
+| Reads in a recipe | `src/tallyman_xorq/io.py` | `tracked_expr_from_alias`, `pinned_expr_from_alias`, and the refusals of a raw file read |
 | Classifier and rewrite | `worthiness.py`, `source_cache.py`, `row_order.py` | worthy or cheap, the canonical sort, the `__row_order` rules |
 | Materialization | `src/tallyman_xorq/materialize.py` | `materialize` writes snapshots; `ensure_materialized` makes every file an entry reads exist |
 | Reads | `src/tallyman_xorq/result_cache.py` | `cached_result_expr`, the one canonical read |
 | State + git | `src/tallyman_core/catalog_state.py`, `catalog.py` | per-concern tracked files in tallyman's native catalog git repo; the checkpoint commits |
 | Companion | `src/tallyman_companion/app.py` | HTTP/SSE API the React SPA talks to |
 | Buckaroo mgr | `src/tallyman_companion/buckaroo_lifecycle.py` | owns the Buckaroo subprocess and opens its sessions |
-| Paths | `src/tallyman_core/paths.py` | the project's directory layout (the subdirectories of `compute_cache/` and `data/.cas/` are named in `materialize.py`, `ordered_copy.py` and `source_identity.py`) |
+| Paths | `src/tallyman_core/paths.py` | the project's directory layout (`compute_cache/result_cache/` is named in `materialize.py`, and `data/.cas/` in `source_identity.py`) |
 
 Throughout, `<entry>` is `entry_dir(project, content_hash)` =
 `<project>/artifacts/catalog/entries/<hash>/`, and `<catalog>` is
@@ -60,13 +61,27 @@ The model calls one of three tools (`server.py`):
   the companion's `put_code` code-edit path.
 
 The code is a Python string that must bind a variable `expr` to an
-ibis/xorq expression, typically built from `tracked_expr_from_alias("alias")` (another
-entry), `read_project_file("file")` (a raw parquet source) or
-`tallyman_read_csv(path, schema=...)` (a CSV). All three tools converge on
-`_run_and_record` → `build_and_persist(project, code, prompt)`, and so does
-`catalog_load_parquet(rel_path)`, which writes a one-line `read_project_file`
-recipe itself. The companion's code editor (`PUT /{project}/api/code/{alias}`)
-calls `build_and_persist` directly.
+ibis/xorq expression built from other entries: `tracked_expr_from_alias("alias")`
+follows an alias, and `pinned_expr_from_alias("alias-v2")` pins one version of
+it. A recipe never opens a file. All three tools converge on `_run_and_record` →
+`build_and_persist(project, code, prompt)`. The companion's code editor
+(`PUT /{project}/api/code/{alias}`) calls `build_and_persist` directly, after
+refusing a source alias.
+
+### Before this: the data is imported
+
+The data at the bottom of every chain entered the catalog earlier, through
+`catalog_import_source(outside_path, alias, ...)` (`source_import.update_and_depend`,
+ADR-011). That call is not a build of a recipe. It digests the file, clones its
+bytes to `<project>/data/.cas/<digest><suffix>` (checked against the digest after
+the copy), writes the rows in file order with a last `__row_order` column to
+`compute_cache/result_cache/<content_hash>.parquet`, and writes an entry
+directory of its own: a generated `expr.py` whose header records the path, the
+digest and the reader options, a frozen `xorq_build/`, `schema.json`, and a
+`manifest.json` whose `provenance` says where the data came from. The content
+hash is an md5 of the bytes' digest and the reader options. It then appends the
+entry to the source alias, so the recipe above can read it with
+`tracked_expr_from_alias("orders")`. The outside file is never read again.
 
 ## 2. Build + execute (`build_and_persist`)
 
@@ -75,21 +90,17 @@ so builds, materializations, checkpoints and resets in either process happen one
 at a time. In order:
 
 1. **Import the user code** in a fresh module scope (`_import_script`). During
-   the import, each loader announces itself. `read_project_file` and
-   `tallyman_read_csv` take the source's content digest, clone the source
-   under the `cas` identity mode (the default) to `data/.cas/<digest><suffix>`,
-   and write an **ordered copy** of it under `compute_cache/ordered_sources/`
-   (the source's rows in file order, plus a last column `__row_order`), unless
-   that copy is already on disk. `tracked_expr_from_alias` and
-   `pinned_expr_from_alias` record each parent edge, and make the parent's
-   files exist first (`ensure_materialized`), because a child cannot be built
-   over a snapshot that is missing.
-   `source_identity`, `parent_capture` and `ordered_copy` each collect what was
-   announced, for the manifest.
+   the import, `tracked_expr_from_alias` and `pinned_expr_from_alias` resolve
+   each alias, record the parent edge (`parent_capture` collects them for the
+   manifest), and make the parent's files exist first (`ensure_materialized`),
+   because a child cannot be built over a snapshot that is missing.
+   `read_project_file` and `tallyman_read_csv` raise here, naming the import to
+   use, and so does a bare content hash or bare alias passed to
+   `pinned_expr_from_alias`.
 2. **Check, classify, rewrite, compile.** The build refuses a raw
    `xo.deferred_read_csv` and a raw `xo.deferred_read_parquet` of a file that
-   is not under `compute_cache/`, since such a read gets no digest, clone or
-   ordered copy. `worthiness.classify_expr` then decides, once and on the
+   is not under `compute_cache/`, since such a read gets no digest and no
+   clone. `worthiness.classify_expr` then decides, once and on the
    expression the author wrote, whether the entry is **worthy** (materialized)
    or **cheap** (row-preserving over one file, no file of its own); the
    verdict goes in the manifest. `rewrite_for_build` rejects in-memory reads, a
@@ -104,10 +115,9 @@ at a time. In order:
    compiles into a throwaway temp dir whose name *is* the content hash: xorq's
    dask-style token over the rewritten expression structure
    (`content_hash = build_path.name`). The hash follows the content of every
-   source in every identity mode, because the path xorq tokenizes is the
-   ordered copy's, whose name is a function of the source's digest. Under
-   `salt` the digests are also folded in afterward (`si.salted_hash`). `expr.py`
-   keeps the author's literal source.
+   input, because every path xorq tokenizes is a snapshot named by a content
+   hash, down to the source entries, whose hash is a function of their bytes.
+   `expr.py` keeps the author's literal source.
 3. **Idempotency check**: if `<entry>/manifest.json` already exists for this
    hash, nothing is rebuilt: the prompt is appended as a re-run event and the
    existing `BuildResult` is returned. (This is the cheap path that Part 2
@@ -144,9 +154,9 @@ at a time. In order:
    prompt to `<catalog>/prompts/<hash>.jsonl`. The manifest carries the verdict
    (`cache_worthy`, `cache_worthy_why`), `compile_seconds` and `cache_bytes`
    (the snapshot's size, or `None` for a cheap entry), `result_digest`,
-   `reproducible`, `snapshot_format`, `engine_versions`, `ordered_copies`,
-   `sources` and `parents`, and is written last and atomically, so its
-   presence means the entry is complete.
+   `reproducible`, `snapshot_format`, `engine_versions` and `parents`, and is
+   written last and atomically, so its presence means the entry is complete.
+   (Only a source entry's manifest has `provenance`, written by the import.)
 7. **Mark persisted; the checkpoint commits.** `build_and_persist` sets
    `catalog_registered = True`, meaning the entry dir is fully on disk — it does
    not write git itself. Durability is the *checkpoint's* job: when the MCP tool
@@ -165,12 +175,9 @@ at a time. In order:
 | User source | `<entry>/expr.py` | step 4 |
 | **Snapshot** (worthy only) | `<catalog>/compute_cache/result_cache/<content_hash>.parquet` | `materialize`, step 5 |
 | Expanded build (worthy only) | `<entry>/.xorq_build_expanded/` and its `.complete` marker | `materialize` loading the build, step 5 |
-| **Ordered copy** of each source | `<catalog>/compute_cache/ordered_sources/<key>.parquet` (and a `<key>.digest` file) | `read_project_file` / `tallyman_read_csv`, step 1, unless already there |
 | Schema / manifest | `<entry>/schema.json`, `<entry>/manifest.json` | step 6 |
 | Prompt history | `<catalog>/prompts/<hash>.jsonl` | step 6 |
 | Chart / display config (if attached or carried forward) | `<catalog>/chart_specs/<hash>.vl.json`, `<catalog>/display_configs/<hash>.json` | UI, or `carry_forward_entry_config` on revise (§3) |
-| Source digests | `<project>/artifacts/source_digests.json` (stat-keyed memo, every mode) + the manifest's `sources` map (`cas` and `salt`) | `source_identity`, step 1 |
-| Content source clones (`cas` only) | `<project>/data/.cas/<digest><suffix>` (outside the catalog repo) | `read_project_file` → `ensure_cas_path`, step 1 |
 | Alias | `<catalog>/aliases.jsonl` | `set_alias` (§3 below) |
 | Recipe zip + pointers + commit | `<catalog>/entries/<hash>.zip`, `entries.jsonl` + a git commit | the checkpoint, step 7 |
 
@@ -209,11 +216,13 @@ step 5, not on first read (§6).
 
 For a named entry, `catalog_create` calls `set_alias(project, name, hash,
 expect_exists=False)`, which rewrites the tracked `<catalog>/aliases.jsonl` (one
-`{"alias", "latest", "history": [...]}` line per alias) with the new alias in
-it, and then appends a notebook cell. Aliases live in their own tracked file now, not in a
-`catalog.yaml`; #103 made that possible by giving tallyman its own native
-catalog repo (the old xorq catalog package rejected extra tracked files, which
-is why aliases used to be smuggled into `catalog.yaml`). Then
+`{"alias", "latest", "history": [...], "kind"}` line per alias) with the new
+alias in it, and then appends a notebook cell. The kind is `catalog` here;
+`set_alias` refuses a name that is already a source alias, and refuses to point
+a catalog alias at a source entry. Aliases live in their own tracked file now,
+not in a `catalog.yaml`; #103 made that possible by giving tallyman its own
+native catalog repo (the old xorq catalog package rejected extra tracked files,
+which is why aliases used to be smuggled into `catalog.yaml`). Then
 `_notify("new_entry", content_hash=…, alias=…, version=…)` POSTs the companion's
 `/internal/notify`, which publishes an SSE event (a message on the HTTP stream
 each open browser tab holds) to any connected SPA (`app.py`). The viewer's
@@ -321,9 +330,11 @@ first, and then:
 If a snapshot is missing, `ensure_materialized` re-creates it under the project
 lock, after re-checking that it is still missing, by running the frozen build once
 through the same writer, and verifies the result against the `result_digest`
-recorded at build. Missing files it reads are made first: a parent's snapshot by
-recursing on the hash in its name, an ordered copy from its clone with the reader
-options in the manifest, a clone from the live source while the bytes still match.
+recorded at build. Missing files it reads are made first, each a parent's
+snapshot, by recursing on the hash in its name. A source entry's snapshot is made
+again from its clone with the reader options in its manifest, and checked the
+same way; if the clone is gone too, the error names it and the import call that
+repairs the version.
 A mismatch is still served, but never silently: `_verify_self_heal` records a
 durable `unfaithful_heal` error (which also pins the file), wipes the entry's
 stat cache, and fires the hooks. In the companion the hook posts a forced reload
@@ -347,12 +358,13 @@ Three distinct "warm" scenarios, because they hit different caches.
 
 `build_and_persist` runs `build_expr` again, gets the **same content hash**,
 finds `<entry>` and its manifest already present, appends the prompt, and
-returns the existing `BuildResult`. No execution, no materialization, and no new file: the ordered
-copies of its sources are already on disk, so ingest finds them and writes
-nothing. The expression is never recomputed when its structure and its sources'
-content are unchanged. If a source *has* changed, its digest changes, so the
-ordered copy has a new name and the same recipe forks a new entry; the old entry
-keeps the rows it was built from.
+returns the existing `BuildResult`. No execution, no materialization, and no new
+file. The expression is never recomputed when its structure and its parents are
+unchanged. A changed data file changes nothing here until it is imported again:
+the import mints the next version of its source alias, the entries that follow
+the alias go stale, and recalc replays their recipes into new entries (at once,
+when auto-recalc is on, as it is by default). The old entries keep the rows they
+were built from. Importing unchanged bytes is itself a no-op.
 
 ## B. Revisiting an entry in the same companion process (RAM-warm)
 
@@ -407,13 +419,14 @@ restart never does.
 
 # One-line summary of cache write phases
 
-- **Build time** (`build_and_persist`): during the recipe import, the ordered
-  copy of each source under `compute_cache/ordered_sources/` and (`cas` only) its
-  `data/.cas/<digest>` clone, and the source-digest memo
-  (`artifacts/source_digests.json`, in every mode); then `xorq_build/` and
-  `expr.py`, the snapshot under `compute_cache/result_cache/` and the expanded
-  build (worthy entries only), `schema.json` / `manifest.json` (whose `sources`
-  map is filled under `cas` and `salt`), and the prompt history.
+- **Import time** (`catalog_import_source`, before any recipe reads the data):
+  the clone under `data/.cas/`, the source entry's snapshot under
+  `compute_cache/result_cache/`, and its entry directory (`expr.py`,
+  `xorq_build/`, `schema.json`, `manifest.json` with `provenance`); then the
+  source alias in `aliases.jsonl`.
+- **Build time** (`build_and_persist`): `xorq_build/` and `expr.py`, the snapshot
+  under `compute_cache/result_cache/` and the expanded build (worthy entries
+  only), `schema.json` / `manifest.json`, and the prompt history.
 - **Naming** (right after the build, in the tool): `aliases.jsonl` via
   `set_alias`, and the notebook cell.
 - **Checkpoint** (when the tool returns, `checkpoint_catalog`): the recipe zip
@@ -430,11 +443,10 @@ a klass-changing edit, a reset or recalc, or an unfaithful heal (all of them
 the stat cache). Only the user deletes a file (the Cache page; a pinned snapshot
 is refused), apart from a failed build, which deletes the snapshot at its
 entry's path (#193). A `reset_to`
-leaves `compute_cache/` alone, and moves the `data/.cas` source clones that no
-surviving entry's `manifest.sources` refers to into `<catalog>/bullpen/cas/`
-instead of deleting them, so a reset forward brings them back. A child's
-`manifest.sources` records every clone its parents' builds read, so a clone stays
-referenced as long as any entry built on it survives. See `caching.md` for the
-full invalidation table. (The cold-reconstruction staleness hole this section
-used to reference — #74/#115 — is closed: reads load the frozen build, so a cold
-read cannot see a post-build source edit.)
+leaves `compute_cache/` alone, and moves the `data/.cas` clones that no surviving
+source entry's `manifest.provenance` names into `<catalog>/bullpen/cas/` instead
+of deleting them, so a reset forward brings them back. A clone therefore stays
+as long as the source version that imported it survives. See `caching.md` for
+the full invalidation table. (The cold-reconstruction staleness
+hole this section used to reference — #74/#115 — is closed: reads load the
+frozen build, so a cold read cannot see a post-build edit of a data file.)

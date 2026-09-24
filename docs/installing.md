@@ -190,7 +190,6 @@ gone.
 | `TALLYMAN_PROJECT` | none | Seeds the `active_project` file when that file does not exist yet and the named project does (see below) |
 | `TALLYMAN_COMPANION_URL` | `http://127.0.0.1:7860` | Where the MCP server and the CLI send notifications |
 | `TALLYMAN_AUTO_RECALC` | unset | `1`/`0` (or `true`/`false`) overrides the project's auto-recalc switch (on by default) |
-| `TALLYMAN_SOURCE_IDENTITY` | `cas` | How source files are identified: `cas`, `salt` or `off` |
 | `TALLYMAN_LOG_LEVEL` | `INFO` | Log level of the MCP server |
 
 **State on disk** lives under `TALLYMAN_HOME`:

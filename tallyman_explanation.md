@@ -85,16 +85,24 @@ When the expression is added, it is also executed and cached, along with summary
   were minted together.
 - **Intelligent CSV import** with a deterministic reader and an error
   contract designed to hand the LLM a usable suggestion when a file doesn't
-  parse cleanly. Parquet and CSV sources alike are read once, in file order.
+  parse cleanly. Parquet and CSV files alike are read once, in file order,
+  when they are imported.
+- **Data files are aliases too.** A file enters the catalog only by an explicit
+  import, `catalog_import_source`, which copies its bytes in and makes each
+  version of it an entry under a *source alias*. Import it again to bring in new
+  data: the next version is minted and everything downstream recomputes. A
+  recipe never opens a file, so editing or deleting the original changes
+  nothing.
 - **Projects** — multiple independent catalogs, with `project_new`,
   `project_list`, `project_switch`.
 
 ## Identity and caching — execute once
 - **Content-addressed entries.** An entry's identity is a hash of its
-  expression structure plus its source-file digests. Same code + same inputs →
-  same hash → same directory on disk. Resubmitting identical work is free.
-- **Materialize what is expensive.** Each input file is read once into an
-  ordered copy that numbers its rows, and an entry judged expensive (aggregates,
+  expression structure and its inputs, down to the bytes of every imported file.
+  Same code + same inputs → same hash → same directory on disk. Resubmitting
+  identical work is free.
+- **Materialize what is expensive.** Each imported file is read once into a
+  snapshot that numbers its rows, and an entry judged expensive (aggregates,
   joins, sorts, windows, UDFs) has its result written to a snapshot file when it
   is created. Cheap row-preserving entries recompute rather than pay for
   storage.
@@ -105,17 +113,18 @@ When the expression is added, it is also executed and cached, along with summary
   parquet writer or row-group size does not change it. A new materialized
   entry's query is also run twice when it is created. If the two runs disagree,
   or a deleted snapshot comes back different from the recorded digest, the
-  expression is nondeterministic (sampling, `now()`, an impure UDF, source
-  drift) or the engine changed, and tallyman says so instead of silently serving
-  different numbers.
+  expression is nondeterministic (sampling, `now()`, an impure UDF) or the
+  engine changed, and tallyman says so instead of silently serving different
+  numbers.
 - **Nothing lives in a kernel.** All catalog state is on disk. The MCP server
   keeps nothing in memory but caches of things that never change and the
   project its session is working on.
 
 ## Reactivity — revise one alias, the graph catches up
-- **Staleness on two axes**: an alias axis (a followed parent advanced) and a
-  source axis (an input file's content digest changed). Computing staleness
-  runs no query and changes no catalog state; it reports reasons.
+- **Staleness on one axis**: an entry is stale when an alias it follows has
+  advanced, whether by a revise or by an import of new data. Computing staleness
+  runs no query, opens no data file and changes no catalog state; it reports
+  reasons.
 - **Recalc cone.** When an alias head moves, its dependents are recomputed in
   topological order, parents before children.
 - **Auto-recalc on revise**, with preview-then-commit for explicit recalcs. Only
@@ -194,8 +203,9 @@ You start the way you always do:
 
 > Load `violations.csv` and show me what's in it.
 
-The agent reads the file, writes an expression, and sends it to tallyman. A
-second later the browser has an entry in it called `violations`, and clicking it
+The agent imports the file, so tallyman keeps its own copy of the bytes, writes
+an expression over it, and sends that to tallyman. A second later the browser
+has an entry in it called `violations`, and clicking it
 gives you a real grid: 4 million rows, every column, with a histogram and
 summary statistics sitting above each column. Not `df.head()`. Not the first
 five rows wrapped across your terminal at 80 characters. The whole result, and
@@ -365,7 +375,8 @@ express arbitrary Python, so tallyman never has to reason about arbitrary
 Python.
 
 **Identity is content-addressed.** An entry's identity is a hash of its
-expression structure plus the content digests of its source files. Same code
+expression structure and its inputs, which bottom out in the content digests of
+the files it was imported from. Same code
 over the same inputs produces the same hash and lands in the same directory.
 Resubmitting identical work is a no-op, which makes builds idempotent and makes
 "did this change?" a pointer comparison rather than a diff.
@@ -383,13 +394,13 @@ Revising mints a new hash, advances the head, and appends to the history. Old
 versions are never garbage; they're the lineage, and they're what makes diff
 possible.
 
-**Staleness is computed on two axes, without running a query.** An entry is stale on the
-alias axis when a following parent's head no longer matches the recorded hash,
-and on the source axis when an input file's content digest no longer matches
-what was recorded. Detecting staleness runs no query: it compares the manifest
-against the world and returns reasons. Its cost is reading the manifests and
-re-hashing each recorded source file, which it does in full so that an in-place
-edit cannot hide behind a cached digest.
+**Staleness is computed on one axis, without running a query.** An entry is
+stale when a parent it follows by name has a head that no longer matches the
+recorded hash. Data files are no exception: a file is an alias whose versions are
+imports, so new data advances an alias like a revise does, and a file edited on
+disk but not imported changes nothing. Detecting staleness runs no query and
+opens no data file: it compares the manifests with the alias heads and returns
+reasons.
 
 **Recalc walks a cone in topological order.** When an alias head advances, its
 dependents form a cone. Kahn's algorithm over the intra-cone edges orders the
@@ -397,8 +408,8 @@ rebuild so parents finish before children, and each entry is rebuilt exactly
 once no matter how many paths reach it. Pre-existing staleness elsewhere in the
 catalog is left alone and logged rather than swept into the walk.
 
-**Materialization follows a worthiness rubric.** Each input file is read once
-into an ordered copy, which numbers the rows in file order so that a page of an
+**Materialization follows a worthiness rubric.** Each imported file is read
+once into a snapshot, which numbers the rows in file order so that a page of an
 entry read through tallyman's API is the same page on every request (the grid
 will do the same once Buckaroo uses the column, buckaroo-data/buckaroo#974). A
 result is written to a snapshot
@@ -416,8 +427,8 @@ so scan-order nondeterminism and writer details don't produce false alarms. A
 new materialized entry's query is run twice when it is created, on a
 single-partition connection so that float sums add up in one order. If the runs
 disagree, or a deleted snapshot comes back different from the recorded digest,
-something in the expression is nondeterministic — sampling, `now()`, an impure
-UDF, or source drift — or the engine version changed, and tallyman reports it
+something in the expression is nondeterministic — sampling, `now()`, or an
+impure UDF — or the engine version changed, and tallyman reports it
 rather than silently serving different numbers under the same hash.
 
 **State lives on disk; there is no kernel.** The MCP server and the companion

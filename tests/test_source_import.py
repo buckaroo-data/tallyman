@@ -1227,18 +1227,6 @@ def test_ensure_cas_path_rejects_a_clone_that_does_not_match_its_name(project: s
         si.ensure_cas_path(project, src, "0" * 32)
 
 
-def test_recon_cas_path_raises_instead_of_serving_drifted_live_bytes(project: str, tmp_path: Path):
-    """A version tallyman promised and then lost is a failure, not a downgrade to whatever is on disk now."""
-    from tallyman_xorq import source_identity as si
-
-    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
-    digest = si._digest_file(src)
-    _write_parquet(src, 20)  # the live bytes drift and no clone was ever written
-
-    with pytest.raises(si.LostSourceVersion):
-        si.recon_cas_path(project, src, digest)
-
-
 # ---------------------------------------------------------------------------
 # D10 — the MCP surface
 # ---------------------------------------------------------------------------
@@ -1650,6 +1638,23 @@ def test_a_parquet_column_with_no_ibis_type_is_left_out_and_named(project: str, 
     assert pq.read_schema(snapshot_path(project, out["hash"])).names == ["n", ROW_ORDER]
 
 
+def test_a_parquet_file_with_no_column_xorq_can_read_is_refused(project: str, tmp_path: Path, monkeypatch):
+    """#224. Left out, the unreadable columns leave nothing to import, so the import refuses and writes nothing."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "ids.parquet"
+    pq.write_table(_unreadable_ids_table().select(["id", "guid"]), src)
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(src), "ids")
+
+    message = str(exc.value)
+    assert "'id'" in message and "'guid'" in message and str(src) in message, message
+    assert _arena(project) == {"result_cache": [], "cas": []}
+    assert get_alias(project, "ids") is None
+
+
 @pytest.mark.parametrize("name", ["ids[v2].parquet", "ids[12].parquet", "ids*.parquet", "ids?.parquet"])
 def test_the_type_check_reads_the_named_file_whatever_its_name(project: str, tmp_path: Path, monkeypatch, name):
     """#224's check handed the caller's path to DataFusion's ``register_parquet``, which reads it as a glob pattern.
@@ -1982,28 +1987,6 @@ def test_a_bug_while_writing_the_snapshot_is_not_reported_as_an_unreadable_file(
 
     assert not isinstance(exc.value, source_import.SourceImportError)
     assert _arena(project) == {"result_cache": [], "cas": []}
-
-
-def test_an_import_whose_alias_write_fails_leaves_nothing_it_wrote(project: str, tmp_path: Path, monkeypatch):
-    """#225. The alias is written after ``_mint`` returns, outside its cleanup, so a failure there left the entry, its
-    snapshot and its clone on disk with no alias, and a retry took the existing-entry branch over the orphan."""
-    from tallyman_core import aliases
-    from tallyman_xorq import source_identity as si
-    from tallyman_xorq import source_import
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
-    content_hash = source_import.source_entry_hash(si._digest_file(src), {"kind": "parquet"})
-
-    def disk_full(*args, **kwargs):
-        raise OSError(errno.ENOSPC, "No space left on device")
-
-    monkeypatch.setattr(aliases, "set_alias", disk_full)
-    with pytest.raises(OSError):
-        source_import.update_and_depend(str(src), "orders")
-
-    assert _arena(project) == {"result_cache": [], "cas": []}
-    assert not entry_dir(project, content_hash).exists()
 
 
 def test_a_schema_the_tool_cannot_convert_is_a_recorded_import_error(

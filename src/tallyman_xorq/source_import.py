@@ -231,53 +231,106 @@ def _types_without_ibis(path: str, typ, nullable: bool) -> list[tuple[str, objec
 
 
 def _cast_for(typ) -> str:
-    """What to cast a column of arrow type *typ* to so that it imports."""
+    """What to cast a field of arrow type *typ* to so that it imports.
+
+    Never ``string`` for a UUID or a 16-byte ``fixed_size_binary``: raw UUID bytes are not UTF-8, and arrow refuses
+    that cast. Such values import as binary, or as text only when each one is formatted.
+    """
     import pyarrow as pa
 
+    uuid_text = "or, to see UUIDs as text, write each value as str(uuid.UUID(bytes=value))"
     if isinstance(typ, pa.UuidType):
-        return "string"
+        return f"cast it to binary, {uuid_text}"
     if isinstance(typ, pa.BaseExtensionType):  # pyarrow's own (JSON, bool8) and a Python-defined one alike
-        return str(typ.storage_type)
+        return f"cast it to {typ.storage_type}"
     if pa.types.is_fixed_size_binary(typ):
-        return "binary, or string if it holds UUIDs" if typ.byte_width == 16 else "binary"
-    return "a type xorq reads, such as string"
+        return f"cast it to binary, {uuid_text}" if typ.byte_width == 16 else "cast it to binary"
+    return "cast it to a type xorq reads, such as string"
 
 
-def _refuse_types_the_read_cannot_take(src: Path) -> None:
-    """Raise, naming each one, when a column of the parquet file *src* has no ibis type (#224).
+def _schema_the_read_sees(path: Path):
+    """The arrow schema xorq's DataFusion backend reports for the parquet file *path*.
 
-    The generated recipe reads the snapshot with ``deferred_read_parquet``, which asks xorq's DataFusion backend for
-    the file's arrow schema and converts each field with ``PyArrowType.to_ibis``. A type the conversion has no entry
-    for, ``fixed_size_binary`` and so a UUID, failed there with a KeyError that named no column, after the clone and
-    the snapshot were written. This registers the file with the same backend, takes the arrow schema it reports and
-    runs the same conversion field by field, before anything is written.
+    The generated recipe reads the snapshot with ``deferred_read_parquet``, which asks this backend for the file's
+    schema and converts each field with ``PyArrowType.to_ibis``. This asks the same backend with the same call
+    (``SessionContext.register_parquet``), and executes nothing. It asks DataFusion rather than ``pq.read_schema``
+    because their schemas differ where it matters: DataFusion gives a top-level extension column its storage type (a
+    JSON column reads as a string, and imports) and keeps a nested one (a JSON field in a struct does not).
 
-    It asks DataFusion rather than ``pq.read_schema`` because their schemas differ where it matters: DataFusion gives a
-    top-level extension column its storage type (a JSON column reads as a string, and imports) and keeps a nested one
-    (a JSON field in a struct does not), so pyarrow's schema would refuse files that import and pass files that fail.
-    Nothing is executed. The snapshot keeps the file's types, so its schema is the file's plus ``__row_order``.
+    ``register_parquet`` takes a glob pattern, not a path: a name holding ``[``, ``*`` or ``?`` matched nothing, or
+    another file. So the backend is given a link to *path* under a name with none of them.
     """
     from xorq.backends.xorq_datafusion import connect
 
-    from tallyman_xorq.row_order import ROW_ORDER
-
     context = connect().con
     name = f"tallyman_import_{uuid.uuid4().hex}"
+    with tempfile.TemporaryDirectory(prefix="tallyman_schema_") as tmp:
+        link = Path(tmp) / "file.parquet"
+        os.symlink(path.resolve(), link)
+        context.register_parquet(name, [str(link)], file_extension=".parquet")
+        try:
+            return context.catalog().database().table(name).schema
+        finally:
+            context.deregister_table(name)
+
+
+def _unreadable_columns(schema) -> list[tuple[str, list[tuple[str, object]]]]:
+    """``[(column, [(path, arrow type)])]`` for each top-level column of *schema* with a field that has no ibis type.
+
+    A column is left out whole when any field in it has no ibis type, so ``meta`` goes when ``meta.key`` is a
+    ``fixed_size_binary``: the fields are named by their paths (``_types_without_ibis``).
+    """
+    from tallyman_xorq.row_order import ROW_ORDER
+
+    found = [(f.name, _types_without_ibis(f.name, f.type, f.nullable)) for f in schema if f.name != ROW_ORDER]
+    return [(column, hits) for column, hits in found if hits]
+
+
+def _recorded_omissions(unreadable) -> list[list[str]]:
+    """The ``omitted`` a parquet reader records: ``[[column, why]]``, *why* naming each field and its type."""
+    return [[column, "; ".join(f"{path!r} is {typ}" for path, typ in hits)] for column, hits in unreadable]
+
+
+def _parquet_unreadable(src: Path) -> list[tuple[str, list[tuple[str, object]]]]:
+    """The columns of the parquet file *src* an import leaves out (``_unreadable_columns``), or raise.
+
+    A column xorq has no type for failed the generated recipe's read with a KeyError that named no column, after the
+    clone and the snapshot were written (#224). Such a column is left out of the snapshot instead, and the reader the
+    entry records lists it, so the heal leaves it out too. A file with no other column is refused.
+    """
+    from tallyman_xorq.row_order import ROW_ORDER
+
     try:
-        context.register_parquet(name, [str(src)], file_extension=src.suffix)
-        schema = context.catalog().database().table(name).schema
+        schema = _schema_the_read_sees(src)
     except Exception as exc:
         raise SourceImportError(f"catalog_import_source cannot read {src} as a parquet file: {exc}") from exc
-    finally:
-        context.deregister_table(name)
-    unreadable = [hit for f in schema if f.name != ROW_ORDER for hit in _types_without_ibis(f.name, f.type, f.nullable)]
-    if unreadable:
-        columns = "\n".join(f"  - {path!r} is {typ}: cast it to {_cast_for(typ)}" for path, typ in unreadable)
+    unreadable = _unreadable_columns(schema)
+    if unreadable and len(unreadable) == len([f for f in schema if f.name != ROW_ORDER]):
         raise SourceImportError(
-            f"catalog_import_source cannot import {src}: xorq, which reads every entry, has no type for "
-            f"{'this column' if len(unreadable) == 1 else 'these columns'}, so nothing was imported:\n{columns}\n"
+            f"catalog_import_source cannot import {src}: xorq, which reads every entry, has no type for any of its "
+            f"columns, so nothing was imported:\n{_omission_lines(unreadable)}\n"
             "Write the file again with those columns cast, and import that file."
         )
+    return unreadable
+
+
+def _omission_lines(unreadable) -> str:
+    """One line per left-out column: each field without an ibis type, and what brings it in (``_cast_for``)."""
+    return "\n".join(
+        f"  - {column!r}: " + "; ".join(f"{path!r} is {typ}, {_cast_for(typ)}" for path, typ in hits)
+        for column, hits in unreadable
+    )
+
+
+def _omission_warning(src: Path, alias: str, unreadable) -> str:
+    """What the import says when it left columns out: a recipe over *alias* does not see them."""
+    one = len(unreadable) == 1
+    return (
+        f"{src} was imported without {'this column' if one else f'these {len(unreadable)} columns'}, which xorq, "
+        f"the reader of every entry, has no type for. Recipes over {alias!r} do not see {'it' if one else 'them'}:\n"
+        f"{_omission_lines(unreadable)}\n"
+        "To import them, write the file again with those columns cast, and import that file."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -302,10 +355,8 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
             raise SourceImportError(
                 f"these bytes are already {alias}-v{already}, and {alias} is at v{head}. Version history is "
                 f"append-only: a v{head + 1} whose rows equal v{already}'s would make the version number meaningless. "
-                f"To put {alias} back on v{already}, reset the catalog to the revision before v{already + 1}, from "
-                "a shell (there is no MCP tool for it): `tallyman revisions` lists the steps, then "
-                f"`tallyman reset-to <step>`. To read v{already} in a recipe without moving the head, use "
-                f"pinned_expr_from_alias('{alias}-v{already}')."
+                f"To read v{already} in a recipe, use pinned_expr_from_alias('{alias}-v{already}'); {alias}'s head "
+                f"stays on v{head}."
             )
         return True, head + 1
 
@@ -378,13 +429,14 @@ def _numbered(batches):
         written += batch.num_rows
 
 
-def _write_parquet_snapshot(clone: Path, dest: Path) -> None:
+def _write_parquet_snapshot(clone: Path, dest: Path, omitted=()) -> None:
     """Copy the parquet *clone* to *dest*, in file order, numbering the rows in a last ``__row_order``.
 
     pyarrow reads and writes every type a parquet file can hold, so the snapshot's schema is the imported file's
     plus ``__row_order``, and a recipe over the source alias sees the types the file has. polars, which wrote this
     before, turned a ``date32`` into a timestamp, a ``time32`` into a ``time64`` and a map into a list of structs
-    (#197). An existing ``__row_order`` is dropped and written again, last.
+    (#197). An existing ``__row_order`` is dropped and written again, last. The columns named in *omitted*, the
+    reader's record of the ones xorq has no type for (#224), are left out.
     """
     import pyarrow as pa
     import pyarrow.parquet as pq
@@ -394,7 +446,8 @@ def _write_parquet_snapshot(clone: Path, dest: Path) -> None:
     from tallyman_xorq.row_order import ROW_ORDER
 
     with pq.ParquetFile(clone) as source:
-        kept = [f for f in source.schema_arrow if f.name != ROW_ORDER]
+        left_out = {ROW_ORDER, *(column for column, _why in omitted)}
+        kept = [f for f in source.schema_arrow if f.name not in left_out]
         schema = pa.schema([*kept, pa.field(ROW_ORDER, pa.int64())])
         batches = source.iter_batches(columns=[f.name for f in kept])
         write_pinned_parquet(_numbered(batches), schema, dest, row_group_rows=ORDERED_COPY_ROW_GROUP_ROWS)
@@ -452,7 +505,7 @@ def _write_snapshot(clone: Path, reader: dict, dest: Path) -> str:
     tmp = dest.with_name(f".{dest.stem}.{uuid.uuid4().hex}.tmp")
     try:
         if reader["kind"] == "parquet":
-            _write_parquet_snapshot(clone, tmp)
+            _write_parquet_snapshot(clone, tmp, reader.get("omitted", ()))
         else:
             _write_csv_snapshot(clone, reader, tmp)
         os.replace(tmp, dest)
@@ -547,6 +600,16 @@ def _read_failure(src: Path, alias: str, reader: dict, pinned_version: int | Non
     return SourceImportError(f"catalog_import_source could not read {src} {what}: {text}")
 
 
+def _reader_errors() -> tuple[type[BaseException], ...]:
+    """What a reader raises for a file it cannot read: pyarrow's and the schema DSL's ValueErrors, polars' errors,
+    parsy's ParseError, and a TypeError for reader options polars refuses. ``_mint`` wraps these (#227) and lets any
+    other exception, a bug in tallyman's writer, keep its type."""
+    import polars as pl
+    from parsy import ParseError
+
+    return (ValueError, TypeError, pl.exceptions.PolarsError, ParseError)
+
+
 def _clone_verified(
     project: str, src: Path, digest: str, suffix: str, *, alias: str, reader: dict, pinned_version: int | None
 ) -> Path:
@@ -592,7 +655,11 @@ def _recipe(outside_path: Path, alias: str, version: int, digest: str, reader: d
         f"#   imported from: {outside_path}\n"
         f"#   content:       md5:{digest}\n"
         f"#   reader:        {json.dumps(reader, sort_keys=True)}\n"
-        "from tallyman_xorq.io import read_project_file\n"
+        + "".join(
+            f"#   not imported:  {column!r} ({why}, which xorq has no type for)\n"
+            for column, why in reader.get("omitted", ())
+        )
+        + "from tallyman_xorq.io import read_project_file\n"
         "\n"
         f"expr = read_project_file({str(outside_path)!r})\n"
     )
@@ -617,6 +684,9 @@ def _mint(
     a CSV read two ways is two entries over one clone (ADR-011 D12), and a snapshot already there holds exactly these
     rows: it is the one a reset left (#193). The caller holds the project lock, so nothing else writes these paths
     meanwhile. *pinned_version* is the caller's, for the retry an error prints.
+
+    A parquet file's columns xorq has no type for were found in the caller's file before it was digested. The clone
+    is checked again, since the file can change in between, and a clone whose columns differ is refused (#224).
     """
     import pyarrow.parquet as pq
 
@@ -645,7 +715,7 @@ def _mint(
     absent = [path for path in (clone, snapshot) if not path.exists()]
     try:
         # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
-        _clone_verified(
+        clone = _clone_verified(
             project,
             outside_path,
             digest,
@@ -654,6 +724,13 @@ def _mint(
             reader=reader,
             pinned_version=pinned_version,
         )
+        if reader["kind"] == "parquet":
+            if _recorded_omissions(_unreadable_columns(_schema_the_read_sees(clone))) != reader.get("omitted", []):
+                raise SourceImportError(
+                    f"{outside_path} changed while it was imported: the columns xorq has no type for are not the "
+                    f"ones found before it was copied, so nothing was imported. To try again: "
+                    f"{import_call(str(outside_path), alias, reader, pinned_version)}."
+                )
 
         # 2. The one snapshot, named by the entry hash. An existing one is kept: the hash is a function of the bytes
         #    and the reader, so it already holds exactly these rows.
@@ -664,9 +741,9 @@ def _mint(
         else:
             try:
                 result_digest = _write_snapshot(clone, reader, snapshot)
-            except OSError:
-                raise
-            except Exception as exc:  # the reader's own errors: polars', parsy's, the schema DSL's (#227)
+            except _reader_errors() as exc:  # the reader's own errors: polars', parsy's, the schema DSL's (#227)
+                if isinstance(exc, TypeError) and not reader.get("scan_kwargs"):
+                    raise  # a TypeError with no reader options to blame is a bug here, not the caller's file
                 raise _read_failure(outside_path, alias, reader, pinned_version, exc) from exc
         arrow_schema = pq.read_schema(snapshot)
         row_count = pq.ParquetFile(snapshot).metadata.num_rows
@@ -795,7 +872,9 @@ def update_and_depend(
             They are recorded on the entry and never re-derived at build time (ADR-011 D12).
 
     Returns:
-        ``{"alias", "version", "hash", "created", "path", "digest", "row_count", "schema"}``. ``created`` is False
+        ``{"alias", "version", "hash", "created", "path", "digest", "row_count", "schema"}``, plus
+        ``omitted_columns`` and a ``warning`` when a parquet file had columns xorq has no type for, which the entry
+        leaves out and its recipe's header names (#224). ``created`` is False
         when the import was a no-op. An import of bytes that are already an entry rewrites nothing of that entry. If
         its clone is gone, the caller's bytes restore it; if its snapshot is gone it is healed from the clone and
         checked against the recorded digest, exactly as ``ensure_materialized`` heals one, so a repair is never a way
@@ -803,9 +882,9 @@ def update_and_depend(
 
     Raises:
         SourceImportError: for every row of the table above that is an error, for a path that is not an importable
-            file, and for a file the import cannot read: a parquet column xorq has no type for, a CSV polars cannot
-            parse under the given options, or a copy that does not match its digest. A failed import leaves on disk
-            nothing it wrote.
+            file, and for a file the import cannot read: a parquet file with no column xorq has a type for, a CSV
+            polars cannot parse under the given options, or a copy that does not match its digest. A failed import
+            leaves on disk nothing it wrote.
     """
     from tallyman_core import ensure_project, resolve_project
     from tallyman_core.aliases import SOURCE_KIND, alias_kind, history_for, set_alias, validate_alias_name
@@ -837,8 +916,9 @@ def update_and_depend(
         )
 
     reader = _reader_for(src, schema, reader_options)
-    if reader["kind"] == "parquet":
-        _refuse_types_the_read_cannot_take(src)
+    unreadable = _parquet_unreadable(src) if reader["kind"] == "parquet" else []
+    if unreadable:
+        reader = {**reader, "omitted": _recorded_omissions(unreadable)}
     digest = si._digest_file(src)
     content_hash = source_entry_hash(digest, reader)
 
@@ -886,7 +966,7 @@ def update_and_depend(
         if mint:
             set_alias(proj, alias, content_hash, kind=SOURCE_KIND)
 
-    return {
+    out = {
         "alias": alias,
         "version": version,
         "hash": content_hash,
@@ -896,3 +976,7 @@ def update_and_depend(
         "row_count": written["row_count"],
         "schema": written["schema"],
     }
+    if unreadable:
+        out["omitted_columns"] = [{"column": column, "why": why} for column, why in reader["omitted"]]
+        out["warning"] = _omission_warning(src, alias, unreadable)
+    return out

@@ -38,6 +38,7 @@ from tallyman_core import (
     version_of_hash,
 )
 from tallyman_core.events import list_sessions, read_events, record_event
+from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_core.telemetry import read_spans, record_span
@@ -947,7 +948,11 @@ def create_app(
         # manifest's row_count, recorded at build. The manifest is written after the build dir exists (build.py), so a
         # build that did not finish leaves a directory without one, which is not an entry: 404 with the rebuild (#204).
         total = _require_manifest(project, content_hash).row_count or 0
-        df = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit).execute()
+        # The page runs on the process's shared backend, one execution at a time (#118). cached_result_expr may heal,
+        # and a heal takes the project lock, which comes before the execution lock, so it runs first.
+        expr = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit)
+        with execution_lock():
+            df = expr.execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,

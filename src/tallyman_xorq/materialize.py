@@ -150,6 +150,10 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     ADR-008 D6). It regroups the stream into row groups of ``SNAPSHOT_ROW_GROUP_ROWS`` and combines each into
     contiguous arrays, so the file does not depend on how the engine batched the rows. Memory is bounded by one row
     group.
+
+    It does not take ``execution_lock`` (#118). That lock guards the one shared default backend, and *expr* here is
+    bound to the single-partition connection ``_run_once`` made for this materialization, so nothing else executes on
+    it. Taking the lock would make every page read in the process wait for the whole build or heal.
     """
     reader = expr.to_pyarrow_batches()
     kept = [f for f in reader.schema if f.name not in (ROW_ORDER, ROW_ORDER_RIGHT)]

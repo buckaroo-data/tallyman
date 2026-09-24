@@ -24,16 +24,20 @@ exist: a table whose full rows fall under the threshold (duplicated rows,
 repeated contracts) has none, and resolves to ``[]`` at once.  Otherwise the
 search runs one query per column combination, with the budget checked before
 each; when it runs out, :class:`PrimaryKeySearchTimeout` is raised and nothing
-is cached.
+is cached.  The budget counts only the time the search's own queries spend
+executing: not reading the entry (which may heal its snapshot) and not waiting
+for the execution lock behind other threads (#118).
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import time
 from itertools import combinations
 from pathlib import Path
 
+from tallyman_core.execution import execution_lock
 from tallyman_xorq.row_order import ROW_ORDER
 
 PK_SEARCH_BUDGET_S = 1.0
@@ -46,9 +50,29 @@ class PrimaryKeySearchTimeout(TimeoutError):
     """The primary-key search ran past its time budget."""
 
 
-def _check_deadline(deadline: float, content_hash: str) -> None:
-    if _clock() >= deadline:
-        raise PrimaryKeySearchTimeout(f"primary key search for {content_hash[:12]} exceeded {PK_SEARCH_BUDGET_S:g}s")
+class _Budget:
+    """The search's time budget, spent only while its queries execute.
+
+    Each query runs under ``with execution_lock(), budget.charge(content_hash):``. ``charge`` is entered once the lock
+    is held: it checks what is left and charges the query's run time. Time before a query (reading the entry, a heal)
+    and time waiting for the lock is not charged, so a busy process makes the search slower but never makes it time
+    out (#118).
+    """
+
+    def __init__(self) -> None:
+        self.left = PK_SEARCH_BUDGET_S
+
+    @contextlib.contextmanager
+    def charge(self, content_hash: str):
+        if self.left <= 0:
+            raise PrimaryKeySearchTimeout(
+                f"primary key search for {content_hash[:12]} exceeded {PK_SEARCH_BUDGET_S:g}s"
+            )
+        t0 = _clock()
+        try:
+            yield
+        finally:
+            self.left -= _clock() - t0
 
 
 def _keyable(dtype) -> bool:
@@ -56,23 +80,23 @@ def _keyable(dtype) -> bool:
     return not (dtype.is_array() or dtype.is_struct() or dtype.is_map())
 
 
-def _column_stats(expr, cols: list[str], *, deadline: float, content_hash: str) -> tuple[int, dict[str, int]]:
+def _column_stats(expr, cols: list[str], *, budget: _Budget, content_hash: str) -> tuple[int, dict[str, int]]:
     """Row count and per-column distinct counts, in one query."""
-    _check_deadline(deadline, content_hash)
     aggs = [expr.count().name("__n__")] + [expr[c].nunique().name(c) for c in cols]
-    row = expr.aggregate(aggs).execute().iloc[0]
+    with execution_lock(), budget.charge(content_hash):
+        row = expr.aggregate(aggs).execute().iloc[0]
     return int(row["__n__"]), {c: int(row[c]) for c in cols}
 
 
-def _any_key_possible(expr, cols: list[str], need: float, *, deadline: float, content_hash: str) -> bool:
+def _any_key_possible(expr, cols: list[str], need: float, *, budget: _Budget, content_hash: str) -> bool:
     """Whether some subset of ``cols`` could reach ``need`` distinct tuples.
 
     Dropping columns from a tuple can only merge distinct tuples, never split
     them, so no subset of ``cols`` has more distinct tuples than ``cols`` as a
     whole.  If all of them together fall short, every combination does.
     """
-    _check_deadline(deadline, content_hash)
-    return int(expr.select(*cols).distinct().count().execute()) >= need
+    with execution_lock(), budget.charge(content_hash):
+        return int(expr.select(*cols).distinct().count().execute()) >= need
 
 
 def _detect_pk(
@@ -83,11 +107,11 @@ def _detect_pk(
     distinct: dict[str, int],
     threshold: float,
     max_group: int | None,
-    deadline: float,
+    budget: _Budget,
     content_hash: str,
     max_width: int = 4,
 ) -> list[str] | None:
-    """buckaroo's ``_rank_pk_xorq`` search with a deadline checked before each query.
+    """buckaroo's ``_rank_pk_xorq`` search with the budget checked before each query.
 
     Single columns (most-unique first), then composites of width 2..``max_width``
     (shortest first); the first whose distinct-tuple fraction reaches
@@ -106,8 +130,8 @@ def _detect_pk(
             return False
         if max_group is None:
             return True
-        _check_deadline(deadline, content_hash)
-        return _max_group_xorq(expr, list(combo)) <= max_group
+        with execution_lock(), budget.charge(content_hash):
+            return _max_group_xorq(expr, list(combo)) <= max_group
 
     for c in sorted(cols, key=lambda c: distinct[c], reverse=True):
         if _accept((c,), distinct[c]):
@@ -123,8 +147,8 @@ def _detect_pk(
                     break
             if bound < need:
                 continue
-            _check_deadline(deadline, content_hash)
-            d = int(expr.select(*combo).distinct().count().execute())
+            with execution_lock(), budget.charge(content_hash):
+                d = int(expr.select(*combo).distinct().count().execute())
             if _accept(combo, d):
                 return list(combo)
     return None
@@ -180,7 +204,7 @@ def resolve_primary_key(
     *,
     threshold: float = 0.98,
     max_group: int | None = 10_000,
-    deadline: float | None = None,
+    budget: _Budget | None = None,
 ) -> list[str]:
     """Resolved primary key for an entry (``[]`` if none), cached + inherited.
 
@@ -188,12 +212,12 @@ def resolve_primary_key(
     survive; otherwise the key is detected once and cached.  Returns the key
     columns; an empty list means "no usable key" and is cached too.
 
-    Detection must finish by ``deadline`` (a ``_clock()`` reading; default
-    ``PK_SEARCH_BUDGET_S`` from now) or :class:`PrimaryKeySearchTimeout` is
-    raised.
+    Detection's queries must fit in ``budget`` (default: a fresh
+    ``PK_SEARCH_BUDGET_S`` of execution time) or :class:`PrimaryKeySearchTimeout`
+    is raised.
     """
-    if deadline is None:
-        deadline = _clock() + PK_SEARCH_BUDGET_S
+    if budget is None:
+        budget = _Budget()
     cached = _read_cached(project, content_hash)
     if cached is not None:
         return cached
@@ -208,9 +232,7 @@ def resolve_primary_key(
     if not cache_worthy(project, content_hash):
         parent = _parent_hash(project, content_hash)
         if parent is not None:
-            parent_pk = resolve_primary_key(
-                project, parent, threshold=threshold, max_group=max_group, deadline=deadline
-            )
+            parent_pk = resolve_primary_key(project, parent, threshold=threshold, max_group=max_group, budget=budget)
             if parent_pk and set(parent_pk) <= cols:
                 _write_cached(project, content_hash, parent_pk)
                 return parent_pk
@@ -225,8 +247,8 @@ def resolve_primary_key(
         _write_cached(project, content_hash, [])
         return []
 
-    n, distinct = _column_stats(expr, candidates, deadline=deadline, content_hash=content_hash)
-    if n == 0 or not _any_key_possible(expr, candidates, threshold * n, deadline=deadline, content_hash=content_hash):
+    n, distinct = _column_stats(expr, candidates, budget=budget, content_hash=content_hash)
+    if n == 0 or not _any_key_possible(expr, candidates, threshold * n, budget=budget, content_hash=content_hash):
         _write_cached(project, content_hash, [])
         return []
 
@@ -262,7 +284,7 @@ def resolve_primary_key(
                 distinct=distinct,
                 threshold=threshold,
                 max_group=max_group,
-                deadline=deadline,
+                budget=budget,
                 content_hash=content_hash,
             )
             or []
@@ -287,13 +309,13 @@ def diff_keys(
 
     Returns ``[]`` when neither side's key applies to both — the caller then
     skips the keyed diff (``full_diff(keys=[])``).  Both sides share one
-    ``PK_SEARCH_BUDGET_S`` budget.
+    ``PK_SEARCH_BUDGET_S`` budget of execution time.
     """
     a_cols = set(_entry_columns(project, a_hash)) - {ROW_ORDER}
     b_cols = set(_entry_columns(project, b_hash)) - {ROW_ORDER}
-    deadline = _clock() + PK_SEARCH_BUDGET_S
+    budget = _Budget()
     for h in (a_hash, b_hash):
-        pk = resolve_primary_key(project, h, threshold=threshold, max_group=max_group, deadline=deadline)
+        pk = resolve_primary_key(project, h, threshold=threshold, max_group=max_group, budget=budget)
         if pk and set(pk) <= a_cols and set(pk) <= b_cols:
             return pk
     return []

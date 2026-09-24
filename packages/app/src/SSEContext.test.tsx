@@ -144,7 +144,7 @@ describe("SSEProvider", () => {
     await act(async () => es.emit(kind, { hash: "abc" }));
 
     expect(seen!.version).toBe(1);
-    expect(seen!.lastEvent?.kind).toBe(kind);
+    expect(seen!.events.map((d) => [d.seq, d.event.kind])).toEqual([[1, kind]]);
   });
 
   // The fake must drop an unlistened name, or the cases above would pass for any kind.

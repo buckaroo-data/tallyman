@@ -1,22 +1,40 @@
-import { createContext, useContext, useEffect, useState } from "react";
+import { createContext, useContext, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import type { SSEEvent } from "./types";
 
-interface SSEState {
-  status: "connecting" | "live" | "offline";
-  version: number;
-  lastEvent: SSEEvent | null;
+// One received event and its sequence number. seq counts every event this
+// provider received, starting at 1, and never goes back.
+export interface SSEDelivery {
+  seq: number;
+  event: SSEEvent;
 }
 
-const SSEContext = createContext<SSEState>({ status: "connecting", version: 0, lastEvent: null });
+interface SSEState {
+  status: "connecting" | "live" | "offline";
+  // The seq of the latest event. A page that refetches whatever changed keys
+  // its fetch on this.
+  version: number;
+  // The latest events, oldest first. Several can arrive before React renders
+  // once (the companion sends `recalc` then `entry_added` back to back), so a
+  // consumer that acts on a kind reads them all with useSSEEvents, never only
+  // the newest (#235).
+  events: SSEDelivery[];
+}
+
+// More than this many events between two renders drops the oldest.
+const MAX_EVENTS = 50;
+
+const SSEContext = createContext<SSEState>({ status: "connecting", version: 0, events: [] });
 
 export function SSEProvider({ project, children }: { project: string | null; children: React.ReactNode }) {
-  const [state, setState] = useState<SSEState>({ status: "connecting", version: 0, lastEvent: null });
+  const [state, setState] = useState<SSEState>({ status: "connecting", version: 0, events: [] });
   const navigate = useNavigate();
 
   useEffect(() => {
     if (!project) {
-      setState({ status: "offline", version: 0, lastEvent: null });
+      // Keep version and events: seq must never go back, or useSSEEvents
+      // would skip the events that reuse old numbers.
+      setState((s) => ({ ...s, status: "offline" }));
       return;
     }
 
@@ -26,7 +44,11 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     const bump = (e: MessageEvent, kind: string) => {
       const data: SSEEvent = JSON.parse(e.data);
       console.log(`[tallyman-sse] event kind=${kind}`, data);
-      setState((s) => ({ status: "live", version: s.version + 1, lastEvent: { ...data, kind } }));
+      setState((s) => {
+        const seq = s.version + 1;
+        const events = [...s.events, { seq, event: { ...data, kind } }].slice(-MAX_EVENTS);
+        return { status: "live", version: seq, events };
+      });
     };
 
     es.addEventListener("hello", (e) => {
@@ -84,4 +106,24 @@ export function SSEProvider({ project, children }: { project: string | null; chi
 
 export function useSSE() {
   return useContext(SSEContext);
+}
+
+// Calls `handle` once for each event that arrives after the calling component
+// mounts, in the order they arrived, including events that arrived together
+// before one render. `handle` may change between renders; the latest is used.
+export function useSSEEvents(handle: (event: SSEEvent) => void) {
+  const { version, events } = useSSE();
+  // Seeded with the mount-time version, so an event from before the mount is
+  // not replayed. A ref, so StrictMode's second effect run handles nothing twice.
+  const seen = useRef(version);
+  const handleRef = useRef(handle);
+  handleRef.current = handle;
+  useEffect(() => {
+    for (const { seq, event } of events) {
+      if (seq <= seen.current) continue;
+      seen.current = seq;
+      handleRef.current(event);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [version]);
 }

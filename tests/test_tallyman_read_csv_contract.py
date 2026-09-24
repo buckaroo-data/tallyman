@@ -376,3 +376,50 @@ def test_text_that_is_not_a_timestamp_raises_in_a_zoned_column(project, lines):
     err = str(exc.value)
     assert "'ts'" in err
     assert bad in err
+
+
+# Found in review of #244: reading a zoned column as text must not change which CSVs import.
+def _csv_snapshot(project: str, name: str, text: str, schema, **reader_options):
+    """Import *text* as a CSV under *schema* and return the snapshot the import wrote, read with pyarrow."""
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    p = data_dir(project) / f"{name}.csv"
+    p.write_text(text)
+    out = _import(project, name, p, schema, **reader_options)
+    return pq.read_table(snapshot_path(project, out["hash"]))
+
+
+ROW_AND_ZONED = {"row": "int64", "ts": f"timestamp({NY!r})"}
+
+
+def test_a_zoned_column_beside_a_column_named_row(project):
+    """A header named ``row`` is the file's own column, and the zoned column beside it imports."""
+    table = _csv_snapshot(project, "tz_row", "row,ts\n7,2024-01-02 09:30:00\n", ROW_AND_ZONED)
+    assert table.column("row").to_pylist() == [7]
+    assert [v.isoformat() for v in table.column("ts").to_pylist()] == ["2024-01-02T09:30:00-05:00"]
+
+
+def test_a_zoned_failure_beside_a_column_named_row_is_explained(project):
+    """The explanation of a failed zoned column reads the file again; a ``row`` header does not defeat it."""
+    with pytest.raises(ValueError) as exc:
+        _csv_snapshot(project, "tz_row_gap", "row,ts\n1,2024-03-10 01:59:59\n2,2024-03-10 02:30:00\n", ROW_AND_ZONED)
+    assert f"'2024-03-10 02:30:00' (row 2) does not exist in {NY}" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "ts", "s"),
+    [
+        ("ts,s\n,a\n2024-01-02 09:30:00,\n", [None, "2024-01-02T09:30:00-05:00"], ["a", ""]),
+        ("ts,s\n2024-01-02 09:30:00,\n,a\n", ["2024-01-02T09:30:00-05:00", None], ["", "a"]),
+    ],
+    ids=["empty-first", "empty-later"],
+)
+def test_an_empty_zoned_cell_is_null_when_empty_strings_are_kept(project, text, ts, s):
+    """``missing_utf8_is_empty_string`` keeps an empty cell as ``""`` in a string column. A zoned column is read as
+    text, but an empty cell in it is still null, as it was when polars' reader parsed it."""
+    schema = {"ts": f"timestamp({NY!r})", "s": "string"}
+    table = _csv_snapshot(project, "tz_empty", text, schema, missing_utf8_is_empty_string=True)
+    assert [v and v.isoformat() for v in table.column("ts").to_pylist()] == ts
+    assert table.column("s").to_pylist() == s

@@ -46,6 +46,22 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     // remapped (see recalcTarget). Without this the SPA never saw the nine other
     // kinds change but missed `recalc`, so an open view went silently stale.
     es.addEventListener("recalc", (e) => bump(e, "recalc"));
+    // The companion sends each event with its kind as the event name, and an
+    // EventSource drops a name nobody listens for, so every kind it publishes
+    // needs a line here. tests/test_sse_listeners.py fails when one is missing
+    // (#235).
+    // project_reset: a reset moved heads, so the catalog, notebook and Cache
+    // page refetch. unfaithful_heal: the heal recorded an error (the error
+    // banner) and pinned the snapshot (the Cache page's pin reason).
+    // entry_added: a promoted diff got an alias. alias_changed, alias_renamed:
+    // the sidebar's names changed. display_changed: a display klass changed,
+    // handled like the other klass kinds above.
+    es.addEventListener("project_reset", (e) => bump(e, "project_reset"));
+    es.addEventListener("unfaithful_heal", (e) => bump(e, "unfaithful_heal"));
+    es.addEventListener("entry_added", (e) => bump(e, "entry_added"));
+    es.addEventListener("alias_changed", (e) => bump(e, "alias_changed"));
+    es.addEventListener("alias_renamed", (e) => bump(e, "alias_renamed"));
+    es.addEventListener("display_changed", (e) => bump(e, "display_changed"));
     es.addEventListener("project_switched", (e) => {
       const data: SSEEvent = JSON.parse(e.data);
       console.log("[tallyman-sse] project_switched", data);

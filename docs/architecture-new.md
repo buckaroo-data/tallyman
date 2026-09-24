@@ -708,8 +708,15 @@ Where the code breaks one of these, section 13 names the issue.
 
 ## 13. Known defects
 
-Found while writing this document, with no issue filed:
+With no issue filed:
 
+- `build._raw_parquet_read_check` allows `xo.deferred_read_parquet` of any file
+  under `compute_cache/`, so a recipe can read a snapshot by its path: a bare
+  content hash in a recipe, with no parent edge recorded and no
+  `ensure_materialized` first.
+- An unfaithful heal of a source entry is attributed to a graph that runs
+  differently each time ("or source drift under off"), though a source entry is
+  re-parsed from its clone and the likely cause is a reader change.
 - A recipe's readers and `build_diff_expr` take the project from the
   `active_project` file while the MCP tool builds into its session's project, so
   after another session switches projects a recipe looks up its aliases in the

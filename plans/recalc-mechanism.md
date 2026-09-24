@@ -5,14 +5,13 @@
   `plans/reactive-staleness-recalc.md` (the staged plan) and
   `plans/adr-reactive-catalog-recalc.md` (the design questions). Stage 1
   (staleness detection) shipped in PR #126; the #115 cold-read blocker in PR #127.
-- **Status note (2026-09-22, revised 2026-09-24):** three things below no longer
-  hold. A cheap child's build inlines its parent's frozen graph and does not re-run
-  the parent's recipe. There is no source axis
-  (`plans/ADR-011-sources-are-aliases.md` D6): a data file is a source alias whose
-  versions are imports, so new data advances an alias, its followers go directly
-  stale and the rest of the cone transitively, exactly as for a revise.
-  Auto-recalc on revise (and on import) exists and is on by default
-  (`plans/auto-recalc-on-revise.md`). And a pin is written
+- **Status note (2026-09-24):** three things below no longer hold. A cheap child's
+  build inlines its parent's frozen graph and does not re-run the parent's
+  recipe. There is no source axis (`plans/ADR-011-sources-are-aliases.md` D6): a
+  data file is a source alias whose versions are imports, so new data advances an
+  alias, its followers go directly stale and the rest of the cone transitively,
+  exactly as for a revise. Auto-recalc on revise and on import exists and is on
+  by default (`plans/auto-recalc-on-revise.md`). And a pin is written
   `pinned_expr_from_alias("<alias>-v<N>")`; a bare hash is refused (ADR-011 D5).
   `docs/reactive-recalc.md` describes the current behaviour.
 - **Code:** `src/tallyman_xorq/recalc.py` (the engine), `tallyman_xorq/staleness.py`

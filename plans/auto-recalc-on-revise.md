@@ -6,13 +6,14 @@
   dependents in the same atomic checkpoint.** The recalc engine already exists; this
   is about *triggering* it from revise, folding it into *one* git transaction, and
   *reporting* what cascaded. No new compute.
-- **Status note (2026-09-22):** implemented, on by default. Three things below
-  are out of date: the SPA now listens for the `recalc` SSE event (Stage C
-  shipped); the checkpoint-free walk is `_replay_cone`, not `_recalc_walk`; and
-  since `plans/ADR-011-sources-are-aliases.md` there is no source axis, new data
-  arrives by `catalog_import_source` (which replaced `catalog_load_parquet`), and
-  an import that mints a version triggers auto-recalc like a revise.
-  `docs/reactive-recalc.md` ("Trigger model") describes the current behaviour.
+- **Status note (2026-09-24):** implemented, on by default. Three things below
+  are out of date: the SPA listens for the `recalc` SSE event; the
+  checkpoint-free walk is `_replay_cone`, not `_recalc_walk`; and there is no
+  source axis (`plans/ADR-011-sources-are-aliases.md`): new data arrives by
+  `catalog_import_source`, which takes the place of the `catalog_load_parquet`
+  named below, and an import that mints a version triggers auto-recalc like a
+  revise. `docs/reactive-recalc.md` ("Trigger model") describes the current
+  behaviour.
 - **Builds on:** `recalc.py` (the cone walk + re-point + single checkpoint),
   `catalog_revise` (`tallyman_mcp/server.py`), the companion revise route
   (`tallyman_companion/app.py`), and the normalized cross-process notify/SSE path

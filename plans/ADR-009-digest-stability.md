@@ -1,16 +1,15 @@
 # ADR: Digest stability (a heal is flagged only when the result changed)
 
-- **Status:** Accepted (2026-09-22). Implemented in #189.
-  History: implemented in buckaroo-data/tallyman#189 on 2026-09-21, at Paddy's request to implement the
-  set, and accepted on 2026-09-22, when `plans/ADR-010-immutable-store-one-owner.md` (a proposal to replace
-  this set) was rejected and #189 was chosen as the direction. Where this text says a decision is "not yet
-  confirmed" or "Proposed", it was implemented as written; the differences between the text and the code
-  are under "Implementation notes" below. The defects the review of #189 found were filed as #193 to #211.
-  Of those touching this ADR, #193 (a failed create deleted an existing snapshot) is fixed in #222, and #194,
-  #195 and #196 (the pin of a snapshot that cannot be made again faithfully was lost across a reset and when
-  the error banner was dismissed) are fixed in #223, which moved the pin into the manifest
-  (`unfaithful_heal_digest`). #208 (an unfaithful heal reaches only the healed entry) is open.
-  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session: D3 gains two format requirements from `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is new; and again the same day after a review of PR #184: D1 and D3 now say what single-partition execution leaves undetermined, and D6's cheap-entry half moved to #185; and a third time that day after a second review: D1 now says how a loaded build gets onto the single-partition connection, and D3's format version covers the ordered copies of sources). Awaiting Paddy's review; nothing here is implemented. Amends `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the snapshot bytes") and decision D5 of `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said "`result_digest` keeps its file-hash definition". The canonical sort itself is unchanged and is still required.
+- **Status:** Accepted (2026-09-22), implemented. Where the text below says a
+  decision is "not yet confirmed" or "Proposed", it was implemented as written;
+  the differences between the text and the code are under "Implementation
+  notes". Open defect touching it: #208 (an unfaithful heal reaches only the
+  healed entry).
+- **Amends:** `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's
+  "hash the snapshot bytes") and decision D5 of
+  `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
+  "`result_digest` keeps its file-hash definition". The canonical sort itself is
+  unchanged and is still required.
 - **Reading decision labels:** a bare label such as "D2" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.

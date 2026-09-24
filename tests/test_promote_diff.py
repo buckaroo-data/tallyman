@@ -390,9 +390,7 @@ def test_http_promote_diff_out_of_range_400(fresh_companion_app, project: str, o
     assert r.status_code == 400
 
 
-def test_http_entry_detail_diff_has_display_config(
-    fresh_companion_app, project: str, orders_src: str, monkeypatch
-):
+def test_http_entry_detail_diff_has_display_config(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -487,9 +485,7 @@ def test_marimo_export_diff_entry_includes_overrides(project: str, orders_src: s
     assert "membership" in nb_source
 
 
-def test_marimo_export_loads_in_marimo_without_collisions(
-    project: str, orders_src: str, monkeypatch, tmp_path: Path
-):
+def test_marimo_export_loads_in_marimo_without_collisions(project: str, orders_src: str, monkeypatch, tmp_path: Path):
     """The exported notebook must load in marimo without a MultipleDefinitionError.
 
     Each code cell inlines an ``expr.py`` that binds ``expr`` and imports
@@ -528,3 +524,52 @@ def test_marimo_export_loads_in_marimo_without_collisions(
 
     # bootstrap + title + (markdown + code) per entry
     assert len(graph.cells) >= 6
+
+
+def test_http_promote_diff_leaves_the_event_loop_free_while_it_works(
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
+):
+    """The route's work (key search, reads that may heal, the build, the checkpoint) blocks, so it runs on the
+    threadpool, not the event loop. Here the key search is held until the test releases it; another request made
+    meanwhile is still answered, and the promote then completes."""
+    import threading
+
+    import tallyman_companion.app as app_module
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+
+    entered, release = threading.Event(), threading.Event()
+    real = app_module.diff_keys
+
+    def _held_diff_keys(*args, **kwargs):
+        entered.set()
+        release.wait(60)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(app_module, "diff_keys", _held_diff_keys)
+
+    # One client in a `with` block: every request shares its one event loop, as in the server.
+    with TestClient(fresh_companion_app) as c:
+        promoted: list = []
+        promote = threading.Thread(
+            target=lambda: promoted.append(c.post(f"/{project}/api/promote_diff/shoe_sales/1/2"))
+        )
+        promote.start()
+        try:
+            assert entered.wait(60), "the promote never reached its key search"
+            probed: list = []
+            probe = threading.Thread(target=lambda: probed.append(c.get("/api/version")))
+            probe.start()
+            probe.join(10)
+            answered_meanwhile = not probe.is_alive()
+        finally:
+            release.set()
+            promote.join(120)
+            probe.join(120)
+
+    assert answered_meanwhile, "GET /api/version waited for the promote: the route blocked the event loop"
+    assert probed[0].status_code == 200
+    assert promoted[0].status_code == 200, promoted[0].text
+    assert promoted[0].json()["alias"] == "diff_shoe_sales_v1_v2"

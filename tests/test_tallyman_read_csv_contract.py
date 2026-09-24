@@ -225,3 +225,97 @@ def test_ordinary_reader_kwarg_still_forwarded(project):
     out = _import(project, "semicsv", p, separator=";")
     types = _types_of(project, out)
     assert "a" in types and "b" in types  # split into two columns, not one "a;b"
+
+
+# --------------------------------------------------------------------------- #
+# #231 — a zone on text with no UTC offset is attached, not converted (ADR-005 D9(a))
+# --------------------------------------------------------------------------- #
+NY = "America/New_York"
+
+
+def _zoned_snapshot(project: str, name: str, lines: list[str], dtype: str = f"timestamp({NY!r})"):
+    """Import a one-column CSV of *lines* under ``{"ts": dtype}`` and return the snapshot's ``ts`` column.
+
+    Read back with pyarrow, straight from the file the import wrote, so the test sees the stored instants and the
+    stored type with nothing between them and the assertion.
+    """
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    p = data_dir(project) / f"{name}.csv"
+    p.write_text("ts\n" + "\n".join(lines) + "\n")
+    out = _import(project, name, p, {"ts": dtype})
+    return pq.read_table(snapshot_path(project, out["hash"])).column("ts")
+
+
+def test_a_zone_attaches_to_offsetless_text(project):
+    """#231: ``09:30`` under America/New_York is 09:30 there, in winter and in summer.
+
+    polars' reader parsed it as UTC and converted, so it came out as 04:30-05:00 and 05:30-04:00. An empty field
+    stays null.
+    """
+    ts = _zoned_snapshot(project, "tz_wall", ["2024-01-02 09:30:00", "", "2024-07-02 09:30:00"])
+    assert str(ts.type) == f"timestamp[us, tz={NY}]"
+    assert [v and v.isoformat() for v in ts.to_pylist()] == [
+        "2024-01-02T09:30:00-05:00",
+        None,
+        "2024-07-02T09:30:00-04:00",
+    ]
+
+
+def test_a_zoned_nanosecond_column_keeps_its_digits(project):
+    """#231 with #145: a zone attached to offset-less text keeps the declared ``ns`` unit and every digit."""
+    import pyarrow as pa
+
+    ts = _zoned_snapshot(project, "tz_ns", ["2024-01-02 09:30:00.123456789"], f"timestamp({NY!r}, 9)")
+    assert str(ts.type) == f"timestamp[ns, tz={NY}]"
+    # 09:30:00.123456789 in New York in January is 14:30:00.123456789 UTC.
+    assert ts.cast(pa.int64()).to_pylist() == [1_704_205_800_123_456_789]
+
+
+def test_a_wall_clock_time_the_zone_skips_raises(project):
+    """#231: 02:30 on 2024-03-10 never happens in New York, so no instant is right for it and the import raises.
+
+    polars' reader read it as UTC and stored 2024-03-09 21:30-05:00.
+    """
+    lines = ["2024-03-09 12:00:00", "2024-03-10 01:59:59", "2024-03-10 02:30:00", "2024-03-10 03:00:00"]
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_gap", lines)
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "'2024-03-10 02:30:00' (row 3)" in err
+    assert f"does not exist in {NY}" in err
+
+
+def test_a_wall_clock_time_the_zone_repeats_raises(project):
+    """#231: 01:30 on 2024-11-03 happens twice in New York, once at -04:00 and once at -05:00, so the import raises
+    rather than picking one."""
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_overlap", ["2024-11-02 12:00:00", "2024-11-03 01:30:00"])
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "'2024-11-03 01:30:00' (row 2)" in err
+    assert f"occurs twice in {NY}" in err
+
+
+@pytest.mark.parametrize(
+    ("lines", "offset_row", "offsetless_row"),
+    [
+        (["2024-01-02 09:30:00", "2024-01-02T09:30:00+00:00"], 2, 1),
+        (["2024-01-02T09:30:00+00:00", "2024-01-02 09:30:00"], 1, 2),
+        # Far past the first morsel polars parses, so the rule is the column's, not a batch's.
+        (["2024-01-02 09:30:00"] * 50_000 + ["2024-01-02T09:30:00+00:00"], 50_001, 1),
+    ],
+    ids=["offset-second", "offset-first", "offset-late"],
+)
+def test_a_zoned_column_mixing_offset_and_offsetless_text_raises(project, lines, offset_row, offsetless_row):
+    """#231: text with an offset is an instant and text without one is a wall-clock time, and one column is read
+    one way, so a column with both raises an error that names the column and a row of each kind."""
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_mixed", lines)
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "mixes text with a UTC offset and text without one" in err
+    assert f"'{lines[offset_row - 1]}' (row {offset_row})" in err
+    assert f"'{lines[offsetless_row - 1]}' (row {offsetless_row})" in err

@@ -38,6 +38,7 @@ from tallyman_core import (
     version_of_hash,
 )
 from tallyman_core.events import list_sessions, read_events, record_event
+from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_core.telemetry import read_spans, record_span
@@ -936,7 +937,11 @@ def create_app(
         total = 0
         if manifest_path.exists():
             total = json.loads(manifest_path.read_text()).get("row_count") or 0
-        df = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit).execute()
+        # The page runs on the process's shared backend, one execution at a time (#118). cached_result_expr may heal,
+        # and a heal takes the project lock, which comes before the execution lock, so it runs first.
+        expr = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit)
+        with execution_lock():
+            df = expr.execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,

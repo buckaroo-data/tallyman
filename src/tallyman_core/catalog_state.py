@@ -49,6 +49,7 @@ import threading
 from pathlib import Path
 
 from tallyman_core import catalog
+from tallyman_core.execution import holds_execution_lock
 from tallyman_core.git_util import run_git
 from tallyman_core.paths import (
     ENTRIES_DIRNAME,
@@ -272,6 +273,10 @@ def project_lock(project: str):
     companion, which both build), and re-entrant within a thread, since a promote builds and then checkpoints and a
     build materializes. Another thread or process waits. It is blocking with no timeout (ADR-007 D11, #186), and it
     cannot be held across an ``await``: the companion moves work between threads with ``run_in_threadpool``.
+
+    It comes before ``execution_lock`` (#118). A thread that holds the execution lock and would take a new project lock
+    raises ``RuntimeError`` instead: another thread may hold this project lock and be waiting to execute. A re-entrant
+    acquire takes no new ``flock``, so it is allowed.
     """
     depth = getattr(_held, "depth", None)
     if depth is None:
@@ -283,6 +288,12 @@ def project_lock(project: str):
         finally:
             depth[project] -= 1
         return
+    if holds_execution_lock():
+        raise RuntimeError(
+            f"project_lock({project!r}) was requested by a thread that holds execution_lock. The order is project_lock "
+            "first, then execution_lock (#118): take anything that can heal (cached_result_expr, ensure_materialized) "
+            "before `with execution_lock():`, not inside it."
+        )
     cd = catalog_dir(project)
     cd.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(cd / ".checkpoint.lock"), os.O_CREAT | os.O_RDWR, 0o644)

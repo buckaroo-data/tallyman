@@ -387,6 +387,17 @@ def _zoned_columns(overrides: dict) -> dict:
     return {name: dt for name, dt in overrides.items() if isinstance(dt, pl.Datetime) and dt.time_zone is not None}
 
 
+def _zoned_text_value(name: str):
+    """Zoned column *name*, which the scan read as text, with an empty cell as null.
+
+    ``missing_utf8_is_empty_string`` reads an empty cell of a string column as ``""``. It is meant for the file's
+    string columns, and an empty cell of a zoned column stays null, as it was when polars' reader parsed the column.
+    """
+    import polars as pl
+
+    return pl.when(pl.col(name) != "").then(pl.col(name))
+
+
 def _parse_zoned(lf, zoned: dict):
     """Parse each zoned column of *lf*, which the scan read as text, into its declared type (ADR-005 D9(a), #231).
 
@@ -409,10 +420,8 @@ def _parse_zoned(lf, zoned: dict):
     first non-null value it sees matches no format (fixed upstream in pola-rs/polars#28986). The file's first
     non-null value is that value, so ``_unreadable_first_zoned_value`` checks it before the read.
     """
-    import polars as pl
-
     return lf.with_columns(
-        pl.col(name).str.to_datetime(time_unit=dt.time_unit, time_zone=dt.time_zone, ambiguous="raise")
+        _zoned_text_value(name).str.to_datetime(time_unit=dt.time_unit, time_zone=dt.time_zone, ambiguous="raise")
         for name, dt in zoned.items()
     )
 
@@ -423,13 +432,16 @@ _UTC_OFFSET = r"\d:\d{2}(?::\d{2}(?:[.,]\d+)?)?\s*(?:[Zz]|[+-]\d{2}(?::?\d{2})?)
 
 
 def _zoned_text(src: Path, scan_kwargs: dict, name: str):
-    """The non-null text of column *name* of *src*, with its row number counted from 1 after the header."""
+    """The non-null text of column *name* of *src*, with its row number counted from 1 after the header.
+
+    The row index is added after the select, so a column of the file's own named ``row`` does not collide with it.
+    """
     import polars as pl
 
     return (
         pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs)
+        .select(_zoned_text_value(name).alias("text"))
         .with_row_index("row", offset=1)
-        .select("row", pl.col(name).alias("text"))
         .filter(pl.col("text").is_not_null())
     )
 

@@ -843,9 +843,15 @@ What the implementation does that the text above does not say, or says different
   snapshot path it was made for, so a project that moved regenerates it.
 - **The verify sweep (D5, D12)** reports `absent` (the hashes whose snapshot is missing) next to `results`,
   `unfaithful` and `errors`, and writes nothing.
-- **Pinned files (D12).** `materialize.pinned_reason` answers whether a snapshot may be deleted: the manifest says
-  `reproducible: false`, or an `unfaithful_heal` record exists for the hash. `/api/result_cache` reports `pinned` and
-  `pinned_reason` per row and lists a file whose entry is gone as `orphan`; the delete route answers 409 with the reason.
+- **Pinned files (D12).** `materialize.pinned_reason` answers whether a snapshot may be deleted, from the manifest
+  alone: it says `reproducible: false`, or it holds `unfaithful_heal_digest`, which an unfaithful heal records (the one
+  field written after create; the `unfaithful_heal` record in `errors.jsonl` is only the banner's, #196). For a file
+  whose entry a reset retired it reads the manifest parked in the bullpen, and a reset that retires an entry the
+  bullpen already holds replaces the parked dir with the live one, whose manifest matches the file (#194, #195). A
+  source version (ADR-011 D1) is also pinned when the clone of its imported bytes is gone, and for a retired one a
+  clone the reset parked beside its dir counts, since a reset forward brings both back.
+  `/api/result_cache` reports `pinned` and `pinned_reason` per row and marks a retired entry's file `retired` and a
+  file no entry names `orphan`; the delete route answers 409 with the reason.
 - **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
   the whole build, including the recipe import, so a chained build waits for its parent's materialization.
 - **Clones (D13, D14).** `ensure_cas_path` clones to a unique temp name, since two builders cloning one source shared

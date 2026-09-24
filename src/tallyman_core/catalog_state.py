@@ -18,7 +18,9 @@ Those heavy artifacts are content-addressed, additive, and gitignored, so
 pointers via the bullpen: evictions retire (not deleted), and anything a
 restored step records but is missing comes back by copy. An eviction replaces a
 parked dir of the same name, since the live one matches the snapshot on disk
-(#194). Live operations never read the bullpen.
+(#194). The one live reader of the bullpen is the Cache page, which reads a
+retired entry's parked manifest, and a retired source version's parked clone,
+to decide its snapshot's pin (#195).
 
 ``compute_cache/`` is not managed here (ADR-007 D14). Its files are named by
 content hash and each one can be made again by ``ensure_materialized``, so a
@@ -157,6 +159,15 @@ def _retire(src: Path, dest: Path) -> None:
     shutil.move(str(src), str(dest))
 
 
+def parked_entry_dir(project: str, content_hash: str) -> Path:
+    """Where a reset parks an entry's dir: ``<catalog>/bullpen/entries/<hash>``.
+
+    Besides ``reset_to``, only the Cache page reads it: a retired entry's snapshot stays on disk (ADR-007 D14), and the
+    parked manifest is what still says whether that file can be made again (#195).
+    """
+    return bullpen_dir(project) / ENTRIES_DIRNAME / content_hash
+
+
 def prune_entries(project: str) -> int:
     """Retire entry dirs not named by ``entries.jsonl``. No-op when the pointer
     file is absent (never captured), so a build before the first checkpoint is
@@ -171,13 +182,23 @@ def prune_entries(project: str) -> int:
     removed = 0
     for child in ed.iterdir():
         if child.is_dir() and child.name not in valid:
-            _retire(child, bullpen_dir(project) / ENTRIES_DIRNAME / child.name)
+            _retire(child, parked_entry_dir(project, child.name))
             removed += 1
     return removed
 
 
 def _cas_bullpen(project: str) -> Path:
     return bullpen_dir(project) / "cas"
+
+
+def parked_clone_path(project: str, clone_name: str) -> Path:
+    """Where a reset parks a source clone named *clone_name*: ``<catalog>/bullpen/cas/<digest><suffix>``.
+
+    A reset back to a step before an import parks the source entry's dir and the clone of its bytes together, and a
+    reset forward copies both back, so the Cache page reads it to tell a retired source version's snapshot, which that
+    clone can still make again, from one that nothing can (#195).
+    """
+    return _cas_bullpen(project) / clone_name
 
 
 def _live_source_digests(project: str) -> set[str] | None:
@@ -212,14 +233,12 @@ def restore_from_bullpen(project: str) -> int:
     restored pointer file names that is absent from the live tree comes back by
     *copy*, and so does every source clone (``data/.cas/``) that a restored entry
     refers to, so the bullpen keeps its set and the back/forward rehearsal loop
-    can repeat. Only ``reset_to`` calls this — live operations never see the
-    bullpen.
+    can repeat. Only ``reset_to`` calls this.
     """
-    bp = bullpen_dir(project)
     restored = 0
     ed = entries_dir(project)
     for h in _read_jsonl(_entries_file(project), "hash") or []:
-        live, parked = ed / h, bp / ENTRIES_DIRNAME / h
+        live, parked = ed / h, parked_entry_dir(project, h)
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1

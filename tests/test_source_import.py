@@ -955,6 +955,37 @@ def test_promote_diff_refuses_a_source_alias_as_its_target(project: str, tmp_pat
     assert "source alias" in out["error"]
 
 
+def test_catalog_alias_refuses_a_source_entry(project: str, tmp_path: Path, monkeypatch):
+    """A source version cannot take a catalog name: the alias's kind must match its entry's.
+
+    catalog_alias checked only the kind of the *name*, so ``catalog_alias(<source hash>, "x")`` made a catalog alias
+    whose head was an imported file, and ``catalog_revise("x", ...)`` was then allowed on it. The refusal names the
+    source alias-version that holds the entry and steers to a catalog entry that reads it, which follows the source
+    when it is imported again.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.aliases import alias_kind
+    from tallyman_mcp.server import catalog_alias, catalog_create, catalog_import_source
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    imported = catalog_import_source(str(src), "orders")
+
+    out = catalog_alias(imported["hash"], "x")
+
+    assert "error" in out, out
+    assert "orders-v1" in out["error"]
+    assert "catalog_create" in out["error"]
+    assert get_alias(project, "x") is None
+    assert alias_kind(project, "x") is None
+
+    steer = "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('orders')"
+    followed = catalog_create("x", steer)
+
+    assert "error" not in followed, followed
+    assert followed["hash"] != imported["hash"]
+    assert alias_kind(project, "x") == "catalog"
+
+
 # ---------------------------------------------------------------------------
 # D6 — the ordered-copy store is subsumed into the source entry's snapshot
 # ---------------------------------------------------------------------------

@@ -429,6 +429,40 @@ def test_set_alias_refuses_to_change_an_alias_kind(project: str):
         set_alias(project, "orders", "bbbbbbbbbbbb")
 
 
+# An alias's kind matches the kind of the entries it points at. The kind lives on the alias (aliases.jsonl); whether an
+# entry is a *source entry* — a version of an imported file, recognised by its manifest carrying ``provenance`` — lives
+# on the entry. set_alias is the one writer every route goes through, so it is where the two are tied together.
+
+
+def test_set_alias_refuses_a_catalog_alias_onto_a_source_entry(project: str, tmp_path: Path, monkeypatch):
+    """A catalog name over an import would let catalog_revise "revise" a version that has no recipe (D1)."""
+    from tallyman_core.aliases import AliasKindMismatch, alias_kind
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    imported = _import(project, tmp_path, "orders")
+
+    with pytest.raises(AliasKindMismatch) as exc:
+        set_alias(project, "looks_like_catalog", imported["hash"])
+
+    assert "orders" in str(exc.value)
+    assert get_alias(project, "looks_like_catalog") is None
+    assert alias_kind(project, "looks_like_catalog") is None
+
+
+def test_set_alias_refuses_a_source_alias_onto_a_computed_entry(project: str, tmp_path: Path, monkeypatch):
+    """A source alias advances only by an import, so its head is always an imported file, never a recipe's result."""
+    from tallyman_core.aliases import SOURCE_KIND, AliasKindMismatch
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    imported = _import(project, tmp_path, "orders")
+    computed = build_and_persist(project, _over_source("orders", project))
+
+    with pytest.raises(AliasKindMismatch):
+        set_alias(project, "orders", computed.content_hash, kind=SOURCE_KIND)
+
+    assert history_for(project, "orders") == [imported["hash"]]
+
+
 def test_renaming_a_source_alias_keeps_its_kind(project: str, tmp_path: Path, monkeypatch):
     """Rename and unalias behave as they do for catalog aliases (D1)."""
     from tallyman_core.aliases import SOURCE_KIND, alias_kind

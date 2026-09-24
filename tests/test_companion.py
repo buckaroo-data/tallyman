@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core import entry_dir
@@ -170,16 +171,17 @@ expr = t.select("order_id", "region", "price", "__row_order")
     assert page2 == full[50:100]
 
 
-def test_api_data_missing_manifest_serves_page_without_500(
-    fresh_companion_app, project: str, orders_src: str, monkeypatch
+@pytest.mark.parametrize("route", ["data", "entry", "entry_cache"])
+def test_entry_routes_refuse_an_entry_with_no_manifest(
+    fresh_companion_app, project: str, orders_src: str, monkeypatch, route: str
 ):
-    """#90: a missing manifest must not 500 the row read.
+    """#204, and #90, which stopped the row read answering 500 here.
 
-    The build dir is written before manifest.json (build.py creates the dir, then
-    writes the manifest after executing), so a half-built or pruned entry can pass
-    the build-dir check yet have no manifest. cached_result_expr needs none — only
-    ``total`` reads it — so the read must be guarded: serve the page with a
-    best-effort total rather than raising FileNotFoundError on the manifest read.
+    The build dir is written before manifest.json, and the manifest is the build's last write, so a build that did not
+    finish leaves a directory with no manifest, and that directory is not an entry (ADR-007 D6). Every route that
+    reads one entry answers 404 with the reason and the rebuild. The row read used to serve the rows with a total of
+    0, which for a worthy entry whose snapshot was gone too meant re-running its aggregate as if it were cheap, and
+    the detail and metadata routes answered 500 when they read the missing manifest.
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
@@ -188,15 +190,14 @@ t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
-    (entry_dir(project, h) / "manifest.json").unlink()  # half-built / pruned entry
+    (entry_dir(project, h) / "manifest.json").unlink()  # what a build that did not finish leaves
 
-    c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/api/data/{h}?offset=0&limit=10")
-    assert r.status_code == 200  # served off the expression, not the manifest
-    body = r.json()
-    assert len(body["data"]) == 10
-    assert set(body["data"][0]) == {"region", "price", "__row_order"}
-    assert body["total"] == 0  # no manifest → best-effort total, not a crash
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.get(f"/{project}/api/{route}/{h}")
+    assert r.status_code == 404, (r.status_code, r.text[:500])
+    detail = r.json()["detail"]
+    assert "has no manifest.json" in detail
+    assert "expr.py" in detail, "the refusal names the recipe to run again"
 
 
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core.paths import catalog_dir, entry_dir
@@ -145,6 +146,55 @@ def test_classifier_skips_cheap_caches_expensive(project, orders_src, monkeypatc
     proj_h = _hash_of(project)
     assert cache_worthy(project, proj_h) is False
     assert "cheap" in read_manifest(entry_dir(project, proj_h)).cache_worthy_why
+
+
+@pytest.mark.parametrize("snapshot_on_disk", [True, False], ids=["snapshot-on-disk", "no-snapshot"])
+@pytest.mark.parametrize("kind", ["worthy", "cheap"])
+def test_cache_worthy_refuses_an_entry_with_no_manifest(project, orders_src, monkeypatch, kind, snapshot_on_disk):
+    """#204: the verdict is the manifest's (ADR-008 D4), and a directory without a manifest is not an entry (ADR-007
+    D6), so ``cache_worthy`` refuses one and names the rebuild. It used to answer with whether a file sat at the
+    snapshot path: a worthy entry that had lost both was reported cheap, and a cheap entry with a file at that path
+    was reported worthy."""
+    import shutil
+
+    from tallyman_core.aliases import get_alias
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create(kind, _agg_code(project) if kind == "worthy" else _project_code(project))
+    h = _hash_of(project)
+    snap = snapshot_path(project, h)
+    if snapshot_on_disk and not snap.exists():
+        shutil.copy(snapshot_path(project, get_alias(project, ORDERS_SRC)), snap)
+    if not snapshot_on_disk:
+        snap.unlink(missing_ok=True)
+    (entry_dir(project, h) / "manifest.json").unlink()
+
+    with pytest.raises(BuildError, match="has no manifest.json") as info:
+        cache_worthy(project, h)
+    assert "expr.py" in str(info.value), "the refusal names the recipe to run again"
+
+
+def test_cache_worthy_refuses_a_hash_whose_entry_dir_is_gone(project, orders_src, monkeypatch):
+    """#204: a reset that retires an entry parks its directory in the bullpen and leaves its snapshot on disk
+    (ADR-007 D14). The file is still there, but the hash names no entry of this catalog, so nothing reads it as one.
+    ``cache_worthy`` used to report it worthy because the file existed, and ``cached_result_expr`` served it."""
+    import shutil
+
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import snapshot_path
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    h = _hash_of(project)
+    shutil.rmtree(entry_dir(project, h))
+    assert snapshot_path(project, h).is_file()
+
+    for read in (cache_worthy, cached_result_expr):
+        with pytest.raises(BuildError, match=f"no entry {h}"):
+            read(project, h)
 
 
 def test_cheap_entry_writes_no_result_parquet(project, orders_src, monkeypatch):

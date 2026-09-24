@@ -12,10 +12,27 @@ from pathlib import Path
 _TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="tallyman_xorq_cache_"))
 os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 
+# No test reaches a companion it did not start. A test on a tmp data dir has no owner record, so companion_url() would
+# fall back to http://127.0.0.1:7860, and every MCP tool and `reset-to` notify would land on whatever companion the
+# developer has running there. Port 0 is one nothing can listen on, so a notify is refused at connect. Set here as well
+# as per test (below) so collection, module- and session-scoped fixtures and the subprocesses they start are covered,
+# and a developer's own TALLYMAN_COMPANION_URL never reaches a test. A test of the owner-record path clears it itself.
+CLOSED_COMPANION_URL = "http://127.0.0.1:0"
+os.environ["TALLYMAN_COMPANION_URL"] = CLOSED_COMPANION_URL
+
 import pytest  # noqa: E402
 
 from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402
 from tallyman_core import data_dir, ensure_project, set_active_project  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def no_live_companion(monkeypatch) -> str:
+    """Point every test's companion at a closed port (see ``CLOSED_COMPANION_URL``), re-set per test so one that wrote
+    ``os.environ`` directly cannot leak to the next. A test that needs a companion sets the URL itself, or requests this
+    fixture and then deletes the variable to exercise the owner-record lookup."""
+    monkeypatch.setenv("TALLYMAN_COMPANION_URL", CLOSED_COMPANION_URL)
+    return CLOSED_COMPANION_URL
 
 
 @pytest.fixture

@@ -95,7 +95,10 @@ def hold_data_dir():
 
 
 @pytest.fixture
-def no_companion_url_env(monkeypatch):
+def no_companion_url_env(no_live_companion, monkeypatch):
+    """Clear the closed-port URL conftest sets for every test, so companion_url() takes the owner-record path. Requests
+    ``no_live_companion`` so this runs after it; the tests that use it assert an owner's port, which the closed-port
+    URL would fail, so the conftest default cannot mask the path they cover."""
     monkeypatch.delenv("TALLYMAN_COMPANION_URL", raising=False)
 
 
@@ -324,6 +327,42 @@ def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(
     monkeypatch.setenv("TALLYMAN_HOME", str(home_b))
     monkeypatch.setenv("TALLYMAN_COMPANION_URL", "http://127.0.0.1:19999")
     assert companion_url() == "http://127.0.0.1:19999"  # an explicit URL wins
+
+
+def test_no_test_notifies_a_companion_it_did_not_start(isolated_home, monkeypatch):
+    """conftest points TALLYMAN_COMPANION_URL at a closed port for every test. Without that, a test on a tmp data dir
+    (no owner record) resolves the default, http://127.0.0.1:7860, and posts its events to whatever companion the
+    developer has running there. Checked both at the resolver and at the wire, and for subprocesses a test starts."""
+    import httpx
+
+    import tallyman_mcp.server as srv
+    from tallyman_core.server_lock import DEFAULT_COMPANION_URL, companion_url
+
+    assert companion_url() != DEFAULT_COMPANION_URL
+    assert os.environ.get("TALLYMAN_COMPANION_URL") == companion_url()  # what a spawned subprocess inherits
+
+    posted: list[str] = []
+
+    class _Capture:
+        def __init__(self, *a, **k):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def post(self, url, json=None):
+            posted.append(url)
+
+    monkeypatch.setattr(srv.httpx, "Client", _Capture)
+    srv._notify("new_entry", content_hash="abc")
+
+    assert len(posted) == 1
+    assert not posted[0].startswith(DEFAULT_COMPANION_URL), posted[0]
+    with socket.socket() as probe:  # nothing accepts a connection there
+        assert probe.connect_ex(("127.0.0.1", httpx.URL(posted[0]).port)) != 0
 
 
 def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(

@@ -1,9 +1,12 @@
 # DataFusion scan ordering — findings and decision
 
 - **Status:** Resolved (2026-06-25) — **stick with polars for the ingest reader.**
-- **Status note (2026-09-22):** the polars decision stands, and since #189 covers
-  parquet sources too: every source is read through a polars-written ordered copy
-  (`plans/ADR-008-row-order-of-reads.md` D2). The row-index column is
+- **Status note (2026-09-22, revised 2026-09-24):** the polars decision stands
+  for CSV. #189 extended it to parquet sources, reading every source through a
+  polars-written ordered copy (`plans/ADR-008-row-order-of-reads.md` D2); since
+  ADR-011 (`plans/ADR-011-sources-are-aliases.md`) a file is read once, when it
+  is imported, polars parses only a CSV, and a parquet file is copied in file
+  order by pyarrow, which keeps its types. The row-index column is
   `__row_order`, not `original_row_order`, and `result_digest` is a content digest
   of the snapshot read back, not a hash of its bytes
   (`plans/ADR-009-digest-stability.md`).

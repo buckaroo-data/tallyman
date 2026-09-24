@@ -11,7 +11,7 @@
   import time, not in a recipe.** `tallyman_read_csv` is refused in an authored recipe alongside
   `read_project_file` (ADR-011 D2) — both open a file the catalog does not own, and leaving the CSV reader
   open would be a hole in the rule. A CSV enters through
-  `catalog_import_source(path, alias, separator=..., schema=...)`, and everything this ADR designed goes
+  `catalog_import_source(path, alias, schema=..., reader_options={"separator": ...})`, and everything this ADR designed goes
   with it: the schema DSL and its normaliser, the inference ladder (100 → 10k → whole file), the
   suggestion engine and the error contract all run inside the import, over
   `source_import._write_csv_snapshot`. The recipe then reads the resulting source alias.

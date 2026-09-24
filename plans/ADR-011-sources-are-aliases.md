@@ -16,10 +16,12 @@
   `plans/ADR-005-intelligent-csv-import.md` (its reader runs at import, not in
   a recipe) and `plans/ADR-008-row-order-of-reads.md` (its refusal extends to
   `read_project_file`, and the ordered copy becomes the source entry's
-  snapshot). Still outstanding: `docs/architecture.md`, `docs/caching.md`,
-  `docs/expression-lifecycle.md` and `docs/system-contract.md` all describe the
-  deleted source axis, and are left until PR #216 lands to avoid rewriting the
-  same four files twice.
+  snapshot). `docs/architecture.md`, `docs/caching.md`,
+  `docs/expression-lifecycle.md` and `docs/system-contract.md`, which described
+  the deleted source axis and were held back so PR #216 would not have to
+  rewrite them twice, were brought up to date in #216 after it was rebased onto
+  this work (2026-09-24), with `docs/reactive-recalc.md`, `docs/mcp-server.md`,
+  `docs/installing.md`, the README and `tallyman_explanation.md`.
   Written from Paddy's design session the same day, after a review of PR #189
   found that a child pinned to its parent by content hash is permanently stale
   and reports itself as an UNEXPLAINED orphan. The direction is his: "treat the
@@ -432,7 +434,8 @@ every build. Options are evaluated once, at import, and stored.
 - Data no longer arrives by being dropped in `data/`. That is a real loss of
   convenience, and the import step is the price of the model.
 - `docs/architecture.md`, `docs/caching.md`, `docs/expression-lifecycle.md` and
-  `docs/system-contract.md` all describe the source axis and need rewriting.
+  `docs/system-contract.md` described the source axis and needed rewriting (done
+  in #216, 2026-09-24).
 - ADR-002 is narrowed rather than superseded: its clone store survives, its
   modes and its `sources`-as-freshness reading do not.
 

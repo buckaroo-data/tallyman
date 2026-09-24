@@ -7,7 +7,10 @@
   written, reads load the frozen build (#167, `plans/ADR-006-read-path-loads-builds.md`)
   and tallyman writes its own result files (#189, ADR-007 to ADR-009), which
   changed several findings: CSV sources go through source identity and a
-  content-keyed ordered copy (W3, #168); entry session ids include the project
+  content-keyed ordered copy (W3, #168), and since ADR-011
+  (`plans/ADR-011-sources-are-aliases.md`) every data file enters only by an
+  import, as a source entry named by its bytes and reader options, so a build
+  never reads a file on a path the user controls; entry session ids include the project
   and tallyman keeps no session map, though diff session ids still do not include
   it (B1, #172); every snapshot a heal re-creates is verified before it is served
   (W6); and `csv_ordered/` is gone. Check an issue's current state before relying

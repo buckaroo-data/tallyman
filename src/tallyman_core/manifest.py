@@ -36,6 +36,10 @@ class SourceProvenance(BaseModel):
     the imported bytes, which names their clone in ``data/.cas/<digest><suffix>`` and, with ``reader``, determines
     the entry's content hash. ``reader`` is the reader options the import used (``{"kind": "parquet"}``, or a CSV's
     schema spec and ``scan_csv`` options): fixed at import and never re-derived at build time.
+
+    ``alias`` and ``version`` are the name the version was **imported as**, which is history too: a rename moves the
+    alias's history to a new name and an unalias drops it, and neither rewrites this record. Anything that names the
+    version as it is now asks the alias store (``source_import.current_source_version``).
     """
 
     alias: str

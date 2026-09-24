@@ -162,3 +162,26 @@ def test_entry_detail_omits_edit_button_in_serve_mode(project: str, orders_src: 
     c = TestClient(app)
     r = c.put(f"/{project}/api/code/shoe_sales", json={"code": _filter(project)})
     assert r.status_code == 403
+
+
+def test_put_code_refuses_a_source_alias(fresh_companion_app, project: str, orders_src: str, monkeypatch):
+    """A source alias's versions are imported files with no recipe to revise (ADR-011 D1), so the route refuses.
+
+    It refuses before building, as ``catalog_revise`` does. It used to build the entry, fail to point the source
+    alias at it, and answer 500 with the entry left behind under no alias.
+    """
+    from tallyman_core import entry_dir
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg(project))
+    head = get_alias(project, orders_src)
+    entries = sorted(p.name for p in entry_dir(project, head).parent.iterdir())
+    code = "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('shoe_sales')\n"
+
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.put(f"/{project}/api/code/{orders_src}", json={"code": code})
+
+    assert r.status_code == 409, r.text
+    assert "catalog_import_source" in r.json()["detail"]
+    assert get_alias(project, orders_src) == head
+    assert sorted(p.name for p in entry_dir(project, head).parent.iterdir()) == entries

@@ -227,6 +227,32 @@ def test_bytes_matching_an_older_version_error_names_reset(project: str, tmp_pat
     assert "reset" in message.lower()
 
 
+def test_the_append_only_refusal_does_not_advise_a_second_alias(project: str, tmp_path: Path, monkeypatch):
+    """D11's refusal offers ways back that work: a reset, or reading the old version pinned.
+
+    It used to offer "import these bytes under a different alias", which is refused too, because bytes an alias
+    already holds cannot be imported under another (ADR-011 D1).
+    """
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.parquet"
+    _write_parquet(src, 10)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 10)  # back to v1's bytes
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(src), "orders")
+
+    message = str(exc.value)
+    assert "different alias" not in message, message
+    assert "pinned_expr_from_alias('orders-v1')" in message, message
+    with pytest.raises(source_import.SourceImportError, match="orders-v1"):
+        source_import.update_and_depend(str(src), "orders_again")
+
+
 def test_absent_alias_with_a_skipped_pin_errors(project: str, tmp_path: Path, monkeypatch):
     """A brand-new source alias starts at v1; a pin of v2 would leave version 1 undefined forever."""
     from tallyman_xorq import source_import
@@ -323,20 +349,138 @@ def test_the_snapshot_is_the_ordered_copy(project: str, tmp_path: Path, monkeypa
     assert read_manifest(entry_dir(project, out["hash"])).cache_worthy is True
 
 
-def test_two_aliases_over_identical_bytes_share_one_entry(project: str, tmp_path: Path, monkeypatch):
-    """The entry hash is a function of the bytes and the reader options, so one file serves both aliases."""
+def test_identical_bytes_under_a_second_alias_is_an_error(project: str, tmp_path: Path, monkeypatch):
+    """One set of bytes is one source version under one alias; importing it again under another name is refused.
+
+    The likeliest way to get here is not knowing the bytes are already in the project, so the error names the alias
+    and version that hold them and the way to give them a second name. The first alias's entry is untouched: a second
+    import used to rewrite its manifest and recipe, and a failure part-way deleted the entry outright.
+    """
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
-
     a = source_import.update_and_depend(str(src), "orders")
-    b = source_import.update_and_depend(str(src), "orders_again")
+    entry = entry_dir(project, a["hash"])
+    manifest_before = (entry / "manifest.json").read_bytes()
+    recipe_before = (entry / "expr.py").read_bytes()
+    copy = _write_parquet(_outside(tmp_path) / "copy_of_orders.parquet", 10)
+    assert copy.read_bytes() == src.read_bytes()
 
-    assert a["hash"] == b["hash"]
-    assert get_alias(project, "orders") == get_alias(project, "orders_again")
-    snaps = sorted(p.name for p in snapshot_path(project, a["hash"]).parent.glob("*.parquet"))
-    assert snaps == [f"{a['hash']}.parquet"]
+    with pytest.raises(source_import.SourceImportError) as info:
+        source_import.update_and_depend(str(copy), "orders_again")
+
+    message = str(info.value)
+    assert "orders-v1" in message
+    assert "tracked_expr_from_alias('orders')" in message
+    assert "catalog_create" in message
+    assert get_alias(project, "orders_again") is None
+    assert (entry / "manifest.json").read_bytes() == manifest_before
+    assert (entry / "expr.py").read_bytes() == recipe_before
+
+
+def test_bytes_of_an_older_version_of_another_alias_are_refused(project: str, tmp_path: Path, monkeypatch):
+    """The bytes need not be another alias's head: any version of any other alias holds them."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.parquet"
+    _write_parquet(src, 10)
+    first_bytes = src.read_bytes()
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders")
+    old = _outside(tmp_path) / "old_orders.parquet"
+    old.write_bytes(first_bytes)
+
+    with pytest.raises(source_import.SourceImportError, match="orders-v1"):
+        source_import.update_and_depend(str(old), "archive")
+
+    assert get_alias(project, "archive") is None
+
+
+def test_a_repair_import_writes_the_snapshot_and_nothing_else(project: str, tmp_path: Path, monkeypatch):
+    """Re-importing a version whose snapshot is gone restores the snapshot and leaves the entry alone.
+
+    The entry's recipe, build and manifest are the record of the import, and a repair is not an import: it goes
+    through the heal ``ensure_materialized`` uses. So nothing is rebuilt (a failing ``build_expr`` does not matter),
+    and repairing from another path does not move the recorded provenance path or its time.
+    """
+    import xorq.ibis_yaml.compiler as compiler
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    entry = entry_dir(project, a["hash"])
+    record = {name: (entry / name).read_bytes() for name in ("manifest.json", "expr.py")}
+    snapshot = snapshot_path(project, a["hash"])
+    before = snapshot.read_bytes()
+    snapshot.unlink()
+    moved = _outside(tmp_path) / "moved" / "orders.parquet"
+    moved.parent.mkdir()
+    moved.write_bytes(src.read_bytes())
+
+    def rebuild(*args, **kwargs):
+        raise RuntimeError("a repair rebuilt the entry")
+
+    monkeypatch.setattr(compiler, "build_expr", rebuild)
+    out = source_import.update_and_depend(str(moved), "orders")
+
+    assert out["created"] is False
+    assert snapshot.read_bytes() == before
+    assert {name: (entry / name).read_bytes() for name in record} == record
+
+
+def test_a_repair_import_is_verified_like_any_heal(project: str, tmp_path: Path, monkeypatch):
+    """A repair that writes other rows under the recorded hash is an unfaithful heal, and is recorded as one.
+
+    The recorded digest and row count stay the build-time ones. A repair used to take whatever it wrote as the new
+    truth, so a child built on the old rows read the new ones with nothing to say they had changed.
+    """
+    from tallyman_core.errors import list_errors
+    from tallyman_xorq import source_import
+    from tallyman_xorq.digest import content_digest
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    recorded = read_manifest(entry_dir(project, a["hash"]))
+    snapshot_path(project, a["hash"]).unlink()
+    write = source_import._write_snapshot
+
+    def one_row_short(clone, reader, dest):  # a reader that now parses the same bytes into other rows
+        write(clone, reader, dest)
+        table = pq.read_table(dest)
+        pq.write_table(table.slice(0, table.num_rows - 1), dest)
+        return content_digest(dest)
+
+    monkeypatch.setattr(source_import, "_write_snapshot", one_row_short)
+    source_import.update_and_depend(str(src), "orders")
+
+    after = read_manifest(entry_dir(project, a["hash"]))
+    assert (after.result_digest, after.row_count) == (recorded.result_digest, recorded.row_count)
+    codes = [r.get("code") for r in list_errors(project, limit=1000) if r.get("hash") == a["hash"]]
+    assert "unfaithful_heal" in codes, codes
+
+
+def test_an_entry_whose_manifest_is_gone_is_written_again_by_a_re_import(project: str, tmp_path: Path, monkeypatch):
+    """An entry directory with no readable manifest, which a crash part-way through an import leaves, is not an entry.
+
+    A re-import of its bytes writes it again rather than failing to read it.
+    """
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    (entry_dir(project, a["hash"]) / "manifest.json").unlink()
+
+    out = source_import.update_and_depend(str(src), "orders")
+
+    assert (out["hash"], out["created"]) == (a["hash"], False)
+    assert read_manifest(entry_dir(project, a["hash"])).provenance.alias == "orders"
 
 
 def test_a_source_version_keeps_its_raw_bytes_in_the_clone_store(project: str, tmp_path: Path, monkeypatch):
@@ -764,6 +908,218 @@ def test_a_source_snapshot_whose_clone_is_gone_is_pinned(project: str, tmp_path:
     assert ".cas" in reason, reason  # the pin is the missing clone, not the fact that this is a source
 
 
+# ``manifest.provenance.alias`` and ``.version`` are the name the import was made under, recorded once. A rename
+# carries an alias's history and kind to the new name (``aliases.rename_alias``) and an unalias drops it, so a
+# message that names a source version, or tells the user which import repairs it, has to ask the alias store who
+# holds the entry now.
+
+
+def _advised_import(message: str) -> tuple[list, dict]:
+    """The arguments of the ``catalog_import_source(...)`` call that ends *message*, parsed as Python literals."""
+    import ast
+
+    call = ast.parse(message[message.index("catalog_import_source(") :].rstrip("."), mode="eval").body
+    assert isinstance(call, ast.Call), message
+    return [ast.literal_eval(a) for a in call.args], {k.arg: ast.literal_eval(k.value) for k in call.keywords}
+
+
+def test_a_pinned_source_snapshot_is_named_by_the_alias_it_was_renamed_to(project: str, tmp_path: Path, monkeypatch):
+    """The pin names the version as the catalog knows it now; the name it was imported under is history."""
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.materialize import pinned_reason
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+    _clone_of(project, out).unlink()
+
+    reason = pinned_reason(project, out["hash"])
+    assert reason is not None
+    assert "renamed_src-v1" in reason, reason
+    assert "source version a_src-v1" not in reason, reason
+
+
+def test_the_re_import_advice_names_the_alias_a_source_was_renamed_to(project: str, tmp_path: Path, monkeypatch):
+    """The heal error names the version by its alias now, and so does the import it advises."""
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+
+    message = str(exc.value)
+    assert "renamed_src-v1" in message, message
+    assert f"catalog_import_source({str(src)!r}, 'renamed_src', pinned_version=1)" in message, message
+    assert "'a_src'" not in message, message
+
+
+def test_following_the_re_import_advice_after_a_rename_repairs_the_version(project: str, tmp_path: Path, monkeypatch):
+    """The advice is a call the user runs as written, so it has to repair the renamed alias's version.
+
+    Advice that named the import-time alias minted a second source alias, ``a_src``, over the same entry, and the
+    renamed one's snapshot came back only by accident.
+    """
+    from tallyman_core.aliases import load_kinds, rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    before = snapshot_path(project, out["hash"]).read_bytes()
+    rename_alias(project, "a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = source_import.update_and_depend(*args, **kwargs)
+
+    assert load_kinds(project) == {"renamed_src": "source"}
+    assert (repaired["alias"], repaired["version"], repaired["created"]) == ("renamed_src", 1, False)
+    assert repaired["hash"] == out["hash"]
+    assert history_for(project, "renamed_src") == [out["hash"]]
+    assert snapshot_path(project, out["hash"]).read_bytes() == before
+
+
+def test_catalog_rename_then_the_advised_catalog_import_source_repairs_the_version(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """The same, through the tools a user has: the advice is an MCP call, run against the MCP tool."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.aliases import load_kinds
+    from tallyman_mcp.server import catalog_import_source, catalog_rename
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = catalog_import_source(str(src), "a_src")
+    assert "error" not in catalog_rename("a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = catalog_import_source(*args, **kwargs)
+
+    assert "error" not in repaired, repaired
+    assert load_kinds(project) == {"renamed_src": "source"}
+    assert snapshot_path(project, out["hash"]).is_file()
+
+
+def test_a_source_version_no_alias_holds_is_not_advised_back_under_its_old_name(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """After an unalias no alias holds the version, and the messages say so instead of naming the dead alias.
+
+    Re-importing under the old name would not restore anything that exists: it would mint a new alias of that name.
+    """
+    from tallyman_core.aliases import remove_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized, pinned_reason
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    remove_alias(project, "a_src")
+    _clone_of(project, out).unlink()
+
+    reason = pinned_reason(project, out["hash"])
+    assert reason is not None
+    assert "no source alias" in reason, reason
+    assert "imported as a_src-v1" in reason, reason
+
+    snapshot_path(project, out["hash"]).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+
+    message = str(exc.value)
+    assert "no source alias" in message, message
+    assert "'a_src'" not in message, message
+    assert "pinned_version" not in message, message
+
+
+def test_following_the_re_import_advice_for_a_csv_repairs_the_version(project: str, tmp_path: Path, monkeypatch):
+    """A CSV's entry hash covers its reader options (D12), so the advised import has to carry them.
+
+    Without them the same file hashes to another entry, and the advised call is refused as "not orders-v1".
+    """
+    from tallyman_mcp.server import catalog_import_source
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("north", 1), ("south", 2)], sep=";")
+    out = catalog_import_source(
+        str(src), "orders", schema={"region": "string", "n": "int64"}, reader_options={"separator": ";"}
+    )
+    assert "error" not in out, out
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = catalog_import_source(*args, **kwargs)
+
+    assert "error" not in repaired, repaired
+    assert (repaired["hash"], repaired["created"]) == (out["hash"], False)
+    assert snapshot_path(project, out["hash"]).is_file()
+
+
+def test_a_pinned_import_read_another_way_says_the_reader_options_differ(project: str, tmp_path: Path, monkeypatch):
+    """The same bytes under other reader options are another entry, and the refusal has to say so.
+
+    "This file is not orders-v1" is false about the file; what differs is how it is read.
+    """
+    from tallyman_mcp.server import catalog_import_source
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("north", 1), ("south", 2)], sep=";")
+    assert "error" not in catalog_import_source(str(src), "orders", reader_options={"separator": ";"})
+
+    out = catalog_import_source(str(src), "orders", pinned_version=1)
+
+    assert "reader options" in out.get("error", ""), out
+
+
+def test_a_source_recipe_names_its_alias_as_the_one_it_was_imported_under(project: str, tmp_path: Path, monkeypatch):
+    """The generated recipe is written once, at import, so the Code tab must not present that name as the entry's.
+
+    After a rename the entry is ``renamed_src-v1``; a header reading ``# a_src-v1: a source version`` says otherwise.
+    """
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+
+    header = (entry_dir(project, out["hash"]) / "expr.py").read_text().splitlines()[0]
+    assert "imported as a_src-v1" in header, header
+    assert not header.startswith("# a_src-v1:"), header
+
+
 def test_a_reset_keeps_the_clone_of_an_imported_source_alive(project: str, tmp_path: Path, monkeypatch):
     """``gc_cas`` walks the retention closure; an imported version's clone is in it via the entry's provenance."""
     from tallyman_xorq import source_import
@@ -925,6 +1281,22 @@ def test_catalog_import_source_reports_an_error_as_a_dict(project: str, tmp_path
     assert "nope.parquet" in out["error"]
 
 
+def test_catalog_import_source_reports_a_duplicate_import_as_an_error(project: str, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.catalog_state import list_revisions
+    from tallyman_mcp.server import catalog_import_source
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    catalog_import_source(str(src), "orders")
+    before = len(list_revisions(project))
+
+    out = catalog_import_source(str(src), "orders_again")
+
+    assert "orders-v1" in out.get("error", ""), out
+    assert get_alias(project, "orders_again") is None
+    assert len(list_revisions(project)) == before
+
+
 def test_catalog_revise_refuses_a_source_alias(project: str, tmp_path: Path, monkeypatch):
     """There is no recipe to revise: a source alias advances only by an import."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -953,6 +1325,37 @@ def test_promote_diff_refuses_a_source_alias_as_its_target(project: str, tmp_pat
 
     assert "error" in out
     assert "source alias" in out["error"]
+
+
+def test_catalog_alias_refuses_a_source_entry(project: str, tmp_path: Path, monkeypatch):
+    """A source version cannot take a catalog name: the alias's kind must match its entry's.
+
+    catalog_alias checked only the kind of the *name*, so ``catalog_alias(<source hash>, "x")`` made a catalog alias
+    whose head was an imported file, and ``catalog_revise("x", ...)`` was then allowed on it. The refusal names the
+    source alias-version that holds the entry and steers to a catalog entry that reads it, which follows the source
+    when it is imported again.
+    """
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.aliases import alias_kind
+    from tallyman_mcp.server import catalog_alias, catalog_create, catalog_import_source
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    imported = catalog_import_source(str(src), "orders")
+
+    out = catalog_alias(imported["hash"], "x")
+
+    assert "error" in out, out
+    assert "orders-v1" in out["error"]
+    assert "catalog_create" in out["error"]
+    assert get_alias(project, "x") is None
+    assert alias_kind(project, "x") is None
+
+    steer = "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('orders')"
+    followed = catalog_create("x", steer)
+
+    assert "error" not in followed, followed
+    assert followed["hash"] != imported["hash"]
+    assert alias_kind(project, "x") == "catalog"
 
 
 # ---------------------------------------------------------------------------
@@ -996,3 +1399,148 @@ def test_the_ordered_copy_store_is_gone(project: str, tmp_path: Path, monkeypatc
 
     assert snapshot_path(project, out["hash"]).is_file()
     assert [d.name for d in sorted(compute_cache_dir(project).iterdir())] == [RESULT_CACHE_DIRNAME]
+
+
+# ---------------------------------------------------------------------------
+# a second name for a source is an expression over it, not a second import
+# ---------------------------------------------------------------------------
+
+
+def test_a_second_name_for_a_source_is_a_catalog_entry_over_it(project: str, tmp_path: Path, monkeypatch):
+    """What the duplicate-import error tells the user to do instead, and why it needs nothing to force the hash apart.
+
+    A source entry's hash is an md5 of its bytes and reader options; a recipe's hash is xorq's hash of the expression.
+    An expression that only reads the source is therefore a different entry already, with a followed parent edge, so a
+    re-import of the source advances it like any other follower.
+    """
+    from tallyman_mcp.server import catalog_create
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    source = source_import.update_and_depend(str(src), "orders")
+
+    out = catalog_create(
+        "orders_eu", "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('orders')\n"
+    )
+
+    assert "error" not in out, out
+    assert out["hash"] != source["hash"]
+    parents = read_manifest(entry_dir(project, out["hash"])).parents
+    assert [(p.ref, p.hash, p.follow) for p in parents] == [("orders", source["hash"], True)]
+
+
+# ---------------------------------------------------------------------------
+# two projects importing one file share nothing
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def two_projects(isolated_home: Path) -> tuple[str, str]:
+    from tallyman_core import ensure_project, set_active_project
+
+    for name in ("alpha", "beta"):
+        ensure_project(name)
+    set_active_project("alpha")
+    return "alpha", "beta"
+
+
+def test_two_projects_importing_one_file_each_get_their_own_copy(two_projects, tmp_path: Path):
+    """Same bytes, same entry hash, but each project holds its own entry, snapshot and clone."""
+    from tallyman_xorq import source_import
+    from tallyman_xorq.source_import import source_clone_path
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+
+    a = source_import.update_and_depend(str(src), "orders", project=alpha)
+    b = source_import.update_and_depend(str(src), "orders", project=beta)
+
+    assert a["hash"] == b["hash"]
+    assert a["created"] and b["created"], "the second project's import is not a no-op on the first's entry"
+    for proj in (alpha, beta):
+        manifest = read_manifest(entry_dir(proj, a["hash"]))
+        assert manifest.project == proj
+        assert snapshot_path(proj, a["hash"]).is_file()
+        assert source_clone_path(proj, manifest.provenance).is_file()
+        assert get_alias(proj, "orders") == a["hash"]
+    assert snapshot_path(alpha, a["hash"]) != snapshot_path(beta, b["hash"])
+
+
+def test_the_duplicate_import_check_is_per_project(two_projects, tmp_path: Path):
+    """One file under different alias names in two projects is two unrelated imports, not a duplicate."""
+    from tallyman_xorq import source_import
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+
+    source_import.update_and_depend(str(src), "orders", project=alpha)
+    out = source_import.update_and_depend(str(src), "sales", project=beta)
+
+    assert out["created"] is True
+    assert history_for(beta, "sales") == [out["hash"]]
+    assert history_for(beta, "orders") == []
+
+
+def test_deleting_and_healing_one_projects_snapshot_leaves_the_others_alone(two_projects, tmp_path: Path):
+    from tallyman_xorq import source_import
+    from tallyman_xorq.build import build_and_persist
+    from tallyman_xorq.digest import content_digest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    h = source_import.update_and_depend(str(src), "orders", project=alpha)["hash"]
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    child_a = build_and_persist(alpha, _child_code("orders", alpha)).content_hash
+    child_b = build_and_persist(beta, _child_code("orders", beta)).content_hash
+    beta_snapshot = snapshot_path(beta, h)
+    beta_digest, beta_mtime = content_digest(beta_snapshot), beta_snapshot.stat().st_mtime_ns
+
+    snapshot_path(alpha, h).unlink()
+    ensure_materialized(alpha, h)
+
+    assert snapshot_path(alpha, h).is_file()
+    assert (content_digest(beta_snapshot), beta_snapshot.stat().st_mtime_ns) == (beta_digest, beta_mtime)
+    assert len(cached_result_expr(alpha, child_a).execute()) == 3
+    assert len(cached_result_expr(beta, child_b).execute()) == 3
+
+
+def test_retiring_one_projects_clones_leaves_the_others(two_projects, tmp_path: Path):
+    """``.cas`` lives under each project's ``data/``; a sweep in one project never reaches another's."""
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq import source_import
+    from tallyman_xorq.source_import import source_clone_path
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    h = source_import.update_and_depend(str(src), "orders", project=alpha)["hash"]
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    beta_clone = source_clone_path(beta, read_manifest(entry_dir(beta, h)).provenance)
+
+    assert si.gc_cas(alpha, set(), bullpen=tmp_path / "bullpen") == 1
+
+    assert beta_clone.is_file()
+
+
+def test_a_re_import_in_one_project_does_not_stale_the_other(two_projects, tmp_path: Path):
+    from tallyman_core.aliases import set_alias
+    from tallyman_xorq import source_import
+    from tallyman_xorq.build import build_and_persist
+    from tallyman_xorq.staleness import scan
+
+    alpha, beta = two_projects
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 12)
+    source_import.update_and_depend(str(src), "orders", project=alpha)
+    source_import.update_and_depend(str(src), "orders", project=beta)
+    child_a = build_and_persist(alpha, _child_code("orders", alpha)).content_hash
+    child_b = build_and_persist(beta, _child_code("orders", beta)).content_hash
+    for proj, child in ((alpha, child_a), (beta, child_b)):
+        set_alias(proj, "totals", child)  # the scan judges live alias heads (#154)
+
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders", project=beta)
+
+    assert scan(alpha)[child_a].stale is False
+    assert scan(beta)[child_b].stale is True

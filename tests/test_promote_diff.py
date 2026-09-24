@@ -328,6 +328,37 @@ def test_http_promote_diff_creates_entry(fresh_companion_app, project: str, orde
     assert body["row_count"] > 0
 
 
+def test_http_promote_diff_refuses_a_source_alias_as_its_target(
+    fresh_companion_app, project: str, orders_src: str, tmp_path: Path, monkeypatch
+):
+    """The generated target name can already be a source alias; the route refuses before building, as the tool does.
+
+    It used to build the diff entry, fail to point the source alias at it, and answer 500 with the entry left behind.
+    """
+    import pandas as pd
+
+    from tallyman_core import entry_dir, get_alias
+    from tallyman_xorq.source_import import update_and_depend
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+    other = tmp_path / "outside" / "other.parquet"
+    other.parent.mkdir(parents=True)
+    pd.DataFrame({"x": [1, 2, 3]}).to_parquet(other)
+    update_and_depend(str(other), "diff_shoe_sales_v1_v2", project=project)
+    head = get_alias(project, "diff_shoe_sales_v1_v2")
+    entries = sorted(p.name for p in entry_dir(project, head).parent.iterdir())
+
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.post(f"/{project}/api/promote_diff/shoe_sales/1/2")
+
+    assert r.status_code == 409, r.text
+    assert "source alias" in r.json()["detail"]
+    assert get_alias(project, "diff_shoe_sales_v1_v2") == head
+    assert sorted(p.name for p in entry_dir(project, head).parent.iterdir()) == entries
+
+
 def test_http_promote_diff_sets_display_config(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     from tallyman_core.display_configs import get_display_config
 

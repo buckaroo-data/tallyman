@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from tallyman_core import (
     AliasExists,
+    AliasKindMismatch,
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
@@ -256,18 +257,11 @@ def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> di
 def _source_alias_refusal(project: str, name: str, doing: str) -> str | None:
     """The error for an operation aimed at a source alias, or None when *name* is not one (ADR-011 D1).
 
-    A source alias names an imported dataset. Its versions are files, not recipes, so there is nothing to revise and
-    nothing to promote a diff onto, and a catalog alias may not take its name either.
+    The text lives in ``tallyman_core.aliases.source_alias_refusal`` so the companion's routes refuse with it too.
     """
-    from tallyman_core.aliases import SOURCE_KIND, alias_kind  # noqa: PLC0415
+    from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
 
-    if alias_kind(project, name) != SOURCE_KIND:
-        return None
-    return (
-        f"{name!r} is a source alias — its versions are imported files, not recipes — so it cannot be {doing}. "
-        f"To give it new data, import the file again with catalog_import_source(<path>, {name!r}). To build on it, "
-        f"write a recipe over tracked_expr_from_alias({name!r}) under a different name."
-    )
+    return source_alias_refusal(project, name, doing)
 
 
 @mcp.tool()
@@ -583,7 +577,10 @@ def catalog_import_source(
     Args:
         outside_path: Any path to a parquet or CSV file. It does not have to live
             under the project's `data/` directory.
-        alias: The source alias. Must not already name a catalog entry.
+        alias: The source alias. Must not already name a catalog alias, and the
+            bytes must not already be a version of another alias — the error
+            names that alias. For a second name, catalog_create an entry whose
+            recipe is `tracked_expr_from_alias(<that alias>)`.
         pinned_version: The version you claim this file is. Given, it is checked:
             if the file is that version the call is a no-op, and if it is not you
             get an error instead of an accidental new version. Use it in a script
@@ -831,6 +828,12 @@ def catalog_alias(hash: str, name: str) -> dict:
 
     Use this when an entry was created via `catalog_run` and you decide
     post-hoc that it deserves a name. Errors if the alias already exists.
+
+    The entry must be a computed one. A source entry (a version of an imported
+    file) belongs to its source alias and cannot take a catalog name (ADR-011
+    D1); to give a source a second name, `catalog_create` an entry whose recipe
+    is `tracked_expr_from_alias("<source alias>")`, which follows the source
+    when it is imported again.
     """
     project = _resolve_active_project()
     refusal = _source_alias_refusal(project, name, "given to another entry")
@@ -840,7 +843,10 @@ def catalog_alias(hash: str, name: str) -> dict:
         return {"error": f"no catalog entry for hash {hash!r}"}
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists"}
-    info = set_alias(project, name, hash, expect_exists=False)
+    try:
+        info = set_alias(project, name, hash, expect_exists=False)
+    except AliasKindMismatch as exc:  # a source entry: the message names its source alias-version and the steer
+        return {"error": str(exc)}
     notebook.append(project, name)
     _notify("alias_changed", content_hash=hash, alias=name, version=info["version"])
     _notify("notebook_changed")

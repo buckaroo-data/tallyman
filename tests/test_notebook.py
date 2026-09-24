@@ -234,6 +234,23 @@ def test_notebook_route_renders_cells(fresh_companion_app, project: str, orders_
     assert cells[0]["entry_meta"]["prompt"] == "region totals"
 
 
+def test_notebook_route_errors_when_a_cells_entry_has_no_manifest(
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
+):
+    """#204: an entry directory without a manifest is corrupt, and the notebook reads the head entry of every cell.
+    The cell used to render with no metadata and a row count of 0."""
+    from tallyman_core import entry_dir
+    from tallyman_core.aliases import get_alias
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project), prompt="region totals")
+    (entry_dir(project, get_alias(project, "shoe_sales")) / "manifest.json").unlink()
+
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.get(f"/{project}/api/notebook_full")
+    assert r.status_code == 500, (r.status_code, r.text[:500])
+
+
 def test_api_notebook_reorder(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("a", _agg_code(project))

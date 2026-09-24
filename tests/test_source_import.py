@@ -484,13 +484,13 @@ def test_an_entry_whose_manifest_is_gone_is_written_again_by_a_re_import(project
     assert read_manifest(entry_dir(project, a["hash"])).provenance.alias == "orders"
 
 
-def test_a_source_version_that_lost_its_manifest_and_snapshot_is_refused_and_names_the_import(
+def test_reading_a_source_version_that_lost_its_manifest_and_snapshot_is_an_error(
     project: str, tmp_path: Path, monkeypatch
 ):
     """#204. With its manifest gone a version has no provenance to find its clone by, and its build reads the very
     snapshot that is missing, so there is nothing to make the file from. The read used to take it for cheap and recurse
-    on that snapshot without bound (RecursionError). It is refused now, and the error names the import that writes
-    the version again."""
+    on that snapshot without bound (RecursionError). It raises now, with the same error as any entry directory
+    without a manifest. Importing the file again by hand writes the version again."""
     from tallyman_xorq import source_import
     from tallyman_xorq.build import BuildError
     from tallyman_xorq.result_cache import cached_result_expr
@@ -502,9 +502,10 @@ def test_a_source_version_that_lost_its_manifest_and_snapshot_is_refused_and_nam
     snapshot_path(project, a["hash"]).unlink()
     cached_result_expr.cache_clear()
 
-    with pytest.raises(BuildError, match="has no manifest.json") as info:
-        cached_result_expr(project, a["hash"])
-    assert "import" in str(info.value)
+    h = a["hash"]
+    with pytest.raises(BuildError) as info:
+        cached_result_expr(project, h)
+    assert str(info.value) == f"entry {h} in {project!r} has no manifest.json: {entry_dir(project, h)}"
 
     assert source_import.update_and_depend(str(src), "orders")["hash"] == a["hash"]
     assert len(cached_result_expr(project, a["hash"]).execute()) == 10

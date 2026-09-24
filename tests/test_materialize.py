@@ -411,12 +411,12 @@ def test_ensure_materialized_rewrites_a_missing_snapshot_and_verifies_it(project
 
 
 @pytest.mark.parametrize("kind", ["worthy", "cheap"])
-def test_an_entry_that_lost_its_manifest_is_refused_until_its_recipe_runs_again(project, orders_src, kind):
-    """#204, ADR-007 D6 (an entry with no manifest is treated as absent). The manifest is an entry's last write and
-    holds what a read needs: the worthy-or-cheap verdict, and the digest a heal is checked against. So a read refuses
-    a directory without one and names the rebuild, for a cheap entry as for a worthy one. A worthy entry that had also
-    lost its snapshot used to be read as cheap: every read re-ran its aggregate and nothing made the file again.
-    Running the recipe again writes the entry again, under the same hash."""
+def test_reading_an_entry_that_lost_its_manifest_is_an_error_until_its_recipe_runs_again(project, orders_src, kind):
+    """#204. The manifest holds what a read needs: the worthy-or-cheap verdict, and the digest a heal is checked
+    against. An entry directory without one is corrupt, so a read raises before it loads or writes anything, for a
+    cheap entry as for a worthy one. A worthy entry that had also lost its snapshot used to be read as cheap: every
+    read re-ran its aggregate and nothing made the file again. Running the recipe again by hand writes the entry
+    again, under the same hash."""
     from tallyman_xorq.materialize import ensure_materialized
 
     code = _agg_code(project) if kind == "worthy" else _root_code(project)
@@ -428,9 +428,9 @@ def test_an_entry_that_lost_its_manifest_is_refused_until_its_recipe_runs_again(
     cached_result_expr.cache_clear()
 
     for read in (cached_result_expr, ensure_materialized):
-        with pytest.raises(BuildError, match="has no manifest.json") as info:
+        with pytest.raises(BuildError) as info:
             read(project, h)
-        assert "expr.py" in str(info.value), "the refusal names the recipe to run again"
+        assert str(info.value) == f"entry {h} in {project!r} has no manifest.json: {entry_dir(project, h)}"
     assert not snap.exists()
 
     assert build_and_persist(project, code).content_hash == h
@@ -439,20 +439,20 @@ def test_an_entry_that_lost_its_manifest_is_refused_until_its_recipe_runs_again(
     assert len(cached_result_expr(project, h).execute()) == built.row_count
 
 
-def test_a_child_of_an_entry_that_lost_its_manifest_is_refused_and_names_that_entry(project, orders_src):
+def test_a_child_of_an_entry_that_lost_its_manifest_raises_that_entrys_error(project, orders_src):
     """#204. A worthy entry that lost its manifest and its snapshot used to look cheap. A child that reads its snapshot
     asked for the file, nothing wrote it, and the read failed with "still missing after it was made again"; a new
-    child built over it inlined the aggregate as if it were cheap. Both are refused now, and the error names the entry
-    that has to be built again."""
+    child built over it inlined the aggregate as if it were cheap. Both raise now, with the parent's own error:
+    nothing on the way up catches it or adds to it."""
     agg = _hash(catalog_create("agg", _agg_code(project)))
     child = _hash(catalog_create("share", _cheap_child_code("agg")))
     (entry_dir(project, agg) / "manifest.json").unlink()
     snapshot_path(project, agg).unlink()
     cached_result_expr.cache_clear()
 
-    with pytest.raises(BuildError, match="has no manifest.json") as info:
+    with pytest.raises(BuildError) as info:
         cached_result_expr(project, child)
-    assert child in str(info.value) and agg in str(info.value)
+    assert str(info.value) == f"entry {agg} in {project!r} has no manifest.json: {entry_dir(project, agg)}"
 
     res = catalog_create(
         "busy",

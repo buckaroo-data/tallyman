@@ -150,9 +150,9 @@ def test_classifier_skips_cheap_caches_expensive(project, orders_src, monkeypatc
 
 @pytest.mark.parametrize("snapshot_on_disk", [True, False], ids=["snapshot-on-disk", "no-snapshot"])
 @pytest.mark.parametrize("kind", ["worthy", "cheap"])
-def test_cache_worthy_refuses_an_entry_with_no_manifest(project, orders_src, monkeypatch, kind, snapshot_on_disk):
-    """#204: the verdict is the manifest's (ADR-008 D4), and a directory without a manifest is not an entry (ADR-007
-    D6), so ``cache_worthy`` refuses one and names the rebuild. It used to answer with whether a file sat at the
+def test_cache_worthy_errors_on_an_entry_with_no_manifest(project, orders_src, monkeypatch, kind, snapshot_on_disk):
+    """#204: the verdict is the manifest's (ADR-008 D4). An entry directory without a manifest is corrupt, so
+    ``cache_worthy`` raises, and the error says only what is missing. It used to answer with whether a file sat at the
     snapshot path: a worthy entry that had lost both was reported cheap, and a cheap entry with a file at that path
     was reported worthy."""
     import shutil
@@ -171,15 +171,16 @@ def test_cache_worthy_refuses_an_entry_with_no_manifest(project, orders_src, mon
         snap.unlink(missing_ok=True)
     (entry_dir(project, h) / "manifest.json").unlink()
 
-    with pytest.raises(BuildError, match="has no manifest.json") as info:
+    with pytest.raises(BuildError) as info:
         cache_worthy(project, h)
-    assert "expr.py" in str(info.value), "the refusal names the recipe to run again"
+    assert str(info.value) == f"entry {h} in {project!r} has no manifest.json: {entry_dir(project, h)}"
 
 
-def test_cache_worthy_refuses_a_hash_whose_entry_dir_is_gone(project, orders_src, monkeypatch):
+def test_cache_worthy_errors_on_a_hash_whose_entry_dir_is_gone(project, orders_src, monkeypatch):
     """#204: a reset that retires an entry parks its directory in the bullpen and leaves its snapshot on disk
-    (ADR-007 D14). The file is still there, but the hash names no entry of this catalog, so nothing reads it as one.
-    ``cache_worthy`` used to report it worthy because the file existed, and ``cached_result_expr`` served it."""
+    (ADR-007 D14). The file is still there, but the hash names no entry of this catalog, so reading it raises the same
+    error as a directory without a manifest. ``cache_worthy`` used to report it worthy because the file existed, and
+    ``cached_result_expr`` served it."""
     import shutil
 
     from tallyman_xorq.build import BuildError
@@ -193,8 +194,9 @@ def test_cache_worthy_refuses_a_hash_whose_entry_dir_is_gone(project, orders_src
     assert snapshot_path(project, h).is_file()
 
     for read in (cache_worthy, cached_result_expr):
-        with pytest.raises(BuildError, match=f"no entry {h}"):
+        with pytest.raises(BuildError) as info:
             read(project, h)
+        assert str(info.value) == f"entry {h} in {project!r} has no manifest.json: {entry_dir(project, h)}"
 
 
 def test_cache_worthy_is_the_manifests_verdict_whatever_is_at_the_snapshot_path(project, orders_src, monkeypatch):

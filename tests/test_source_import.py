@@ -11,6 +11,7 @@ axis (D6) and the source-identity modes (D8) are stage 2.
 
 from __future__ import annotations
 
+import errno
 from pathlib import Path
 
 import pandas as pd
@@ -1132,6 +1133,37 @@ def test_a_reset_keeps_the_clone_of_an_imported_source_alive(project: str, tmp_p
     capture_tallyman_state(project)  # what a checkpoint does; the retention closure reads its pointer list
 
     assert out["digest"] in (_live_source_digests(project) or set())
+
+
+def test_a_failed_re_import_keeps_the_snapshot_a_reset_left_on_disk(project: str, tmp_path: Path, monkeypatch):
+    """#193 for a source entry. A reset back past an import parks the entry and leaves its snapshot (ADR-007 D14), and
+    importing the file again mints over that file. ``_mint`` keeps a snapshot already at the path, since the entry hash
+    fixes its rows (D12), so a mint that fails, here at its manifest write, leaves the file as it was. A build stages
+    its snapshot for this; a mint does not need to."""
+    import tallyman_core
+    from tallyman_core import catalog_state as cs
+    from tallyman_xorq import source_import
+    from tallyman_xorq.result_cache import snapshot_file_digest
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    cs.ensure_catalog_repo(project)
+    empty = cs.checkpoint_catalog(project, "empty")
+    out = source_import.update_and_depend(str(src), "orders")
+    assert empty is not None and cs.checkpoint_catalog(project, "imported") is not None
+    snap = snapshot_path(project, out["hash"])
+    digest = snapshot_file_digest(snap)
+    cs.reset_to(project, empty)
+    assert not entry_dir(project, out["hash"]).exists()
+
+    def _disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(tallyman_core, "write_manifest", _disk_full)
+    with pytest.raises(Exception, match="No space left on device"):
+        source_import.update_and_depend(str(src), "orders")
+    assert not entry_dir(project, out["hash"]).exists()
+    assert snapshot_file_digest(snap) == digest
 
 
 # ---------------------------------------------------------------------------

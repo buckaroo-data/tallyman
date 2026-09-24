@@ -1284,6 +1284,8 @@ def create_app(
 
         import textwrap  # noqa: PLC0415
 
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from tallyman_companion.diff import compute_column_config_overrides  # noqa: PLC0415
         from tallyman_core.aliases import AliasExists, set_alias  # noqa: PLC0415
         from tallyman_core.catalog_state import checkpoint_catalog  # noqa: PLC0415
@@ -1292,105 +1294,113 @@ def create_app(
         from tallyman_xorq.build import BuildError  # noqa: PLC0415
         from tallyman_xorq.result_cache import cached_result_expr  # noqa: PLC0415
 
-        hashes = history_for(project, alias)
-        if not hashes:
-            raise HTTPException(404, f"alias {alias!r} has no history")
+        def _promote() -> tuple[dict, bool]:
+            # Everything here blocks (the key search, reads that may heal under project_lock, the build, the
+            # alias and config writes), so it runs on the threadpool and the event loop stays free.
+            hashes = history_for(project, alias)
+            if not hashes:
+                raise HTTPException(404, f"alias {alias!r} has no history")
 
-        def _resolve(v: int):
-            if v < 0:
-                v = len(hashes) + v + 1
-            if v < 1 or v > len(hashes):
-                return None
-            return v, hashes[v - 1]
+            def _resolve(v: int):
+                if v < 0:
+                    v = len(hashes) + v + 1
+                if v < 1 or v > len(hashes):
+                    return None
+                return v, hashes[v - 1]
 
-        a = _resolve(va)
-        b = _resolve(vb)
-        if a is None or b is None:
-            raise HTTPException(400, f"version out of range; alias has {len(hashes)} versions")
-        a_idx, a_hash = a
-        b_idx, b_hash = b
+            a = _resolve(va)
+            b = _resolve(vb)
+            if a is None or b is None:
+                raise HTTPException(400, f"version out of range; alias has {len(hashes)} versions")
+            a_idx, a_hash = a
+            b_idx, b_hash = b
 
-        try:
-            keys = diff_keys(project, a_hash, b_hash) or []
-        except PrimaryKeySearchTimeout as exc:
-            raise HTTPException(504, detail=str(exc)) from exc
-        if not keys:
-            raise HTTPException(400, "no stable join key detected; cannot build keyed diff")
+            try:
+                keys = diff_keys(project, a_hash, b_hash) or []
+            except PrimaryKeySearchTimeout as exc:
+                raise HTTPException(504, detail=str(exc)) from exc
+            if not keys:
+                raise HTTPException(400, "no stable join key detected; cannot build keyed diff")
 
-        a_expr = cached_result_expr(project, a_hash)
-        b_expr = cached_result_expr(project, b_hash)
-        column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
+            a_expr = cached_result_expr(project, a_hash)
+            b_expr = cached_result_expr(project, b_hash)
+            column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
-        target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
-        # The generated name can already be a source alias: refuse before building the diff, as the MCP tool does.
-        from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
+            target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
+            # The generated name can already be a source alias: refuse before building the diff, as the MCP tool does.
+            from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
 
-        refusal = source_alias_refusal(project, target_alias, "the target of a promoted diff")
-        if refusal:
-            raise HTTPException(409, refusal)
-        keys_repr = repr(keys)
-        code = textwrap.dedent(f"""\
-            # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
-            # a_hash: {a_hash}
-            # b_hash: {b_hash}
-            from tallyman_companion.diff import build_diff_expr
-            expr = build_diff_expr(
-                a_hash={a_hash!r},
-                b_hash={b_hash!r},
-                keys={keys_repr},
-            )
-        """)
+            refusal = source_alias_refusal(project, target_alias, "the target of a promoted diff")
+            if refusal:
+                raise HTTPException(409, refusal)
+            keys_repr = repr(keys)
+            code = textwrap.dedent(f"""\
+                # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
+                # a_hash: {a_hash}
+                # b_hash: {b_hash}
+                from tallyman_companion.diff import build_diff_expr
+                expr = build_diff_expr(
+                    a_hash={a_hash!r},
+                    b_hash={b_hash!r},
+                    keys={keys_repr},
+                )
+            """)
 
-        try:
-            result = _build_and_persist(project, code, prompt=f"promote diff {alias} V{a_idx}→V{b_idx}")
-        except BuildError as exc:
-            raise HTTPException(500, str(exc)) from exc
+            try:
+                result = _build_and_persist(project, code, prompt=f"promote diff {alias} V{a_idx}→V{b_idx}")
+            except BuildError as exc:
+                raise HTTPException(500, str(exc)) from exc
 
-        repointed = False
-        try:
-            set_alias(project, target_alias, result.content_hash, expect_exists=False)
-        except AliasExists:
-            set_alias(project, target_alias, result.content_hash)
-            repointed = True  # re-pointed an existing alias → its followers may go stale
+            repointed = False
+            try:
+                set_alias(project, target_alias, result.content_hash, expect_exists=False)
+            except AliasExists:
+                set_alias(project, target_alias, result.content_hash)
+                repointed = True  # re-pointed an existing alias → its followers may go stale
 
-        set_display_config(
-            project,
-            result.content_hash,
-            {
-                "column_config_overrides": column_config_overrides,
-                "diff_provenance": {
-                    "source_alias": alias,
-                    "va": a_idx,
-                    "vb": b_idx,
-                    "a_hash": a_hash,
-                    "b_hash": b_hash,
-                    "keys": keys,
+            set_display_config(
+                project,
+                result.content_hash,
+                {
+                    "column_config_overrides": column_config_overrides,
+                    "diff_provenance": {
+                        "source_alias": alias,
+                        "va": a_idx,
+                        "vb": b_idx,
+                        "a_hash": a_hash,
+                        "b_hash": b_hash,
+                        "keys": keys,
+                    },
                 },
-            },
-        )
+            )
+
+            return {
+                "alias": target_alias,
+                "hash": result.content_hash,
+                "source_alias": alias,
+                "va": a_idx,
+                "vb": b_idx,
+                "a_hash": a_hash,
+                "b_hash": b_hash,
+                "keys": keys,
+                "row_count": result.row_count,
+            }, repointed
+
+        out, repointed = await run_in_threadpool(_promote)
 
         # D5 parity: re-pointing an existing alias cascades to its followers in the
         # same revision (the walk runs before this route's checkpoint).
         recalc_report = (
-            await _auto_recalc_after_head_advance(project, target_alias, tool="companion_promote_diff")
+            await _auto_recalc_after_head_advance(project, out["alias"], tool="companion_promote_diff")
             if repointed
             else None
         )
 
-        checkpoint_catalog(project, f"tallyman: catalog_promote_diff {alias} V{a_idx}→V{b_idx}")
-        await publish({"kind": "entry_added", "hash": result.content_hash})
+        await run_in_threadpool(
+            checkpoint_catalog, project, f"tallyman: catalog_promote_diff {alias} V{out['va']}→V{out['vb']}"
+        )
+        await publish({"kind": "entry_added", "hash": out["hash"]})
 
-        out = {
-            "alias": target_alias,
-            "hash": result.content_hash,
-            "source_alias": alias,
-            "va": a_idx,
-            "vb": b_idx,
-            "a_hash": a_hash,
-            "b_hash": b_hash,
-            "keys": keys,
-            "row_count": result.row_count,
-        }
         if recalc_report is not None:
             out["recalc"] = recalc_report
         return out

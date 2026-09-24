@@ -227,6 +227,32 @@ def test_bytes_matching_an_older_version_error_names_reset(project: str, tmp_pat
     assert "reset" in message.lower()
 
 
+def test_the_append_only_refusal_does_not_advise_a_second_alias(project: str, tmp_path: Path, monkeypatch):
+    """D11's refusal offers ways back that work: a reset, or reading the old version pinned.
+
+    It used to offer "import these bytes under a different alias", which is refused too, because bytes an alias
+    already holds cannot be imported under another (ADR-011 D1).
+    """
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.parquet"
+    _write_parquet(src, 10)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 10)  # back to v1's bytes
+
+    with pytest.raises(source_import.SourceImportError) as exc:
+        source_import.update_and_depend(str(src), "orders")
+
+    message = str(exc.value)
+    assert "different alias" not in message, message
+    assert "pinned_expr_from_alias('orders-v1')" in message, message
+    with pytest.raises(source_import.SourceImportError, match="orders-v1"):
+        source_import.update_and_depend(str(src), "orders_again")
+
+
 def test_absent_alias_with_a_skipped_pin_errors(project: str, tmp_path: Path, monkeypatch):
     """A brand-new source alias starts at v1; a pin of v2 would leave version 1 undefined forever."""
     from tallyman_xorq import source_import

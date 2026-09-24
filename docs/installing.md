@@ -167,7 +167,6 @@ on disk — same catalog and history, no edit affordances (mutation routes retur
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `TALLYMAN_PROJECT` | `spike` | Active project name |
-| `TALLYMAN_COMPANION_URL` | the companion serving `TALLYMAN_HOME`, else `http://127.0.0.1:7860` | Where the MCP server and `reset-to` push updates |
 | `TALLYMAN_HOME` | `~/.tallyman-notebooks` | Root for all project state |
 
 **State on disk** lives under `TALLYMAN_HOME`:
@@ -196,7 +195,9 @@ The active project is resolved from `TALLYMAN_PROJECT` first, then the
   that holds it (pid, port, start time). Stop it, or run the second tallyman on
   its own data dir and port: `TALLYMAN_HOME=<another dir> uv run tallyman run
   --port 7861`. An MCP server started with the same `TALLYMAN_HOME` finds that
-  companion's port by itself.
+  companion's port by itself, from the `server.lock` the server writes in the
+  data dir. With no server on its data dir, the MCP server sends no updates,
+  its replies carry no entry links, and `project_switch` / `project_new` fail.
 - **Port 7860 already in use** — something else is listening there; pass
   `--port` to `tallyman run`.
 </content>

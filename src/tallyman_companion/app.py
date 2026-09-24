@@ -41,7 +41,7 @@ from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
-from tallyman_core.server_lock import resolved_home
+from tallyman_core.server_lock import is_this_data_dir, resolved_home
 from tallyman_core.telemetry import read_spans, record_span
 from tallyman_core.version import git_revision, version_info
 from tallyman_xorq import (
@@ -72,6 +72,22 @@ class NotifyPayload(BaseModel):
     # The sender's data dir (TALLYMAN_HOME). A notify from a client of another data dir is refused (#183); absent → not
     # checked.
     home: str | None = None
+
+
+def _refuse_another_data_dir(what: str, home: str | None) -> None:
+    """409 when a client names a data dir (``home``) other than the one this companion serves (#183).
+
+    A client of another data dir reached this companion (a second tallyman on its own data dir). Its projects are not
+    this data dir's, so it must not reload, publish to or switch anything here. A client that names no data dir (the
+    browser) is not checked.
+    """
+    if home is None or is_this_data_dir(home):
+        return
+    raise HTTPException(
+        409,
+        f"{what} from data dir {home} refused: this companion serves data dir {resolved_home()}. A client reaches the "
+        "companion of its own data dir through the server.lock of that data dir.",
+    )
 
 
 def _broadcaster() -> tuple[asyncio.Queue, list]:
@@ -1831,18 +1847,7 @@ def create_app(
 
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
-        # A client of another data dir reached this companion (a second tallyman on its own data dir, with the client
-        # pointed at the wrong port). Its project is not this data dir's, so refuse it before anything is reloaded or
-        # published to this data dir's browsers (#183).
-        if payload.home is not None:
-            ours, theirs = resolved_home(), resolved_home(payload.home)
-            if theirs != ours:
-                raise HTTPException(
-                    409,
-                    f"notify from data dir {theirs} refused: this companion serves data dir {ours}. Point the client "
-                    "at the companion of its own data dir (TALLYMAN_COMPANION_URL, or unset it to use that data dir's "
-                    "running server).",
-                )
+        _refuse_another_data_dir("notify", payload.home)
         # The payload may name its project (CLI `reset-to --project` can target
         # a non-active project); only fall back to the active one when it doesn't.
         project_name = payload.project or _require_project()
@@ -1899,6 +1904,7 @@ def create_app(
     async def api_projects_switch(payload: dict):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
+        _refuse_another_data_dir("project switch", (payload or {}).get("home"))
         name = (payload or {}).get("name", "")
         try:
             from tallyman_core.paths import set_active_project as _sap  # noqa: PLC0415
@@ -1919,6 +1925,7 @@ def create_app(
     async def api_projects_new(payload: dict):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
+        _refuse_another_data_dir("new project", (payload or {}).get("home"))
         from tallyman_core import ensure_project as _ensure_project  # noqa: PLC0415
         from tallyman_core.paths import projects_root as _projects_root  # noqa: PLC0415
         from tallyman_core.paths import set_active_project as _sap  # noqa: PLC0415

@@ -57,7 +57,6 @@ def hold_data_dir():
 
     def _hold(home: Path, *, port: int, bind_host: str = "127.0.0.1", spawn_child: bool = False) -> _Holder:
         env = {**os.environ, "TALLYMAN_HOME": str(home)}
-        env.pop("TALLYMAN_COMPANION_URL", None)
         proc = subprocess.Popen(
             [sys.executable, "-c", _HOLDER, str(port), bind_host, "spawn" if spawn_child else "-"],
             env=env,
@@ -94,12 +93,17 @@ def hold_data_dir():
                 pass
 
 
-@pytest.fixture
-def no_companion_url_env(no_live_companion, monkeypatch):
-    """Clear the closed-port URL conftest sets for every test, so companion_url() takes the owner-record path. Requests
-    ``no_live_companion`` so this runs after it; the tests that use it assert an owner's port, which the closed-port
-    URL would fail, so the conftest default cannot mask the path they cover."""
-    monkeypatch.delenv("TALLYMAN_COMPANION_URL", raising=False)
+@pytest.fixture(autouse=True)
+def _reset_mcp_server_state():
+    """Each test starts and ends with clean module-level MCP server state: a project tool that succeeds (against a
+    stubbed companion) makes its project the MCP's sticky in-process one, which every later tool call would use."""
+    from tallyman_mcp import server as srv
+
+    srv._last_project = None
+    srv._mcp_active_project = None
+    yield
+    srv._last_project = None
+    srv._mcp_active_project = None
 
 
 def _alive(pid: int) -> bool:
@@ -307,9 +311,7 @@ def test_run_refuses_a_port_already_in_use_before_starting_anything(project, iso
 # ---------------------------------------------------------------------------
 
 
-def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(
-    tmp_path, monkeypatch, hold_data_dir, no_companion_url_env
-):
+def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(tmp_path, monkeypatch, hold_data_dir):
     """With two tallymans running, a client of data dir B must reach B's companion, not the one on 7860."""
     from tallyman_core.server_lock import companion_url
 
@@ -333,45 +335,7 @@ def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(
     assert companion_url() is None
 
 
-def test_no_test_notifies_a_companion_it_did_not_start(isolated_home, monkeypatch):
-    """conftest points TALLYMAN_COMPANION_URL at a closed port for every test. Without that, a test on a tmp data dir
-    (no owner record) resolves the default, http://127.0.0.1:7860, and posts its events to whatever companion the
-    developer has running there. Checked both at the resolver and at the wire, and for subprocesses a test starts."""
-    import httpx
-
-    import tallyman_mcp.server as srv
-    from tallyman_core.server_lock import DEFAULT_COMPANION_URL, companion_url
-
-    assert companion_url() != DEFAULT_COMPANION_URL
-    assert os.environ.get("TALLYMAN_COMPANION_URL") == companion_url()  # what a spawned subprocess inherits
-
-    posted: list[str] = []
-
-    class _Capture:
-        def __init__(self, *a, **k):
-            pass
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            return False
-
-        def post(self, url, json=None):
-            posted.append(url)
-
-    monkeypatch.setattr(srv.httpx, "Client", _Capture)
-    srv._notify("new_entry", content_hash="abc")
-
-    assert len(posted) == 1
-    assert not posted[0].startswith(DEFAULT_COMPANION_URL), posted[0]
-    with socket.socket() as probe:  # nothing accepts a connection there
-        assert probe.connect_ex(("127.0.0.1", httpx.URL(posted[0]).port)) != 0
-
-
-def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(
-    project, isolated_home, monkeypatch, hold_data_dir, no_companion_url_env
-):
+def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(project, isolated_home, monkeypatch, hold_data_dir):
     """The MCP server read TALLYMAN_COMPANION_URL once at import, defaulting to 7860. It has to resolve the companion
     per call, and name its data dir in the notify so a companion of another data dir can refuse it."""
     import tallyman_mcp.server as srv
@@ -405,9 +369,7 @@ def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(
     assert srv._entry_url(project, "abc") == f"http://127.0.0.1:17874/{project}/catalog/abc"
 
 
-def test_cli_reset_notifies_the_companion_of_its_own_data_dir(
-    isolated_home, monkeypatch, hold_data_dir, no_companion_url_env
-):
+def test_cli_reset_notifies_the_companion_of_its_own_data_dir(isolated_home, monkeypatch, hold_data_dir):
     import httpx
     from click.testing import CliRunner
 
@@ -533,7 +495,6 @@ def test_mcp_with_no_server_on_its_data_dir_posts_nothing_and_links_nothing(proj
     monkeypatch.setenv("TALLYMAN_COMPANION_URL", "http://127.0.0.1:19999")  # stale: names no server of this data dir
     posted: list = []
     monkeypatch.setattr(srv.httpx, "Client", _CapturePosts(posted))
-    before = srv._mcp_active_project
 
     srv._notify("new_entry", content_hash="abc")
     assert srv._entry_url(project, "abc") is None
@@ -542,7 +503,7 @@ def test_mcp_with_no_server_on_its_data_dir_posts_nothing_and_links_nothing(proj
     assert posted == []
     assert "active" not in out
     assert "no tallyman server" in out["error"] and str(isolated_home.resolve()) in out["error"]
-    assert srv._mcp_active_project == before
+    assert srv._mcp_active_project != "beta"  # the MCP did not switch on its own either
 
 
 def test_cli_reset_with_no_server_on_its_data_dir_posts_nothing(isolated_home, monkeypatch):
@@ -568,9 +529,7 @@ def test_cli_reset_with_no_server_on_its_data_dir_posts_nothing(isolated_home, m
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_project_changes_name_their_data_dir(
-    project, isolated_home, monkeypatch, hold_data_dir, no_companion_url_env
-):
+def test_mcp_project_changes_name_their_data_dir(project, isolated_home, monkeypatch, hold_data_dir):
     import tallyman_mcp.server as srv
 
     hold_data_dir(isolated_home, port=17876)
@@ -675,7 +634,6 @@ def test_sigterm_runs_the_cleanup_of_tallyman_run(project, isolated_home):
     """uvicorn stops on SIGTERM and then re-raises it with the default handler, which kills the process before the
     `finally` of `tallyman run` releases the claim and stops Buckaroo. The restart script stops the server this way."""
     env = {**os.environ, "TALLYMAN_HOME": str(isolated_home)}
-    env.pop("TALLYMAN_COMPANION_URL", None)
     port = _free_port()
     proc = subprocess.Popen(
         [sys.executable, "-m", "tallyman_cli.main", "run", "--project", project, "--port", str(port), "--no-buckaroo"],

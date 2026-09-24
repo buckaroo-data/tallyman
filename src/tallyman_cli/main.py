@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-import errno
 import os
-import socket
+import signal
 from pathlib import Path
 
 import click
@@ -86,6 +85,8 @@ def _notify_companion_reset(project: str) -> None:
     from tallyman_core.server_lock import companion_url, resolved_home
 
     url = companion_url()
+    if url is None:
+        return  # no server on this data dir, so no browsers or Buckaroo sessions to reload
     # `home` names this data dir, so a companion serving another one refuses the notify (#183).
     payload = {"kind": "project_reset", "project": project, "home": str(resolved_home())}
     try:
@@ -156,6 +157,7 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
     One server runs per data dir (TALLYMAN_HOME, #183): it claims the data dir before anything else, and a second
     `tallyman run` on the same one is refused. A second tallyman runs on its own data dir and port.
     """
+    from tallyman_companion.buckaroo_lifecycle import port_in_use
     from tallyman_core.server_lock import DataDirInUse, claim_data_dir, release_data_dir
 
     try:
@@ -164,13 +166,17 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         raise click.ClickException(str(exc)) from None
     data_dir = Path(claim["data_dir"])
 
+    # uvicorn shuts down on SIGTERM and then re-raises it with the handler it found installed. Python's default kills
+    # the process there, before the `finally` below releases the claim and stops Buckaroo; this one exits through it.
+    previous_sigterm = signal.signal(signal.SIGTERM, _exit_on_sigterm)
     bk = None  # the BuckarooManager once started, stopped on the way out
+    served = False
     try:
         project_name = resolve_project(project)
         if not project_dir(project_name).exists():
             raise click.ClickException(f"project '{project_name}' not found. Run `tallyman init {project_name}` first.")
         # Checked before Buckaroo starts, so a refused run leaves nothing running.
-        if _port_in_use(host, port):
+        if port_in_use(host, port):
             raise click.ClickException(
                 f"port {port} on {host} is already in use. Pass --port to serve this data dir ({data_dir}) on another."
             )
@@ -202,6 +208,7 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
                 bk = None
 
         app = create_app(project_name, buckaroo=bk)
+        served = True
         uvicorn.run(app, host=host, port=port, log_level="info")
     finally:
         # Released as soon as the server has stopped serving, before Buckaroo is stopped, so a restart that waits
@@ -210,23 +217,13 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         release_data_dir(data_dir)
         if bk is not None:
             bk.stop()
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        if served:
+            click.echo(f"tallyman run · stopped · data dir={data_dir}")
 
 
-def _port_in_use(host: str, port: int) -> bool:
-    """Whether a listener already holds *host*:*port*.
-
-    Binds the way uvicorn does (asyncio's create_server sets SO_REUSEADDR), so a port that a server which just
-    stopped left in TIME_WAIT is not reported busy, and a port with a live listener is. Any other bind error (a host
-    that is not an address of this machine) is left for uvicorn to report.
-    """
-    family = socket.AF_INET6 if ":" in host else socket.AF_INET
-    with socket.socket(family, socket.SOCK_STREAM) as s:
-        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        try:
-            s.bind((host.strip("[]"), port))
-        except OSError as exc:
-            return exc.errno == errno.EADDRINUSE
-    return False
+def _exit_on_sigterm(signum: int, frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 @cli.command("mcp")

@@ -35,6 +35,7 @@ idle hour.
 from __future__ import annotations
 
 import atexit
+import errno
 import json
 import logging
 import shutil
@@ -103,26 +104,30 @@ def ensure_view_build(project: str, content_hash: str) -> Path:
     return dest
 
 
-def _port_in_use(port: int) -> bool:
-    """Probe whether `port` is currently bound to a listener on localhost.
+def port_in_use(host: str, port: int) -> bool:
+    """Whether a listener already holds *port* on *host*, or on an address that overlaps it.
 
-    SO_REUSEADDR matches Tornado's own bind options — without it, the probe
-    false-positives for ~60s after a restart whenever the previous buckaroo
-    had any client connections (a browser WS, the embed) open at shutdown:
-    the closed connections' TIME_WAIT artifacts make a bare bind() fail with
-    EADDRINUSE even though no listener exists. The real Tornado server can
-    still bind such a port; the probe just disagreed and forced a port=0
-    fallback the user noticed as a fresh random port on each restart.
+    Two probes. A bind with SO_REUSEADDR, the way the servers bind (uvicorn through asyncio's create_server, Tornado
+    for Buckaroo): without it, a port a stopped server left in TIME_WAIT (its closed browser and WS connections) is
+    reported busy for ~60s after a restart, though the server itself could bind it. And a connect, because on macOS
+    that bind succeeds beside a live listener on an overlapping address: 127.0.0.1 next to 0.0.0.0, or the reverse.
+    A wildcard *host* is probed on the loopback, so a listener only on another interface's address is not seen.
+    A bind error other than EADDRINUSE (a *host* that is not an address of this machine) is left for the server to
+    report.
     """
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", port))
-    except OSError:
-        return True
-    finally:
-        s.close()
-    return False
+    family = socket.AF_INET6 if ":" in host else socket.AF_INET
+    bare = host.strip("[]")
+    with socket.socket(family, socket.SOCK_STREAM) as s:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            s.bind((bare, port))
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                return True
+    target = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(bare, bare)
+    with socket.socket(socket.AF_INET6 if ":" in target else socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(1.0)
+        return s.connect_ex((target, port)) == 0
 
 
 class BuckarooUnavailable(RuntimeError):
@@ -207,7 +212,7 @@ class BuckarooManager:
         """Spawn the Buckaroo subprocess and wait for the handshake."""
         if self.is_running:
             return
-        if _port_in_use(self.requested_port):
+        if port_in_use("127.0.0.1", self.requested_port):
             log.warning(
                 "buckaroo port %d already in use; using --port=0 (random)",
                 self.requested_port,

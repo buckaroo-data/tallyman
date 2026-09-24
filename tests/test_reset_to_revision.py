@@ -445,7 +445,7 @@ def test_cli_genesis_revisions_label_and_reset(isolated_home):
     assert pp.list_post_processings("alpha") == []  # back to the empty genesis
 
 
-def test_cli_reset_notify_names_the_reset_project(isolated_home, monkeypatch):
+def test_cli_reset_notify_names_the_reset_project(isolated_home, running_server, monkeypatch):
     """`reset-to --project` must tell the companion *which* project was reset.
     The notify payload otherwise falls back to the companion's active project,
     so resetting a non-active project would reload the wrong sessions and

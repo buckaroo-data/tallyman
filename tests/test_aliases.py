@@ -229,11 +229,11 @@ def test_catalog_rename(project: str, orders_src: str, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# url field — every entry-creating tool must return a viewer URL
+# url field — every entry-creating tool must return a viewer URL, on the companion of this data dir (running_server)
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_run_returns_url(project: str, orders_src: str, monkeypatch):
+def test_catalog_run_returns_url(project: str, orders_src: str, running_server, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_run(_agg_code(project), prompt="url check")
     assert "url" in out
@@ -241,7 +241,7 @@ def test_catalog_run_returns_url(project: str, orders_src: str, monkeypatch):
     assert project in out["url"]
 
 
-def test_catalog_create_returns_url(project: str, orders_src: str, monkeypatch):
+def test_catalog_create_returns_url(project: str, orders_src: str, running_server, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     out = catalog_create("shoe_sales", _agg_code(project), prompt="url check")
     assert "url" in out
@@ -249,7 +249,7 @@ def test_catalog_create_returns_url(project: str, orders_src: str, monkeypatch):
     assert project in out["url"]
 
 
-def test_catalog_revise_returns_url(project: str, orders_src: str, monkeypatch):
+def test_catalog_revise_returns_url(project: str, orders_src: str, running_server, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_revise("shoe_sales", _filter_code(project), prompt="url check")
@@ -258,7 +258,7 @@ def test_catalog_revise_returns_url(project: str, orders_src: str, monkeypatch):
     assert project in out["url"]
 
 
-def test_catalog_alias_returns_url(project: str, orders_src: str, monkeypatch):
+def test_catalog_alias_returns_url(project: str, orders_src: str, running_server, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     scratch = catalog_run(_agg_code(project))
     out = catalog_alias(scratch["hash"], "shoe_sales")

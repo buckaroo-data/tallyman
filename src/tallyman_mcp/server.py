@@ -58,9 +58,9 @@ from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
-# The companion is found per call with ``companion_url()``: TALLYMAN_COMPANION_URL when set, else the port the server
-# holding this data dir serves on, so a second tallyman on its own data dir is notified and linked, not the one on
-# 7860 (#183).
+# The companion is found per call with ``companion_url()``: the port the server holding this data dir serves on, from
+# its owner record, so a second tallyman on its own data dir is notified and linked, not the one on 7860. With no server
+# on this data dir there is no companion: notifies are skipped, replies carry no link, project changes fail (#183).
 
 # Identifies this MCP process in the project activity log. Claude Code spawns one
 # `tallyman mcp` per session, so one process == one session; multiple sessions
@@ -223,7 +223,10 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
     ``home`` names this data dir, so a companion serving another one refuses the notify (409) instead of publishing
     this project's events to its own browsers (#183).
     """
-    url = f"{companion_url()}/internal/notify"
+    base = companion_url()
+    if base is None:
+        return  # no server on this data dir: no browsers to tell
+    url = f"{base}/internal/notify"
     try:
         with httpx.Client(timeout=2.0) as client:
             resp = client.post(
@@ -663,8 +666,10 @@ def catalog_import_source(
     return out
 
 
-def _entry_url(project: str, content_hash: str) -> str:
-    return f"{companion_url()}/{project}/catalog/{content_hash}"
+def _entry_url(project: str, content_hash: str) -> str | None:
+    """The entry's page on the companion of this data dir, or None when no server is running on it."""
+    base = companion_url()
+    return None if base is None else f"{base}/{project}/catalog/{content_hash}"
 
 
 def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
@@ -1687,10 +1692,18 @@ def _companion_post(path: str, payload: dict) -> dict:
     URL is included so the LLM can tell the user which endpoint to bring
     up if the request failed."""
     base = companion_url()
+    if base is None:
+        return {
+            "error": (
+                f"no tallyman server is running on data dir {resolved_home()}. "
+                f"Project lifecycle tools require 'tallyman run' to be active on it."
+            )
+        }
     url = f"{base}{path}"
     try:
         with httpx.Client(timeout=10.0) as client:
-            resp = client.post(url, json=payload)
+            # `home` names this data dir, so a companion serving another one refuses the change (#183).
+            resp = client.post(url, json={**payload, "home": str(resolved_home())})
     except httpx.HTTPError as exc:
         return {
             "error": (

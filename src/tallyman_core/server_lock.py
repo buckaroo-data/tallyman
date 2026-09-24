@@ -13,6 +13,11 @@ descriptor of the file, which ``read_owner`` does in the server's own process. T
 client of this data dir which port its companion serves on (``companion_url``). The record is believed only while the
 lock is held; a dead server's record stays in the file and ``read_owner`` returns None for it.
 
+The port is decided once, by ``tallyman run --port``, and this record is how it reaches the clients of the data dir
+(the MCP server, ``reset-to``), which are separate processes started independently of the server. There is no
+fallback: with no server on the data dir there is no companion to reach, and a guessed port (7860, or a URL left in
+the environment) would be some other data dir's server.
+
 Not claimed here: ``tallyman mcp`` (each Claude Code session spawns one, and their writes are serialized by
 ``catalog_state.project_lock``) and ``tallyman serve`` (read-only). ``flock`` holds between processes on one machine;
 on a network filesystem it may not exclude a server on another host.
@@ -32,7 +37,6 @@ from pathlib import Path
 from tallyman_core.paths import tallyman_home
 
 LOCK_FILENAME = "server.lock"
-DEFAULT_COMPANION_URL = "http://127.0.0.1:7860"
 _WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "[::]"})
 
 # How long a claim keeps retrying a lock it finds taken before it refuses. ``read_owner`` probes the lock by holding a
@@ -137,28 +141,35 @@ def read_owner(home: Path | str | None = None) -> dict | None:
         os.close(fd)
 
 
-def companion_url(home: Path | str | None = None) -> str:
-    """Where a client of this data dir reaches its companion, resolved at call time.
+def companion_url(home: Path | str | None = None) -> str | None:
+    """Where a client of this data dir reaches its companion, resolved at call time, or None when no server holds it.
 
-    ``TALLYMAN_COMPANION_URL`` when set; else the address the server holding this data dir serves on (the loopback
-    when it is bound to a wildcard address); else ``http://127.0.0.1:7860``, the default port of ``tallyman run``.
+    The address the server holding this data dir serves on, from its owner record (the loopback when it is bound to a
+    wildcard address). A caller that gets None has no companion: it skips the notify, the link or the request.
     """
-    explicit = os.environ.get("TALLYMAN_COMPANION_URL")
-    if explicit:
-        return explicit.rstrip("/")
     try:
         owner = read_owner(home)
     except OSError:
-        owner = None
+        return None
     port = (owner or {}).get("port")
-    if isinstance(port, int):
-        host = str(owner.get("bind_host") or "")
-        if host in _WILDCARD_HOSTS:
-            host = "127.0.0.1"
-        elif ":" in host and not host.startswith("["):
-            host = f"[{host}]"
-        return f"http://{host}:{port}"
-    return DEFAULT_COMPANION_URL
+    if not isinstance(port, int):
+        return None
+    host = str(owner.get("bind_host") or "")
+    if host in _WILDCARD_HOSTS:
+        host = "127.0.0.1"
+    elif ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    return f"http://{host}:{port}"
+
+
+def is_this_data_dir(home: Path | str) -> bool:
+    """Whether *home* names this process's data dir. Compared as files, not as paths: on a case-insensitive
+    filesystem one directory has many spellings, which ``Path.resolve()`` keeps and ``flock`` treats as one. A *home*
+    that does not exist is not this data dir."""
+    try:
+        return os.path.samefile(Path(home).expanduser(), resolved_home())
+    except OSError:
+        return False
 
 
 def _lock_exclusive(fd: int) -> None:

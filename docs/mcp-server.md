@@ -189,18 +189,26 @@ a version of `alias` is minted. Recipes then read
 `tracked_expr_from_alias(alias)`; the original path is provenance and is never
 read again.
 - **Params:** `outside_path` (required) — any path, `data/` is not special;
-  `alias` (required) — the source alias, which may not name a catalog entry;
+  `alias` (required) — the source alias, which may not name a catalog alias;
   `pinned_version` — the version you claim the file is, checked rather than
   assumed; `prompt` — optional intent / cell markdown; `schema` and
   `reader_options` — CSV column types and `polars.scan_csv` options, recorded on
   the entry and never re-derived (ADR-011 D12).
 - **Returns:** `hash`, `alias`, `version`, `created`, `row_count`, `schema`,
   `path`, `digest`, `url`, plus `recalc` when advancing the alias cascaded.
-  `{error, error_id}` for a missing path, an alias collision, or any row of the
-  ADR-011 D3 table that is an error.
+  `{error, error_id}` for a missing path, an alias collision, bytes another
+  alias already holds (the error names that alias and version), or any row of
+  the ADR-011 D3 table that is an error.
 - Re-running it on **unchanged** bytes is a no-op that returns the current
-  version, so it is safe in a script. Re-running it on **changed** bytes mints
-  the next version and cascades like a revise.
+  version, so it is safe in a script. If that version's snapshot is gone, the
+  no-op heals it from the clone and checks it against the recorded digest; it
+  never rewrites the version. Re-running it on **changed** bytes mints the next
+  version and cascades like a revise.
+- **One set of bytes is one version under one alias** (ADR-011 D1). To give a
+  source a second name, `catalog_create` an entry whose recipe is
+  `tracked_expr_from_alias("<source alias>")`; it follows the source when it is
+  re-imported. A CSV read with other reader options is a different entry and
+  may be imported under its own alias (ADR-011 D12).
 
 ### `catalog_create(name, code, prompt="") -> dict`
 Execute and persist as a **named** entry (alias) and append a notebook cell.
@@ -239,7 +247,9 @@ cell. Used after a `catalog_run` when a scratch entry earns a permanent name.
 - **Params:** `hash` (required) — must name an on-disk entry; `name` (required)
   — must be free.
 - **Returns:** `{hash, alias, version, url}`. `{error}` if the hash has no entry
-  or the name is taken.
+  or the name is taken, and if the entry is a source version: a source entry
+  belongs to its source alias, and the error names the `catalog_create` over
+  `tracked_expr_from_alias` that gives the source a second name (ADR-011 D1).
 
 ### `catalog_rename(old_name, new_name) -> dict`
 Rename an alias, preserving its full version history and notebook position.

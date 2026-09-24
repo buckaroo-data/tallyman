@@ -5,7 +5,12 @@
   decisions of the same day folded into D1: the snapshot is written by pyarrow
   in the pinned layout, and it is cache that `ensure_materialized` re-creates
   from the clone. Stage 2 — D6, D8 and the rewrite of every call site that
-  authored a raw file read — is PR #218, stacked on it. Amends
+  authored a raw file read — is PR #218, stacked on it. The fixes from reviewing
+  both are PR #219, stacked on #218: one set of bytes is one version under one
+  alias, an alias's kind matches its entries' kind, a version is named by the
+  alias that holds it now, and a re-import that finds a version already there
+  rewrites nothing but a missing snapshot, verified like any heal (D1, D3, D11,
+  D12 and the PR #219 implementation notes). Amends
   `plans/ADR-002-source-identity-content-hash.md` (its modes, its `sources` map
   and its reconstruction caveat go; the clone store stays),
   `plans/ADR-005-intelligent-csv-import.md` (its reader runs at import, not in
@@ -45,8 +50,8 @@
   `src/tallyman_mcp/server.py` (`catalog_load_parquet`),
   `docs/system-contract.md`.
 - **Related ADRs:** `plans/ADR-002-source-identity-content-hash.md` (the `.cas`
-  clone store this builds on; its `off` and `salt` modes go, and its `sources`
-  map narrows to a retention record),
+  clone store this builds on; its `off` and `salt` modes go, and so does its
+  `sources` map, D6),
   `plans/ADR-005-intelligent-csv-import.md` (reader options and the suggestion
   contract, which move to import time),
   `plans/ADR-008-row-order-of-reads.md` (its D2 and D7 — every source enters
@@ -64,8 +69,8 @@
 - **Source entry:** one version of a source alias, stored as an ordinary entry
   with a content hash, a recipe and a manifest.
 - **The arena:** the files tallyman owns — the clone store under `data/.cas/`
-  and the ordered copies under `compute_cache/`. A file outside the arena is
-  never read by a build.
+  and the snapshots under `compute_cache/result_cache/`. A file outside the arena
+  is never read by a build.
 - **Import:** the explicit act of copying a file into the arena and pointing a
   source alias at the resulting entry.
 - **Provenance path:** the outside path a version was imported from, recorded
@@ -137,15 +142,29 @@ Everything below follows from those two sentences.
 ### D1. A raw input is an alias whose versions are entries
 
 Importing a file mints an entry and points a source alias at it. The entry is
-ordinary: a content hash, a recipe, a manifest, an ordered copy carrying
+ordinary: a content hash, a recipe, a manifest, a snapshot carrying
 `__row_order`. The alias lives in the same `aliases.jsonl` as catalog aliases,
 with the same head-plus-history shape, so `orders-v2` resolves through the
 existing `VERSION_REF_RE` and `resolve_version_ref` with no new syntax.
 
 A source alias is a distinct kind. `catalog_revise` is refused on one (there is
-no recipe to revise), as is promoting a diff onto it. Rename and unalias behave
-as they do for catalog aliases. The kind is recorded in the alias store so
+no recipe to revise), as is promoting a diff onto it, on every surface that
+offers those (the MCP tools and the companion's code-edit and promote-diff
+routes, which refuse before building anything). Rename and unalias behave as
+they do for catalog aliases. The kind is recorded in the alias store so
 `catalog_list` can separate inputs from computations.
+
+**An alias's kind matches the kind of the entries it points at.** A catalog
+alias never points at a source entry (one whose manifest records `provenance`),
+and a source alias never points at a computed one. `set_alias` enforces it, so
+it holds on every route that names an entry: `catalog_alias`, a revise, a
+promoted diff, a recalc, an import.
+
+A source version's `provenance` keeps the name it was **imported as**. A rename
+moves the alias's history to a new name and an unalias drops it, and neither
+rewrites that record, so anything that names the version as it is now (the pin
+reason, the heal error and the import it advises, the rebuild's replay) asks
+the alias store which source alias holds it.
 
 Consequence: a child of a source records `{hash: <version's entry hash>, ref:
 "orders", follow: True}` — the same edge shape as any catalog parent. The DAG
@@ -226,6 +245,17 @@ The official, and only, way to advance a source alias:
 | `pinned_version` beyond head+1 | error: versions cannot be skipped |
 | `pinned_version=N` < head, digest matches | return vN; the head does not move |
 | bytes match a version older than the head | error: see D11 |
+| bytes are a version of another alias | error: one set of bytes, one alias (D1) |
+
+"Bytes" in this table means the bytes read with the given reader options, which
+is what the entry hash covers (D12). A row that ends on a version that already
+exists (the no-ops, and a new alias over an entry no alias holds any more) never
+rewrites that entry: its recipe, build and manifest are the record of the import
+that minted it. If its snapshot is gone, the import heals it the way
+`ensure_materialized` does, from the clone (restored from the caller's bytes
+first when it is gone too) and checked against the recorded `result_digest`, so
+a reader that now parses the bytes differently is recorded as an unfaithful heal
+rather than becoming the version's rows.
 
 **Considered and not shipped: `import_once_and_depend(outside_path, alias)`.**
 An idempotent form for a standalone script that wants the same data wherever it
@@ -313,8 +343,11 @@ existing alias is an error, and under this ADR it mints the next version.
 ### D11. Version history is append-only and monotonic
 
 An import whose bytes match a version older than the head is an error, naming
-`reset_to` as the way back. Two version numbers never denote the same bytes, and
-a version number never moves backwards while history is intact.
+`reset_to` as the way back, and `pinned_expr_from_alias("<alias>-v<N>")` as the
+way to read the old version without moving the head. Importing the bytes under
+a different alias is not offered, because D1 refuses it. Two version numbers
+never denote the same bytes read the same way, and a version number never moves
+backwards while history is intact.
 
 The case is unlikely — it takes a source file that was edited and then restored
 exactly — and the error keeps the alternative (a v3 whose content equals v1's,
@@ -324,7 +357,15 @@ or a head that jumps backwards) out of the model.
 
 A CSV's delimiter, schema overrides and inference settings are named once, in
 the import call, and recorded on the source entry. Two recipes cannot read one
-file two ways; import it twice under two aliases.
+file two ways; import it twice under two aliases. That is the one case in which
+the same bytes are under two aliases, and it is two entries, because the entry
+hash covers the reader options.
+
+Because the hash covers them, an import that leaves them out names another
+entry. Every message that advises an import therefore prints the recorded
+options with it (`source_import.import_call`, in the MCP tool's `schema=` and
+`reader_options=` shapes), and a pinned import refused for naming another entry
+says the reader options may be what differs.
 
 This removes the hash fork found in the #215 review, where a function-valued
 reader option's `repr` carries a memory address and re-derives a new copy key on
@@ -335,14 +376,27 @@ every build. Options are evaluated once, at import, and stored.
 - A child of a source alias is stale after an import advances it, and clear
   after recalc. The permanently-stale case of Problem cannot be constructed,
   because D5 refuses the recipe.
-- `import_once_and_depend` returns v1 after the alias has advanced to v3, and
-  does not read the outside file.
-- Every row of D3's `update_and_depend` table, including the three errors.
+- Every row of D3's `update_and_depend` table, including the four errors. (The
+  `import_once_and_depend` test this list first named went with the function,
+  which D3 records as considered and not shipped.)
+- The same bytes under a second alias are refused, naming the alias and version
+  that hold them, and the first alias's entry is left byte for byte as it was.
+- Two projects importing one file each hold their own entry, snapshot and
+  clone; a heal, a clone sweep or a re-import in one never reaches the other.
+- `catalog_alias` of a source entry is refused, as is a source alias pointed at
+  a computed entry.
+- After a rename, the pin reason and the heal error name the alias the version
+  is under now, and running the advised import repairs that version.
+- A re-import of a version whose snapshot is gone rebuilds nothing, rewrites
+  nothing of the entry, and records an unfaithful heal when the rows differ.
+- The advised import for a CSV carries its schema and reader options and, run
+  as written, repairs the version.
 - An authored recipe calling `read_project_file` fails to build, and the error
   names the import call.
 - An authored recipe passing a bare content hash to `pinned_expr_from_alias`
   fails, and the error names `<alias>-v<N>`.
-- A source alias refuses `catalog_revise` and refuses a promoted diff.
+- A source alias refuses `catalog_revise` and refuses a promoted diff, through
+  the MCP tools and through the companion's routes alike.
 - `reset_to` rewinds a source alias to v1 and a reset forward restores v2 from
   the bullpen.
 - Editing the outside file after import changes nothing: the same build, the
@@ -441,6 +495,8 @@ D5, D9, D10, D12.** What the code does that this document did not say:
   for one, so `catalog_state._live_source_digests` had to learn to keep a clone
   alive from `provenance.digest` as well — otherwise a reset retires the only
   copy of the imported bytes.
+  Its `alias` and `version` are the name the version was imported as (D1): a
+  rename or unalias does not rewrite them.
 - **`entry_staleness` skips axis 2 for a source entry** rather than reporting it
   unknown. A small piece of D6, forced: every source entry would otherwise carry
   a permanent "source axis unknown".
@@ -503,6 +559,35 @@ code does that this document did not say:
   backward reset parks a clone in the bullpen rather than unlinking it — the
   failure mode that deleting `manifest.sources` could otherwise have caused
   silently.
+
+**Review fixes (PR #219, 2026-09-24).** Found reviewing #217 and #218; each
+landed test first. What the code does that the decisions above did not say:
+
+- **Duplicate bytes were a shared entry.** Stage 1 let a second alias import
+  bytes another alias held, on the grounds that the hash made it one entry. The
+  second import re-ran `_mint` over that entry, rewriting the first alias's
+  provenance and recipe, and a failure part-way deleted the entry directory the
+  first alias pointed at. D1 now refuses the import (`_refuse_bytes_held_elsewhere`).
+- **The kind rule lives in `set_alias`** (D1), not in each tool, after
+  `catalog_alias` put a catalog name on a source entry and opened it to
+  `catalog_revise`. The companion's `PUT /api/code` and promote-diff routes had
+  no refusal at all: they built the entry, failed to point the source alias at
+  it and answered 500 with the entry left under no alias. They now refuse with
+  the tools' text (`aliases.source_alias_refusal`) before building, answering 409.
+- **A version is named by the alias that holds it now**
+  (`source_import.current_source_version`). Naming it by `provenance.alias`
+  made the heal advice mint a second alias under the old name after a rename,
+  and made `scripts/rebuild_native_catalog.py` replay a renamed source under the
+  old name: children reading the new name failed to rebuild, and the order of
+  the source's versions was lost.
+- **A repair import heals** (D3). It used to go through `_mint`, which rebuilt
+  the entry, rewrote the manifest and recorded whatever digest it wrote: a
+  probe with a reader that drops a row went from 10 rows to 9 under the same
+  hash with nothing recorded. An entry directory without a manifest, which a
+  crash part-way through an import leaves, is not an entry, and a re-import
+  writes it again.
+- **Advised imports carry the reader options** (D12). Without them the heal
+  error's advice for a CSV named another entry and was refused.
 
 ## Open questions
 

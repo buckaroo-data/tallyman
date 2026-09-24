@@ -49,7 +49,8 @@ def orders_parquet(project: str) -> Path:
     """Generate a deterministic shoe-orders fixture under project/data/.
 
     The file only. A recipe cannot read it (ADR-011 D2) — depend on ``orders_src`` for that, and use
-    this where the test is about the file itself: editing it, importing it under another alias, or
+    this where the test is about the file itself: editing it, importing it under an alias of the test's own (not
+    alongside ``orders_src``, since one set of bytes goes under one alias), or
     asserting on the bytes.
     """
     return write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=0)

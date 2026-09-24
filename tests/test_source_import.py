@@ -1593,20 +1593,18 @@ def _arena(project: str) -> dict[str, list[str]]:
     return {"result_cache": names(snapshots_dir(project)), "cas": names(data_dir(project) / ".cas")}
 
 
-def test_a_parquet_column_with_no_ibis_type_is_refused_before_anything_is_written(
-    project: str, tmp_path: Path, monkeypatch
-):
-    """#224. A fixed_size_binary column, and a UUID column, which is stored as fixed_size_binary(16), have no ibis
-    type. The generated recipe's read of the snapshot failed on them with a KeyError that named no column, after the
-    clone and the snapshot were written. The import checks the types the read will see before it writes anything,
-    and names every such column, a nested one by its path, with the cast that makes the file importable."""
+def _read_alias(project: str, alias: str) -> pd.DataFrame:
+    """The rows a recipe gets from ``tracked_expr_from_alias(alias)``: the read #224 failed in."""
+    from tallyman_xorq.io import tracked_expr_from_alias
+
+    return tracked_expr_from_alias(alias, project=project).execute()
+
+
+def _unreadable_ids_table() -> pa.Table:
+    """A top-level fixed_size_binary, one nested in a struct, a UUID (stored as fixed_size_binary(16)), and ``n``."""
     import uuid
 
-    from tallyman_xorq import source_import
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    src = _outside(tmp_path) / "ids.parquet"
-    table = pa.table(
+    return pa.table(
         {
             "id": pa.array([b"a" * 16, b"b" * 16], type=pa.binary(16)),
             "meta": pa.array([{"key": b"k1k1"}, {"key": b"k2k2"}], type=pa.struct([("key", pa.binary(4))])),
@@ -1614,18 +1612,86 @@ def test_a_parquet_column_with_no_ibis_type_is_refused_before_anything_is_writte
             "n": pa.array([1, 2]),
         }
     )
-    pq.write_table(table, src)
 
+
+def test_a_parquet_column_with_no_ibis_type_is_left_out_and_named(project: str, tmp_path: Path, monkeypatch):
+    """#224. A fixed_size_binary column, and a UUID column, which is stored as fixed_size_binary(16), have no ibis
+    type. The generated recipe's read of the snapshot failed on them with a KeyError that named no column. The import
+    leaves each such column out of the snapshot, a column with such a field nested in it too, and says so: in its
+    return value, in the recipe's header and in the reader the entry records, which its heal replays."""
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import ensure_materialized
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "ids.parquet"
+    pq.write_table(_unreadable_ids_table(), src)
+
+    out = source_import.update_and_depend(str(src), "ids")
+
+    assert out["created"] is True
+    assert [f["name"] for f in out["schema"]["fields"]] == ["n", ROW_ORDER]
+    omitted = out["omitted_columns"]
+    assert [c["column"] for c in omitted] == ["id", "meta", "guid"], omitted
+    assert "meta.key" in omitted[1]["why"], omitted
+    warning = out["warning"]
+    for column in ("'id'", "'meta'", "'meta.key'", "'guid'"):
+        assert column in warning, warning
+    assert "'n'" not in warning and str(src) in warning, warning
+    assert "binary" in warning, warning
+    assert "cast it to string" not in warning, warning  # raw UUID bytes are not UTF-8: that cast fails
+
+    assert _read_alias(project, "ids")["n"].tolist() == [1, 2]
+    manifest = read_manifest(entry_dir(project, out["hash"]))
+    assert [c for c, _why in manifest.provenance.reader["omitted"]] == ["id", "meta", "guid"]
+    recipe = (entry_dir(project, out["hash"]) / "expr.py").read_text()
+    assert "'guid'" in recipe and "not imported" in recipe, recipe
+
+    snapshot_path(project, out["hash"]).unlink()
+    ensure_materialized(project, out["hash"])  # the heal replays the recorded reader, so its digest matches
+    assert pq.read_schema(snapshot_path(project, out["hash"])).names == ["n", ROW_ORDER]
+
+
+@pytest.mark.parametrize("name", ["ids[v2].parquet", "ids[12].parquet", "ids*.parquet", "ids?.parquet"])
+def test_the_type_check_reads_the_named_file_whatever_its_name(project: str, tmp_path: Path, monkeypatch, name):
+    """#224's check handed the caller's path to DataFusion's ``register_parquet``, which reads it as a glob pattern.
+    ``ids[v2].parquet`` matched nothing, the schema came back empty and the check passed a fixed_size_binary column;
+    ``ids[12].parquet`` matched the sibling ``ids1.parquet`` and checked that file's schema instead."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    outside = _outside(tmp_path)
+    pq.write_table(pa.table({"decoy": pa.array([1])}), outside / "ids1.parquet")
+    src = outside / name
+    pq.write_table(_unreadable_ids_table().select(["id", "n"]), src)
+
+    out = source_import.update_and_depend(str(src), "ids")
+
+    assert [c["column"] for c in out["omitted_columns"]] == ["id"]
+    assert [f["name"] for f in out["schema"]["fields"]] == ["n", ROW_ORDER]
+    assert _read_alias(project, "ids")["n"].tolist() == [1, 2]
+
+
+def test_a_file_that_changes_after_the_type_check_is_refused(project: str, tmp_path: Path, monkeypatch):
+    """#224. The check reads the caller's file before it is digested. A file rewritten in between, here with a UUID
+    column added, was checked on its old bytes and minted from its new ones. The import checks the clone it made."""
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "ids.parquet"
+    table = _unreadable_ids_table()
+    pq.write_table(table.select(["n"]), src)
+    digest_file = si._digest_file
+
+    def rewritten_first(path: Path) -> str:
+        pq.write_table(table.select(["guid", "n"]), path)
+        return digest_file(path)
+
+    monkeypatch.setattr(si, "_digest_file", rewritten_first)
     with pytest.raises(source_import.SourceImportError) as exc:
         source_import.update_and_depend(str(src), "ids")
 
-    message = str(exc.value)
-    for column in ("'id'", "'meta.key'", "'guid'"):
-        assert column in message, message
-    assert "'n'" not in message, message
-    assert "binary" in message and "string" in message, message  # the casts: to binary, and a UUID to string
-    assert str(src) in message, message
-    assert "read_project_file" not in message and "Traceback" not in message, message
+    assert "changed" in str(exc.value) and str(src) in str(exc.value), exc.value
     assert _arena(project) == {"result_cache": [], "cas": []}
     assert get_alias(project, "ids") is None
 
@@ -1896,3 +1962,92 @@ def test_a_failed_import_keeps_a_clone_another_entry_uses(project: str, tmp_path
     assert _arena(project) == before
     assert _clone_of(project, first).read_bytes() == src.read_bytes()
     assert pinned_reason(project, first["hash"]) is None
+
+
+def test_a_bug_while_writing_the_snapshot_is_not_reported_as_an_unreadable_file(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """#227 wraps the reader's own errors in a SourceImportError that says the caller's file could not be read. A
+    KeyError from tallyman's own snapshot writer is not that: it keeps its type, so the tool reports it with its class
+    name, and the import still leaves nothing behind (#225)."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+
+    def broken(batches):
+        raise KeyError("a bug in the writer")
+
+    monkeypatch.setattr(source_import, "_numbered", broken)
+    with pytest.raises(KeyError) as exc:
+        source_import.update_and_depend(str(src), "orders")
+
+    assert not isinstance(exc.value, source_import.SourceImportError)
+    assert _arena(project) == {"result_cache": [], "cas": []}
+
+
+def test_an_import_whose_alias_write_fails_leaves_nothing_it_wrote(project: str, tmp_path: Path, monkeypatch):
+    """#225. The alias is written after ``_mint`` returns, outside its cleanup, so a failure there left the entry, its
+    snapshot and its clone on disk with no alias, and a retry took the existing-entry branch over the orphan."""
+    from tallyman_core import aliases
+    from tallyman_xorq import source_identity as si
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    content_hash = source_import.source_entry_hash(si._digest_file(src), {"kind": "parquet"})
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(aliases, "set_alias", disk_full)
+    with pytest.raises(OSError):
+        source_import.update_and_depend(str(src), "orders")
+
+    assert _arena(project) == {"result_cache": [], "cas": []}
+    assert not entry_dir(project, content_hash).exists()
+
+
+def test_a_schema_the_tool_cannot_convert_is_a_recorded_import_error(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227. The tool turned a list ``schema`` into a tuple of tuples before its handler, so ``schema=[1]`` reached the
+    agent as a raw TypeError with no error_id and no record."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1)])
+
+    reply = _call_import({"outside_path": str(src), "alias": "orders", "schema": [1]})
+
+    out = _assert_recorded(project, reply, notified)
+
+    assert "schema" in out["error"], out
+
+
+def test_a_failure_after_the_head_advanced_is_recorded_and_the_advance_is_committed(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227. The steps after the import (the event, the notebook, carrying the entry's config forward, the recalc)
+    ran outside the tool's handler. A failure there skipped the dispatch checkpoint too, so the head advance was left
+    uncommitted with nothing recording why. The import happened: the reply says so, with the failure's error_id."""
+    from tallyman_core.catalog_state import current_step
+    from tallyman_core.errors import list_errors
+    from tallyman_mcp import server
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1)])
+    first = _call_import({"outside_path": str(src), "alias": "orders"}).data
+    step = current_step(project)
+    _write_csv(src, [("east", 1), ("west", 2)])
+
+    def fails(*args, **kwargs):
+        raise RuntimeError("carrying the config forward failed")
+
+    monkeypatch.setattr(server, "carry_forward_entry_config", fails)
+    out = _call_import({"outside_path": str(src), "alias": "orders"}).data
+
+    assert (out["version"], out["created"]) == (2, True), out
+    failure = out["after_import_error"]
+    assert "RuntimeError" in failure["error"], failure
+    assert [r["id"] for r in list_errors(project, limit=1000)] == [failure["error_id"]]
+    assert get_alias(project, "orders") == out["hash"] != first["hash"]
+    assert current_step(project) is not None and current_step(project) != step

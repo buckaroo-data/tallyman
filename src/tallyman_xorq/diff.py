@@ -24,6 +24,7 @@ from buckaroo.compare import (
 )
 
 from tallyman_core.paths import ENTRY_SCHEMA_FILENAME
+from tallyman_xorq.row_order import without_row_order
 
 __all__ = [
     "code_diff",
@@ -114,6 +115,9 @@ def full_diff(
     ``keys`` is the join key from ``primary_key.diff_keys``.  ``[]`` means the
     caller established there is no key, so the keyed diff is skipped (``None``);
     only ``None`` lets ``key_diff_xorq`` run its own, unbounded, detection.
+
+    ``__row_order`` is dropped from both sides first, as ``build_compare_expr``
+    does: a row's position in its file is not data (ADR-008 D6, #200).
     """
     a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
     b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
@@ -128,6 +132,7 @@ def full_diff(
             "result.parquet fallback was removed"
         )
 
+    a_expr, b_expr = without_row_order(a_expr), without_row_order(b_expr)
     stats = stats_diff_xorq(a_expr, b_expr)
     head = head_diff_xorq(a_expr, b_expr)
     keyed = None if keys == [] else key_diff_xorq(a_expr, b_expr, keys=keys)

@@ -16,6 +16,8 @@ from __future__ import annotations
 ROW_ORDER = "__row_order"
 # ibis's name for the right side's copy of a column both sides of a join carry.
 ROW_ORDER_RIGHT = "__row_order_right"
+# The two names that are tallyman's and not the author's (ADR-008 D6).
+RESERVED = (ROW_ORDER, ROW_ORDER_RIGHT)
 
 
 class RowOrderError(RuntimeError):
@@ -236,6 +238,17 @@ def move_last(expr):
     if columns[-1] == ROW_ORDER:
         return expr
     return expr.select(*[c for c in columns if c != ROW_ORDER], ROW_ORDER)
+
+
+def without_row_order(expr):
+    """*expr* without ``__row_order`` or ibis's join copy of it, for comparing one entry with another (ADR-008 D6).
+
+    A row's position in its entry's file is not data, and a diff is keyed: one row inserted near the front of a file
+    moves every later row's position, so comparing positions shows every later row as changed (#200). A copy under a
+    name the author chose, such as ``__row_order_v1``, is ordinary data and stays.
+    """
+    reserved = [c for c in RESERVED if c in expr.columns]
+    return expr.drop(*reserved) if reserved else expr
 
 
 def assert_joinable(expr) -> None:

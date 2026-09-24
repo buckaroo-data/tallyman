@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from tallyman_xorq.row_order import ROW_ORDER
+from tallyman_xorq.row_order import RESERVED, without_row_order
 
 
 def _is_comparable(dt_a: Any, dt_b: Any) -> bool:
@@ -41,8 +41,8 @@ def _classify_shared(a_schema: Any, b_schema: Any, keys: list[str]) -> tuple[lis
     numeric_shared ⊆ eq_shared.  A name-shared column in neither set changed to
     an incomparable dtype and renders side-by-side with no equality term.
     """
-    a_non_keys = [c for c in a_schema if c not in keys and c != ROW_ORDER]
-    b_non_keys = [c for c in b_schema if c not in keys and c != ROW_ORDER]
+    a_non_keys = [c for c in a_schema if c not in keys and c not in RESERVED]
+    b_non_keys = [c for c in b_schema if c not in keys and c not in RESERVED]
     shared = [c for c in a_non_keys if c in b_non_keys]
     numeric_shared = {c for c in shared if a_schema[c].is_numeric() and b_schema[c].is_numeric()}
     eq_shared = {c for c in shared if _is_comparable(a_schema[c], b_schema[c])}
@@ -139,6 +139,17 @@ def strip_live_diff_color(overrides: dict) -> dict:
     return out
 
 
+def _marker_names(taken: set[str]) -> tuple[str, str]:
+    """Names for the two side markers that no column of either side already has."""
+
+    def unused(name: str) -> str:
+        while name in taken:
+            name = f"_{name}"
+        return name
+
+    return unused("__in_a"), unused("__in_b")
+
+
 def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, dict]:
     """Build an outer-join comparison expression from two ibis expressions.
 
@@ -149,7 +160,8 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
           {col}_v2        the "after" value shown with color
           {col}_pct_delta (b-a)/|a|, numeric cols only; null when a=0
           {col}_abs_delta b-a, numeric cols only
-      - membership (int8): 1=a_only, 2=b_only, 3=both
+      - membership (int8): 1=a_only, 2=b_only, 3=both, read off a marker
+        each side carries into the join, never off a data or key column
       - {col}_eq (int8): membership+4 if equal, membership+0 if different
     """
     import xorq.vendor.ibis as ibis
@@ -158,8 +170,7 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
     # A diff has no row-order column of its own from either side (ADR-008 D6): each side's positions mean nothing to
     # the other, and the join would leave a ``__row_order_v2`` behind. A promoted diff is a worthy entry, since it
     # contains a join, and gets its own when it is materialized.
-    a_expr = a_expr.drop(ROW_ORDER) if ROW_ORDER in a_expr.columns else a_expr
-    b_expr = b_expr.drop(ROW_ORDER) if ROW_ORDER in b_expr.columns else b_expr
+    a_expr, b_expr = without_row_order(a_expr), without_row_order(b_expr)
     a_schema = a_expr.schema()
     b_schema = b_expr.schema()
     a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)
@@ -177,6 +188,11 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
 
     a_expr, b_expr = _align_backends(a_expr, b_expr)
     b_renamed = b_expr.rename({f"{c}_v2": c for c in b_non_keys})
+    # Each side carries a marker that is null after the outer join exactly where that side has no row (#13). A data
+    # column can be null on a side that has the row, and a side can have no data column at all.
+    a_mark, b_mark = _marker_names({*a_expr.columns, *b_renamed.columns})
+    a_expr = a_expr.mutate(**{a_mark: ibis.literal(True)})
+    b_renamed = b_renamed.mutate(**{b_mark: ibis.literal(True)})
     joined = a_expr.outer_join(b_renamed, [_key(a_expr, k) == _key(b_renamed, k) for k in keys])
 
     sel: list = [ibis.coalesce(_key(a_expr, k), _key(b_renamed, k)).name(k) for k in keys]
@@ -194,11 +210,9 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
                 sel.append(pct)
                 sel.append((b_val - a_val).name(f"{col}_abs_delta"))
 
-    a_sent = a_non_keys[0] if a_non_keys else keys[0]
-    b_sent = f"{b_non_keys[0]}_v2" if b_non_keys else keys[0]
     membership = ibis.cases(
-        (joined[b_sent].isnull(), ibis.literal(1).cast("int8")),
-        (joined[a_sent].isnull(), ibis.literal(2).cast("int8")),
+        (joined[b_mark].isnull(), ibis.literal(1).cast("int8")),
+        (joined[a_mark].isnull(), ibis.literal(2).cast("int8")),
         else_=ibis.literal(3).cast("int8"),
     ).name("membership")
     sel.append(membership)

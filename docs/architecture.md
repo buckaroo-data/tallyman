@@ -792,7 +792,7 @@ Heals and Buckaroo:
 Design questions still open: #185 (a non-pure recipe's verdict is not recorded
 or passed on to entries built on it) and #187 (an ungrouped float `SUM` depends
 on the layout of the file it reads, which the snapshot format version pins).
-Found while checking these docs, with no issue filed yet: a recipe's
+Found while checking these docs (#233): a recipe's
 `tracked_expr_from_alias` and `pinned_expr_from_alias` resolve the project from
 the `active_project` file, not the MCP session's own project, so the two can
 disagree after another session switches projects and a recipe then looks its
@@ -801,6 +801,14 @@ Older open issues in the same areas: #118 (concurrent reads can fail with
 `Already borrowed`), #170 (Buckaroo is not pointed at the project's stats and
 post-processing functions) and #157 (Buckaroo's on-disk statistics cache has not
 been seen to give a first-load hit).
+
+Filed on 2026-09-24 against the same code, and described one by one in
+[architecture-new.md](architecture-new.md#13-known-defects) and
+[plans/open-bugs-2026-09-24.md](../plans/open-bugs-2026-09-24.md): wrong rows or
+edges without an error (#228, #229, #231, #232), the import (#224, #225, #227,
+#234, #237, #239), writes and leftovers (#226, #230, #240), recalc of a source
+entry (#238), the SPA's missing SSE listeners (#235) and ADR-011 leftovers in
+the code (#236).
 
 These no longer apply since ADR-011 (a raw input is a source alias, PRs #217 to
 #219), because the mechanism each was about is gone: #197 (a parquet source's

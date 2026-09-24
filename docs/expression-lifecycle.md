@@ -151,8 +151,7 @@ at a time. In order:
    `materialize` wrote, since parquet changes some types (a `timestamp[s]`
    column comes back `timestamp[ms]`) and the writer adds `__row_order`; a cheap
    entry's schema comes from the expression, which already ends in that column.
-   Write `<entry>/schema.json` and `<entry>/manifest.json`, and append the
-   prompt to `<catalog>/prompts/<hash>.jsonl`. The manifest carries the verdict
+   Write `<entry>/schema.json` and `<entry>/manifest.json`. The manifest carries the verdict
    (`cache_worthy`, `cache_worthy_why`), `compile_seconds` and `cache_bytes`
    (the snapshot's size, or `None` for a cheap entry), `result_digest`,
    `reproducible`, `snapshot_format`, `engine_versions` and `parents`, and is
@@ -161,7 +160,7 @@ at a time. In order:
    the import.) Then, for a worthy entry, `publish_snapshot` moves the staged
    file into place with one atomic replace. That is the last write to the
    entry's result, so the snapshot's path changes only once the entry is
-   complete.
+   complete. Last, the prompt is appended to `<catalog>/prompts/<hash>.jsonl`.
 7. **Mark persisted; the checkpoint commits.** `build_and_persist` sets
    `catalog_registered = True`, meaning the entry dir is fully on disk — it does
    not write git itself. Durability is the *checkpoint's* job: when the MCP tool

@@ -708,47 +708,61 @@ Where the code breaks one of these, section 13 names the issue.
 
 ## 13. Known defects
 
-With no issue filed:
+The open issues that touch this design, as of `1f8cb02`. The full list, including
+the viewer, export and hint issues, with a priority for each, is
+[`plans/open-bugs-2026-09-24.md`](../plans/open-bugs-2026-09-24.md).
 
-- `build._raw_parquet_read_check` allows `xo.deferred_read_parquet` of any file
-  under `compute_cache/`, so a recipe can read a snapshot by its path: a bare
-  content hash in a recipe, with no parent edge recorded and no
-  `ensure_materialized` first.
-- An unfaithful heal of a source entry is attributed to a graph that runs
-  differently each time ("or source drift under off"), though a source entry is
-  re-parsed from its clone and the likely cause is a reader change.
-- A recipe's readers and `build_diff_expr` take the project from the
-  `active_project` file while the MCP tool builds into its session's project, so
-  after another session switches projects a recipe looks up its aliases in the
-  other project.
-- `catalog_import_source` catches only `SourceImportError`, `BuildError` and
-  `OSError`, so a CSV that fails to parse, or a clone that fails its digest
-  check, escapes the tool as a plain `ValueError`, and nothing reaches
-  `errors.jsonl` or the activity log.
-- Importing a version's bytes again restores a lost clone only when the snapshot
-  is gone too, so a version whose clone alone is lost stays pinned.
-- Alias, notebook, chart, display-config and `config.json` writes take no lock,
-  so two processes editing one file at the same moment can lose one edit.
+Wrong rows, pins or edges without an error:
 
-Open issues:
-
-- #118: concurrent reads on the shared default backend can fail with `Already borrowed`.
-- #170: Buckaroo is pointed at `artifacts/`, so it never finds the project's statistics and post-processing functions under `artifacts/catalog/`.
-- #183: two tallyman servers on one project are not detected, and each holds in-process state the other never sees.
-- #185: whether a recipe is pure is neither recorded nor passed on, so an entry built on a non-reproducible parent is recorded as reproducible, and `today()` passes the check at create.
-- #186: the project lock blocks with no timeout, so a page read that needs a heal waits behind any build in the other process.
-- #187: an ungrouped float `SUM` or `AVG` depends on the row-group layout of the file it reads, which only the snapshot format version holds fixed.
-- #188: the live diff grid hands Buckaroo an unmaterialized join, which Buckaroo runs for every query.
-- #190: `PUT /code` and `POST /promote_diff` build on the companion's event loop, so the whole UI stops answering while they wait for the lock or build.
-- #199: the three-way join check also refuses chains of semi and anti joins, which add no right-hand columns and cannot collide.
-- #200: `full_diff` keeps `__row_order` as a data column, so one inserted row shows every later row as changed.
-- #201: a klass reload posts `/reload_expr` once per catalog entry, one after another, from the event loop.
-- #202: every grid open posts `/load_expr`, so two opens at once both load, and a promoted diff runs Buckaroo's statistics again on every open.
-- #203: an unfaithful heal runs its checks and the forced Buckaroo reload while holding the project lock, and the reload opens a session nobody has open.
+- #229: a pinned child and a tracked child with the same query compile to one content hash, so they are one entry and the first build's edge wins; a pinned alias can then move when its parent is revised.
+- #228: `build._raw_parquet_read_check` allows `xo.deferred_read_parquet` of any file under `compute_cache/`, so a recipe can read a snapshot by its path: a bare content hash, with no parent edge and no `ensure_materialized` first.
+- #231: a tz-aware timestamp in an import schema reads text with no UTC offset as UTC and converts it, so `09:30` in New York is stored as `04:30-05:00`.
+- #232: an unfaithful heal of a source entry is attributed to a graph that runs differently each time ("or source drift under off"), though the likely cause is a reader change; a corrupt clone is healed from and pinned.
 - #204: with its manifest gone, an entry's worthiness is guessed from whether its snapshot exists, so a worthy entry that has lost both is served as cheap.
 - #205: the canonical sort leaves nested columns out of its tie-break, so rows tied on every sortable column can come out in either order.
 - #206: the snapshot writer drops any column named `__row_order_right`, including one the author made.
 - #208: an unfaithful heal of a worthy parent changes its cheap children's rows under their hashes, and only the parent is flagged and reloaded.
-- #209: an expanded build's marker does not record the project path, so a copied project keeps reading the old location.
+- #209: an expanded build's marker does not record the project path, so a copied project keeps reading the old location; the marker is also trusted when the expanded folder is gone.
+- #200: `full_diff` keeps `__row_order` as a data column, so one inserted row shows every later row as changed.
+- #142: the CSV reader null-fills a short row instead of raising.
+
+Import:
+
+- #224: a parquet file with a `fixed_size_binary` or UUID column fails at import with a long traceback that names no column.
+- #225: a failed import leaves its clone in `data/.cas/` and its snapshot in `result_cache/`, and nothing deletes the clone.
+- #227: `catalog_import_source` lets a CSV parse error, or a clone that fails its digest check, escape as a plain `ValueError`; nothing reaches `errors.jsonl`, and the message names the clone and `tallyman_read_csv`.
+- #234: the error for an older version's bytes names reset commands that do not exist.
+- #239: importing a version's bytes again restores a lost clone only when the snapshot is gone too, so a version whose clone alone is lost stays pinned.
+- #237: `catalog_list` does not report an alias's kind.
+
+Writes, the lock and processes:
+
+- #240: alias, notebook and `config.json` writes load, change and replace the file without the project lock, so two overlapping writers lose one change.
+- #233: a recipe's alias reads take the project from the `active_project` file, while the MCP tool builds into its session's project and a companion route into the project in its URL.
+- #186: the project lock blocks with no timeout, so a page read that needs a heal waits behind any build in the other process.
+- #183: two tallyman servers on one project are not detected, and each holds in-process state the other never sees.
+- #190: `PUT /code` and `POST /promote_diff` build on the companion's event loop, so the whole UI stops answering while they wait for the lock or build.
+- #226: a writer killed mid-write leaves a `.tmp` in `result_cache/` or `data/.cas/` that nothing lists or deletes.
+- #230: every failed build leaves its temporary `tallyman_expr_<uuid>.py` in the OS temp directory.
+
+Recalc and row order:
+
+- #238: `catalog_recalc` with a source entry as a root fails, because the replay runs the generated `read_project_file` outside the import.
+- #199: the three-way join check also refuses chains of semi and anti joins, which add no right-hand columns and cannot collide.
+- #185: whether a recipe is pure is neither recorded nor passed on, so an entry built on a non-reproducible parent is recorded as reproducible, and `today()` passes the check at create.
+- #187: an ungrouped float `SUM` or `AVG` depends on the row-group layout of the file it reads, which only the snapshot format version holds fixed.
+
+The viewer:
+
+- #118: concurrent reads on the shared default backend can fail with `Already borrowed`.
+- #170: Buckaroo is pointed at `artifacts/`, so it never finds the project's statistics and post-processing functions under `artifacts/catalog/`.
+- #172: diff sessions are keyed by the two hashes with no project, so two projects holding the same source versions can share one.
+- #188: the live diff grid hands Buckaroo an unmaterialized join, which Buckaroo runs for every query.
+- #201: a klass reload posts `/reload_expr` once per catalog entry, one after another, from the event loop.
+- #202: every grid open posts `/load_expr`, so two opens at once both load, and a promoted diff runs Buckaroo's statistics again on every open.
+- #203: an unfaithful heal runs its checks and the forced Buckaroo reload while holding the project lock, and the reload opens a session nobody has open.
 - #210: the plan memo keeps every loaded build and its backend objects alive, up to 256 of them.
+- #235: the SPA has no listener for `project_reset`, `unfaithful_heal`, `entry_added` or `alias_changed`, so an open page goes stale.
 - buckaroo-data/buckaroo#974: Buckaroo ignores `row_order_column`, so grid pages are not ordered by `__row_order`.
+
+Code and text left behind by ADR-011: #236.

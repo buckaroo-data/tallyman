@@ -235,8 +235,10 @@ snapshot is the last copy of those rows, so `pinned_reason` pins it; if the
 snapshot is gone as well, the read fails with an error naming the missing clone
 and the `catalog_import_source` call, reader options included, that restores
 it. Importing the same bytes again under the alias that holds them rewrites
-nothing of the entry: it writes the clone back from the given file, verified
-against the digest, and heals the snapshot.
+nothing of the entry. When the snapshot is gone, it writes the clone back from
+the given file, verified against the digest, and heals the snapshot. When the
+snapshot is still there, it leaves a lost clone lost, so the version stays
+pinned (#239).
 
 Every other way of reading a file is a build error: `read_project_file`,
 `tallyman_read_csv`, `xo.deferred_read_csv`, and `xo.deferred_read_parquet` of a
@@ -284,7 +286,7 @@ longer be read (#204).
 |---|---|---|
 | Snapshot of a computed entry, `compute_cache/result_cache/<hash>.parquet` | `materialize` | re-run the entry's build, and verify the digest |
 | Snapshot of a source entry, same directory | the import | parse the clone again with the recorded reader options, and verify the digest; with the clone gone too, raise an error naming the clone and the import that repairs it |
-| Clone, `data/.cas/<digest><suffix>` | the import (`ensure_cas_path`) | nothing in a read makes it again; the snapshot is pinned while it exists, and a re-import of the same bytes writes the clone back |
+| Clone, `data/.cas/<digest><suffix>` | the import (`ensure_cas_path`) | nothing in a read makes it again; the snapshot is pinned while it exists; a re-import of the same bytes writes the clone back only when the snapshot is gone too (#239) |
 
 A healed snapshot is checked against the recorded `result_digest`. A mismatch is
 still served, since the rows are the honest output of the frozen build, but

@@ -648,6 +648,6 @@ path below.
 With the switch off, advancing an alias marks its followers stale but recomputes
 nothing. `catalog_recalc` / `POST …/api/recalc` is then the deliberate action that
 writes — preview with a dry run, commit with `dry_run=False`. This is also the path
-for staleness the auto trigger never sees: an alias moved by `catalog_alias`, or
-any alias left stale because auto-recalc was off when it was revised or
-imported.
+for any alias left stale because auto-recalc was off when it was revised or
+imported. A source entry passed as a root fails instead of being skipped
+(#238).

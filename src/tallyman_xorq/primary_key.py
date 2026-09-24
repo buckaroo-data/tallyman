@@ -34,6 +34,7 @@ import time
 from itertools import combinations
 from pathlib import Path
 
+from tallyman_core.execution import execution_lock
 from tallyman_xorq.row_order import ROW_ORDER
 
 PK_SEARCH_BUDGET_S = 1.0
@@ -60,7 +61,8 @@ def _column_stats(expr, cols: list[str], *, deadline: float, content_hash: str) 
     """Row count and per-column distinct counts, in one query."""
     _check_deadline(deadline, content_hash)
     aggs = [expr.count().name("__n__")] + [expr[c].nunique().name(c) for c in cols]
-    row = expr.aggregate(aggs).execute().iloc[0]
+    with execution_lock():
+        row = expr.aggregate(aggs).execute().iloc[0]
     return int(row["__n__"]), {c: int(row[c]) for c in cols}
 
 
@@ -72,7 +74,8 @@ def _any_key_possible(expr, cols: list[str], need: float, *, deadline: float, co
     whole.  If all of them together fall short, every combination does.
     """
     _check_deadline(deadline, content_hash)
-    return int(expr.select(*cols).distinct().count().execute()) >= need
+    with execution_lock():
+        return int(expr.select(*cols).distinct().count().execute()) >= need
 
 
 def _detect_pk(
@@ -107,7 +110,8 @@ def _detect_pk(
         if max_group is None:
             return True
         _check_deadline(deadline, content_hash)
-        return _max_group_xorq(expr, list(combo)) <= max_group
+        with execution_lock():
+            return _max_group_xorq(expr, list(combo)) <= max_group
 
     for c in sorted(cols, key=lambda c: distinct[c], reverse=True):
         if _accept((c,), distinct[c]):
@@ -124,7 +128,8 @@ def _detect_pk(
             if bound < need:
                 continue
             _check_deadline(deadline, content_hash)
-            d = int(expr.select(*combo).distinct().count().execute())
+            with execution_lock():
+                d = int(expr.select(*combo).distinct().count().execute())
             if _accept(combo, d):
                 return list(combo)
     return None

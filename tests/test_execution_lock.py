@@ -371,3 +371,45 @@ def test_every_execution_in_src_holds_the_execution_lock():
 
     assert found >= 10, f"the scan found only {found} executions in src/; the walker is broken"
     assert outside == [], "these execute outside `with execution_lock():`\n" + "\n".join(outside)
+
+
+# Calls that can take a project lock: a heal (cached_result_expr and what it calls), a materialization or publish, a
+# build, a checkpoint or reset, the primary-key search (it reads through cached_result_expr), and the lock itself.
+_TAKES_A_PROJECT_LOCK = frozenset(
+    {
+        "cached_result_expr",
+        "ensure_materialized",
+        "_ensure",
+        "_heal",
+        "_heal_a_source",
+        "_recreate",
+        "materialize",
+        "publish_snapshot",
+        "rewrite_source_snapshot",
+        "build_and_persist",
+        "update_and_depend",
+        "checkpoint_catalog",
+        "reset_to",
+        "resolve_primary_key",
+        "diff_keys",
+        "project_lock",
+        "_project_lock",
+    }
+)
+
+
+def test_nothing_that_can_take_a_project_lock_runs_inside_the_execution_lock():
+    """#118, the lock order, checked in the source: no ``with execution_lock():`` block in ``src/`` calls anything that
+    can take a project lock. ``project_lock`` raises at run time when it happens, but only when the call does take a
+    new lock: ``with execution_lock(): cached_result_expr(...).execute()`` passes every test until the snapshot is
+    missing and the read has to heal. (This passes on 1f8cb02 too, which has no such block.)"""
+    inside: list[str] = []
+    for path in sorted(SRC_ROOT.rglob("*.py")):
+        rel = path.relative_to(SRC_ROOT).as_posix()
+        for line, func, text, locked in _calls(
+            ast.parse(path.read_text()), lambda call: _called_name(call) in _TAKES_A_PROJECT_LOCK
+        ):
+            if locked:
+                inside.append(f"{rel}:{line} in {func}(): {text}")
+
+    assert inside == [], "these can take a project lock inside `with execution_lock():`\n" + "\n".join(inside)

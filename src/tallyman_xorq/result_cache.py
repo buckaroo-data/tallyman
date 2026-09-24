@@ -276,10 +276,15 @@ def stream_row_count(expr) -> int:
     failing cast / arithmetic at build time) and get the exact row count — the
     only obligation the build has for a cheap entry.  No digest is recorded for
     cheap entries; their result has no snapshot to hash.
+
+    The whole stream holds the execution lock (#118).
     """
+    from tallyman_core.execution import execution_lock
+
     n = 0
-    for batch in expr.to_pyarrow_batches():
-        n += batch.num_rows
+    with execution_lock():
+        for batch in expr.to_pyarrow_batches():
+            n += batch.num_rows
     return n
 
 

@@ -303,8 +303,18 @@ def test_a_reentrant_project_lock_inside_the_execution_lock_is_allowed(project):
 _EXECUTING_METHODS = frozenset({"execute", "to_pyarrow_batches", "to_pandas", "to_polars", "to_pyarrow"})
 # buckaroo's xorq helpers that execute the expressions they are given (``buckaroo.compare``).
 _EXECUTING_FUNCTIONS = frozenset({"stats_diff_xorq", "head_diff_xorq", "key_diff_xorq", "_max_group_xorq"})
-# (path under src/, enclosing function) -> why it may execute outside the lock. Empty: nothing is exempt.
-_ALLOWED: dict[tuple[str, str], str] = {}
+# (path under src/, enclosing function) -> why it may execute outside the lock. The lock guards the one shared default
+# backend, so only an execution on a connection of its own is exempt, and
+# test_the_allowlisted_executions_never_run_on_the_default_backend checks that each one stays that way. Holding the lock
+# around them would make every page read in the process wait for a whole build or heal.
+_ALLOWED: dict[tuple[str, str], str] = {
+    # A materialization's stream: _run_once rebinds the entry's build onto the single-partition connection it made for
+    # this run (ADR-009 D1), never onto xorq.config.default_backend().
+    ("tallyman_xorq/materialize.py", "_stream_to_parquet"): "its own single-partition connection",
+    # A cheap build's row count: the build passes the expression load_expr returned, bound to the backend that load
+    # created, never to xorq.config.default_backend().
+    ("tallyman_xorq/result_cache.py", "stream_row_count"): "the backend load_expr created",
+}
 
 
 def _called_name(call: ast.Call) -> str | None:
@@ -358,19 +368,74 @@ def _calls(tree: ast.AST, wanted) -> list[tuple[int, str, str, bool]]:
 
 
 def test_every_execution_in_src_holds_the_execution_lock():
-    """#118: every call in ``src/`` that executes an expression sits inside a ``with execution_lock():`` block in the
-    same function. At 1f8cb02 there is no such block, so each one is listed."""
+    """#118: every call in ``src/`` that executes an expression on the shared default backend sits inside a
+    ``with execution_lock():`` block in the same function; ``_ALLOWED`` names the ones that execute on a connection of
+    their own. At 1f8cb02 there is no such block, so each one is listed. An allowlist entry that no longer names an
+    unlocked execution fails too, so the list cannot go stale."""
     found = 0
     outside: list[str] = []
+    allowed_seen: set[tuple[str, str]] = set()
     for path in sorted(SRC_ROOT.rglob("*.py")):
         rel = path.relative_to(SRC_ROOT).as_posix()
         for line, func, text, locked in _calls(ast.parse(path.read_text()), _executes):
             found += 1
-            if not locked and (rel, func) not in _ALLOWED:
+            if locked:
+                continue
+            if (rel, func) in _ALLOWED:
+                allowed_seen.add((rel, func))
+            else:
                 outside.append(f"{rel}:{line} in {func}(): {text}")
 
     assert found >= 10, f"the scan found only {found} executions in src/; the walker is broken"
     assert outside == [], "these execute outside `with execution_lock():`\n" + "\n".join(outside)
+    assert allowed_seen == set(_ALLOWED), f"stale allowlist entries: {sorted(set(_ALLOWED) - allowed_seen)}"
+
+
+def _sources(expr) -> list:
+    from xorq.common.utils.graph_utils import find_all_sources
+
+    return list(find_all_sources(expr))
+
+
+def test_the_allowlisted_executions_never_run_on_the_default_backend(project, orders_src, monkeypatch):
+    """#118: the two functions ``_ALLOWED`` exempts execute without the lock because their expressions are never bound
+    to the shared default backend. Each is spied on through its real callers (a worthy entry's create and heal for
+    ``_stream_to_parquet``, a cheap entry's create for ``stream_row_count``), and every backend in every expression it
+    is handed must be something other than ``xorq.config.default_backend()``. If either one is ever handed an
+    expression on the shared backend, its allowlist entry is wrong and it needs the lock."""
+    from xorq.config import default_backend
+
+    import tallyman_xorq.materialize as materialize_module
+    import tallyman_xorq.result_cache as result_cache_module
+    from tallyman_xorq.materialize import ensure_materialized, snapshot_path
+
+    handed: dict[str, list[list]] = {"_stream_to_parquet": [], "stream_row_count": []}
+    real_stream = materialize_module._stream_to_parquet
+    real_count = result_cache_module.stream_row_count
+
+    def spy_stream(expr, dest):
+        handed["_stream_to_parquet"].append(_sources(expr))
+        return real_stream(expr, dest)
+
+    def spy_count(expr):
+        handed["stream_row_count"].append(_sources(expr))
+        return real_count(expr)
+
+    monkeypatch.setattr(materialize_module, "_stream_to_parquet", spy_stream)
+    monkeypatch.setattr(result_cache_module, "stream_row_count", spy_count)
+
+    worthy = build_and_persist(project, _worthy_code(project)).content_hash  # a create runs the query twice
+    snapshot_path(project, worthy).unlink()
+    ensure_materialized(project, worthy)  # a heal runs it once
+    build_and_persist(project, _cheap_code(project))
+
+    assert len(handed["_stream_to_parquet"]) == 3, handed
+    assert len(handed["stream_row_count"]) == 1, handed
+    shared = default_backend()
+    for name, calls in handed.items():
+        for sources in calls:
+            assert sources, f"{name} was handed an expression with no backend; the check would prove nothing"
+            assert all(s is not shared for s in sources), f"{name} executed on the shared default backend"
 
 
 # Calls that can take a project lock: a heal (cached_result_expr and what it calls), a materialization or publish, a

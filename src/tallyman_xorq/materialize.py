@@ -151,28 +151,26 @@ def _stream_to_parquet(expr, dest: Path) -> tuple[int, pa.Schema]:
     contiguous arrays, so the file does not depend on how the engine batched the rows. Memory is bounded by one row
     group.
 
-    The execution lock is held from the reader's creation to the last batch (#118): the reader executes as it is read.
-    The caller holds the project lock already, which comes first.
+    It does not take ``execution_lock`` (#118). That lock guards the one shared default backend, and *expr* here is
+    bound to the single-partition connection ``_run_once`` made for this materialization, so nothing else executes on
+    it. Taking the lock would make every page read in the process wait for the whole build or heal.
     """
-    from tallyman_core.execution import execution_lock
+    reader = expr.to_pyarrow_batches()
+    kept = [f for f in reader.schema if f.name not in (ROW_ORDER, ROW_ORDER_RIGHT)]
+    out_schema = pa.schema([*kept, pa.field(ROW_ORDER, pa.int64())])
+    names = [f.name for f in kept]
+    written = 0
 
-    with execution_lock():
-        reader = expr.to_pyarrow_batches()
-        kept = [f for f in reader.schema if f.name not in (ROW_ORDER, ROW_ORDER_RIGHT)]
-        out_schema = pa.schema([*kept, pa.field(ROW_ORDER, pa.int64())])
-        names = [f.name for f in kept]
-        written = 0
-
-        with pq.ParquetWriter(dest, out_schema, **_PARQUET_OPTIONS) as writer:
-            for table in row_groups(reader, SNAPSHOT_ROW_GROUP_ROWS):
-                n = table.num_rows
-                numbered = table.select(names).append_column(
-                    pa.field(ROW_ORDER, pa.int64()), pa.array(np.arange(written, written + n, dtype=np.int64))
-                )
-                if not numbered.schema.equals(out_schema, check_metadata=False):
-                    numbered = numbered.cast(out_schema)
-                writer.write_table(numbered.combine_chunks(), row_group_size=SNAPSHOT_ROW_GROUP_ROWS)
-                written += n
+    with pq.ParquetWriter(dest, out_schema, **_PARQUET_OPTIONS) as writer:
+        for table in row_groups(reader, SNAPSHOT_ROW_GROUP_ROWS):
+            n = table.num_rows
+            numbered = table.select(names).append_column(
+                pa.field(ROW_ORDER, pa.int64()), pa.array(np.arange(written, written + n, dtype=np.int64))
+            )
+            if not numbered.schema.equals(out_schema, check_metadata=False):
+                numbered = numbered.cast(out_schema)
+            writer.write_table(numbered.combine_chunks(), row_group_size=SNAPSHOT_ROW_GROUP_ROWS)
+            written += n
     return written, out_schema
 
 

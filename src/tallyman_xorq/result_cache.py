@@ -277,14 +277,13 @@ def stream_row_count(expr) -> int:
     only obligation the build has for a cheap entry.  No digest is recorded for
     cheap entries; their result has no snapshot to hash.
 
-    The whole stream holds the execution lock (#118).
+    It does not take ``execution_lock`` (#118). That lock guards the one shared default backend, and the build passes
+    the expression ``load_expr`` returned, which is bound to backends that load created, so nothing else executes on
+    them. Taking the lock would make every page read in the process wait for the whole stream.
     """
-    from tallyman_core.execution import execution_lock
-
     n = 0
-    with execution_lock():
-        for batch in expr.to_pyarrow_batches():
-            n += batch.num_rows
+    for batch in expr.to_pyarrow_batches():
+        n += batch.num_rows
     return n
 
 

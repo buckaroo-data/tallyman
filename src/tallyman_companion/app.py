@@ -1323,6 +1323,12 @@ def create_app(
         column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
         target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
+        # The generated name can already be a source alias: refuse before building the diff, as the MCP tool does.
+        from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
+
+        refusal = source_alias_refusal(project, target_alias, "the target of a promoted diff")
+        if refusal:
+            raise HTTPException(409, refusal)
         keys_repr = repr(keys)
         code = textwrap.dedent(f"""\
             # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
@@ -1657,6 +1663,12 @@ def create_app(
         prev_hash = _get_alias(project, alias)
         if prev_hash is None:
             raise HTTPException(404, f"alias {alias!r} not found")
+        # A source alias's versions are imported files: refuse before building, as catalog_revise does (ADR-011 D1).
+        from tallyman_core.aliases import source_alias_refusal as _source_alias_refusal  # noqa: PLC0415
+
+        refusal = _source_alias_refusal(project, alias, "revised")
+        if refusal:
+            raise HTTPException(409, refusal)
         code = payload.get("code", "")
         if not code.strip():
             raise HTTPException(400, "code is empty")

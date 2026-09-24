@@ -228,6 +228,23 @@ def previous_version(project: str, content_hash: str, alias: str | None = None) 
     return hist[idx] if 0 <= idx < len(hist) else None
 
 
+def source_alias_refusal(project: str, name: str, doing: str) -> str | None:
+    """The error for an operation that would give *name* a computed version, or None when *name* is not a source alias.
+
+    A source alias names an imported dataset (ADR-011 D1). Its versions are files, not recipes, so there is nothing
+    to revise and nothing to promote a diff onto, and a catalog alias may not take its name either. Every surface
+    that can aim such an operation at a name (the MCP tools, the companion's routes) refuses with this text before it
+    builds anything, so no entry is left behind under no alias. *doing* completes "it cannot be …".
+    """
+    if alias_kind(project, name) != SOURCE_KIND:
+        return None
+    return (
+        f"{name!r} is a source alias — its versions are imported files, not recipes — so it cannot be {doing}. "
+        f"To give it new data, import the file again with catalog_import_source(<path>, {name!r}). To build on it, "
+        f"write a recipe over tracked_expr_from_alias({name!r}) under a different name."
+    )
+
+
 def _entry_kind(project: str, content_hash: str) -> str | None:
     """The kind of alias the entry *content_hash* may take, or None when there is no readable manifest to tell.
 

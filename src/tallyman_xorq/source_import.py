@@ -75,12 +75,23 @@ def source_entry_hash(digest: str, reader: dict) -> str:
     """The content hash of the entry an import mints: its bytes and its reader options, and nothing else.
 
     Same 12-hex shape as xorq's build hash, so nothing downstream (entry directories, URLs, aliases) notices the
-    difference. The same bytes under the same reader are the same entry, which is why one alias may hold them.
+    difference. The same bytes under the same reader are the same entry, which is why only one alias may hold them.
     """
     from tallyman_xorq.ordered_copy import _reader_signature
 
     payload = f"source|{digest}|{_reader_signature(reader)}"
     return hashlib.md5(payload.encode()).hexdigest()[:HASH_LEN]  # noqa: S324 — an identity, not a credential
+
+
+def _readable_manifest(project: str, content_hash: str):
+    """The entry's manifest, or None when there is no entry or its manifest cannot be read."""
+    from tallyman_core import read_manifest
+    from tallyman_core.paths import entry_dir
+
+    try:
+        return read_manifest(entry_dir(project, content_hash))
+    except (OSError, ValueError):
+        return None
 
 
 def is_source_entry(project: str, content_hash: str) -> bool:
@@ -196,7 +207,8 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
     """Decide what this import does: ``(mint, version)``, or raise.
 
     The full case table of ADR-011 D3, plus D11's rule that history is append-only and monotonic — two version
-    numbers never denote the same bytes, and a version number never moves backwards while history is intact.
+    numbers never denote the same bytes read the same way, and a version number never moves backwards while history
+    is intact.
     """
     head = len(history)  # the head's 1-based version; 0 when the alias is absent
     already = history.index(content_hash) + 1 if content_hash in history else None
@@ -209,7 +221,8 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
                 f"these bytes are already {alias}-v{already}, and {alias} is at v{head}. Version history is "
                 f"append-only: a v{head + 1} whose rows equal v{already}'s would make the version number meaningless. "
                 f"To put {alias} back on v{already}, reset the catalog to the revision before v{already + 1} "
-                f"(tallyman reset / catalog_reset_to), or import these bytes under a different alias."
+                f"(tallyman reset / catalog_reset_to). To read v{already} in a recipe without moving the head, use "
+                f"pinned_expr_from_alias('{alias}-v{already}')."
             )
         return True, head + 1
 
@@ -225,14 +238,16 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
         if claimed == content_hash:
             return False, pinned_version  # the file IS that version; the head does not move
         raise SourceImportError(
-            f"this file is not {alias}-v{pinned_version}: that version is entry {claimed}, and these bytes are "
-            f"{content_hash}. Import without pinned_version to mint the next version, or point at the file "
-            f"{alias}-v{pinned_version} was imported from."
+            f"this import is not {alias}-v{pinned_version}: that version is entry {claimed}, and this import would "
+            f"be entry {content_hash}. An entry is named by the bytes and the reader options together (ADR-011 D12), "
+            f"so either this is not the file {alias}-v{pinned_version} was imported from, or it is read with other "
+            f"reader options than that import used; the header of {alias}-v{pinned_version}'s recipe records them. "
+            f"Import without pinned_version to mint the next version."
         )
     if already is not None:  # pinned at head+1, but these bytes are already a version (D11)
         raise SourceImportError(
             f"these bytes are already {alias}-v{already}, so they cannot also be v{pinned_version}. "
-            f"Two version numbers never denote the same bytes."
+            f"Two version numbers never denote the same bytes read the same way."
         )
     return True, pinned_version
 
@@ -373,6 +388,28 @@ def source_clone_path(project: str, provenance) -> Path:
     from tallyman_core.paths import data_dir
 
     return data_dir(project) / ".cas" / f"{provenance.digest}{provenance.suffix}"
+
+
+def import_call(path: str, alias: str | None, reader: dict, pinned_version: int | None = None) -> str:
+    """The ``catalog_import_source(...)`` call that imports *path* the way *reader* records it was read.
+
+    What an error prints when the way out is an import. A CSV's entry hash covers its reader options (D12), so a call
+    without them names another entry and a pinned one is refused; the call therefore carries the schema and the
+    ``scan_csv`` options the entry recorded, in the MCP tool's own argument shapes. *alias* None prints ``<alias>``,
+    for a version no alias holds, where the caller has to choose the name.
+    """
+    args = [repr(path), "<alias>" if alias is None else repr(alias)]
+    if pinned_version is not None:
+        args.append(f"pinned_version={pinned_version}")
+    if reader.get("kind") == "csv":
+        spec = reader.get("schema")
+        if spec is not None:
+            cells = [[name, dtype] for name, dtype in spec["cells"]]
+            schema = dict(cells) if spec["form"] == "named" else cells
+            args.append(f"schema={schema!r}")
+        if reader.get("scan_kwargs"):
+            args.append(f"reader_options={reader['scan_kwargs']!r}")
+    return f"catalog_import_source({', '.join(args)})"
 
 
 def rewrite_source_snapshot(project: str, content_hash: str, provenance) -> str:
@@ -584,7 +621,9 @@ def update_and_depend(
 
     Returns:
         ``{"alias", "version", "hash", "created", "path", "digest", "row_count", "schema"}``. ``created`` is False
-        when the import was a no-op.
+        when the import was a no-op. An import of bytes that are already an entry rewrites nothing of that entry; if
+        its snapshot is gone it is healed from the clone and checked against the recorded digest, exactly as
+        ``ensure_materialized`` heals one, so a repair is never a way to change a version's rows.
 
     Raises:
         SourceImportError: for every row of the table above that is an error, and for a path that is not an importable
@@ -628,12 +667,11 @@ def update_and_depend(
         mint, version = _plan_version(alias, history, content_hash, pinned_version)
         if mint:
             _refuse_bytes_held_elsewhere(proj, alias, content_hash)
-        from tallyman_core.paths import entry_dir
         from tallyman_xorq.materialize import snapshot_path
 
-        # A no-op whose entry is gone is repaired here, and so is a missing snapshot: the caller has handed us the
-        # bytes, which is cheaper than going through the clone, and an entry directory is not cache at all.
-        if mint or not (entry_dir(proj, content_hash).is_dir() and snapshot_path(proj, content_hash).exists()):
+        existing = _readable_manifest(proj, content_hash)
+        if existing is None:
+            # No entry, or a directory a crash left without a manifest, which is not an entry either: write it.
             written = _mint(
                 proj,
                 src,
@@ -645,10 +683,21 @@ def update_and_depend(
                 prompt=prompt,
             )
         else:
-            from tallyman_core import entry_schema_path, read_manifest
+            # The entry exists, and its recipe, build and manifest are the record of the import that minted it: an
+            # import of the same bytes, as a repair or under a new alias, rewrites none of them. A missing snapshot
+            # is healed the way ensure_materialized heals any source snapshot, from the clone and checked against
+            # the recorded result_digest, so a reader that now parses the bytes differently is recorded as an
+            # unfaithful heal instead of becoming the version's rows. The caller's bytes restore the clone first
+            # when it is gone too; ensure_cas_path verifies them against the digest (D9).
+            if not snapshot_path(proj, content_hash).exists():
+                from tallyman_xorq.materialize import ensure_materialized
+
+                si.ensure_cas_path(proj, src, digest)
+                ensure_materialized(proj, content_hash)
+            from tallyman_core import entry_schema_path
 
             written = {
-                "row_count": read_manifest(entry_dir(proj, content_hash)).row_count,
+                "row_count": existing.row_count,
                 "schema": json.loads(entry_schema_path(proj, content_hash).read_text()),
             }
         if mint:

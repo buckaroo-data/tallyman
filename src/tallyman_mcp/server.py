@@ -257,18 +257,11 @@ def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> di
 def _source_alias_refusal(project: str, name: str, doing: str) -> str | None:
     """The error for an operation aimed at a source alias, or None when *name* is not one (ADR-011 D1).
 
-    A source alias names an imported dataset. Its versions are files, not recipes, so there is nothing to revise and
-    nothing to promote a diff onto, and a catalog alias may not take its name either.
+    The text lives in ``tallyman_core.aliases.source_alias_refusal`` so the companion's routes refuse with it too.
     """
-    from tallyman_core.aliases import SOURCE_KIND, alias_kind  # noqa: PLC0415
+    from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
 
-    if alias_kind(project, name) != SOURCE_KIND:
-        return None
-    return (
-        f"{name!r} is a source alias — its versions are imported files, not recipes — so it cannot be {doing}. "
-        f"To give it new data, import the file again with catalog_import_source(<path>, {name!r}). To build on it, "
-        f"write a recipe over tracked_expr_from_alias({name!r}) under a different name."
-    )
+    return source_alias_refusal(project, name, doing)
 
 
 @mcp.tool()
@@ -584,7 +577,7 @@ def catalog_import_source(
     Args:
         outside_path: Any path to a parquet or CSV file. It does not have to live
             under the project's `data/` directory.
-        alias: The source alias. Must not already name a catalog entry, and the
+        alias: The source alias. Must not already name a catalog alias, and the
             bytes must not already be a version of another alias — the error
             names that alias. For a second name, catalog_create an entry whose
             recipe is `tracked_expr_from_alias(<that alias>)`.

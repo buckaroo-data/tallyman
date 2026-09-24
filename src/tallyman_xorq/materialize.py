@@ -304,14 +304,15 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
     Only a clone that is gone as well makes the version unrecoverable, and then the error names the file that is
     missing and the re-import that repairs it: the alias and version that hold the entry now (``_source_names``), so
     the advised call re-imports into the version it names rather than minting an alias under the name the version
-    was imported as. When no source alias holds it there is no version to re-import into, and the error says what
+    was imported as, and the reader options the entry recorded (``source_import.import_call``), without which a CSV
+    names another entry. When no source alias holds it there is no version to re-import into, and the error says what
     an import of the same bytes would do instead. Returns whether this entry is a source version, so the general
     path can stop.
     """
     from tallyman_core.catalog_state import project_lock
     from tallyman_xorq.build import BuildError
     from tallyman_xorq.result_cache import _verify_self_heal
-    from tallyman_xorq.source_import import rewrite_source_snapshot, source_clone_path
+    from tallyman_xorq.source_import import import_call, rewrite_source_snapshot, source_clone_path
 
     provenance = _source_provenance(project, content_hash)
     if provenance is None:
@@ -329,14 +330,15 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
             if held is None:
                 raise BuildError(
                     f"the data imported as {imported} (entry {content_hash}), which no source alias holds now, "
-                    f"{lost} Importing the same bytes again, catalog_import_source({provenance.path!r}, <alias>), "
-                    "writes these rows again as a new version of <alias>."
+                    f"{lost} Importing the same bytes again, "
+                    f"{import_call(provenance.path, None, provenance.reader)}, writes these rows again as a new "
+                    "version of <alias>."
                 )
             alias, version = held
             also = "" if f"{alias}-v{version}" == imported else f", imported as {imported}"
             raise BuildError(
                 f"the data of {alias}-v{version} (entry {content_hash}{also}) {lost} Import them again with "
-                f"catalog_import_source({provenance.path!r}, {alias!r}, pinned_version={version})."
+                f"{import_call(provenance.path, alias, provenance.reader, pinned_version=version)}."
             )
         digest = rewrite_source_snapshot(project, content_hash, provenance)
         perf_log.debug("ensure_materialized re-imported %s from %s", content_hash, clone.name)

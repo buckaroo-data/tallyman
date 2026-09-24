@@ -7,7 +7,8 @@ minting (build / revise / recalc) and in the structural-nondeterminism diagnosti
 is a hard error (ADR-006 D6), never a fallback.
 
 There is no xorq cache node in any build (ADR-007 D1). Whether an entry has a file of its own is one recorded fact,
-``manifest.cache_worthy``, decided once at build by ``worthiness.classify_expr`` (ADR-008 D4):
+``manifest.cache_worthy``, decided once at build by ``worthiness.classify_expr`` (ADR-008 D4). A directory without a
+manifest is not an entry, and every read refuses it (``entry_manifest``, #204):
 
   * **Worthy** entries do work that is expensive or that cannot inherit a row order (an aggregate, join, sort, window
     function, UDF, union). Tallyman materializes them: ``materialize`` writes
@@ -30,29 +31,52 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from tallyman_core.manifest import Manifest
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
 perf_log = logging.getLogger("tallyman.perf")
 
 
-def cache_worthy(project: str, content_hash: str) -> bool:
-    """Whether the entry is materialized, read from its manifest: the verdict recorded at build (ADR-008 D4).
+def entry_manifest(project: str, content_hash: str) -> Manifest:
+    """The entry's manifest, which is what makes its directory an entry (ADR-007 D6).
 
-    Nothing re-derives it: the manifest is the record, and ``expr.yaml`` is never parsed to work it out. An entry whose
-    manifest is gone (half-built, or pruned) still has its build and may still serve a page (#90), so a snapshot on disk
-    stands in for the verdict: it can only have been written for a worthy entry.
+    The manifest is an entry's last write, so a build or an import that did not finish leaves a directory without one,
+    and a reset that retires an entry leaves its snapshot with no directory at all (ADR-007 D14). Neither is an entry,
+    and no read serves one. The manifest holds what a read needs: the worthy-or-cheap verdict, the digest a heal is
+    checked against, the pin, and a source version's provenance. So this raises ``NotAnEntryError``, naming the
+    rebuild, rather than letting a read guess (#204).
     """
     from tallyman_core import read_manifest
     from tallyman_core.paths import entry_dir
+    from tallyman_xorq.build import NotAnEntryError
 
+    path = entry_dir(project, content_hash)
     try:
-        return bool(read_manifest(entry_dir(project, content_hash)).cache_worthy)
+        return read_manifest(path)
     except FileNotFoundError:
-        from tallyman_xorq.materialize import snapshot_path
+        pass
+    if not path.is_dir():
+        raise NotAnEntryError(f"there is no entry {content_hash} in {project!r}: {path} does not exist")
+    raise NotAnEntryError(
+        f"entry {content_hash} in {project!r} is not complete: {path} has no manifest.json. The manifest is an "
+        "entry's last write, so a build or import that did not finish leaves a directory like this, and nothing reads "
+        f"it (ADR-007 D6). Build it again: run its recipe, {path / 'expr.py'}, with catalog_run, or import the file "
+        "again if it is a version of a source alias."
+    )
 
-        return snapshot_path(project, content_hash).exists()
+
+def cache_worthy(project: str, content_hash: str) -> bool:
+    """Whether the entry is materialized, read from its manifest: the verdict recorded at build (ADR-008 D4).
+
+    Nothing re-derives it and nothing stands in for it: the manifest is the record, ``expr.yaml`` is never parsed to
+    work it out, and a file at the snapshot path says nothing about it. A directory without a manifest is not an
+    entry, so ``entry_manifest`` raises ``NotAnEntryError`` for one (#204).
+    """
+    return bool(entry_manifest(project, content_hash).cache_worthy)
 
 
 # Entries currently being reconstructed by cached_result_expr, on this call

@@ -126,6 +126,21 @@ def _require_hash(content_hash: str) -> None:
         raise HTTPException(400, f"malformed content hash {content_hash!r}")
 
 
+def _require_manifest(project: str, content_hash: str):
+    """The entry's manifest, or a 404 that says why there is none and names the rebuild.
+
+    A directory without a manifest is what a build or import that did not finish leaves, and it is not an entry
+    (ADR-007 D6), so every route that reads one entry refuses it the same way (#204).
+    """
+    from tallyman_xorq.build import NotAnEntryError  # noqa: PLC0415
+    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+    try:
+        return entry_manifest(project, content_hash)
+    except NotAnEntryError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
 def _fmt_bytes(n: int) -> str:
     if n >= 1_000_000_000:
         return f"{n / 1_000_000_000:.2f} GB"
@@ -929,13 +944,9 @@ def create_app(
         # the user's keys and then ``__row_order``, so the same request returns the same rows in any process and any
         # cache state. cached_result_expr hands back the result as a live single-backend expression over files that
         # exist (ensure_materialized ran first), so the window pushes down and nothing is written here. total is the
-        # manifest's row_count (recorded at build; api_entry_detail reads it the same way). The manifest is written
-        # after the build dir exists (build.py), so guard the read: a half-built or pruned entry still serves its page
-        # with a best-effort total of 0 rather than 500ing on a missing manifest.
-        manifest_path = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
-        total = 0
-        if manifest_path.exists():
-            total = json.loads(manifest_path.read_text()).get("row_count") or 0
+        # manifest's row_count, recorded at build. The manifest is written after the build dir exists (build.py), so a
+        # build that did not finish leaves a directory without one, which is not an entry: 404 with the rebuild (#204).
+        total = _require_manifest(project, content_hash).row_count or 0
         df = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit).execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
@@ -986,6 +997,7 @@ def create_app(
         entry = entry_dir(project, content_hash)
         if not entry.exists():
             raise HTTPException(404, f"entry {content_hash!r} not found")
+        _require_manifest(project, content_hash)
 
         manifest = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
         schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
@@ -1073,6 +1085,7 @@ def create_app(
             _require_hash(content_hash)
         if not entry_dir(project, content_hash).exists():
             raise HTTPException(404, f"entry {content_hash!r} not found")
+        _require_manifest(project, content_hash)
         return _compute_entry_cache(project, content_hash)
 
     @app.get("/{project}/api/session/{content_hash}")

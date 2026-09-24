@@ -197,6 +197,27 @@ def test_cache_worthy_refuses_a_hash_whose_entry_dir_is_gone(project, orders_src
             read(project, h)
 
 
+def test_cache_worthy_is_the_manifests_verdict_whatever_is_at_the_snapshot_path(project, orders_src, monkeypatch):
+    """#204, the complete-entry half: a worthy entry whose snapshot was deleted is still worthy, and a cheap entry with
+    a file at its snapshot path is still cheap. The file says nothing about the verdict (ADR-008 D4)."""
+    import shutil
+
+    from tallyman_core.aliases import get_alias
+    from tallyman_xorq.materialize import snapshot_path
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    worthy = _hash_of(project)
+    catalog_create("proj", _project_code(project))
+    cheap = _hash_of(project)
+
+    snapshot_path(project, worthy).unlink()
+    shutil.copy(snapshot_path(project, get_alias(project, ORDERS_SRC)), snapshot_path(project, cheap))
+
+    assert cache_worthy(project, worthy) is True
+    assert cache_worthy(project, cheap) is False
+
+
 def test_cheap_entry_writes_no_result_parquet(project, orders_src, monkeypatch):
     # A cheap entry materialises nothing — no result.parquet, ever (not at build,
     # not on read), and nothing under the (retired) result_cache dir.

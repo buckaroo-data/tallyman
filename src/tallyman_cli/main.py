@@ -211,9 +211,10 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         served = True
         uvicorn.run(app, host=host, port=port, log_level="info")
     finally:
-        # Released as soon as the server has stopped serving, before Buckaroo is stopped, so a restart that waits
-        # for the port to close is not refused while Buckaroo winds down. A crash or SIGKILL releases it too: the
-        # kernel drops the lock with the process.
+        # Released only once uvicorn has returned. It closes the port first and then finishes in-flight requests
+        # (a build, a recalc), which still write into the data dir, so a restart has to wait for this process to
+        # exit, not for the port to close. A crash or SIGKILL releases the claim too: the kernel drops the lock
+        # with the process.
         release_data_dir(data_dir)
         if bk is not None:
             bk.stop()

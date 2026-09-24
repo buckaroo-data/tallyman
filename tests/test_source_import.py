@@ -208,7 +208,7 @@ def test_pinned_older_version_returns_it_without_moving_the_head(project: str, t
     assert get_alias(project, "orders") == v2["hash"], "an older pin must not move the head"
 
 
-def test_bytes_matching_an_older_version_error_names_reset(project: str, tmp_path: Path, monkeypatch):
+def test_bytes_matching_an_older_version_error_names_that_version(project: str, tmp_path: Path, monkeypatch):
     """Row 9 / D11: history is append-only and monotonic, so restoring v1's bytes cannot mint a v3."""
     from tallyman_xorq import source_import
 
@@ -225,11 +225,10 @@ def test_bytes_matching_an_older_version_error_names_reset(project: str, tmp_pat
 
     message = str(exc.value)
     assert "orders-v1" in message
-    assert "reset" in message.lower()
 
 
 def test_the_append_only_refusal_does_not_advise_a_second_alias(project: str, tmp_path: Path, monkeypatch):
-    """D11's refusal offers ways back that work: a reset, or reading the old version pinned.
+    """D11's refusal offers a way back that works: reading the old version pinned.
 
     It used to offer "import these bytes under a different alias", which is refused too, because bytes an alias
     already holds cannot be imported under another (ADR-011 D1).
@@ -1854,9 +1853,11 @@ def test_a_clone_that_fails_its_digest_check_is_a_recorded_import_error(
     assert _arena(project) == {"result_cache": [], "cas": []}
 
 
-def test_the_append_only_refusal_names_reset_commands_that_exist(project: str, tmp_path: Path, monkeypatch):
-    """#234. The refusal sent the user to ``tallyman reset`` and ``catalog_reset_to``, and neither exists: the CLI
-    has ``tallyman revisions`` and ``tallyman reset-to <step>``, and the MCP server has no reset tool."""
+def test_the_append_only_refusal_does_not_advise_resetting_the_catalog(project: str, tmp_path: Path, monkeypatch):
+    """#234. The refusal sent the user to ``tallyman reset`` and ``catalog_reset_to``, and neither exists. The CLI's
+    ``tallyman reset-to <step>`` does exist, but it moves the whole catalog back, every alias and entry with it, to
+    put one source back on an older version. That is not advice to give for one alias. Until one alias can be moved
+    back on its own, the refusal offers the pinned read and no reset."""
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
@@ -1871,11 +1872,8 @@ def test_the_append_only_refusal_names_reset_commands_that_exist(project: str, t
         source_import.update_and_depend(str(src), "orders")
 
     message = str(exc.value)
-    assert "tallyman revisions" in message, message
-    assert "tallyman reset-to <step>" in message, message
-    assert "shell" in message, message
-    assert "catalog_reset_to" not in message, message
-    assert "tallyman reset " not in message, message
+    assert "reset" not in message.lower(), message
+    assert "pinned_expr_from_alias('orders-v1')" in message, message
 
 
 @pytest.mark.parametrize("suffix", [".parquet", ".pq"], ids=["the same suffix", "another suffix"])

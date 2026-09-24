@@ -589,6 +589,45 @@ def test_prune_retires_to_bullpen_not_delete(project):
     assert not paths.entry_dir(project, "aaaa").exists()  # the live tree no longer has it
 
 
+def test_prune_replaces_a_parked_entry_dir_with_the_live_one(project):
+    """An entry dir is named by its content hash, but a create of the same hash writes another manifest
+    (``created_at``, ``prompt``, and for a recipe that is not reproducible the ``result_digest`` of the snapshot that
+    create wrote). The live dir is the one that agrees with the snapshot on disk, so when the bullpen already holds a
+    dir of that name the live one replaces it, where it used to be dropped (#194)."""
+    cs.ensure_catalog_repo(project)
+    parked = paths.bullpen_dir(project) / "entries" / "aaaa"
+    parked.mkdir(parents=True)
+    (parked / "manifest.json").write_text('{"created": "first"}')
+    live = paths.entry_dir(project, "aaaa")
+    live.mkdir(parents=True)
+    (live / "manifest.json").write_text('{"created": "second"}')
+
+    cs.write_tallyman_state(project, entry_hashes=[])
+    assert cs.prune_entries(project) == 1
+
+    assert not live.exists()
+    assert (parked / "manifest.json").read_text() == '{"created": "second"}', "the live entry dir was dropped"
+
+
+def test_prune_keeps_a_parked_entry_dir_over_a_live_one_with_no_manifest(project):
+    """A live entry dir with no manifest is what an interrupted build leaves (the manifest is the build's last write),
+    so it must not replace a complete dir already parked under that name: a reset forward would restore it broken."""
+    cs.ensure_catalog_repo(project)
+    parked = paths.bullpen_dir(project) / "entries" / "aaaa"
+    parked.mkdir(parents=True)
+    (parked / "manifest.json").write_text('{"created": "first"}')
+    live = paths.entry_dir(project, "aaaa")
+    live.mkdir(parents=True)
+    (live / "expr.py").write_text("expr = None\n")
+
+    cs.write_tallyman_state(project, entry_hashes=[])
+    assert cs.prune_entries(project) == 1
+
+    assert not live.exists()
+    assert (parked / "manifest.json").read_text() == '{"created": "first"}'
+    assert not (parked / "expr.py").exists()
+
+
 def test_scrub_back_then_forward_restores_from_bullpen(project):
     """The rehearsal gesture: reset back (evict to bullpen), reset forward
     (the step's recorded artifacts come back from the bullpen instead of

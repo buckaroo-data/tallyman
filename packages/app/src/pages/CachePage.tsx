@@ -72,7 +72,11 @@ export function CachePage() {
                   <td className="num">{e.row_count.toLocaleString()}</td>
                   <td className="created">{e.created}</td>
                   <td>
-                    {e.alias ? (
+                    {e.retired ? (
+                      <span className="muted" title="A reset retired its entry; a reset forward brings it back">
+                        (retired by a reset)
+                      </span>
+                    ) : e.alias ? (
                       <>
                         <span className="alias-name">{e.alias}</span>
                         {e.version != null && (
@@ -83,7 +87,7 @@ export function CachePage() {
                         )}
                       </>
                     ) : e.orphan ? (
-                      <span className="muted" title="Its entry is not in the catalog (a reset retired it)">
+                      <span className="muted" title="No entry names this file, in the catalog or retired by a reset">
                         (no entry)
                       </span>
                     ) : (
@@ -96,7 +100,7 @@ export function CachePage() {
                     )}
                   </td>
                   <td>
-                    {e.orphan ? (
+                    {e.orphan || e.retired ? (
                       <span className="hash">{e.hash}</span>
                     ) : (
                       <Link className="hash" to={`/${project}/catalog/${e.hash}`}>

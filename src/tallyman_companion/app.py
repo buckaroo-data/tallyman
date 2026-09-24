@@ -34,7 +34,6 @@ from tallyman_core import (
     list_errors,
     load_aliases,
     notebook,
-    read_manifest,
     resolve_project,
     version_of_hash,
 )
@@ -1517,12 +1516,14 @@ def create_app(
         project = _validate_project(project)
         import datetime  # noqa: PLC0415
 
-        from tallyman_xorq.materialize import pinned_reason, snapshots_dir  # noqa: PLC0415
+        from tallyman_xorq.materialize import pinned_reason_of, snapshot_manifest, snapshots_dir  # noqa: PLC0415
 
         # The page lists the snapshot files that exist on disk right now: the rows the delete button can actually
         # evict (ADR-007 D2, D12). An entry's snapshot is a function of its hash, so nothing is derived or loaded. A
-        # file whose entry is not in the catalog (a reset retired the entry and left its file, ADR-007 D14) gets a row
-        # of its own, marked orphan, since nothing else lists it and the user has to be able to delete it.
+        # file whose entry a reset retired (ADR-007 D14) is listed from the manifest the reset parked in the bullpen,
+        # marked retired, and that manifest still decides its pin (#195). A file no entry names, live or parked, is an
+        # orphan. Both get a row, since nothing else lists them and the user has to be able to delete them. The pin is
+        # read from the manifest alone, so the listing never reads errors.jsonl (#196).
         entries = []
         root = snapshots_dir(project)
         for snap in sorted(root.glob("*.parquet")) if root.is_dir() else []:
@@ -1531,10 +1532,7 @@ def create_app(
                 size = snap.stat().st_size
             except OSError:
                 continue
-            try:
-                m = read_manifest(entry_dir(project, content_hash))
-            except Exception:
-                m = None
+            m, retired = snapshot_manifest(project, content_hash)
             if m is None:
                 mtime = datetime.datetime.fromtimestamp(snap.stat().st_mtime, tz=datetime.timezone.utc)
                 try:
@@ -1555,6 +1553,7 @@ def create_app(
                         "is_current": False,
                         "prompt": None,
                         "orphan": True,
+                        "retired": False,
                         "pinned": False,
                         "pinned_reason": None,
                     }
@@ -1573,7 +1572,7 @@ def create_app(
             if not is_current and info is not None:
                 alias = info[0]
                 is_current = False
-            reason = pinned_reason(project, content_hash)
+            reason = pinned_reason_of(project, content_hash, m, retired=retired)
             entries.append(
                 {
                     "hash": content_hash,
@@ -1588,6 +1587,7 @@ def create_app(
                     "is_current": is_current,
                     "prompt": m.prompt,
                     "orphan": False,
+                    "retired": retired,
                     "pinned": reason is not None,
                     "pinned_reason": reason,
                 }
@@ -1611,9 +1611,10 @@ def create_app(
         _require_hash(content_hash)
         from tallyman_xorq.materialize import pinned_reason, snapshot_path  # noqa: PLC0415
 
-        # Delete the entry's snapshot, or an orphan file's: the single materialized copy. A file is deleted only by an
-        # explicit user action (ADR-007 D12), and reading the entry afterward makes it again and verifies it. A file
-        # that cannot be made again faithfully is pinned (ADR-009 D6) and this leaves it alone, with the reason.
+        # Delete the entry's snapshot, or the file of a retired entry or an orphan: the single materialized copy. A file
+        # is deleted only by an explicit user action (ADR-007 D12), and reading the entry afterward makes it again and
+        # verifies it. A file that cannot be made again faithfully is pinned (ADR-009 D6), as its manifest says, the
+        # parked one for a retired entry (#195), and this leaves it alone, with the reason.
         p = snapshot_path(project, content_hash)
         if not p.exists():
             raise HTTPException(404, "no snapshot for this entry")

@@ -27,6 +27,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from tallyman_core.manifest import Manifest
 from tallyman_xorq.row_order import ROW_ORDER, ROW_ORDER_RIGHT
 
 perf_log = logging.getLogger("tallyman.perf")
@@ -407,45 +408,74 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     _ensure(project, content_hash)
 
 
-def pinned_reason(project: str, content_hash: str) -> str | None:
-    """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
+def snapshot_manifest(project: str, content_hash: str) -> tuple[Manifest | None, bool]:
+    """The manifest that speaks for the snapshot named *content_hash*, and whether a reset has retired its entry.
 
-    A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
-    time gave different digests), a heal already produced different rows than were built, or it is a source
-    version whose clone of the imported bytes is gone (ADR-011 D1 — with the clone it is ordinary cache, made again
-    from those bytes). The Cache page's delete leaves such a file alone and says why, naming a source version by the
-    alias that holds it now (``_source_names``). ``compute_cache/`` as a whole is still deletable by definition.
+    The live entry's manifest when it can be read. Otherwise the copy a reset parked in the bullpen: a reset leaves a
+    retired entry's snapshot on disk (ADR-007 D14), and the parked manifest still records whether that file can be
+    made again (#195). ``(None, False)`` for an orphan, a file that no entry names.
     """
     from tallyman_core import read_manifest
-    from tallyman_core.errors import list_errors
+    from tallyman_core.catalog_state import parked_entry_dir
     from tallyman_core.paths import entry_dir
+
+    for where, retired in ((entry_dir(project, content_hash), False), (parked_entry_dir(project, content_hash), True)):
+        try:
+            return read_manifest(where), retired
+        except (OSError, ValueError):
+            continue
+    return None, False
+
+
+def pinned_reason_of(project: str, content_hash: str, manifest: Manifest, *, retired: bool = False) -> str | None:
+    """Why the snapshot of the entry *manifest* describes must not be deleted, or None when it may be.
+
+    A snapshot is pinned when it cannot be made again faithfully: it is a source version whose clone of the imported
+    bytes is gone (ADR-011 D1: with the clone it is ordinary cache, made again from those bytes), the recipe is not
+    reproducible (two runs at create time gave different digests, ADR-009 D6), or a heal already produced different
+    rows than were built (ADR-006 D12, unfaithful entries are pinned and badged). All three are read from the manifest,
+    so the pin holds wherever the manifest goes, and dismissing the error banner does not lift it (#196).
+
+    *retired* says the manifest is the one a reset parked (``snapshot_manifest``). A reset parks a retired source
+    version's clone beside its dir, and a reset forward brings both back, so for such an entry a clone in the bullpen
+    still makes the file again (#195). A source version is named by the alias that holds it now (``_source_names``).
+    """
+    from tallyman_core.catalog_state import parked_clone_path
     from tallyman_xorq.source_import import source_clone_path
 
-    try:
-        manifest = read_manifest(entry_dir(project, content_hash))
-    except (OSError, ValueError):
-        manifest = None
-    if manifest is not None and manifest.provenance is not None:
+    if manifest.provenance is not None:
         clone = source_clone_path(project, manifest.provenance)
-        if not clone.is_file():
+        parked = parked_clone_path(project, clone.name)
+        if not clone.is_file() and not (retired and parked.is_file()):
             held, imported = _source_names(project, content_hash, manifest.provenance)
             if held is None:
                 name = f"the source version imported as {imported}, which no source alias holds now"
             else:
                 current = f"{held[0]}-v{held[1]}"
                 name = f"the source version {current}" + ("" if current == imported else f" (imported as {imported})")
+            gone = f"{clone} and from {parked}" if retired else f"{clone}"
             return (
                 f"this file is the last copy of {name}: the clone of the bytes imported from "
-                f"{manifest.provenance.path} is gone from {clone}, so nothing can make it again and it is kept"
+                f"{manifest.provenance.path} is gone from {gone}, so nothing can make it again and it is kept"
             )
-    if manifest is not None and manifest.reproducible is False:
+    if manifest.reproducible is False:
         columns = ", ".join(manifest.nonreproducible_columns or [])
         return (
             "this entry's query is not reproducible (two runs at create time gave different results"
             + (f" in {columns}" if columns else "")
             + "), so its snapshot cannot be re-created faithfully and is kept"
         )
-    for record in list_errors(project, limit=1_000_000_000):
-        if record.get("code") == "unfaithful_heal" and record.get("hash") == content_hash:
-            return "a heal of this snapshot produced different rows than were built, so it is kept"
+    if manifest.unfaithful_heal_digest is not None:
+        return "a heal of this snapshot produced different rows than were built, so it is kept"
     return None
+
+
+def pinned_reason(project: str, content_hash: str) -> str | None:
+    """Why the entry's snapshot must not be deleted, or None when it may be (ADR-009 D6, ADR-007 D12).
+
+    The rules of ``pinned_reason_of``, applied to the manifest that speaks for the file (``snapshot_manifest``: the
+    live entry's, or the one a reset parked). The Cache page's delete leaves a pinned file alone and says why.
+    ``compute_cache/`` as a whole is still deletable by definition.
+    """
+    manifest, retired = snapshot_manifest(project, content_hash)
+    return pinned_reason_of(project, content_hash, manifest, retired=retired) if manifest is not None else None

@@ -16,8 +16,11 @@ dirs, in one tracked JSONL file:
 Those heavy artifacts are content-addressed, additive, and gitignored, so
 ``git reset`` can't roll them back; ``reset_to`` reconciles them to the recorded
 pointers via the bullpen: evictions retire (not deleted), and anything a
-restored step records but is missing comes back by copy. Live operations never
-read the bullpen.
+restored step records but is missing comes back by copy. An eviction replaces a
+parked dir of the same name, since the live one matches the snapshot on disk
+(#194). The one live reader of the bullpen is the Cache page, which reads a
+retired entry's parked manifest, and a retired source version's parked clone,
+to decide its snapshot's pin (#195).
 
 ``compute_cache/`` is not managed here (ADR-007 D14). Its files are named by
 content hash and each one can be made again by ``ensure_materialized``, so a
@@ -137,16 +140,32 @@ def capture_tallyman_state(project: str) -> dict:
 
 
 def _retire(src: Path, dest: Path) -> None:
-    """Move an evicted artifact into the bullpen.
+    """Move an evicted entry dir into the bullpen, replacing any dir already parked under its name.
 
-    Content-addressed names mean an existing *dest* is the same content, so
-    the source is simply dropped rather than re-moved.
+    The name is the content hash, but the dir's contents are not a function of it: the manifest records ``created_at``
+    and ``prompt``, and a recipe that is not reproducible records another ``result_digest`` each time it is created.
+    The live dir is the one that agrees with the snapshot on disk, since a create always rewrites the snapshot
+    (ADR-007 D4), so it replaces the parked one (#194). A crash between the two steps loses only the older copy. A live
+    dir with no manifest is what an interrupted build leaves (the manifest is the build's last write), so it never
+    replaces a parked dir and is dropped instead. Source clones are content-addressed files: ``source_identity.gc_cas``
+    retires them, and still drops one whose copy is already parked.
     """
     if dest.exists():
-        shutil.rmtree(src) if src.is_dir() else src.unlink()
-        return
+        if not (src / "manifest.json").is_file():
+            shutil.rmtree(src)
+            return
+        shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(src), str(dest))
+
+
+def parked_entry_dir(project: str, content_hash: str) -> Path:
+    """Where a reset parks an entry's dir: ``<catalog>/bullpen/entries/<hash>``.
+
+    Besides ``reset_to``, only the Cache page reads it: a retired entry's snapshot stays on disk (ADR-007 D14), and the
+    parked manifest is what still says whether that file can be made again (#195).
+    """
+    return bullpen_dir(project) / ENTRIES_DIRNAME / content_hash
 
 
 def prune_entries(project: str) -> int:
@@ -163,13 +182,23 @@ def prune_entries(project: str) -> int:
     removed = 0
     for child in ed.iterdir():
         if child.is_dir() and child.name not in valid:
-            _retire(child, bullpen_dir(project) / ENTRIES_DIRNAME / child.name)
+            _retire(child, parked_entry_dir(project, child.name))
             removed += 1
     return removed
 
 
 def _cas_bullpen(project: str) -> Path:
     return bullpen_dir(project) / "cas"
+
+
+def parked_clone_path(project: str, clone_name: str) -> Path:
+    """Where a reset parks a source clone named *clone_name*: ``<catalog>/bullpen/cas/<digest><suffix>``.
+
+    A reset back to a step before an import parks the source entry's dir and the clone of its bytes together, and a
+    reset forward copies both back, so the Cache page reads it to tell a retired source version's snapshot, which that
+    clone can still make again, from one that nothing can (#195).
+    """
+    return _cas_bullpen(project) / clone_name
 
 
 def _live_source_digests(project: str) -> set[str] | None:
@@ -204,14 +233,12 @@ def restore_from_bullpen(project: str) -> int:
     restored pointer file names that is absent from the live tree comes back by
     *copy*, and so does every source clone (``data/.cas/``) that a restored entry
     refers to, so the bullpen keeps its set and the back/forward rehearsal loop
-    can repeat. Only ``reset_to`` calls this — live operations never see the
-    bullpen.
+    can repeat. Only ``reset_to`` calls this.
     """
-    bp = bullpen_dir(project)
     restored = 0
     ed = entries_dir(project)
     for h in _read_jsonl(_entries_file(project), "hash") or []:
-        live, parked = ed / h, bp / ENTRIES_DIRNAME / h
+        live, parked = ed / h, parked_entry_dir(project, h)
         if not live.exists() and parked.is_dir():
             shutil.copytree(parked, live)
             restored += 1

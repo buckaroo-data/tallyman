@@ -143,8 +143,11 @@ export interface CacheEntry {
   version: number | null;
   is_current: boolean;
   prompt: string | null;
-  // A snapshot file whose entry is not in the catalog (a reset retired the entry and left its file).
+  // A snapshot file that no entry names, live or retired.
   orphan?: boolean;
+  // A snapshot file whose entry a reset retired: the entry's dir is parked in the bullpen, a reset forward brings it
+  // back, and the parked manifest still decides whether the file is pinned.
+  retired?: boolean;
   // A snapshot that cannot be made again faithfully is kept: delete is refused, and this says why.
   pinned?: boolean;
   pinned_reason?: string | null;

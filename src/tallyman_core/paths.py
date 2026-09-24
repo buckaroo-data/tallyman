@@ -63,8 +63,10 @@ ARTIFACTS_DIRNAME = "artifacts"
 CATALOG_DIRNAME = "catalog"
 ENTRIES_DIRNAME = "entries"
 
-# Per-entry artifacts: immutable build outputs. Safe to symlink read-only into a
-# write-isolated overlay (the perf harness) because nothing rewrites them.
+# Per-entry artifacts: build outputs. Safe to symlink read-only into a
+# write-isolated overlay (the perf harness): the one later write, an unfaithful
+# heal recording its pin in manifest.json (#196), is an atomic replace, which
+# swaps the overlay's link for a file and leaves the linked original alone.
 ENTRY_BUILD_DIRNAME = "xorq_build"
 ENTRY_MANIFEST_FILENAME = "manifest.json"
 ENTRY_SCHEMA_FILENAME = "schema.json"
@@ -223,8 +225,9 @@ def bullpen_dir(project: str) -> Path:
 
     A backward reset moves entry dirs, and the source clones (``data/.cas``) no surviving
     entry refers to, here instead of deleting them; a forward reset copies the step's
-    recorded set back. Live operations never read it. ``compute_cache/`` is not managed
-    by a reset (ADR-007 D14).
+    recorded set back. The one live reader is the Cache page, which reads a retired
+    entry's parked manifest, and a retired source version's parked clone, to decide its
+    snapshot's pin (#195). ``compute_cache/`` is not managed by a reset (ADR-007 D14).
     """
     return catalog_dir(project) / "bullpen"
 

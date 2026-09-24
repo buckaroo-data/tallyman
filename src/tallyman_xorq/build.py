@@ -425,7 +425,13 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
     from tallyman_xorq._git_state_guard import install_git_state_guard
-    from tallyman_xorq.materialize import SNAPSHOT_FORMAT_VERSION, engine_versions, materialize, snapshot_path
+    from tallyman_xorq.materialize import (
+        SNAPSHOT_FORMAT_VERSION,
+        Materialized,
+        engine_versions,
+        materialize,
+        publish_snapshot,
+    )
     from tallyman_xorq.result_cache import stream_row_count
     from tallyman_xorq.row_order import RowOrderError
     from tallyman_xorq.worthiness import classify_expr
@@ -485,7 +491,7 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
         raise
 
     created_target = False
-    wrote_snapshot: Path | None = None
+    staged: Materialized | None = None  # a worthy entry's snapshot, complete at a temp name until it is published
     try:
         # Use a temp builds_dir so xorq's hash naming doesn't collide; we move
         # things into our catalog layout afterwards.
@@ -546,21 +552,21 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
 
             # Execute (ADR-007 D4). A worthy entry is materialized: the ONE writer runs the frozen build on a
             # single-partition connection and writes the snapshot, twice, so a recipe that is not reproducible is known
-            # from birth (ADR-009 D6). A cheap entry writes nothing: one full streaming pass forces row-level evaluation
-            # at author time (a failing cast / arithmetic / UDF surfaces here, in tallyman's process, and not later in
-            # a grid query), and the one pass yields the exact row count.
+            # from birth (ADR-009 D6). The file stays at a temp name until the manifest is written (below). A cheap
+            # entry writes nothing: one full streaming pass forces row-level evaluation at author time (a failing
+            # cast / arithmetic / UDF surfaces here, in tallyman's process, and not later in a grid query), and the one
+            # pass yields the exact row count.
             cache_worthy_v, cache_worthy_why = verdict.worthy, verdict.why
             reproducible: bool | None = None
             differing: list[str] = []
             t0 = time.monotonic()
             try:
                 if cache_worthy_v:
-                    wrote_snapshot = snapshot_path(project, content_hash)
-                    result = materialize(project, content_hash, check_reproducible=True)
-                    row_count = result.row_count
-                    result_digest_v: str | None = result.digest
-                    arrow_schema = result.schema
-                    reproducible, differing = result.reproducible, result.differing_columns
+                    staged = materialize(project, content_hash, check_reproducible=True, publish=False)
+                    row_count = staged.row_count
+                    result_digest_v: str | None = staged.digest
+                    arrow_schema = staged.schema
+                    reproducible, differing = staged.reproducible, staged.differing_columns
                 else:
                     loaded = load_expr(build_path)
                     arrow_schema = loaded.schema().to_pyarrow()
@@ -599,9 +605,9 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             pass
 
         cache_bytes: int | None = None
-        if cache_worthy_v:
+        if staged is not None:
             try:
-                cache_bytes = snapshot_path(project, content_hash).stat().st_size
+                cache_bytes = staged.path.stat().st_size
             except OSError:
                 pass
 
@@ -633,6 +639,11 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             parents=parents or None,
         )
         write_manifest(target, manifest)
+        if staged is not None:
+            # The last step: the snapshot's path changes only once the entry is complete. A build that failed before
+            # here left the file already at the path as it was, such as the one a reset left on disk (ADR-007 D14),
+            # which for an entry that is not reproducible is the only copy of its rows (#193).
+            publish_snapshot(project, content_hash, staged)
     except Exception:
         # No partial entry dir survives a failed build: every population step is
         # covered, not just the load_expr/execute paths that had ad-hoc cleanup
@@ -642,9 +653,11 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
         # durable entry, which always early-returns before created_target is set.
         if created_target:
             shutil.rmtree(target, ignore_errors=True)
-            if wrote_snapshot is not None:
-                wrote_snapshot.unlink(missing_ok=True)
         raise
+    finally:
+        # The staged temp file is gone once it is published. If the build failed before then, it is removed here.
+        if staged is not None:
+            staged.path.unlink(missing_ok=True)
     _append_prompt(project, content_hash, prompt)
 
     if reproducible is False:

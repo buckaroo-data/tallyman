@@ -177,8 +177,24 @@ missing clone and the re-import that repairs it. A source version is therefore
 the one kind of entry whose "cache or data" answer depends on a second file
 being present, which is the price of not storing the bytes three times.
 
-Two imports of identical bytes under different aliases produce the same entry
-hash and share one file, with both aliases pointing at it.
+**One set of bytes, read one way, is one source version under one alias.**
+Importing bytes that another alias of the project already holds, at any version,
+is an error naming that alias and version. The likely way to get there is not
+knowing the bytes are already in the project, and letting two aliases share the
+entry meant one entry directory carrying one alias's name in its provenance and
+recipe while another alias pointed at it. (This document first said two such
+imports share one entry. PR #219 reversed that after the #217/#218 review found
+the second import rewrote the first alias's manifest, and a failure part-way
+deleted its entry.)
+
+A second name for a source is a catalog entry whose recipe reads it:
+`catalog_create("orders_eu", "... expr = tracked_expr_from_alias('orders')")`.
+Nothing has to be added to force the hashes apart, because a source entry's hash
+is an md5 of its bytes and a recipe's is xorq's hash of the expression, and the
+new entry follows `orders`, so a re-import advances it. The rule keys on the entry
+hash, so a CSV read two ways is still two imports under two aliases (D12), and
+it is per project: two projects importing one file each hold their own entry,
+snapshot and clone under the same hash.
 
 ### D2. Files enter only by an explicit import
 
@@ -374,8 +390,7 @@ D5, D9, D10, D12.** What the code does that this document did not say:
 - **A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
   truncated to xorq's 12 hex.** It cannot come from `build_expr`, because the
   generated recipe reads the snapshot and the snapshot is named by the hash. The
-  bytes and the reader options are the whole identity, which is what makes two
-  imports of one file under two aliases mint one entry (`source_import.py`).
+  bytes and the reader options are the whole identity (`source_import.py`).
 - **The generated recipe still calls `read_project_file`**, and a contextvar
   (`_SOURCE_ENTRY`) is what makes that call legal and resolves it to the entry's
   own snapshot. `result_cache._recipe_expr` sets the same contextvar when it

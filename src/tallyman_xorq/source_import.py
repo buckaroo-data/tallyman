@@ -18,8 +18,9 @@ One import does four things:
    records the outside path, the digest and the reader options;
 4. points the source alias at it, appending a version.
 
-The **content hash of a source entry is a function of its bytes and its reader options**, and of nothing else, so two
-imports of identical bytes under two aliases mint one entry and share one file.
+The **content hash of a source entry is a function of its bytes and its reader options**, and of nothing else. One
+such entry belongs to one alias: importing bytes another alias already holds is an error that names that alias, and a
+second name for a source is a catalog entry whose recipe reads it (``_refuse_bytes_held_elsewhere``).
 
 That snapshot is **cache** in the sense of ADR-007 D13 — a file is cache if ``ensure_materialized`` can re-create it
 — because the clone holds the bytes and the entry holds the reader options. A deleted one is written again from the
@@ -74,7 +75,7 @@ def source_entry_hash(digest: str, reader: dict) -> str:
     """The content hash of the entry an import mints: its bytes and its reader options, and nothing else.
 
     Same 12-hex shape as xorq's build hash, so nothing downstream (entry directories, URLs, aliases) notices the
-    difference. Two imports of the same bytes under the same reader are the same entry.
+    difference. The same bytes under the same reader are the same entry, which is why one alias may hold them.
     """
     from tallyman_xorq.ordered_copy import _reader_signature
 
@@ -203,6 +204,28 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
             f"Two version numbers never denote the same bytes."
         )
     return True, pinned_version
+
+
+def _refuse_bytes_held_elsewhere(project: str, alias: str, content_hash: str) -> None:
+    """Raise when another alias of *project* already has *content_hash* as one of its versions.
+
+    One set of bytes, read one way, is one source version under one alias. The likely way to get here is not knowing
+    the bytes are already in the project, so the error says where they are and how to give them a second name. The
+    check keys on the entry hash, so a CSV read two ways is still two entries (D12), and it is per project.
+    """
+    from tallyman_core.aliases import load_history
+
+    for other, hashes in sorted(load_history(project).items()):
+        if other == alias or content_hash not in hashes:
+            continue
+        held = f"{other}-v{hashes.index(content_hash) + 1}"
+        raise SourceImportError(
+            f"these bytes are already {held} in project {project!r}, so they cannot also be imported as {alias!r}: "
+            f"one set of bytes is one source version under one alias. Read them with "
+            f"tracked_expr_from_alias({other!r}). To give them a second name, create a catalog entry over the "
+            f"source — catalog_create({alias!r}, \"from tallyman_xorq.io import tracked_expr_from_alias\\n"
+            f"expr = tracked_expr_from_alias({other!r})\") — which follows {other!r} when it is re-imported."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -387,8 +410,8 @@ def _mint(
     # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
     clone = si.ensure_cas_path(project, outside_path, digest)
 
-    # 2. The one snapshot, named by the entry hash. An existing one (a second alias over the same bytes) is kept:
-    #    the hash is a function of the bytes and the reader, so it already holds exactly these rows.
+    # 2. The one snapshot, named by the entry hash. An existing one is kept: the hash is a function of the bytes and
+    #    the reader, so it already holds exactly these rows.
     snapshot = snapshot_path(project, content_hash)
     if snapshot.exists():
         from tallyman_xorq.digest import content_digest
@@ -412,6 +435,9 @@ def _mint(
         if expr is None:
             raise BuildError(f"the generated recipe of {alias}-v{version} bound no 'expr'")
         target = entry_dir(project, content_hash)
+        # A re-import that repairs a missing snapshot writes into an entry that already exists; a failure must not
+        # take that entry with it.
+        created = not target.exists()
         target.mkdir(parents=True, exist_ok=True)
         try:
             from xorq.ibis_yaml.compiler import build_expr
@@ -462,7 +488,8 @@ def _mint(
                 ),
             )
         except Exception:
-            shutil.rmtree(target, ignore_errors=True)
+            if created:
+                shutil.rmtree(target, ignore_errors=True)
             raise
     finally:
         import sys
@@ -506,12 +533,14 @@ def update_and_depend(
     ``pinned_version`` beyond head+1                    error: versions cannot be skipped
     ``pinned_version=N`` < head, digest matches         return vN; the head does not move
     bytes match a version older than the head           error: history is append-only (D11)
+    bytes are a version of another alias                error: one set of bytes, one alias
     ==================================================  =========================================
 
     Args:
         outside_path: Any path to a parquet or CSV file. ``data/`` is not special — a file is imported from wherever
             it is, and after the import the path is provenance and is never read again.
         alias: The source alias. It may not already name a catalog alias, and a catalog alias may not later take it.
+            Bytes another alias of the project already holds are refused; the error names that alias.
         pinned_version: The version the caller claims this file is, when they want the claim checked.
         project: Project name override (defaults to the active project).
         prompt: Optional human-readable description, recorded on the entry.
@@ -563,6 +592,8 @@ def update_and_depend(
     with project_lock(proj):
         history = history_for(proj, alias)
         mint, version = _plan_version(alias, history, content_hash, pinned_version)
+        if mint:
+            _refuse_bytes_held_elsewhere(proj, alias, content_hash)
         from tallyman_core.paths import entry_dir
         from tallyman_xorq.materialize import snapshot_path
 

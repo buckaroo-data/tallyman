@@ -583,7 +583,10 @@ def catalog_import_source(
     Args:
         outside_path: Any path to a parquet or CSV file. It does not have to live
             under the project's `data/` directory.
-        alias: The source alias. Must not already name a catalog entry.
+        alias: The source alias. Must not already name a catalog entry, and the
+            bytes must not already be a version of another alias — the error
+            names that alias. For a second name, catalog_create an entry whose
+            recipe is `tracked_expr_from_alias(<that alias>)`.
         pinned_version: The version you claim this file is. Given, it is checked:
             if the file is that version the call is a no-op, and if it is not you
             get an error instead of an accidental new version. Use it in a script

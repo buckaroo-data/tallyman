@@ -764,6 +764,174 @@ def test_a_source_snapshot_whose_clone_is_gone_is_pinned(project: str, tmp_path:
     assert ".cas" in reason, reason  # the pin is the missing clone, not the fact that this is a source
 
 
+# ``manifest.provenance.alias`` and ``.version`` are the name the import was made under, recorded once. A rename
+# carries an alias's history and kind to the new name (``aliases.rename_alias``) and an unalias drops it, so a
+# message that names a source version, or tells the user which import repairs it, has to ask the alias store who
+# holds the entry now.
+
+
+def _advised_import(message: str) -> tuple[list, dict]:
+    """The arguments of the ``catalog_import_source(...)`` call that ends *message*, parsed as Python literals."""
+    import ast
+
+    call = ast.parse(message[message.index("catalog_import_source(") :].rstrip("."), mode="eval").body
+    assert isinstance(call, ast.Call), message
+    return [ast.literal_eval(a) for a in call.args], {k.arg: ast.literal_eval(k.value) for k in call.keywords}
+
+
+def test_a_pinned_source_snapshot_is_named_by_the_alias_it_was_renamed_to(project: str, tmp_path: Path, monkeypatch):
+    """The pin names the version as the catalog knows it now; the name it was imported under is history."""
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.materialize import pinned_reason
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+    _clone_of(project, out).unlink()
+
+    reason = pinned_reason(project, out["hash"])
+    assert reason is not None
+    assert "renamed_src-v1" in reason, reason
+    assert "source version a_src-v1" not in reason, reason
+
+
+def test_the_re_import_advice_names_the_alias_a_source_was_renamed_to(project: str, tmp_path: Path, monkeypatch):
+    """The heal error names the version by its alias now, and so does the import it advises."""
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+
+    message = str(exc.value)
+    assert "renamed_src-v1" in message, message
+    assert f"catalog_import_source({str(src)!r}, 'renamed_src', pinned_version=1)" in message, message
+    assert "'a_src'" not in message, message
+
+
+def test_following_the_re_import_advice_after_a_rename_repairs_the_version(project: str, tmp_path: Path, monkeypatch):
+    """The advice is a call the user runs as written, so it has to repair the renamed alias's version.
+
+    Advice that named the import-time alias minted a second source alias, ``a_src``, over the same entry, and the
+    renamed one's snapshot came back only by accident.
+    """
+    from tallyman_core.aliases import load_kinds, rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    before = snapshot_path(project, out["hash"]).read_bytes()
+    rename_alias(project, "a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = source_import.update_and_depend(*args, **kwargs)
+
+    assert load_kinds(project) == {"renamed_src": "source"}
+    assert (repaired["alias"], repaired["version"], repaired["created"]) == ("renamed_src", 1, False)
+    assert repaired["hash"] == out["hash"]
+    assert history_for(project, "renamed_src") == [out["hash"]]
+    assert snapshot_path(project, out["hash"]).read_bytes() == before
+
+
+def test_catalog_rename_then_the_advised_catalog_import_source_repairs_the_version(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """The same, through the tools a user has: the advice is an MCP call, run against the MCP tool."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.aliases import load_kinds
+    from tallyman_mcp.server import catalog_import_source, catalog_rename
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = catalog_import_source(str(src), "a_src")
+    assert "error" not in catalog_rename("a_src", "renamed_src")
+    snapshot_path(project, out["hash"]).unlink()
+    _clone_of(project, out).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+    args, kwargs = _advised_import(str(exc.value))
+
+    repaired = catalog_import_source(*args, **kwargs)
+
+    assert "error" not in repaired, repaired
+    assert load_kinds(project) == {"renamed_src": "source"}
+    assert snapshot_path(project, out["hash"]).is_file()
+
+
+def test_a_source_version_no_alias_holds_is_not_advised_back_under_its_old_name(
+    project: str, tmp_path: Path, monkeypatch
+):
+    """After an unalias no alias holds the version, and the messages say so instead of naming the dead alias.
+
+    Re-importing under the old name would not restore anything that exists: it would mint a new alias of that name.
+    """
+    from tallyman_core.aliases import remove_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_xorq.build import BuildError
+    from tallyman_xorq.materialize import ensure_materialized, pinned_reason
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    remove_alias(project, "a_src")
+    _clone_of(project, out).unlink()
+
+    reason = pinned_reason(project, out["hash"])
+    assert reason is not None
+    assert "no source alias" in reason, reason
+    assert "imported as a_src-v1" in reason, reason
+
+    snapshot_path(project, out["hash"]).unlink()
+    with pytest.raises(BuildError) as exc:
+        ensure_materialized(project, out["hash"])
+
+    message = str(exc.value)
+    assert "no source alias" in message, message
+    assert "'a_src'" not in message, message
+    assert "pinned_version" not in message, message
+
+
+def test_a_source_recipe_names_its_alias_as_the_one_it_was_imported_under(project: str, tmp_path: Path, monkeypatch):
+    """The generated recipe is written once, at import, so the Code tab must not present that name as the entry's.
+
+    After a rename the entry is ``renamed_src-v1``; a header reading ``# a_src-v1: a source version`` says otherwise.
+    """
+    from tallyman_core.aliases import rename_alias
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    out = source_import.update_and_depend(str(src), "a_src")
+    rename_alias(project, "a_src", "renamed_src")
+
+    header = (entry_dir(project, out["hash"]) / "expr.py").read_text().splitlines()[0]
+    assert "imported as a_src-v1" in header, header
+    assert not header.startswith("# a_src-v1:"), header
+
+
 def test_a_reset_keeps_the_clone_of_an_imported_source_alive(project: str, tmp_path: Path, monkeypatch):
     """``gc_cas`` walks the retention closure; an imported version's clone is in it via the entry's provenance."""
     from tallyman_xorq import source_import

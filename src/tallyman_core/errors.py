@@ -50,13 +50,32 @@ def record_error(
     return entry
 
 
+def _read_records(p: Path) -> list[dict]:
+    """Every record in the log, oldest first.
+
+    A line that is not a JSON object (an append torn by a crash, a hand edit) is skipped, so one bad line does not
+    make every reader of the log raise: the banner, the error page and the activity log.
+    """
+    rows = []
+    with p.open() as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+    return rows
+
+
 def list_errors(project: str, limit: int = 20) -> list[dict]:
     """Most recent errors first, capped at `limit`."""
     p = _errors_path(project)
     if not p.exists():
         return []
-    with p.open() as fh:
-        rows = [json.loads(line) for line in fh if line.strip()]
+    rows = _read_records(p)
     rows.reverse()
     return rows[:limit]
 
@@ -107,9 +126,7 @@ def get_error(project: str, error_id: str) -> dict | None:
     p = _errors_path(project)
     if not p.exists():
         return None
-    with p.open() as fh:
-        for line in fh:
-            row = json.loads(line)
-            if row.get("id") == error_id:
-                return row
+    for row in _read_records(p):
+        if row.get("id") == error_id:
+            return row
     return None

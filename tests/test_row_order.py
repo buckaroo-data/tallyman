@@ -600,3 +600,89 @@ def test_a_raw_read_of_a_parquet_file_copied_under_compute_cache_is_a_build_erro
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, _raw_read(copied, 't.group_by("region").aggregate(n=t.count())'))
     _assert_names_the_import(str(exc.value), copied)
+
+
+# The reads tallyman hands a recipe stay allowed. These pass before the fix and guard it.
+_AGG_V2 = 't.group_by("region").aggregate(total=t.price.sum() * 2, n=t.count())'
+
+
+def _edges(project: str, content_hash: str) -> list[tuple[str, str, bool]]:
+    """The entry's parent edges as ``(hash, ref, follow)``."""
+    return [(p.hash, p.ref, p.follow) for p in read_manifest(entry_dir(project, content_hash)).parents or []]
+
+
+def test_a_tracked_child_of_a_worthy_entry_still_builds(project, orders_src):
+    """#228: ``tracked_expr_from_alias`` hands the recipe a read of the parent's snapshot."""
+    agg = _create(project, "agg", _orders(project, _AGG))
+    res = build_and_persist(project, _over(project, "agg", "t.filter(t.n > 0)"))
+    assert _edges(project, res.content_hash) == [(agg, "agg", True)]
+
+
+def test_a_pinned_child_of_a_worthy_entry_still_builds(project, orders_src):
+    """#228: ``pinned_expr_from_alias`` hands the recipe the same read, with a pinned edge."""
+    agg = _create(project, "agg", _orders(project, _AGG))
+    code = (
+        "from tallyman_xorq.io import pinned_expr_from_alias\n"
+        f"t = pinned_expr_from_alias('agg-v1', project={project!r})\n"
+        'expr = t.group_by("region").aggregate(top=t.total.max())\n'
+    )
+    res = build_and_persist(project, code)
+    assert _edges(project, res.content_hash) == [(agg, "agg-v1", False)]
+
+
+def test_a_child_through_a_cheap_parent_still_builds(project, orders_src):
+    """#228: a cheap parent's plan reads its own parent's snapshot, and that read comes with the plan."""
+    _create(project, "agg", _orders(project, _AGG))
+    big = _create(project, "big", _over(project, "agg", "t.filter(t.n > 0)"))
+    assert not cache_worthy(project, big)
+    res = build_and_persist(project, _over(project, "big", "t.aggregate(total=t.total.sum())"))
+    assert _edges(project, res.content_hash) == [(big, "big", True)]
+
+
+def test_a_promoted_diff_still_builds_and_replays(project, orders_src, monkeypatch):
+    """#228: a promoted diff's ``build_diff_expr`` reads both sides through ``cached_result_expr``.
+
+    The key search runs under a 1s wall-clock budget, and its first ``execute()`` in a process imports geopandas
+    through ibis's pandas conversion: over 3s the first time a new venv loads those C extensions. The budget is not
+    what this test is about, so it is lifted.
+    """
+    from tallyman_mcp.server import catalog_create, catalog_promote_diff, catalog_revise
+    from tallyman_xorq import primary_key
+    from tallyman_xorq.recalc import _recipe_code
+
+    monkeypatch.setattr(primary_key, "PK_SEARCH_BUDGET_S", 60.0)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _orders(project, _AGG))
+    catalog_revise("agg", _orders(project, _AGG_V2))
+    out = catalog_promote_diff("agg")
+    assert "error" not in out, out
+    assert build_and_persist(project, _recipe_code(project, out["hash"])).content_hash == out["hash"]
+
+
+def test_a_recalc_after_the_parent_is_revised_still_replays_a_chain_through_a_cheap_entry(
+    project, orders_src, monkeypatch
+):
+    """#228: the recalc replays each recipe through ``build_and_persist``, over the revised parent's snapshot."""
+    from tallyman_core import get_alias
+    from tallyman_mcp.server import catalog_create, catalog_revise
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    catalog_create("agg", _orders(project, _AGG))
+    big = catalog_create("big", _over(project, "agg", "t.filter(t.n > 0)"))["hash"]
+    top = catalog_create("top", _over(project, "big", "t.aggregate(total=t.total.sum())"))["hash"]
+    out = catalog_revise("agg", _orders(project, _AGG_V2))
+    assert out["recalc"]["status"] == "ok", out["recalc"]
+    assert set(out["recalc"]["remap"]) == {big, top}
+    assert _edges(project, get_alias(project, "big")) == [(get_alias(project, "agg"), "agg", True)]
+    assert _edges(project, get_alias(project, "top")) == [(get_alias(project, "big"), "big", True)]
+
+
+def test_reconstructing_a_cheap_entry_still_gives_its_content_hash(project, orders_src):
+    """#228: reconstruction (``result_cache._recipe_expr``, under ``_RECONSTRUCTING``) re-runs the recipe's readers."""
+    from tallyman_xorq.result_cache import _reconstructed_hash
+
+    _create(project, "agg", _orders(project, _AGG))
+    big = _create(project, "big", _over(project, "agg", "t.filter(t.n > 0)"))
+    assert not cache_worthy(project, big)
+    assert _reconstructed_hash(project, big) == big

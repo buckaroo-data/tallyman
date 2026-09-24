@@ -279,6 +279,19 @@ def _source_provenance(project: str, content_hash: str):
         return None
 
 
+def _source_names(project: str, content_hash: str, provenance) -> tuple[tuple[str, int] | None, str]:
+    """``(held, imported)``: how a message names a source version (ADR-011 D1).
+
+    ``held`` is ``(alias, version)`` as the alias store has it now, or None when no source alias holds the entry
+    (``source_import.current_source_version``). ``imported`` is the ``<alias>-v<N>`` the version was imported as,
+    from ``provenance``: history, which a rename or an unalias leaves behind. A message names the version by
+    ``held``, and mentions ``imported`` only where the two differ.
+    """
+    from tallyman_xorq.source_import import current_source_version
+
+    return current_source_version(project, content_hash, provenance), f"{provenance.alias}-v{provenance.version}"
+
+
 def _heal_a_source(project: str, content_hash: str) -> bool:
     """Re-create a source version's snapshot from the clone of the bytes it was imported from (ADR-011 D1).
 
@@ -289,8 +302,11 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
     re-created snapshot.
 
     Only a clone that is gone as well makes the version unrecoverable, and then the error names the file that is
-    missing and the re-import that repairs it. Returns whether this entry is a source version, so the general path
-    can stop.
+    missing and the re-import that repairs it: the alias and version that hold the entry now (``_source_names``), so
+    the advised call re-imports into the version it names rather than minting an alias under the name the version
+    was imported as. When no source alias holds it there is no version to re-import into, and the error says what
+    an import of the same bytes would do instead. Returns whether this entry is a source version, so the general
+    path can stop.
     """
     from tallyman_core.catalog_state import project_lock
     from tallyman_xorq.build import BuildError
@@ -305,12 +321,22 @@ def _heal_a_source(project: str, content_hash: str) -> bool:
             return True
         clone = source_clone_path(project, provenance)
         if not clone.is_file():
+            held, imported = _source_names(project, content_hash, provenance)
+            lost = (
+                f"cannot be made again: {snapshot_path(project, content_hash)} is not on disk and neither is the "
+                f"clone of the imported bytes, {clone}."
+            )
+            if held is None:
+                raise BuildError(
+                    f"the data imported as {imported} (entry {content_hash}), which no source alias holds now, "
+                    f"{lost} Importing the same bytes again, catalog_import_source({provenance.path!r}, <alias>), "
+                    "writes these rows again as a new version of <alias>."
+                )
+            alias, version = held
+            also = "" if f"{alias}-v{version}" == imported else f", imported as {imported}"
             raise BuildError(
-                f"the data of {provenance.alias}-v{provenance.version} (entry {content_hash}) cannot be made "
-                f"again: {snapshot_path(project, content_hash)} is not on disk and neither is the clone of the "
-                f"imported bytes, {clone}. Import them again with "
-                f"catalog_import_source({provenance.path!r}, {provenance.alias!r}, "
-                f"pinned_version={provenance.version})."
+                f"the data of {alias}-v{version} (entry {content_hash}{also}) {lost} Import them again with "
+                f"catalog_import_source({provenance.path!r}, {alias!r}, pinned_version={version})."
             )
         digest = rewrite_source_snapshot(project, content_hash, provenance)
         perf_log.debug("ensure_materialized re-imported %s from %s", content_hash, clone.name)
@@ -358,8 +384,8 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
     A snapshot is pinned when it cannot be made again faithfully: the recipe is not reproducible (two runs at create
     time gave different digests), a heal already produced different rows than were built, or it is a source
     version whose clone of the imported bytes is gone (ADR-011 D1 — with the clone it is ordinary cache, made again
-    from those bytes). The Cache page's delete leaves such a file alone and says why. ``compute_cache/`` as a whole
-    is still deletable by definition.
+    from those bytes). The Cache page's delete leaves such a file alone and says why, naming a source version by the
+    alias that holds it now (``_source_names``). ``compute_cache/`` as a whole is still deletable by definition.
     """
     from tallyman_core import read_manifest
     from tallyman_core.errors import list_errors
@@ -373,9 +399,14 @@ def pinned_reason(project: str, content_hash: str) -> str | None:
     if manifest is not None and manifest.provenance is not None:
         clone = source_clone_path(project, manifest.provenance)
         if not clone.is_file():
+            held, imported = _source_names(project, content_hash, manifest.provenance)
+            if held is None:
+                name = f"the source version imported as {imported}, which no source alias holds now"
+            else:
+                current = f"{held[0]}-v{held[1]}"
+                name = f"the source version {current}" + ("" if current == imported else f" (imported as {imported})")
             return (
-                f"this file is the last copy of the source version {manifest.provenance.alias}-v"
-                f"{manifest.provenance.version}: the clone of the bytes imported from "
+                f"this file is the last copy of {name}: the clone of the bytes imported from "
                 f"{manifest.provenance.path} is gone from {clone}, so nothing can make it again and it is kept"
             )
     if manifest is not None and manifest.reproducible is False:

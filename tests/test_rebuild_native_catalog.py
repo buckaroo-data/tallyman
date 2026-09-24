@@ -231,3 +231,73 @@ def test_rebuild_replays_a_source_entry_as_an_import(project, tmp_path):
     pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
     assert pointers == set(remap.values())
     catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_toposort_orders_a_renamed_sources_versions_by_the_alias_that_holds_them(project):
+    """A source version follows the previous version of the alias that holds it now (ADR-011).
+
+    ``provenance["alias"]`` is the name the version was imported under. After a rename no alias has that name, so
+    ordering by it gave v1 and v2 no edge and left them in hash order. Here v2's hash sorts first, and hash order
+    would replay v2's bytes as the renamed alias's v1.
+    """
+    rb = _load_rebuild()
+    v1, v2 = "bbbbbbbbbbbb", "aaaaaaaaaaaa"
+    recipes = {v1: "# a source version\n", v2: "# a source version\n"}
+    provenance = {v1: {"alias": "a_src", "version": 1}, v2: {"alias": "a_src", "version": 2}}
+    history = {"renamed_src": [v1, v2]}
+
+    assert rb.toposort(recipes, {"renamed_src": v2}, history, provenance) == [v1, v2]
+
+
+def test_rebuild_replays_a_renamed_source_under_the_name_it_has_now(project, tmp_path):
+    """A renamed source is re-imported under its alias now, so a child reading that alias rebuilds (ADR-011).
+
+    Replaying under ``provenance["alias"]`` minted the import-time name, ``a_src``, and never made ``renamed_src``
+    until the final alias write, after every child had tried to build.
+    """
+    import pandas as pd
+    import pytest
+
+    from tallyman_core.aliases import SOURCE_KIND, load_kinds, rename_alias
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import update_and_depend
+
+    rb = _load_rebuild()
+    cs.genesis(project)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pd.DataFrame({"region": ["n", "s", "n"], "price": [1.0, 2.0, 3.0]}).to_parquet(src)
+    v1 = update_and_depend(src, "a_src", project=project)
+    pd.DataFrame({"region": ["n", "s", "e", "e"], "price": [1.0, 2.0, 3.0, 4.0]}).to_parquet(src)
+    v2 = update_and_depend(src, "a_src", project=project)
+    rename_alias(project, "a_src", "renamed_src")
+    child = build_and_persist(
+        project,
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias('renamed_src', {project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n",
+        prompt="count by region",
+    )
+    al.set_alias(project, "regions", child.content_hash)
+    cs.checkpoint_catalog(project, "corpus")
+    logged: list[str] = []
+
+    try:
+        remap = rb.rebuild_project(project, log=logged.append)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"the rebuild failed after a rename: {exc!r}")
+
+    assert remap[v1["hash"]] == v1["hash"] and remap[v2["hash"]] == v2["hash"]
+    assert load_kinds(project) == {"renamed_src": SOURCE_KIND, "regions": "catalog"}
+    assert al.history_for(project, "renamed_src") == [v1["hash"], v2["hash"]]
+    provenance = read_manifest(entry_dir(project, v1["hash"])).provenance
+    assert (provenance.alias, provenance.version) == ("renamed_src", 1)
+    # v1's outside path now holds v2's bytes, so v1 came from its clone, and the log says under which name.
+    assert any("renamed_src-v1" in line for line in logged), logged
+    assert len(cached_result_expr(project, remap[child.content_hash]).execute()) == 3
+
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == set(remap.values())
+    catalog.assert_catalog_consistent(project, pointers)

@@ -23,7 +23,9 @@ as it goes:
   file) is not re-exec'd at all — its generated recipe reads the very snapshot the
   rebuild just wiped, and a raw file read is a build error anywhere else. It is
   replayed through ``update_and_depend``, from the provenance path when that still
-  holds the imported bytes and from the clone under ``data/.cas`` when it does not.
+  holds the imported bytes and from the clone under ``data/.cas`` when it does not,
+  under the source alias that holds it now (a rename leaves ``provenance.alias``
+  naming the alias it was imported as) and pinned to its version there.
   Its hash is a function of the bytes and the reader options, so it is preserved;
 * recipes that chain by ALIAS (``tracked_expr_from_alias("citibike")``) survive untouched —
   the alias is re-pointed at the rebuilt parent before the child is built;
@@ -198,6 +200,7 @@ def parse_deps(
     history: dict[str, list[str]],
     known: set[str],
     provenance: dict | None = None,
+    kinds: dict[str, str] | None = None,
 ) -> set[str]:
     """The old hashes this recipe depends on, as the build resolved them.
 
@@ -208,13 +211,17 @@ def parse_deps(
     this very entry, a false self-cycle); otherwise it is the alias's current hash.
 
     A SOURCE entry reads nothing, but its versions are minted in order — ``update_and_depend``
-    refuses to skip one — so it depends on the previous version of its own alias.
+    refuses to skip one — so it depends on the previous version of the source alias that holds it
+    (``source_version_in``). That is not always ``provenance["alias"]``, the name it was imported as:
+    a rename moves the history to a new name and leaves the provenance behind.
     """
+    from tallyman_xorq.source_import import source_version_in  # noqa: PLC0415
+
     out: set[str] = set()
     if provenance:
-        hist = history.get(provenance["alias"], [])
-        if self_hash in hist and hist.index(self_hash) > 0:
-            out.add(hist[hist.index(self_hash) - 1])
+        held = source_version_in(history, kinds, self_hash, provenance["alias"])
+        if held is not None and held[1] > 1:
+            out.add(history[held[0]][held[1] - 2])
     for ref in _FROM_CAT_RE.findall(expr_text):
         if ref in aliases:
             hist = history.get(ref, [])
@@ -235,12 +242,13 @@ def toposort(
     aliases: dict[str, str],
     history: dict[str, list[str]] | None = None,
     provenance: dict[str, dict] | None = None,
+    kinds: dict[str, str] | None = None,
 ) -> list[str]:
     """Dependency order (parents before children) over the tracked_expr_from_alias graph."""
     history = history or {}
     provenance = provenance or {}
     known = set(recipes)
-    dmap = {h: parse_deps(t, h, aliases, history, known, provenance.get(h)) for h, t in recipes.items()}
+    dmap = {h: parse_deps(t, h, aliases, history, known, provenance.get(h), kinds) for h, t in recipes.items()}
     order: list[str] = []
     placed: set[str] = set()
     while len(placed) < len(recipes):
@@ -266,7 +274,14 @@ def rewrite_hash_refs(expr_text: str, remap: dict[str, str]) -> str:
     return _HASH_RE.sub(sub, expr_text)
 
 
-def replay_import(project: str, provenance: dict, *, prompt: str | None = None, log=print) -> str:
+def replay_import(
+    project: str,
+    provenance: dict,
+    *,
+    into: tuple[str, int] | None = None,
+    prompt: str | None = None,
+    log=print,
+) -> str:
     """Re-import a source version and return its content hash (ADR-011).
 
     A source entry cannot be re-exec'd: its generated recipe reads its own snapshot, which the rebuild
@@ -279,11 +294,25 @@ def replay_import(project: str, provenance: dict, *, prompt: str | None = None, 
     ``data/.cas``, which survives the rebuild because it lives under ``data/`` and only the catalog
     bookkeeping is wiped. Taking the clone changes the provenance path the rebuilt entry records (it
     then names the clone), which is logged; it changes nothing else.
+
+    *into* is ``(alias, version)``: the source alias that holds the version in the old catalog and
+    its place in that alias's history (``source_version_in``). The import goes under that alias,
+    which after a rename is not ``provenance["alias"]`` (the name it was imported as), and is pinned
+    to that version, so a replay out of order is an error instead of one version's bytes minted as
+    another's number. None when no source alias holds it: it goes under the name it was imported
+    as, unpinned, and the final alias write keeps that name only if the old catalog has it.
     """
     from tallyman_core.paths import data_dir  # noqa: PLC0415
     from tallyman_xorq import source_identity as si  # noqa: PLC0415
     from tallyman_xorq.ordered_copy import _spec_from_json  # noqa: PLC0415
     from tallyman_xorq.source_import import update_and_depend  # noqa: PLC0415
+
+    imported = f"{provenance['alias']}-v{provenance['version']}"
+    alias, version = into if into is not None else (provenance["alias"], None)
+    if into is None:
+        name = f"the version imported as {imported}, which no source alias holds"
+    else:
+        name = f"{alias}-v{version}" + ("" if f"{alias}-v{version}" == imported else f" (imported as {imported})")
 
     digest, suffix = provenance["digest"], provenance.get("suffix", "")
     original = Path(provenance["path"])
@@ -292,11 +321,11 @@ def replay_import(project: str, provenance: dict, *, prompt: str | None = None, 
         src = original
     elif clone.is_file():
         src = clone
-        log(f"  {provenance['alias']}-v{provenance['version']}: {original} is gone; re-importing from {clone.name}")
+        log(f"  {name}: {original} no longer holds the imported bytes; re-importing from {clone.name}")
     else:
         raise RuntimeError(
-            f"cannot rebuild {provenance['alias']}-v{provenance['version']}: {original} no longer has the "
-            f"imported bytes and their clone {clone} is missing, so there is nothing to import"
+            f"cannot rebuild {name}: {original} no longer has the imported bytes and their clone {clone} is "
+            "missing, so there is nothing to import"
         )
 
     reader = provenance["reader"]
@@ -304,7 +333,8 @@ def replay_import(project: str, provenance: dict, *, prompt: str | None = None, 
     options = dict(reader.get("scan_kwargs") or {}) if reader["kind"] == "csv" else {}
     out = update_and_depend(
         src,
-        provenance["alias"],
+        alias,
+        version,
         project=project,
         prompt=prompt,
         schema=schema,
@@ -330,11 +360,12 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
     from tallyman_core.post_processing import write_post_processing  # noqa: PLC0415
     from tallyman_core.summary_stats import write_stat  # noqa: PLC0415
     from tallyman_xorq import build_and_persist  # noqa: PLC0415
+    from tallyman_xorq.source_import import source_version_in  # noqa: PLC0415
 
     oc = read_old_catalog(project)
     if not oc.recipes:
         raise RuntimeError(f"no rebuildable entries (expr.py + manifest.json) found in project {project!r}")
-    order = toposort(oc.recipes, oc.aliases, oc.history, oc.provenance)
+    order = toposort(oc.recipes, oc.aliases, oc.history, oc.provenance, oc.kinds)
     log(
         f"project {project!r}: {len(oc.recipes)} entries ({len(oc.provenance)} imported sources), "
         f"{len(oc.aliases)} aliases, {len(oc.charts)} charts, "
@@ -381,8 +412,11 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
         prompts = oc.prompts.get(old_hash, [])
         first = prompts[0].get("prompt") if prompts else None
         provenance = oc.provenance.get(old_hash)
+        imported_into = None  # the alias an import pointed at the entry itself
         if provenance is not None:
-            new_hash = replay_import(project, provenance, prompt=first, log=log)
+            held = source_version_in(oc.history, oc.kinds, old_hash, provenance["alias"])
+            new_hash = replay_import(project, provenance, into=held, prompt=first, log=log)
+            imported_into = held[0] if held is not None else provenance["alias"]
         else:
             recipe = oc.recipes[old_hash].replace("${TALLYMAN_PROJECT_ROOT}", root)
             recipe = rewrite_hash_refs(recipe, remap)  # fix literal parent-hash refs
@@ -391,10 +425,11 @@ def rebuild_project(project: str, *, dry_run: bool = False, log=print) -> dict[s
         tag = "" if new_hash == old_hash else f"  (rehashed -> {new_hash})"
         log(f"  built {old_hash}{tag}")
         for name in revises_at.get(old_hash, []):
-            # An import already pointed its own alias, with the source kind; re-pointing it as a
-            # catalog alias would be refused (aliases.AliasKindMismatch).
-            if provenance is None:
-                al.set_alias(project, name, new_hash)
+            # The import already pointed the alias it went under. Any other alias that holds the entry
+            # is pointed here, with the kind it had: a second source alias over the same bytes has to
+            # be on this version before its own next version replays, pinned to follow it.
+            if name != imported_into:
+                al.set_alias(project, name, new_hash, kind=oc.kinds.get(name, al.CATALOG_KIND))
         if len(prompts) > 1:  # build wrote only the first; carry the rest
             p = prompts_path(project, new_hash)
             p.parent.mkdir(parents=True, exist_ok=True)

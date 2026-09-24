@@ -78,8 +78,8 @@ def test_search_times_out_without_caching(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("dups", _dup_rows(project, orders_src))
     h = _current_hash(project)
-    # Each budget check costs the whole 1s budget, so the search stops before
-    # its first query.
+    # Each query is charged the whole 1s budget, so the search stops before
+    # its second query.
     monkeypatch.setattr(pk, "_clock", _ticking_clock(1.0))
     with pytest.raises(TimeoutError, match="primary key search"):
         resolve_primary_key(project, h)

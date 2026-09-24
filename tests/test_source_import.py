@@ -1877,3 +1877,22 @@ def test_the_type_check_passes_every_type_the_read_takes(project: str, tmp_path:
 
     assert out["created"] is True
     assert [f["name"] for f in out["schema"]["fields"]] == [*table.column_names, ROW_ORDER]
+
+
+def test_a_failed_import_keeps_a_clone_another_entry_uses(project: str, tmp_path: Path, monkeypatch):
+    """#225's cleanup removes what the failed import wrote and nothing else. A CSV read two ways is two entries over
+    one clone (ADR-011 D12), so a second reading that fails must leave the first entry's clone, and its pin, alone."""
+    from tallyman_xorq import source_import
+    from tallyman_xorq.materialize import pinned_reason
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1), ("west", 2)])
+    first = source_import.update_and_depend(str(src), "orders")
+    before = _arena(project)
+
+    with pytest.raises(source_import.SourceImportError):
+        source_import.update_and_depend(str(src), "orders_typed", schema={"region": "int64", "n": "int64"})
+
+    assert _arena(project) == before
+    assert _clone_of(project, first).read_bytes() == src.read_bytes()
+    assert pinned_reason(project, first["hash"]) is None

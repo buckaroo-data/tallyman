@@ -34,11 +34,13 @@ editing the original file has no effect on any build.
 
 from __future__ import annotations
 
+import ast
 import contextvars
 import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import tempfile
 import uuid
@@ -300,8 +302,9 @@ def _plan_version(alias: str, history: list[str], content_hash: str, pinned_vers
             raise SourceImportError(
                 f"these bytes are already {alias}-v{already}, and {alias} is at v{head}. Version history is "
                 f"append-only: a v{head + 1} whose rows equal v{already}'s would make the version number meaningless. "
-                f"To put {alias} back on v{already}, reset the catalog to the revision before v{already + 1} "
-                f"(tallyman reset / catalog_reset_to). To read v{already} in a recipe without moving the head, use "
+                f"To put {alias} back on v{already}, reset the catalog to the revision before v{already + 1}, from "
+                "a shell (there is no MCP tool for it): `tallyman revisions` lists the steps, then "
+                f"`tallyman reset-to <step>`. To read v{already} in a recipe without moving the head, use "
                 f"pinned_expr_from_alias('{alias}-v{already}')."
             )
         return True, head + 1
@@ -465,9 +468,9 @@ def source_clone_path(project: str, provenance) -> Path:
     snapshot when it is deleted, and what ADR-005's suggestion-and-retry contract re-reads when a CSV was imported
     under the wrong schema, so the entry survives the outside file going away.
     """
-    from tallyman_core.paths import data_dir
+    from tallyman_xorq.source_identity import cas_path
 
-    return data_dir(project) / ".cas" / f"{provenance.digest}{provenance.suffix}"
+    return cas_path(project, provenance.digest, provenance.suffix)
 
 
 def import_call(path: str, alias: str | None, reader: dict, pinned_version: int | None = None) -> str:
@@ -490,6 +493,75 @@ def import_call(path: str, alias: str | None, reader: dict, pinned_version: int 
         if reader.get("scan_kwargs"):
             args.append(f"reader_options={reader['scan_kwargs']!r}")
     return f"catalog_import_source({', '.join(args)})"
+
+
+# What ``io._materialize_ordered`` raises when no rung of the inference ladder parses a CSV: the file it read (the
+# clone), polars' error, and the schema whole-file inference suggests, as a Python literal (ADR-005 D6).
+_LADDER_FAILURE = re.compile(
+    r"tallyman_read_csv: the schema does not parse [^:]*: (?P<polars>.*)\. "
+    r"Suggested schema \(whole-file inference\): schema=(?P<schema>.*)",
+    re.S,
+)
+_READER_PREFIX = "tallyman_read_csv: "
+
+
+def _read_failure(src: Path, alias: str, reader: dict, pinned_version: int | None, exc: Exception) -> SourceImportError:
+    """The error for a file the import's reader could not read, in terms of the import the caller made (#227).
+
+    The CSV reader's messages were written for ``tallyman_read_csv``, which a recipe may no longer call (ADR-011 D2),
+    and they name the file it read, which is the clone under ``data/.cas``. This names the caller's file and
+    ``catalog_import_source`` instead. For a parse failure it keeps polars' first paragraph, which names the value
+    and the column, and drops the advice after it, which is written in ``scan_csv``'s keywords and names
+    ``infer_schema_length`` and ``schema_overrides``, both refused by the import. It ends with the retry, the
+    schema whole-file inference suggests, as the ``catalog_import_source`` call to run (ADR-005 D7).
+    """
+    import polars as pl
+    from parsy import ParseError
+
+    from tallyman_xorq import ordered_copy as oc
+
+    text = str(exc)
+    ladder = _LADDER_FAILURE.fullmatch(text)
+    if ladder is not None:
+        polars = ladder["polars"].split("\n\n", 1)[0].strip()
+        try:
+            suggested = ast.literal_eval(ladder["schema"].strip())
+        except (ValueError, SyntaxError):
+            suggested = None
+        if suggested is not None:
+            retry = import_call(str(src), alias, oc.csv_reader(suggested, reader["scan_kwargs"]), pinned_version)
+            return SourceImportError(
+                f"catalog_import_source could not parse {src}: {polars}. Suggested schema (whole-file inference), "
+                f"as the import to run: {retry}."
+            )
+        text = f"{polars}."
+    elif text.startswith(_READER_PREFIX):
+        text = text[len(_READER_PREFIX) :]
+    elif isinstance(exc, pl.exceptions.PolarsError):  # raised outside the ladder: the header scan, an empty file
+        text = text.split("\n\n", 1)[0].strip()
+    elif isinstance(exc, ParseError):
+        text = f"the type {exc.stream!r} in the schema is not a type name ({exc})."
+    elif isinstance(exc, TypeError) and reader.get("scan_kwargs"):
+        text = f"reader_options={reader['scan_kwargs']!r} are polars.scan_csv options, and polars refused them: {exc}"
+    what = "as a parquet file" if reader["kind"] == "parquet" else "as a CSV"
+    return SourceImportError(f"catalog_import_source could not read {src} {what}: {text}")
+
+
+def _clone_verified(
+    project: str, src: Path, digest: str, suffix: str, *, alias: str, reader: dict, pinned_version: int | None
+) -> Path:
+    """Write the clone of *src* if it is missing, and verify it against *digest* (ADR-011 D9).
+
+    A copy that does not hash to its name, because the file changed while it was copied, is an import error that
+    names the caller's file and the call to run again (#227). ``CloneDigestMismatch`` is a ValueError, and no handler
+    of the MCP tool expected one.
+    """
+    from tallyman_xorq import source_identity as si
+
+    try:
+        return si.ensure_cas_path(project, src, digest, suffix)
+    except si.CloneDigestMismatch as exc:
+        raise SourceImportError(f"{exc} To try again: {import_call(str(src), alias, reader, pinned_version)}.") from exc
 
 
 def rewrite_source_snapshot(project: str, content_hash: str, provenance) -> str:
@@ -535,9 +607,17 @@ def _mint(
     content_hash: str,
     alias: str,
     version: int,
+    pinned_version: int | None,
     prompt: str | None,
 ) -> dict:
-    """Write the entry, its snapshot and its clone. Returns ``{"row_count", "schema"}``."""
+    """Write the entry, its snapshot and its clone. Returns ``{"row_count", "schema"}``.
+
+    A failure removes what this call wrote and nothing else (#225): the entry directory when it made it, and the
+    clone and the snapshot when they were not on disk before it. A clone already there can be another entry's, since
+    a CSV read two ways is two entries over one clone (ADR-011 D12), and a snapshot already there holds exactly these
+    rows: it is the one a reset left (#193). The caller holds the project lock, so nothing else writes these paths
+    meanwhile. *pinned_version* is the caller's, for the retry an error prints.
+    """
     import pyarrow.parquet as pq
 
     from tallyman_core import (
@@ -558,39 +638,52 @@ def _mint(
     from tallyman_xorq.source_cache import rewrite_for_build
     from tallyman_xorq.worthiness import Verdict
 
-    # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
-    clone = si.ensure_cas_path(project, outside_path, digest)
-
-    # 2. The one snapshot, named by the entry hash. An existing one is kept: the hash is a function of the bytes and
-    #    the reader, so it already holds exactly these rows.
+    clone = si.cas_path(project, digest, outside_path.suffix)
     snapshot = snapshot_path(project, content_hash)
-    if snapshot.exists():
-        from tallyman_xorq.digest import content_digest
-
-        result_digest = content_digest(snapshot)
-    else:
-        result_digest = _write_snapshot(clone, reader, snapshot)
-    arrow_schema = pq.read_schema(snapshot)
-    row_count = pq.ParquetFile(snapshot).metadata.num_rows
-
-    # 3. The entry: a generated recipe, its frozen build, a schema and a manifest.
-    install_git_state_guard()
-    code = _recipe(outside_path, alias, version, digest, reader)
-    token = in_source_recipe(project, content_hash)
+    target = entry_dir(project, content_hash)
+    created = not target.exists()  # a directory a crash left without a manifest is not this call's to remove
+    absent = [path for path in (clone, snapshot) if not path.exists()]
     try:
-        module, tmp_script = _import_script(code)
-    finally:
-        release_source_recipe(token)
-    try:
-        expr = getattr(module, "expr", None)
-        if expr is None:
-            raise BuildError(f"the generated recipe of {alias}-v{version} bound no 'expr'")
-        target = entry_dir(project, content_hash)
-        # A re-import that repairs a missing snapshot writes into an entry that already exists; a failure must not
-        # take that entry with it.
-        created = not target.exists()
-        target.mkdir(parents=True, exist_ok=True)
+        # 1. The bytes, as imported, into the arena. ensure_cas_path digests what it wrote (ADR-011 D9).
+        _clone_verified(
+            project,
+            outside_path,
+            digest,
+            outside_path.suffix,
+            alias=alias,
+            reader=reader,
+            pinned_version=pinned_version,
+        )
+
+        # 2. The one snapshot, named by the entry hash. An existing one is kept: the hash is a function of the bytes
+        #    and the reader, so it already holds exactly these rows.
+        if snapshot.exists():
+            from tallyman_xorq.digest import content_digest
+
+            result_digest = content_digest(snapshot)
+        else:
+            try:
+                result_digest = _write_snapshot(clone, reader, snapshot)
+            except OSError:
+                raise
+            except Exception as exc:  # the reader's own errors: polars', parsy's, the schema DSL's (#227)
+                raise _read_failure(outside_path, alias, reader, pinned_version, exc) from exc
+        arrow_schema = pq.read_schema(snapshot)
+        row_count = pq.ParquetFile(snapshot).metadata.num_rows
+
+        # 3. The entry: a generated recipe, its frozen build, a schema and a manifest.
+        install_git_state_guard()
+        code = _recipe(outside_path, alias, version, digest, reader)
+        token = in_source_recipe(project, content_hash)
         try:
+            module, tmp_script = _import_script(code)
+        finally:
+            release_source_recipe(token)
+        try:
+            expr = getattr(module, "expr", None)
+            if expr is None:
+                raise BuildError(f"the generated recipe of {alias}-v{version} bound no 'expr'")
+            target.mkdir(parents=True, exist_ok=True)
             from xorq.ibis_yaml.compiler import build_expr
 
             ordered = rewrite_for_build(expr, project, verdict=Verdict(True, _WORTHY_WHY))
@@ -638,15 +731,17 @@ def _mint(
                     ),
                 ),
             )
-        except Exception:
-            if created:
-                shutil.rmtree(target, ignore_errors=True)
-            raise
-    finally:
-        import sys
+        finally:
+            import sys
 
-        sys.modules.pop(getattr(module, "__name__", "") or "", None)
-        tmp_script.unlink(missing_ok=True)
+            sys.modules.pop(getattr(module, "__name__", "") or "", None)
+            tmp_script.unlink(missing_ok=True)
+    except BaseException:
+        if created:
+            shutil.rmtree(target, ignore_errors=True)
+        for path in absent:
+            path.unlink(missing_ok=True)
+        raise
     perf_log.info("import %s-v%s -> %s (%s rows, %s)", alias, version, content_hash, row_count, outside_path)
     return {"row_count": row_count, "schema": schema_doc}
 
@@ -701,13 +796,16 @@ def update_and_depend(
 
     Returns:
         ``{"alias", "version", "hash", "created", "path", "digest", "row_count", "schema"}``. ``created`` is False
-        when the import was a no-op. An import of bytes that are already an entry rewrites nothing of that entry; if
-        its snapshot is gone it is healed from the clone and checked against the recorded digest, exactly as
-        ``ensure_materialized`` heals one, so a repair is never a way to change a version's rows.
+        when the import was a no-op. An import of bytes that are already an entry rewrites nothing of that entry. If
+        its clone is gone, the caller's bytes restore it; if its snapshot is gone it is healed from the clone and
+        checked against the recorded digest, exactly as ``ensure_materialized`` heals one, so a repair is never a way
+        to change a version's rows.
 
     Raises:
-        SourceImportError: for every row of the table above that is an error, and for a path that is not an importable
-            file.
+        SourceImportError: for every row of the table above that is an error, for a path that is not an importable
+            file, and for a file the import cannot read: a parquet column xorq has no type for, a CSV polars cannot
+            parse under the given options, or a copy that does not match its digest. A failed import leaves on disk
+            nothing it wrote.
     """
     from tallyman_core import ensure_project, resolve_project
     from tallyman_core.aliases import SOURCE_KIND, alias_kind, history_for, set_alias, validate_alias_name
@@ -762,19 +860,22 @@ def update_and_depend(
                 content_hash=content_hash,
                 alias=alias,
                 version=version,
+                pinned_version=pinned_version,
                 prompt=prompt,
             )
         else:
             # The entry exists, and its recipe, build and manifest are the record of the import that minted it: an
-            # import of the same bytes, as a repair or under a new alias, rewrites none of them. A missing snapshot
-            # is healed the way ensure_materialized heals any source snapshot, from the clone and checked against
+            # import of the same bytes, as a repair or under a new alias, rewrites none of them. A missing clone is
+            # restored from the caller's bytes, at the path the entry names, and verified against the digest (D9):
+            # without it the snapshot is the last copy of the rows and stays pinned (#239). A missing snapshot is
+            # then healed the way ensure_materialized heals any source snapshot, from the clone and checked against
             # the recorded result_digest, so a reader that now parses the bytes differently is recorded as an
-            # unfaithful heal instead of becoming the version's rows. The caller's bytes restore the clone first
-            # when it is gone too; ensure_cas_path verifies them against the digest (D9).
+            # unfaithful heal instead of becoming the version's rows.
+            suffix = existing.provenance.suffix if existing.provenance is not None else src.suffix
+            _clone_verified(proj, src, digest, suffix, alias=alias, reader=reader, pinned_version=pinned_version)
             if not snapshot_path(proj, content_hash).exists():
                 from tallyman_xorq.materialize import ensure_materialized
 
-                si.ensure_cas_path(proj, src, digest)
                 ensure_materialized(proj, content_hash)
             from tallyman_core import entry_schema_path
 

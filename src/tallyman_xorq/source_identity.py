@@ -80,16 +80,23 @@ def _clone(src: Path, dst: Path) -> None:
     shutil.copy2(src, dst)
 
 
-def ensure_cas_path(project: str, src: Path, digest: str) -> Path:
+def cas_path(project: str, digest: str, suffix: str) -> Path:
+    """Where the clone of the bytes named *digest* lives: ``data/.cas/<digest><suffix>``."""
+    return data_dir(project) / ".cas" / f"{digest}{suffix}"
+
+
+def ensure_cas_path(project: str, src: Path, digest: str, suffix: str | None = None) -> Path:
     """The clone of *src* named by *digest*, written if it is not there yet, and verified before it is published.
 
     The digest is computed before the copy, so a file edited mid-copy would otherwise leave a clone whose name lies
     about its content — and that clone is the only frozen record of what an entry was built from. The written bytes
     are re-digested and a mismatch raises ``CloneDigestMismatch`` rather than publishing the file (ADR-011 D9).
+
+    *suffix* defaults to *src*'s own. A repair passes the one its entry recorded, since the same bytes can arrive
+    from a file with another suffix (``.pq`` for ``.parquet``) and the entry names the clone it was minted with.
     """
-    cas_dir = data_dir(project) / ".cas"
-    cas_dir.mkdir(parents=True, exist_ok=True)
-    dst = cas_dir / f"{digest}{src.suffix}"
+    dst = cas_path(project, digest, src.suffix if suffix is None else suffix)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     if not dst.exists():
         # A unique temp name (not a fixed <digest>.tmp): two builders cloning one source at once must not share one.
         tmp = dst.with_name(f"{dst.name}.{uuid.uuid4().hex}.tmp")

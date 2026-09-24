@@ -615,19 +615,25 @@ def catalog_import_source(
             schema=schema,
             **(reader_options or {}),
         )
-    except (SourceImportError, BuildError, OSError) as exc:
-        rec = record_error(project, code="", message=str(exc), prompt=prompt or None, tool="catalog_import_source")
+    except Exception as exc:  # every failure is recorded and answered with an error_id, as the other tools do (#227)
+        expected = isinstance(exc, (SourceImportError, BuildError, OSError))
+        message = str(exc) if expected else f"{type(exc).__name__}: {exc}"
+        tb = traceback.format_exc()
+        rec = record_error(
+            project, code="", message=message, prompt=prompt or None, tool="catalog_import_source", traceback=tb
+        )
         record_event(
             project,
             "build_error",
             session=SESSION_ID,
             tool="catalog_import_source",
             prompt=prompt or None,
-            message=str(exc),
+            message=message,
+            traceback=tb,
             error_id=rec["id"],
         )
         _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
-        return {"error": str(exc), "error_id": rec["id"]}
+        return {"error": message, "error_id": rec["id"]}
 
     out["url"] = _entry_url(project, out["hash"])
     if not out["created"]:

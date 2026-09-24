@@ -54,8 +54,7 @@ from tallyman_core import (
     entry_stat_cache_dir,
     entry_view_build_dir,
 )
-from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import artifacts_dir, entry_manifest_path, project_dir
+from tallyman_core.paths import artifacts_dir, project_dir
 from tallyman_xorq.row_order import ROW_ORDER
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -480,13 +479,9 @@ class BuckarooManager:
         return self.load_session(content_hash, project, column_config_overrides)["session_id"]
 
     def _load_timeout(self, project: str, content_hash: str) -> float:
-        row_count = 0
-        mpath = entry_manifest_path(project, content_hash)
-        if mpath.exists():
-            try:
-                row_count = read_manifest(mpath.parent).row_count or 0
-            except Exception:
-                pass
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+        row_count = entry_manifest(project, content_hash).row_count or 0
         return 10.0 + row_count / 1_000_000
 
     def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None) -> dict:

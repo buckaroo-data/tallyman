@@ -49,7 +49,7 @@ from tallyman_xorq import (
     read_prompts,
 )
 from tallyman_xorq.primary_key import PrimaryKeySearchTimeout, diff_keys
-from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.result_cache import cached_result_expr, entry_manifest
 from tallyman_xorq.row_order import page as row_order_page
 
 log = logging.getLogger("tallyman.companion")
@@ -125,21 +125,6 @@ def _require_hash(content_hash: str) -> None:
     """
     if not _CONTENT_HASH_RE.match(content_hash):
         raise HTTPException(400, f"malformed content hash {content_hash!r}")
-
-
-def _require_manifest(project: str, content_hash: str):
-    """The entry's manifest, or a 404 that says why there is none and names the rebuild.
-
-    A directory without a manifest is what a build or import that did not finish leaves, and it is not an entry
-    (ADR-007 D6), so every route that reads one entry refuses it the same way (#204).
-    """
-    from tallyman_xorq.build import NotAnEntryError  # noqa: PLC0415
-    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
-
-    try:
-        return entry_manifest(project, content_hash)
-    except NotAnEntryError as exc:
-        raise HTTPException(404, str(exc)) from exc
 
 
 def _fmt_bytes(n: int) -> str:
@@ -230,14 +215,11 @@ def _snapshot_cache_path(project: str, content_hash: str):
     content hash and the manifest's ``cache_worthy``). It loads and writes
     nothing, so a worthy entry whose file was deleted reports an absent (0 B)
     snapshot rather than being forced to materialise just because someone opened
-    the metadata tab.
+    the metadata tab. An entry without a manifest raises (#204).
     """
-    try:
-        from tallyman_xorq.result_cache import baked_snapshot_path  # noqa: PLC0415
+    from tallyman_xorq.result_cache import baked_snapshot_path  # noqa: PLC0415
 
-        path = baked_snapshot_path(project, content_hash)
-    except Exception as exc:  # noqa: BLE001 — best-effort sizing, never 500 the tab
-        return True, None, f"snapshot path unresolved: {type(exc).__name__}"
+    path = baked_snapshot_path(project, content_hash)
     if path is None:
         return False, None, "cheap entry — a small plan over files that exist, no snapshot"
     return True, path, ""
@@ -349,12 +331,9 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     diff_cache_bytes = sum(d["bytes"] for d in diff_caches)
 
     total_bytes = cache_bytes + artifact_bytes + diff_cache_bytes
-    try:
-        from tallyman_xorq.result_cache import cache_worthy as _cw  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cache_worthy as _cw  # noqa: PLC0415
 
-        worthy = _cw(project, content_hash)
-    except Exception:  # noqa: BLE001
-        worthy = False
+    worthy = _cw(project, content_hash)
 
     # Enrichment (#134): the recipe's raw source files, last-modified, the
     # cheap/expensive reason, and clickable lineage (parents + dependent
@@ -364,11 +343,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
 
     from tallyman_xorq.dependents import dependents_index, parents_of  # noqa: PLC0415
 
-    manifest: dict = {}
-    try:
-        manifest = json.loads((entry / "manifest.json").read_text())
-    except (OSError, ValueError):
-        pass
+    manifest = json.loads((entry / "manifest.json").read_text())
 
     # The raw bytes this entry holds, which is a question only a source version has an answer to
     # (ADR-011 D6: a computed entry reads aliases, never a file). For one it is the clone of the
@@ -945,9 +920,9 @@ def create_app(
         # the user's keys and then ``__row_order``, so the same request returns the same rows in any process and any
         # cache state. cached_result_expr hands back the result as a live single-backend expression over files that
         # exist (ensure_materialized ran first), so the window pushes down and nothing is written here. total is the
-        # manifest's row_count, recorded at build. The manifest is written after the build dir exists (build.py), so a
-        # build that did not finish leaves a directory without one, which is not an entry: 404 with the rebuild (#204).
-        total = _require_manifest(project, content_hash).row_count or 0
+        # manifest's row_count, recorded at build. An entry directory without a manifest is corrupt, and this raises
+        # (#204).
+        total = entry_manifest(project, content_hash).row_count or 0
         # The page runs on the process's shared backend, one execution at a time (#118). cached_result_expr may heal,
         # and a heal takes the project lock, which comes before the execution lock, so it runs first.
         expr = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit)
@@ -1002,7 +977,6 @@ def create_app(
         entry = entry_dir(project, content_hash)
         if not entry.exists():
             raise HTTPException(404, f"entry {content_hash!r} not found")
-        _require_manifest(project, content_hash)
 
         manifest = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
         schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
@@ -1090,7 +1064,6 @@ def create_app(
             _require_hash(content_hash)
         if not entry_dir(project, content_hash).exists():
             raise HTTPException(404, f"entry {content_hash!r} not found")
-        _require_manifest(project, content_hash)
         return _compute_entry_cache(project, content_hash)
 
     @app.get("/{project}/api/session/{content_hash}")
@@ -1158,11 +1131,10 @@ def create_app(
             buckaroo_session = None
             if latest is not None:
                 entry = entry_dir(project, latest)
-                if (entry / ENTRY_MANIFEST_FILENAME).exists():
-                    entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
-                    schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                    # #73: row count from the manifest, not a result.parquet.
-                    total_rows = entry_meta.get("row_count", 0)
+                entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
+                schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
+                # #73: row count from the manifest, not a result.parquet.
+                total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)

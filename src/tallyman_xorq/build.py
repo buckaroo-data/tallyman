@@ -102,14 +102,6 @@ class BuildError(RuntimeError):
     pass
 
 
-class NotAnEntryError(BuildError):
-    """A read of a hash whose directory is not an entry: it has no manifest, or there is no directory (#204).
-
-    The manifest is an entry's last write, so a directory without one is what a build or an import that did not
-    finish leaves (ADR-007 D6). ``result_cache.entry_manifest`` raises it, and the message names the rebuild.
-    """
-
-
 def _user_imports_bare_ibis(code: str) -> bool:
     """True if the user code imports the real `ibis` package directly.
 

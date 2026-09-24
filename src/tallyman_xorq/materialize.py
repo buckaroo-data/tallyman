@@ -280,7 +280,7 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
     by recursing on it. A source's ordered copy was the second class and is gone — a source is an entry,
     so its rows come back through this same path (``_heal_a_source`` under ``_ensure``), ADR-011 D1.
     """
-    from tallyman_xorq.build import BuildError, NotAnEntryError
+    from tallyman_xorq.build import BuildError
 
     if path.parent == snapshots_dir(project):
         from tallyman_core.paths import entry_dir
@@ -291,13 +291,7 @@ def _recreate(project: str, owner_hash: str, path: Path) -> None:
                 f"entry {owner_hash} in {project!r} reads the snapshot of entry {parent}, which is not in this "
                 "catalog, so it cannot be made again"
             )
-        try:
-            ensure_materialized(project, parent)
-        except NotAnEntryError as exc:
-            raise NotAnEntryError(
-                f"entry {owner_hash} in {project!r} reads the snapshot of entry {parent}, which cannot be made again: "
-                f"{exc}"
-            ) from exc
+        ensure_materialized(project, parent)
     else:
         raise BuildError(
             f"entry {owner_hash} in {project!r} reads {path}, which tallyman did not write and cannot make again"
@@ -415,9 +409,7 @@ def ensure_materialized(project: str, content_hash: str) -> None:
     Every caller that composes or executes an entry goes through here, so nothing ever runs over a file that is
     missing. When nothing can make a file again, the error names the source file.
 
-    A directory without a manifest is not an entry (ADR-007 D6), and it is refused before anything is loaded or
-    written (``NotAnEntryError``, #204): without the manifest there is no verdict, and no digest to check a heal
-    against.
+    An entry directory without a manifest is corrupt, and this raises before anything is loaded or written (#204).
     """
     _ensure(project, content_hash)
 

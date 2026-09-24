@@ -5,21 +5,28 @@ action), D5 (the verify sweep is not a caller of ``ensure_materialized``) and D1
 file whose entry is not in the catalog), and for ``plans/ADR-009-digest-stability.md`` D6 (an entry whose recipe is not
 reproducible has its file pinned, and the Cache page's delete skips it and says why).
 
+A pin has to hold wherever the page offers a delete: after a reset retires the entry (#195), after the error banner is
+dismissed (#196), and across a reset back and forward (#194). That goes for a source version too (ADR-011 D1, a raw
+input is an entry), whose snapshot a heal writes again from the clone of its imported bytes.
+
 The Cache page is ``GET /{project}/api/result_cache`` and ``DELETE /{project}/api/result_cache/{hash}``.
 """
 
 from __future__ import annotations
 
+import json
 import shutil
+from pathlib import Path
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 from fastapi.testclient import TestClient
 
 from tallyman_companion import create_app
+from tallyman_core import catalog_state as cs
 from tallyman_core import entry_dir, read_manifest
 from tallyman_core.errors import list_errors, record_error
-from tallyman_core.paths import compute_cache_dir
+from tallyman_core.paths import compute_cache_dir, errors_path
 from tallyman_xorq import build_and_persist
 from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, snapshot_file_digest
 
@@ -67,6 +74,41 @@ def _cache_rows(client: TestClient, project: str) -> dict[str, dict]:
     r = client.get(f"/{project}/api/result_cache")
     assert r.status_code == 200, r.text
     return {row["hash"]: row for row in r.json()["entries"]}
+
+
+def _unfaithful_heals(project: str) -> list[str]:
+    return [e["hash"] for e in list_errors(project, limit=1_000_000) if e.get("code") == "unfaithful_heal"]
+
+
+def _heal_unfaithfully(project: str, content_hash: str) -> Path:
+    """Make the next heal of a reproducible entry unfaithful by construction, and run it: the recorded digest is
+    replaced by one no heal can match (as ``tests/test_snapshot_format.py`` does), the snapshot is deleted, and the
+    entry is read. Returns the snapshot's path."""
+    path = entry_dir(project, content_hash) / "manifest.json"
+    doc = json.loads(path.read_text())
+    doc["result_digest"] = "arrow-sha256:" + "0" * 64
+    path.write_text(json.dumps(doc, indent=2))
+    snap = baked_snapshot_path(project, content_hash)
+    assert snap is not None and snap.exists()
+    snap.unlink()
+    cached_result_expr.cache_clear()
+
+    cached_result_expr(project, content_hash)
+
+    assert snap.exists()
+    assert _unfaithful_heals(project) == [content_hash]
+    return snap
+
+
+def _import_outside(project: str, tmp_path: Path, alias: str) -> dict:
+    """Import a small parquet file from outside the project as *alias*, and return ``update_and_depend``'s result."""
+    from tallyman_xorq import source_import
+
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / f"{alias}.parquet"
+    pq.write_table(pa.table({"region": ["e", "w", "e"], "price": [1.0, 2.0, 3.0]}), src)
+    return source_import.update_and_depend(str(src), alias, project=project)
 
 
 # ---------------------------------------------------------------------------
@@ -154,22 +196,67 @@ def test_a_non_reproducible_entry_is_pinned_and_its_delete_is_refused(project, o
     assert snap.exists(), "the delete removed the file of an entry that cannot be recreated"
 
 
-def test_an_entry_with_an_unfaithful_heal_record_is_pinned(project, orders_src):
+def test_an_unfaithful_heal_pins_the_snapshot_and_dismissing_the_error_banner_leaves_it_pinned(project, orders_src):
     """ADR-007 D12 and ADR-006 D12 (unfaithful entries are pinned and badged): a heal that wrote different rows than
-    were built leaves an ``unfaithful_heal`` record in ``errors.jsonl``. That record is what pins the entry, so the
-    Cache page's delete refuses it as it refuses an entry that was found not reproducible at creation."""
+    were built pins the snapshot, so the Cache page's delete refuses it as it refuses an entry that was found not
+    reproducible at creation. The pin used to be the ``unfaithful_heal`` record in ``errors.jsonl``, and the banner's
+    dismiss deletes that file, so after a dismiss the page deleted the snapshot and the next read healed it again
+    (#196). The record stays, for the banner; the pin is one of the entry's durable facts."""
     h = build_and_persist(project, _agg_code(project)).content_hash
-    snap = baked_snapshot_path(project, h)
-    assert snap is not None and snap.exists()
-    record_error(project, code="unfaithful_heal", message="self-heal produced different bytes", hash=h)
+    snap = _heal_unfaithfully(project, h)
     client = TestClient(create_app(project))
+
+    assert client.delete(f"/{project}/api/errors").status_code == 200  # the banner's dismiss
+    assert _unfaithful_heals(project) == []
 
     row = _cache_rows(client, project)[h]
     assert row.get("pinned") is True, row
     assert row.get("pinned_reason"), row
-
-    assert client.delete(f"/{project}/api/result_cache/{h}").status_code == 409
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 409, response.text
     assert snap.exists()
+
+
+def test_an_unfaithful_heal_of_a_source_snapshot_stays_pinned_after_the_banner_is_dismissed(project, tmp_path):
+    """#196 for a source version (ADR-011 D1). Its heal writes the snapshot again from the clone of the imported bytes
+    and is verified like any other (``materialize._heal_a_source``), so an unfaithful one pins the file, and the
+    banner's dismiss must not lift that pin."""
+    h = _import_outside(project, tmp_path, "orders")["hash"]
+    snap = _heal_unfaithfully(project, h)
+    client = TestClient(create_app(project))
+
+    assert client.delete(f"/{project}/api/errors").status_code == 200  # the banner's dismiss
+
+    row = _cache_rows(client, project)[h]
+    assert row.get("pinned") is True, row
+    assert "heal" in (row.get("pinned_reason") or ""), row
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 409, response.text
+    assert snap.exists()
+
+
+def test_the_pin_of_an_unfaithful_heal_survives_a_reset_back_and_forward(project, orders_src):
+    """#194 and #196 together. A reset forward restores an entry's dir by copying it out of the bullpen, which keeps
+    its copy, so a heal of the restored entry changes the live manifest while the parked one stays as it was. The next
+    reset back has to park the live dir, or the pin recorded with it is lost and the Cache page deletes the file."""
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "s0")
+    h = build_and_persist(project, _agg_code(project)).content_hash
+    s1 = cs.checkpoint_catalog(project, "s1")
+    cs.reset_to(project, s0)
+    cs.reset_to(project, s1)  # the entry's dir is copied back, and the bullpen keeps its copy
+    snap = _heal_unfaithfully(project, h)
+    client = TestClient(create_app(project))
+    assert client.delete(f"/{project}/api/errors").status_code == 200  # the banner's dismiss
+
+    for step in (s0, s1):
+        cs.reset_to(project, step)
+
+        row = _cache_rows(client, project)[h]
+        assert row.get("pinned") is True, f"after the reset to step {step}: {row}"
+        response = client.delete(f"/{project}/api/result_cache/{h}")
+        assert response.status_code == 409, f"after the reset to step {step}: {response.text}"
+        assert snap.exists()
 
 
 def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_deleted(project, orders_src):
@@ -194,6 +281,127 @@ def test_a_snapshot_whose_entry_is_not_in_the_catalog_is_listed_and_can_be_delet
 
     assert response.status_code == 200, response.text
     assert not orphan.exists()
+
+
+def test_a_reset_back_keeps_the_pin_of_a_non_reproducible_entrys_snapshot(project, orders_src):
+    """#195: after a reset to an earlier step, the entry's dir is in the bullpen and its snapshot is still on disk
+    (ADR-007 D14). The parked manifest still says the recipe is not reproducible, so the file stays pinned, the delete
+    answers 409, and a reset forward finds the rows that were built. The row used to be an unpinned orphan whose delete
+    removed the only copy, and the next read after a reset forward healed it to different rows."""
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "s0")
+    h = build_and_persist(project, _nonreproducible_code(project)).content_hash
+    s1 = cs.checkpoint_catalog(project, "s1")
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    built = read_manifest(entry_dir(project, h)).result_digest
+    cs.reset_to(project, s0)
+    assert not entry_dir(project, h).exists() and snap.exists()
+    client = TestClient(create_app(project))
+
+    row = _cache_rows(client, project)[h]
+    assert row.get("pinned") is True, row
+    assert "reproducible" in (row.get("pinned_reason") or "").lower(), row
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 409, response.text
+    assert "reproducible" in response.json()["detail"].lower()
+    assert snap.exists()
+
+    cs.reset_to(project, s1)
+    cached_result_expr(project, h)
+    assert snapshot_file_digest(snap) == built
+    assert _unfaithful_heals(project) == []
+
+
+def test_a_snapshot_whose_entry_a_reset_retired_is_labelled_retired_not_orphan(project, orders_src):
+    """#195: the Cache page tells a file whose entry a reset retired (its dir is parked in the bullpen, and a reset
+    forward brings it back) from an orphan, a file no entry names. The retired row carries what its parked manifest
+    records, and a reproducible entry's file is not pinned, so it can still be deleted."""
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "s0")
+    h = build_and_persist(project, _agg_code(project), prompt="sales by region").content_hash
+    assert cs.checkpoint_catalog(project, "s1") is not None
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    cs.reset_to(project, s0)
+    client = TestClient(create_app(project))
+
+    row = _cache_rows(client, project)[h]
+
+    assert row.get("retired") is True, row
+    assert row.get("orphan") is False, row
+    assert row.get("prompt") == "sales by region", row
+    assert row.get("pinned") is False, row
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 200, response.text
+    assert not snap.exists()
+
+
+def test_a_retired_source_versions_snapshot_is_not_pinned_while_its_clone_is_parked(project, tmp_path):
+    """#195 for a source version (ADR-011 D1). A reset back to a step before the import parks the source entry's dir
+    and the clone of its bytes in the bullpen, and leaves its snapshot (ADR-007 D14). A reset forward brings both back,
+    and the heal writes the snapshot again from the clone, so the file is cache: listed as retired, not pinned, and
+    deletable. Reading the entry after the reset forward writes the same rows again."""
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "s0")
+    h = _import_outside(project, tmp_path, "orders")["hash"]
+    s1 = cs.checkpoint_catalog(project, "s1")
+    built = read_manifest(entry_dir(project, h)).result_digest
+    snap = baked_snapshot_path(project, h)
+    assert snap is not None and snap.exists()
+    cs.reset_to(project, s0)
+    assert not entry_dir(project, h).exists() and snap.exists()
+    client = TestClient(create_app(project))
+
+    row = _cache_rows(client, project)[h]
+    assert row.get("retired") is True, row
+    assert row.get("orphan") is False, row
+    assert row.get("pinned") is False, row
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 200, response.text
+    assert not snap.exists()
+
+    cs.reset_to(project, s1)
+    cached_result_expr.cache_clear()
+    assert len(cached_result_expr(project, h).execute()) == 3
+    assert snapshot_file_digest(snap) == built
+    assert _unfaithful_heals(project) == []
+
+
+def test_a_corrupt_line_in_the_error_log_breaks_neither_the_listing_nor_the_delete(project, orders_src):
+    """#196: one line of ``errors.jsonl`` that is not JSON (a torn append, a hand edit) made the listing and the
+    delete answer 500, since the pin check parsed every line of the log with no guard."""
+    h = build_and_persist(project, _agg_code(project)).content_hash
+    record_error(project, code="x", message="before the torn line")
+    with errors_path(project).open("a") as fh:
+        fh.write('{"id": "torn", "code": \n')
+    client = TestClient(create_app(project), raise_server_exceptions=False)
+
+    listing = client.get(f"/{project}/api/result_cache")
+    assert listing.status_code == 200, listing.text
+    assert h in {row["hash"] for row in listing.json()["entries"]}
+    response = client.delete(f"/{project}/api/result_cache/{h}")
+    assert response.status_code == 200, response.text
+
+
+def test_the_listing_does_not_parse_the_error_log_once_per_row(project, orders_src, monkeypatch):
+    """#196: the pin check read and parsed the whole of ``errors.jsonl`` once for every row the Cache page lists."""
+    import tallyman_core.errors as errors_module
+
+    build_and_persist(project, _agg_code(project))
+    build_and_persist(project, _second_agg_code(project))
+    parses = []
+    real = errors_module.list_errors
+
+    def counting(*args, **kwargs):
+        parses.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(errors_module, "list_errors", counting)
+    client = TestClient(create_app(project))
+
+    assert len(_cache_rows(client, project)) == 3  # the two entries and the orders_src source version
+    assert len(parses) <= 1, f"listing 3 rows parsed the error log {len(parses)} times"
 
 
 def test_a_normal_snapshot_can_still_be_deleted_and_the_next_read_re_creates_and_verifies_it(project, orders_src):

@@ -13,6 +13,9 @@ unlinks a clone that no surviving entry refers to) and the forward reset restore
 Snapshots under ``compute_cache/`` were pruned and copied back by a second, non-atomic writer, driven by the
 git-tracked list ``compute_cache.jsonl``; the design retires that list and lets a snapshot that is missing be healed
 and verified like any other (ADR-007 D5).
+
+Because the snapshot stays and a create always rewrites it, a reset also has to keep the entry dir whose manifest
+matches that file when the bullpen already holds an older one (#194).
 """
 
 from __future__ import annotations
@@ -28,7 +31,8 @@ from tallyman_core import catalog, data_dir, read_manifest
 from tallyman_core import catalog_state as cs
 from tallyman_core.paths import bullpen_dir, catalog_dir, compute_cache_dir, entry_dir
 from tallyman_xorq import build_and_persist
-from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.materialize import snapshot_path
+from tallyman_xorq.result_cache import cached_result_expr, snapshot_file_digest, verify_result_faithful
 
 
 def _recipe(alias: str, tail: str = "") -> str:
@@ -37,6 +41,17 @@ def _recipe(alias: str, tail: str = "") -> str:
         "from tallyman_xorq.io import tracked_expr_from_alias\n"
         f"t = tracked_expr_from_alias({alias!r})\n"
         f"expr = t{tail}\n"
+    )
+
+
+def _random_recipe(alias: str) -> str:
+    """``random()`` in a mutate: a worthy entry (an impure operation always is) whose two runs at create differ, so it
+    is recorded as not reproducible (ADR-009 D6) and each create of it writes other rows."""
+    return (
+        "import xorq.vendor.ibis as ibis\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({alias!r})\n"
+        "expr = t.mutate(r=ibis.random())\n"
     )
 
 
@@ -148,6 +163,45 @@ def test_a_backward_reset_parks_the_clone_in_the_bullpen_and_a_forward_reset_res
     cs.reset_to(p, two_steps.s2)
 
     assert extra_clone.is_file(), "the reset forward did not restore the clone"
+
+
+def test_a_reset_forward_restores_the_manifest_that_matches_the_snapshot_of_an_entry_added_again(
+    project: str, orders_src: str
+):
+    """#194: an entry dir is named by its content hash, but its contents are not a function of it. The manifest records
+    ``created_at`` and ``prompt``, and a recipe that is not reproducible records another ``result_digest`` each time it
+    is created, while a create always rewrites the snapshot (ADR-007 D4). So when a reset retires an entry whose name
+    the bullpen already holds, the live dir is the one that matches the snapshot on disk. It used to be dropped, and a
+    reset forward brought back the older manifest over the newer snapshot, with nothing reporting the disagreement.
+
+    The five steps of the issue: create the entry (step 1); reset to step 0, which parks its dir in the bullpen and
+    leaves its snapshot (ADR-007 D14); add it again (step 2), which writes a new snapshot and manifest; reset to step 0
+    again; reset forward to step 2.
+    """
+    cs.ensure_catalog_repo(project)
+    s0 = cs.checkpoint_catalog(project, "s0")
+    first = build_and_persist(project, _random_recipe(orders_src))
+    h = first.content_hash
+    assert first.reproducible is False
+    first_digest = read_manifest(entry_dir(project, h)).result_digest
+    assert cs.checkpoint_catalog(project, "s1") is not None
+
+    cs.reset_to(project, s0)
+    assert (bullpen_dir(project) / "entries" / h).is_dir()
+    assert build_and_persist(project, _random_recipe(orders_src)).content_hash == h
+    s2 = cs.checkpoint_catalog(project, "s2")
+    snap = snapshot_path(project, h)
+    written = snapshot_file_digest(snap)
+    assert read_manifest(entry_dir(project, h)).result_digest == written
+    assert written != first_digest, "the second create wrote the same rows, so the scenario tests nothing"
+
+    cs.reset_to(project, s0)
+    cs.reset_to(project, s2)
+
+    assert snapshot_file_digest(snap) == written, "a reset changed the snapshot (ADR-007 D14)"
+    restored = read_manifest(entry_dir(project, h)).result_digest
+    assert restored == written, "the reset forward restored the first create's manifest over the second's snapshot"
+    assert verify_result_faithful(project, h) is True
 
 
 def test_no_compute_cache_pointer_file_is_written(project: str, orders_parquet: Path):

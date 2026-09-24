@@ -323,20 +323,80 @@ def test_the_snapshot_is_the_ordered_copy(project: str, tmp_path: Path, monkeypa
     assert read_manifest(entry_dir(project, out["hash"])).cache_worthy is True
 
 
-def test_two_aliases_over_identical_bytes_share_one_entry(project: str, tmp_path: Path, monkeypatch):
-    """The entry hash is a function of the bytes and the reader options, so one file serves both aliases."""
+def test_identical_bytes_under_a_second_alias_is_an_error(project: str, tmp_path: Path, monkeypatch):
+    """One set of bytes is one source version under one alias; importing it again under another name is refused.
+
+    The likeliest way to get here is not knowing the bytes are already in the project, so the error names the alias
+    and version that hold them and the way to give them a second name. The first alias's entry is untouched: a second
+    import used to rewrite its manifest and recipe, and a failure part-way deleted the entry outright.
+    """
     from tallyman_xorq import source_import
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
-
     a = source_import.update_and_depend(str(src), "orders")
-    b = source_import.update_and_depend(str(src), "orders_again")
+    entry = entry_dir(project, a["hash"])
+    manifest_before = (entry / "manifest.json").read_bytes()
+    recipe_before = (entry / "expr.py").read_bytes()
+    copy = _write_parquet(_outside(tmp_path) / "copy_of_orders.parquet", 10)
+    assert copy.read_bytes() == src.read_bytes()
 
-    assert a["hash"] == b["hash"]
-    assert get_alias(project, "orders") == get_alias(project, "orders_again")
-    snaps = sorted(p.name for p in snapshot_path(project, a["hash"]).parent.glob("*.parquet"))
-    assert snaps == [f"{a['hash']}.parquet"]
+    with pytest.raises(source_import.SourceImportError) as info:
+        source_import.update_and_depend(str(copy), "orders_again")
+
+    message = str(info.value)
+    assert "orders-v1" in message
+    assert "tracked_expr_from_alias('orders')" in message
+    assert "catalog_create" in message
+    assert get_alias(project, "orders_again") is None
+    assert (entry / "manifest.json").read_bytes() == manifest_before
+    assert (entry / "expr.py").read_bytes() == recipe_before
+
+
+def test_bytes_of_an_older_version_of_another_alias_are_refused(project: str, tmp_path: Path, monkeypatch):
+    """The bytes need not be another alias's head: any version of any other alias holds them."""
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _outside(tmp_path) / "orders.parquet"
+    _write_parquet(src, 10)
+    first_bytes = src.read_bytes()
+    source_import.update_and_depend(str(src), "orders")
+    _write_parquet(src, 20)
+    source_import.update_and_depend(str(src), "orders")
+    old = _outside(tmp_path) / "old_orders.parquet"
+    old.write_bytes(first_bytes)
+
+    with pytest.raises(source_import.SourceImportError, match="orders-v1"):
+        source_import.update_and_depend(str(old), "archive")
+
+    assert get_alias(project, "archive") is None
+
+
+def test_a_failed_repair_leaves_the_existing_entry_in_place(project: str, tmp_path: Path, monkeypatch):
+    """A re-import that repairs a missing snapshot writes into an entry that already exists; failing, it keeps it.
+
+    ``_mint`` removes the entry directory when the build step fails, which is right for a directory it created and
+    destroys the alias's only entry when the directory was already there.
+    """
+    import xorq.ibis_yaml.compiler as compiler
+
+    from tallyman_xorq import source_import
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    a = source_import.update_and_depend(str(src), "orders")
+    snapshot_path(project, a["hash"]).unlink()
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("build_expr failed")
+
+    monkeypatch.setattr(compiler, "build_expr", fail)
+    with pytest.raises(RuntimeError, match="build_expr failed"):
+        source_import.update_and_depend(str(src), "orders")
+
+    assert entry_dir(project, a["hash"]).is_dir()
+    assert read_manifest(entry_dir(project, a["hash"])).provenance.alias == "orders"
 
 
 def test_a_source_version_keeps_its_raw_bytes_in_the_clone_store(project: str, tmp_path: Path, monkeypatch):
@@ -923,6 +983,22 @@ def test_catalog_import_source_reports_an_error_as_a_dict(project: str, tmp_path
 
     assert "error" in out
     assert "nope.parquet" in out["error"]
+
+
+def test_catalog_import_source_reports_a_duplicate_import_as_an_error(project: str, tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    from tallyman_core.catalog_state import list_revisions
+    from tallyman_mcp.server import catalog_import_source
+
+    src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
+    catalog_import_source(str(src), "orders")
+    before = len(list_revisions(project))
+
+    out = catalog_import_source(str(src), "orders_again")
+
+    assert "orders-v1" in out.get("error", ""), out
+    assert get_alias(project, "orders_again") is None
+    assert len(list_revisions(project)) == before
 
 
 def test_catalog_revise_refuses_a_source_alias(project: str, tmp_path: Path, monkeypatch):

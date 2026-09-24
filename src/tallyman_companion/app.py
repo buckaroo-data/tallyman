@@ -41,6 +41,7 @@ from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
+from tallyman_core.server_lock import resolved_home
 from tallyman_core.telemetry import read_spans, record_span
 from tallyman_core.version import git_revision, version_info
 from tallyman_xorq import (
@@ -68,6 +69,9 @@ class NotifyPayload(BaseModel):
     hash: str | None = None
     project: str | None = None  # explicit target; absent → the active project
     extra: dict | None = None
+    # The sender's data dir (TALLYMAN_HOME). A notify from a client of another data dir is refused (#183); absent → not
+    # checked.
+    home: str | None = None
 
 
 def _broadcaster() -> tuple[asyncio.Queue, list]:
@@ -1827,6 +1831,18 @@ def create_app(
 
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
+        # A client of another data dir reached this companion (a second tallyman on its own data dir, with the client
+        # pointed at the wrong port). Its project is not this data dir's, so refuse it before anything is reloaded or
+        # published to this data dir's browsers (#183).
+        if payload.home is not None:
+            ours, theirs = resolved_home(), resolved_home(payload.home)
+            if theirs != ours:
+                raise HTTPException(
+                    409,
+                    f"notify from data dir {theirs} refused: this companion serves data dir {ours}. Point the client "
+                    "at the companion of its own data dir (TALLYMAN_COMPANION_URL, or unset it to use that data dir's "
+                    "running server).",
+                )
         # The payload may name its project (CLI `reset-to --project` can target
         # a non-active project); only fall back to the active one when it doesn't.
         project_name = payload.project or _require_project()
@@ -1866,7 +1882,7 @@ def create_app(
             extra = payload.extra or {}
             event = _recalc_sse_event(extra.get("remap", {}), extra.get("step"))
         else:
-            event = payload.model_dump()
+            event = payload.model_dump(exclude={"home"})
         await publish(event)
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 

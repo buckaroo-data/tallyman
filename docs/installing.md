@@ -90,8 +90,7 @@ server:
       "args": ["run", "tallyman", "mcp"],
       "cwd": "<path-to-your-checkout>",
       "env": {
-        "TALLYMAN_PROJECT": "spike",
-        "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860"
+        "TALLYMAN_PROJECT": "spike"
       }
     }
   }
@@ -168,7 +167,7 @@ on disk — same catalog and history, no edit affordances (mutation routes retur
 | Variable | Default | Purpose |
 |----------|---------|---------|
 | `TALLYMAN_PROJECT` | `spike` | Active project name |
-| `TALLYMAN_COMPANION_URL` | `http://127.0.0.1:7860` | Where the MCP server pushes updates |
+| `TALLYMAN_COMPANION_URL` | the companion serving `TALLYMAN_HOME`, else `http://127.0.0.1:7860` | Where the MCP server and `reset-to` push updates |
 | `TALLYMAN_HOME` | `~/.tallyman-notebooks` | Root for all project state |
 
 **State on disk** lives under `TALLYMAN_HOME`:
@@ -192,7 +191,13 @@ The active project is resolved from `TALLYMAN_PROJECT` first, then the
 - **`uv run tallyman` fails to resolve the command** — make sure you're in the
   checkout directory (or a subdirectory). `uv run` picks the venv from the
   nearest `pyproject.toml`.
-- **Port 7860 already in use** — another companion is running; stop it, or pass
-  `--port` to `tallyman run` and update `TALLYMAN_COMPANION_URL` to match.
+- **"data dir … is in use by another tallyman server"** — one `tallyman run`
+  serves a data dir (`TALLYMAN_HOME`) at a time, and the error names the one
+  that holds it (pid, port, start time). Stop it, or run the second tallyman on
+  its own data dir and port: `TALLYMAN_HOME=<another dir> uv run tallyman run
+  --port 7861`. An MCP server started with the same `TALLYMAN_HOME` finds that
+  companion's port by itself.
+- **Port 7860 already in use** — something else is listening there; pass
+  `--port` to `tallyman run`.
 </content>
 </invoke>

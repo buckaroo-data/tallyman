@@ -101,8 +101,10 @@ def test_project_switch_returns_error_when_unreachable(isolated_home: Path, monk
     out = srv.project_switch("beta")
     assert "error" in out
     assert "active" not in out
-    # The configured companion URL should appear so the LLM can diagnose.
-    assert srv.COMPANION_URL in out["error"]
+    # The companion URL it tried should appear so the LLM can diagnose.
+    from tallyman_core.server_lock import companion_url
+
+    assert companion_url() in out["error"]
 
 
 def test_project_switch_returns_error_on_http_error(isolated_home: Path, monkeypatch):

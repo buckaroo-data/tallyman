@@ -234,6 +234,9 @@ class BuckarooManager:
             stderr=log_fp,
             text=True,
             bufsize=1,
+            # The default, stated: Buckaroo inherits none of our descriptors, in particular not the one holding the
+            # data dir's server claim (server_lock), so a Buckaroo that outlives a killed companion cannot keep it.
+            close_fds=True,
         )
         atexit.register(self.stop)
 

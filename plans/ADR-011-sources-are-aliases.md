@@ -356,7 +356,7 @@ options with it (`source_import.import_call`, in the MCP tool's `schema=` and
 `reader_options=` shapes), and a pinned import refused for naming another entry
 says the reader options may be what differs.
 
-This removes the hash fork found in the #215 review, where a function-valued
+This removes a hash fork, where a function-valued
 reader option's `repr` carries a memory address and re-derives a new copy key on
 every build. Options are evaluated once, at import, and stored.
 

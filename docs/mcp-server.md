@@ -134,12 +134,13 @@ git revision. A cascade whose remap is non-empty emits a `recalc` SSE event.
 | `project_switch` | no | — ⁵ | no |
 | `project_new` | no | — ⁵ | no |
 
-¹ `notebook_changed` only when `name` is supplied. ² only when a cell was
-actually removed. ³ self-checkpoints one revision (for `catalog_recalc`, only a
-committing run whose remap is non-empty); on the opt-out list so the dispatch
-boundary does not double-commit. ⁴ only on a committing run that
-produced a non-empty remap. ⁵ the *companion* broadcasts `project_switched`; the
-MCP tool itself sends no `_notify`. ⚠ see [Known quirks](#known-quirks).
+¹ `notebook_changed` only when the import mints v1 of a new alias, which appends
+a notebook cell. ² only when a cell was actually removed. ³ self-checkpoints one
+revision (for `catalog_recalc`, only a committing run whose remap is non-empty);
+on the opt-out list so the dispatch boundary does not double-commit. ⁴ only on a
+committing run that produced a non-empty remap. ⁵ the *companion* broadcasts
+`project_switched`; the MCP tool itself sends no `_notify`. ⚠ see [Known
+quirks](#known-quirks).
 
 Any tool whose result carries an `error` key skips its checkpoint and sends no
 success notify (a failed build in the authoring tools still sends
@@ -152,19 +153,19 @@ back inline in the response (most as `{error, error_id}` for build failures,
 ## Authoring tools
 
 The compile-and-persist family. The `code` argument is a self-contained Python
-script that binds a top-level `expr` to a xorq/ibis expression;
-`catalog_run`'s docstring is the canonical cookbook for writing it (namespaces,
-the datafusion-only backend, data sourcing, and the `xorq.ml` MODELING section).
+script that binds a top-level `expr` to a xorq/ibis expression; `catalog_run`'s
+docstring is the canonical cookbook for writing it (namespaces, the
+datafusion-only backend, data sourcing, and the `xorq.ml` MODELING section).
 Data sourcing inside `code` uses two helpers from `tallyman_xorq.io`:
-`tracked_expr_from_alias` (a catalog entry by alias, recorded as a lineage parent
-that the entry follows) and `pinned_expr_from_alias` (one version of an alias, by
-`"name-vN"` version reference, no following; a bare alias is rejected, #166, and
-so is a bare content hash, ADR-011 D5). A recipe never opens a file: data files
-come in through `catalog_import_source` (below) as **source aliases**, and a
-recipe reads one like any other alias. `read_project_file`, `tallyman_read_csv`,
-`xo.deferred_read_csv`, and `xo.deferred_read_parquet` on a file outside the
-project's `compute_cache/` are build errors whose message names the import to
-use.
+`tracked_expr_from_alias` (a catalog entry by alias, recorded as a lineage
+parent that the entry follows) and `pinned_expr_from_alias` (one version of an
+alias, by `"name-vN"` version reference, no following; a bare alias is rejected,
+#166, and so is a bare content hash, ADR-011 D5). A recipe never opens a file:
+data files come in through `catalog_import_source` (below) as **source
+aliases**, and a recipe reads one like any other alias. `read_project_file`,
+`tallyman_read_csv` and `xo.deferred_read_csv` are build errors whose message
+names the import to use, and so is `xo.deferred_read_parquet` of any file
+outside the project's `compute_cache/`.
 
 Every entry's result ends in `__row_order`, and pages are ordered by it. A recipe
 that only filters, selects or adds columns is *cheap* and must keep the column:
@@ -194,11 +195,12 @@ default authoring tool for a one-off run.
   or `build_error` event to `events.jsonl`.
 - **Promote** a scratch entry to a name afterward with `catalog_alias`.
 
-### `catalog_import_source(outside_path, alias, pinned_version=None, prompt="", schema=None, reader_options=None) -> dict`
-Import a parquet or CSV into the catalog and point the source alias `alias` at
-it (ADR-011). The only way a file enters: the bytes are copied into the arena,
-one snapshot of them is written in file order with a `__row_order` column, and
-a version of `alias` is minted. Recipes then read
+### `catalog_import_source(outside_path, alias, pinned_version=None, prompt="",
+schema=None, reader_options=None) -> dict` Import a parquet or CSV into the
+catalog and point the source alias `alias` at it (ADR-011). The only way a file
+enters: the bytes are copied into the project's clone store (`data/.cas/`), one
+snapshot of them is written in file order with a `__row_order` column, and a
+version of `alias` is minted. Recipes then read
 `tracked_expr_from_alias(alias)`; the original path is provenance and is never
 read again.
 - **Params:** `outside_path` (required) — any path, `data/` is not special;
@@ -239,7 +241,8 @@ carry chart/display config forward, and cascade-recompute the alias's stale
 followers. The canonical head-advance path.
 - **Params:** `name` (required) — existing alias; `code` (required) — a
   self-contained recipe that **must not reference its own alias by name**
-  (rejected, #135 — inline the source or pin the previous version by hash);
+  (rejected, #135 — inline the source, or pin the previous version with
+  `pinned_expr_from_alias("<name>-v<N>")`; a bare hash is refused);
   `prompt` — optional.
 - **Returns:** `catalog_run` shape plus `alias`, `version`; `carried_over`
   (subset of `chart` / `display_config`) when non-empty; and a `recalc`

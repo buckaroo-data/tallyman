@@ -8,7 +8,8 @@
   (`plans/ADR-006-read-path-loads-builds.md`); tallyman writes its own result
   files (ADR-007 to ADR-009); a data file enters only by an import, as a source
   entry named by its bytes and reader options, so a build never reads a file on
-  a path the user controls (W3, #168; `plans/ADR-011-sources-are-aliases.md`);
+  a path the user controls (`plans/ADR-011-sources-are-aliases.md`), which removes
+  the mechanism of W3 (#168 is still open on GitHub);
   entry session ids include the project and tallyman keeps no session map,
   though diff session ids still do not include it (B1, #172); every snapshot a
   heal re-creates is verified before it is served (W6); and `csv_ordered/` is

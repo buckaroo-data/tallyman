@@ -100,7 +100,9 @@ The follow relationship is the whole game:
 - `pinned_expr_from_alias("orders-v1")` is the deliberate opt-out. It accepts
   only a version reference (`"<alias>-v<N>"`, 1-based into the alias's history).
   It refuses a bare alias, which would pin whatever the head happened to be
-  (#166), and a bare content hash (ADR-011 D5), so every edge names an alias. It
+  (#166), and a bare content hash (ADR-011 D5), so every edge an authored recipe
+  records names an alias (a promoted diff's generated recipe names its two
+  entries by hash and records no edge). It
   records **follow=False**, and the child stays on that exact revision: it never
   goes stale, and recalc finds it but leaves it alone.
 - Source aliases are the roots of every chain. Each version is a source entry,

@@ -130,10 +130,14 @@ worthy without any other expensive operation (#81).
 
 ### Snapshots (`src/tallyman_xorq/materialize.py`)
 
-A worthy entry's **snapshot** is `<compute_cache>/result_cache/<content_hash>.parquet`
-(`snapshot_path`), so its name is a function of the content hash and nothing
-else. `materialize` is the one writer of snapshots, used by the build and by
-every heal (a **heal** re-creates a snapshot that is missing from disk):
+A worthy entry's **snapshot** is
+`<compute_cache>/result_cache/<content_hash>.parquet` (`snapshot_path`), so its
+name is a function of the content hash and nothing else. `materialize` writes
+the snapshot of every computed entry, used by the build and by every heal of one
+(a **heal** re-creates a snapshot that is missing from disk); a source entry's
+snapshot is written by the import's writer (`source_import._write_snapshot`), at
+import and when it is healed from its clone (see "Source entries" below).
+`materialize`:
 
 - it loads the entry's frozen build and rebinds every backend in it onto a
   fresh single-partition connection (`single_partition_backend`, with
@@ -167,14 +171,16 @@ of its rows (#193, fixed in #222). A source entry needs no such staging: the
 import keeps a snapshot already at its path, which holds the same rows, since
 the path is named by the bytes and the reader options.
 
-**Pins.** `pinned_reason` decides from the entry's manifest alone. A snapshot is
-pinned when the manifest says `reproducible: false`, when it holds
-`unfaithful_heal_digest` (the digest an unfaithful heal wrote, below), or when
-it is a source entry whose clone is gone. Because the pin is part of the
-manifest, it moves with the entry through a reset and survives the error
-banner's dismiss, which deletes `errors.jsonl` (#196, fixed in #223). For a file
-whose entry a reset retired, the manifest parked in the bullpen speaks for it
-(`snapshot_manifest`), so the pin holds while the entry is retired (#195).
+**Pins.** `pinned_reason` decides from the entry's manifest and, for a source
+entry, whether its clone is on disk. A snapshot is pinned when the manifest says
+`reproducible: false`, when it holds `unfaithful_heal_digest` (the digest an
+unfaithful heal wrote, below), or when it is a source entry whose clone is gone
+(for a retired one, from both `data/.cas/` and the bullpen). Because the first
+two are part of the manifest, the pin moves with the entry through a reset and
+survives the error banner's dismiss, which deletes `errors.jsonl` (#196, fixed
+in #223). For a file whose entry a reset retired, the manifest parked in the
+bullpen speaks for it (`snapshot_manifest`), so the pin holds while the entry is
+retired (#195).
 
 The row-group size and the batch size decide the batch boundaries that an entry
 built on the file sees, and an ungrouped float total depends on them (#187), so
@@ -363,12 +369,13 @@ pinned version, ignores the hint, so the grid's pages are not yet ordered by it
 tallyman writes: `result_cache/`, the snapshots of worthy entries, source
 entries included. By rule everything in it is cache: a file lives here only if
 `ensure_materialized` can re-create it and check what it made, so the cold state
-is an empty `compute_cache/`, and reading any entry then re-creates every file it
-needs. Two kinds of snapshot are exceptions, and are pinned: the snapshot of an
-entry recorded as not reproducible, which cannot be made again faithfully, and
-the snapshot of a source entry whose clone is gone, which is the last copy of
-the imported rows. A pin protects the file from the Cache page and from nothing
-else (#185).
+is an empty `compute_cache/`, and reading any entry then re-creates every file
+it needs. Three kinds of snapshot are exceptions, and are pinned (see "Pins"
+above): the snapshot of an entry recorded as not reproducible, which cannot be
+made again faithfully; one whose heal already produced different rows than were
+built (`unfaithful_heal_digest`); and the snapshot of a source entry whose clone
+is gone, which is the last copy of the imported rows. A pin protects the file
+from the Cache page and from nothing else (#185).
 
 Files are deleted only by an explicit user action, and written only because
 something is about to read them. The startup warm-up writes nothing here, the
@@ -526,15 +533,16 @@ the overlay's link for a file and leaves the original alone — and omits
 `ENTRY_CACHE_NAMES` (`.buckaroo_stat_cache`, `.xorq_build_expanded`,
 `.xorq_view_build`) so a benchmark starts honestly cold.
 
-The entry directory itself is gitignored. Its durable, git-tracked form is the
-recipe zip `entries/<hash>.zip` — a deterministic archive of `expr.py`,
+The entry directory itself is gitignored. What the catalog repository tracks for
+it is the recipe zip `entries/<hash>.zip`, a deterministic archive of `expr.py`,
 `xorq_build/`, `manifest.json`, and `schema.json`, written once, by the first
 checkpoint after create (`tallyman_core/catalog.py`), so its manifest does not
-carry an `unfaithful_heal_digest` recorded later. So the build dir is
-untracked-but-durable: the recipe zip carries it across a clone, and
-`entries.jsonl` records which dirs should exist so `reset_to` can reconcile them
-from the bullpen. (See the native catalog store, `catalog.py` /
-`catalog_state.py`, for the full tracked surface.)
+carry an `unfaithful_heal_digest` recorded later. Nothing reads the zip back
+(`catalog.py`): it records what a checkpoint committed, and a clone of the
+catalog repository does not recreate entry directories from it. `entries.jsonl`
+records which dirs should exist so `reset_to` can reconcile them from the
+bullpen. (See the native catalog store, `catalog.py` / `catalog_state.py`, for
+the full tracked surface.)
 
 - **Primary key** (`src/tallyman_xorq/primary_key.py`) —
   `<entry>/primary_key.json` saves a full-table cardinality scan. A cheap

@@ -210,12 +210,12 @@ are a no-op.
 
 A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
 truncated to 12 hex characters: the bytes and the reader options, and nothing
-else. That is the answer to xorq's path-only hashing. Every file a recipe's
-expression reads is a snapshot, named by the content hash of the entry it holds,
-so every xorq-level key (the expression hash, and the name of every file
-tallyman writes) is content-honest, and the chain of names ends at hashes of
-bytes. The reader options are fixed at import (a CSV read two ways is two
-imports under two aliases), and they must be plain values that the entry can
+else. This matters because xorq hashes a file read by its path alone. Every file
+a recipe's expression reads is a snapshot, named by the content hash of the
+entry it holds, so every xorq-level key (the expression hash, and the name of
+every file tallyman writes) is content-honest, and the chain of names ends at
+hashes of bytes. The reader options are fixed at import (a CSV read two ways is
+two imports under two aliases), and they must be plain values that the entry can
 record: a callable option is refused.
 
 The import's outcomes form a table (ADR-011 D3). With no `pinned_version`: a new
@@ -243,9 +243,12 @@ computation. It must bind a variable `expr`, built from:
   touches this expression when the parent moves. A pin names an exact version
   with an explicit version reference. A bare alias is rejected as ambiguous (it
   would silently pin whatever the head happened to be when the recipe was built,
-  #166), and so is a bare content hash (ADR-011 D5), so every parent edge names
-  an alias and no opaque hash appears in a recipe. An entry with no alias has to
-  be named before anything can build on it.
+  #166), and so is a bare content hash (ADR-011 D5), so every parent edge an
+  authored recipe records names an alias, and no opaque hash appears in one. An
+  entry with no alias has to be named before anything can build on it. The one
+  generated exception is a promoted diff, whose recipe calls
+  `build_diff_expr(a_hash=..., b_hash=...)` with the two hashes and records no
+  parent edge (below, "Composition").
 
 A recipe never opens a file. `read_project_file`, `tallyman_read_csv`,
 `xo.deferred_read_csv`, and `xo.deferred_read_parquet` of a file outside
@@ -271,7 +274,7 @@ entries/<content_hash>/
   xorq_build/     # the frozen build (Part 1 §3), paths made portable
   manifest.json   # the closure record (below)
   schema.json
-entries/<content_hash>.zip   # git-tracked durable form, written at checkpoint
+entries/<content_hash>.zip   # git-tracked record, written at checkpoint, never read back
 ```
 
 An entry carries **two representations of its computation, with different
@@ -349,7 +352,7 @@ lock. The recipe zip, written by the first checkpoint, keeps the manifest as it
 was at create. An entry directory without a manifest is treated as absent by the
 entry list, the checkpoint, recalc and the build, which builds it again. A page
 read still serves such a directory, with the snapshot's existence standing in
-for the missing `cache_worthy` (#90, #204).
+for the missing `cache_worthy` (#204).
 
 ## Alias
 
@@ -471,13 +474,14 @@ reproducible, the entry still builds, and its file is **pinned**: the Cache
 page's delete leaves it alone. A snapshot changes only by an atomic replace of a
 complete file.
 
-**Pins are read from the manifest alone** (`pinned_reason`): a snapshot is pinned
-when the manifest says `reproducible: false`, when it holds
-`unfaithful_heal_digest`, or when it is a source entry whose clone is gone. So a
-pin moves with its entry through a reset, and nothing outside the entry, such as
-the error log, can lift it. A snapshot whose entry a reset retired is judged by
-the manifest parked in the bullpen, and a retired source version's clone counts
-as present when a reset parked it there too.
+**Pins are read from the entry's manifest and, for a source entry, from whether
+its clone is on disk** (`pinned_reason`): a snapshot is pinned when the manifest
+says `reproducible: false`, when it holds `unfaithful_heal_digest`, or when it
+is a source entry whose clone is gone. So a pin moves with its entry through a
+reset, and nothing outside the entry, such as the error log, can lift it. A
+snapshot whose entry a reset retired is judged by the manifest parked in the
+bullpen (the directory a reset moves retired entries into), and a retired source
+version's clone counts as present when a reset parked it there too.
 
 `ensure_materialized(project, hash)` is the one entry point that makes files
 exist, and every consumer that composes or executes an entry goes through it
@@ -739,11 +743,13 @@ parent alias that no longer exists is reported under `unknown_axes`.
 
 **Recalc** is the one sanctioned re-execution of recipes. When an alias head
 advances (a revise, or an import that mints a new version of a source alias),
-the entries that followed it by name are directly stale;
-they are the roots, and the entries that may be affected form their **cone**:
-the roots and every current alias head reachable from them through recorded
-parent edges, followers of followers and so on. It runs automatically after a
-revise when the project enables auto-recalc (the default), or on demand.
+the entries that followed it by name are directly stale; they are the roots, and
+the entries that may be affected form their **cone**: the roots and every
+current alias head reachable from them through recorded parent edges, followers
+of followers and so on. It runs automatically, when the project enables
+auto-recalc (the default), after a revise, after an import that mints a version,
+and after a promoted diff that re-points an existing alias; otherwise it runs on
+demand.
 
 Recalc rebuilds the cone in topological order, parents before children. For
 each member it re-imports the member's *recipe* — the one situation where
@@ -830,9 +836,11 @@ wrong even if every test passes.
   from immutable inputs; cached values are reproducible from the frozen build
   alone; every read path has a cold seam (an empty `compute_cache/`); a
   self-heal is reproduce-and-verify, never manufacture. Result bytes are
-  manufactured by one routine, `materialize`, which the build and every heal
-  call — a read path that writes bytes some other way has become a second,
-  unaudited build path.
+  manufactured in two places: `materialize`, which the build and every heal of
+  a computed entry call, and the import's writer (`source_import._write_snapshot`),
+  which writes a source entry's snapshot at import and at a heal from its clone.
+  A read path that writes bytes any other way has become a second, unaudited
+  build path.
 - **I3 — One read semantics.** Every consumer that materializes an entry
   reads the frozen build through the one canonical read. The recipe is never
   re-executed on behalf of an existing entry.

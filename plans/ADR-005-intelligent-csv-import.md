@@ -1,8 +1,8 @@
 # ADR: Intelligent CSV import — a deterministic reader with a great error/suggestion contract
 
-- **Status:** Implemented (on `main` since `35ea218`). It addresses #141, #143,
-  #144 and #145, which are still open on GitHub; #142 is deferred to the
-  holistic edge-case pass (see below).
+- **Status:** Implemented. It addresses #141, #143, #144 and #145, which are
+  still open on GitHub; #142 is deferred to the holistic edge-case pass (see
+  below).
 - **Amended by:**
   - `plans/ADR-008-row-order-of-reads.md`: INV-1's row-index column is named
     `__row_order` (not `original_row_order`), and INV-2's trailing `order_by` is

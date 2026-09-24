@@ -4,7 +4,7 @@ Tallyman — a data science environment designed for coding agents. Stop squinti
 
 Two windows: Claude Code in one, a browser in the other. You work by defining a set of named results that can depend on each other, then making sure those results live up to their name. You describe them; the agent writes the queries. You tell it what `likely_customers` should mean, and a moment later the answer is a table in the browser at full size, sortable and searchable, with statistics over every column. Your prompt sits above the query the agent wrote, so you read your intent, the code that came out of it, and the result together. You notice it's catching people who already churned, so you sharpen the sentence and the agent revises the query. Everything built on top of that name updates to match, fast enough that you don't lose your place. How big the data is, what has already been computed, and what needs recomputing never enter into it.
 
-Those queries are expressions: self-contained programs that declare the raw files and other results they read. Writing the expression is the agent's entire job. An expression is declarative and can be introspected, so tallyman reads its dependencies straight off it and builds a directed graph of the project's aliased expressions.  When a parent updates, its children are recomputed; a raw file changing on disk counts as an update too. Tallyman executes each expression once and writes the result and its summary statistics to disk. Reading it back is out of core: scrolling, sorting, and searching pull only the pieces of data needed to fill the screen, so nothing has to fit in memory and four million rows opens like four thousand.
+Those queries are expressions: self-contained programs that name, by alias, the imported data and the other results they read. Writing the expression is the agent's entire job. An expression is declarative and can be introspected, so tallyman reads its dependencies straight off it and builds a directed graph of the project's aliased expressions.  When a parent updates, its children are recomputed; importing a new version of a data file counts as an update too. Tallyman executes each expression once and writes the result and its summary statistics to disk. Reading it back is out of core: scrolling, sorting, and searching pull only the pieces of data needed to fill the screen, so nothing has to fit in memory and four million rows opens like four thousand.
 
 
 You aren't typing `df.sort_values('lifetime_sales')` just to see which customers are at the top, you aren't waiting for the LLM to print a 10 row table like it's coming out of a 1200 baud modem.  You aren't running out of memory in the middle of a session.  You aren't building the ad-hoc cache that every long notebook grows, the pickle in /tmp behind an if not exists guard that you never quite trust. You aren't nursing a kernel along for days because one cell takes five minutes to rerun, or bracing yourself before you close the window. None of that is in your head while you work. What's in your head is the data and what it means.
@@ -185,13 +185,14 @@ project's cheap entries read from the original location; see
 - Recipes read entries by alias, never files:
   `tracked_expr_from_alias("orders")` follows an alias and
   `pinned_expr_from_alias("orders-v2")` pins one version. `read_project_file`,
-  `tallyman_read_csv`, `xo.deferred_read_csv` and `xo.deferred_read_parquet` on a
-  file outside the project's `compute_cache/` are build errors that name the
-  import to use, and `xo.read_parquet` resolves through ibis's backend loader and
-  fails. Use `import xorq.api as xo` and `import xorq.vendor.ibis as ibis`. Do
-  NOT `import ibis` directly.
+  `tallyman_read_csv` and `xo.deferred_read_csv` are build errors that name the
+  import to use, and so is `xo.deferred_read_parquet` of any file outside the
+  project's `compute_cache/`. `xo.read_parquet` resolves through ibis's backend
+  loader and fails. Use `import xorq.api as xo` and `import xorq.vendor.ibis as
+  ibis`. Do NOT `import ibis` directly.
 - Content hash is xorq's build hash — same code + same inputs → same hash → same
-  entry dir (idempotent).
+  entry dir (idempotent). A source entry's hash is instead an md5 of the
+  imported bytes and the reader options.
 - All catalog state lives on disk. The MCP server and the companion keep only
   in-memory caches of things that never change (loaded builds and reads, keyed
   by content hash), plus the MCP session's active project and the companion's

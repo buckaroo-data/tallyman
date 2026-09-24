@@ -42,7 +42,8 @@ meaning.
 - **Recipe:** the Python the author submitted, kept as the entry's `expr.py`.
   It names its inputs by alias, so run again later it can mean something else.
 - **Build:** the entry's `xorq_build/` directory, the expression frozen to disk
-  with every input fixed. A read of a cheap entry and every heal load the build;
+  with every input fixed. A read of a cheap entry and every heal of a computed
+  entry load the build (a source entry heals from its clone);
   a worthy entry whose snapshot exists is read from the snapshot alone. The
   recipe is run again only to make a new entry (a revise or a recalc), and by
   one diagnostic after a heal that went wrong.
@@ -281,9 +282,11 @@ build), `.buckaroo_stat_cache/` (Buckaroo's summary statistics) and
 
 Key formats, and what is tracked:
 
-- **Recipe zip** (`entries/<hash>.zip`) is the committed, durable form of an
-  entry. The checkpoint writes it, deterministically, once per entry, and
-  nothing else does, so it keeps the manifest as it was at create.
+- **Recipe zip** (`entries/<hash>.zip`) is the committed record of an entry.
+  Nothing reads it back, so a clone of the catalog repository does not recreate
+  entry directories from it. The checkpoint writes it, deterministically, once
+  per entry, and nothing else does, so it keeps the manifest as it was at
+  create.
 - **Manifest** (`manifest.json`) records `content_hash`, `project`,
   `created_at`, `prompt`, `row_count`, `execute_seconds`, `compile_seconds`,
   `cache_worthy` and `cache_worthy_why` (the cheap-or-worthy verdict and its
@@ -307,7 +310,7 @@ Key formats, and what is tracked:
 - **Logs** (`errors.jsonl`, `events.jsonl`, `telemetry.jsonl`) live in
   `artifacts/`, outside the catalog repository, so a reset does not rewind
   them and a recorded failure survives it. Dismissing the error banner deletes
-  `errors.jsonl`, which pins nothing (a pin is in the manifest), and the
+  `errors.jsonl`, which holds no pin (pins are decided from the manifest), and the
   readers of `errors.jsonl` skip a line that is not a JSON object, so one torn
   append does not break the banner or the error page.
 - **Display klasses** (`artifacts/display/`) are also outside the catalog
@@ -370,7 +373,9 @@ alias and goes stale when the alias moves. `pinned_expr_from_alias` takes only a
 version reference such as `"sales-v2"` and records `follow=False`: the child
 stays on that entry. A bare alias is refused (#166), because it would pin
 whatever the head happened to be, and so is a bare content hash (ADR-011 D5, no
-bare hashes in recipes), so every edge names an alias; an entry with no alias,
+bare hashes in recipes), so every edge an authored recipe records names an
+alias (a promoted diff's generated recipe is the exception: it names its two
+entries by hash and records no edge); an entry with no alias,
 one built by `catalog_run`, has to be named before anything can build on it. A
 source alias is read the same way as any other. The edge stores the hash the
 alias pointed at when the child was built, and the staleness scan looks the
@@ -629,7 +634,7 @@ Sources: `SSEContext.tsx` in the browser; the `/{project}/api/sse` route and the
    nothing is kept.
 5. It writes `schema.json` (read from the snapshot for a worthy entry) and then
    `manifest.json`, atomically. Only then is a worthy entry's snapshot moved
-   into place, as the build's last write.
+   into place, as the last write to the entry's result.
 6. `catalog_create` sets the alias and adds a notebook cell. The tool notifies
    the companion, and as it returns the dispatch wrapper commits a checkpoint,
    which zips the recipe.
@@ -929,7 +934,8 @@ code wins.
 Point-in-time records. The digest investigation behind #137:
 [datafusion-scan-order-findings.md](../plans/datafusion-scan-order-findings.md)
 (why a parallel DataFusion scan emits rows in a different order each run, and
-the decision to ingest with polars, which still stands) and
+the decision to ingest with polars, which stands for CSV: an import parses a CSV
+with polars, and pyarrow copies a parquet file in file order) and
 [result-digest-vs-xorq-staleness.md](../plans/result-digest-vs-xorq-staleness.md)
 (why `result_digest` cannot reuse xorq's cache staleness). Both have a status
 note for what #189 changed.

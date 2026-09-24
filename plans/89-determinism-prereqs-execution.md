@@ -4,11 +4,12 @@
   items in the reactive-recalc prerequisites epic (#89) to done, so the staleness
   layer's design questions are the only thing left blocking it.
 - **Status note (2026-09-22):** point in time. Reads no longer re-run recipes
-  (#167); a reset no longer prunes `compute_cache/`, so `prune_compute_cache` is
-  gone (`plans/ADR-007-tallyman-owned-materialization.md` D14); `result_digest`
-  is a content digest of the snapshot read back (`plans/ADR-009-digest-stability.md`);
-  and `_warn_if_self_heal_unfaithful` became `_verify_self_heal`, which also
-  names an engine change as a cause.
+  (`plans/ADR-006-read-path-loads-builds.md`); a reset no longer prunes
+  `compute_cache/`, so `prune_compute_cache` is gone
+  (`plans/ADR-007-tallyman-owned-materialization.md` D14); `result_digest` is a
+  content digest of the snapshot read back
+  (`plans/ADR-009-digest-stability.md`); and `_warn_if_self_heal_unfaithful`
+  became `_verify_self_heal`, which also names an engine change as a cause.
 - **Epic:** buckaroo-data/tallyman#89. Design in
   `.claude-worktrees/docs-reactive-catalog/plans/adr-reactive-catalog-recalc.md`.
 - **Branch:** `feat/89-determinism-prereqs` off `main`.

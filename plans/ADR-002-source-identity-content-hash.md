@@ -1,8 +1,8 @@
 # ADR: Content-addressed source reads (CAS) so `content_hash` tracks source data
 
-- **Status:** Accepted (2026-06-18), with the clone store (`cas`) the default and
-  `.cas` GC wired into `reset_to`; this supersedes the 2026-06-10 Proposed draft
-  below.
+- **Status:** Accepted (2026-06-18). It supersedes the 2026-06-10 Proposed
+  draft below. The clone store is the only mode (see "Narrowed by"), and
+  `reset_to` parks the clones no surviving entry names in the bullpen.
 - **Narrowed by:** `plans/ADR-011-sources-are-aliases.md`, which keeps the clone
   store and removes the machinery around it. What stands is the substance of
   this ADR: content-addressed clones under `data/.cas/<digest><suffix>`, written

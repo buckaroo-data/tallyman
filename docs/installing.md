@@ -234,5 +234,3 @@ call and keeps using it for the rest of the Claude Code session, until
   the project's write lock, and a page that needs the same lock (to re-create a
   deleted result file, or an edit made in the browser) waits for it (#186,
   #190).
-</content>
-</invoke>

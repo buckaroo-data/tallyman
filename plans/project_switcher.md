@@ -6,8 +6,8 @@ each one. Implementation order at the bottom.
 
 Status note (2026-09-22): implemented. Two things below have since changed. The
 home root is `~/.tallyman-notebooks/` (movable with `TALLYMAN_HOME`), not
-`~/.tallyman/`. And decision 11's session file is gone: since #189 a Buckaroo
-session id is `entry-<project>-<content_hash>`, derived and never stored
+`~/.tallyman/`. And decision 11's session file is gone: a Buckaroo session id
+is `entry-<project>-<content_hash>`, derived and never stored
 (`plans/ADR-007-tallyman-owned-materialization.md` D6).
 
 ## Goal

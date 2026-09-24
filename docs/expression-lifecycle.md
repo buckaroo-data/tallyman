@@ -159,8 +159,9 @@ at a time. In order:
    the entry directory's last write, atomic, so its presence means the entry
    is complete. (Only a source entry's manifest has `provenance`, written by
    the import.) Then, for a worthy entry, `publish_snapshot` moves the staged
-   file into place with one atomic replace. That is the build's last write, so
-   the snapshot's path changes only once the entry is complete.
+   file into place with one atomic replace. That is the last write to the
+   entry's result, so the snapshot's path changes only once the entry is
+   complete.
 7. **Mark persisted; the checkpoint commits.** `build_and_persist` sets
    `catalog_registered = True`, meaning the entry dir is fully on disk — it does
    not write git itself. Durability is the *checkpoint's* job: when the MCP tool
@@ -196,11 +197,12 @@ alone. There is no `result.parquet` in this list — none is written. The single
 materialized copy of a worthy entry's rows is its snapshot (§6), and a cheap
 entry keeps no copy at all.
 
-The entry directory is gitignored; its git-tracked durable form is the recipe
-zip `entries/<hash>.zip` that the checkpoint commits (step 7). So the build dir
-is untracked-but-durable — the recipe zip carries it across a clone, and
-`entries.jsonl` records which dirs should exist so `reset_to` reconciles them
-from the bullpen, never silently rewriting them.
+The entry directory is gitignored; what the catalog repository tracks for it is
+the recipe zip `entries/<hash>.zip` that the checkpoint commits (step 7).
+Nothing reads the zip back (`catalog.py`): it records what a checkpoint
+committed, and a clone of the catalog repository does not recreate entry
+directories from it. `entries.jsonl` records which dirs should exist so
+`reset_to` can reconcile them from the bullpen.
 
 What is **not** written yet — these are lazy, and that is the whole point of
 the timeline:

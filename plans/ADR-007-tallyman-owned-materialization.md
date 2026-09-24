@@ -4,14 +4,29 @@
   decision is "not yet confirmed" or "Proposed", it was implemented as written;
   the differences between the text and the code are under "Implementation
   notes". Open defects: `docs/architecture.md` ("Known defects").
-- **Supersedes:** two decisions of `plans/ADR-006-read-path-loads-builds.md`: its
-  D4 (chaining inlines the parent's cache node) and its D8 (the manifest records
-  the snapshot key and reads assert it). Five other ADR-006 decisions keep their
-  intent: D5 (the canonical sort), D6 (a missing build is a hard error), D7
-  (verification runs in production and is loud), D10 (an unfaithful heal wipes
-  the entry's Buckaroo state) and D12 (unfaithful entries are pinned and
-  badged). The last three attach to `ensure_materialized`, which is this ADR's
-  D5.
+- **Supersedes:** two decisions of `plans/ADR-006-read-path-loads-builds.md`:
+  ADR-006 D4 (chaining inlines the parent's cache node) and ADR-006 D8 (the
+  manifest records the snapshot key and reads assert it), since no build holds a
+  cache node. It changes two more. ADR-006 D2 (keep the facade, replace the
+  internals) keeps its facade, but the snapshot's path is a function of the
+  content hash (this ADR's D2) and no loader takes a `cache_dir`. ADR-006 D10 (an
+  unfaithful heal wipes the entry's Buckaroo state) keeps the wipe, but its
+  session eviction became a forced Buckaroo reload, since tallyman keeps no
+  record of sessions (this ADR's D6). ADR-006 D5 (the canonical sort) is amended
+  by ADR-008 and ADR-009, not by this ADR. These keep their intent: ADR-006 D3
+  (rebind composition onto the default backend, with a one-group guard), ADR-006
+  D6 (a missing or unloadable build is a hard error), ADR-006 D7 (verification
+  runs in production and is loud), ADR-006 D9 (no cheap-entry digests) and
+  ADR-006 D12 (unfaithful entries are pinned and badged). ADR-006 D7, D10 and D12
+  attach to `ensure_materialized`, which is this ADR's D5.
+- **Amended by:** `plans/ADR-011-sources-are-aliases.md`. A data file enters
+  only by an import, as a source entry whose snapshot takes the place of the
+  ordered copy. The implementation notes below that describe ordered copies
+  (`compute_cache/ordered_sources/`, the `<key>.digest` sidecar,
+  `manifest.sources`, `manifest.ordered_copies`, and `ordered_copy.py` making
+  and re-making copies) describe code ADR-011 removed. D13's rule (a file is
+  cache only if it can be re-created) holds for a source entry's snapshot,
+  which is re-created from its clone.
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
@@ -862,7 +877,7 @@ What the implementation does that the text above does not say, or says different
   file no entry names `orphan`; the delete route answers 409 with the reason.
 - **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
   the whole build, including the recipe import, so a chained build waits for its parent's materialization.
-- **A create publishes its snapshot last (D4, #193, fixed in #222).** The build calls `materialize(..., publish=False)`,
+- **A create publishes its snapshot last (D4).** The build calls `materialize(..., publish=False)`,
   which leaves the file complete at its temp name, and moves it into place with `publish_snapshot` after the manifest
   is written. A build that fails before then removes only its temp file, so a file already at the path, such as the
   one a reset left on disk (D14), is kept. A heal publishes at once. A crash between the manifest write and the

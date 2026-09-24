@@ -10,6 +10,11 @@
   `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
   "`result_digest` keeps its file-hash definition". The canonical sort itself is
   unchanged and is still required.
+- **Amended by:** `plans/ADR-011-sources-are-aliases.md`. The ordered copy of a
+  source that this ADR mentions (written by polars, in its own layout) does not
+  exist: a source entry's snapshot is written by pyarrow with the settings of
+  every other snapshot, in row groups of 122,880 rows, and D3's format version
+  covers it.
 - **Reading decision labels:** a bare label such as "D2" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.

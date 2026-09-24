@@ -322,11 +322,15 @@ def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(
     monkeypatch.setenv("TALLYMAN_HOME", str(home_b))
     assert companion_url() == "http://127.0.0.1:17873"
     monkeypatch.setenv("TALLYMAN_HOME", str(home_c))
-    assert companion_url() == "http://127.0.0.1:7860"  # nothing serves c: the default
+    assert companion_url() is None  # nothing serves c, so there is no companion: 7860 would be some other data dir's
 
-    monkeypatch.setenv("TALLYMAN_HOME", str(home_b))
+    # The owner record is the only source: a URL in the environment can outlive the server it named, and then points
+    # this data dir's clients at another data dir's companion.
     monkeypatch.setenv("TALLYMAN_COMPANION_URL", "http://127.0.0.1:19999")
-    assert companion_url() == "http://127.0.0.1:19999"  # an explicit URL wins
+    monkeypatch.setenv("TALLYMAN_HOME", str(home_b))
+    assert companion_url() == "http://127.0.0.1:17873"
+    monkeypatch.setenv("TALLYMAN_HOME", str(home_c))
+    assert companion_url() is None
 
 
 def test_no_test_notifies_a_companion_it_did_not_start(isolated_home, monkeypatch):
@@ -492,3 +496,209 @@ def test_a_refused_notify_publishes_no_sse_event(project, isolated_home, tmp_pat
         server.should_exit = True
         thread.join(timeout=15)
         sock.close()
+
+
+# ---------------------------------------------------------------------------
+# no server on this data dir: no companion to reach
+# ---------------------------------------------------------------------------
+
+
+class _CapturePosts:
+    """Stands in for httpx.Client in tallyman_mcp.server and records every POST."""
+
+    def __init__(self, posted: list):
+        self.posted = posted
+
+    def __call__(self, *a, **k):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def post(self, url, json=None):
+        import httpx
+
+        self.posted.append((url, json))
+        return httpx.Response(200, json={"previous": None, "active": (json or {}).get("name")})
+
+
+def test_mcp_with_no_server_on_its_data_dir_posts_nothing_and_links_nothing(project, isolated_home, monkeypatch):
+    """With no server holding this data dir, whatever listens on 7860 (or on a URL left in the environment) serves some
+    other data dir. The MCP must not send it notifies or project changes, nor hand out links into it."""
+    import tallyman_mcp.server as srv
+
+    monkeypatch.setenv("TALLYMAN_COMPANION_URL", "http://127.0.0.1:19999")  # stale: names no server of this data dir
+    posted: list = []
+    monkeypatch.setattr(srv.httpx, "Client", _CapturePosts(posted))
+    before = srv._mcp_active_project
+
+    srv._notify("new_entry", content_hash="abc")
+    assert srv._entry_url(project, "abc") is None
+    out = srv.project_switch("beta")
+
+    assert posted == []
+    assert "active" not in out
+    assert "no tallyman server" in out["error"] and str(isolated_home.resolve()) in out["error"]
+    assert srv._mcp_active_project == before
+
+
+def test_cli_reset_with_no_server_on_its_data_dir_posts_nothing(isolated_home, monkeypatch):
+    import httpx
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+
+    monkeypatch.setenv("TALLYMAN_COMPANION_URL", "http://127.0.0.1:19999")
+    sent: list = []
+    monkeypatch.setattr(httpx, "post", lambda url, json=None, timeout=None: sent.append(url))
+
+    runner = CliRunner()
+    assert runner.invoke(cli, ["init", "beta", "--no-fixture"]).exit_code == 0
+    result = runner.invoke(cli, ["reset-to", "0", "--project", "beta"])
+
+    assert result.exit_code == 0, result.output
+    assert sent == []
+
+
+# ---------------------------------------------------------------------------
+# project changes from another data dir are refused
+# ---------------------------------------------------------------------------
+
+
+def test_mcp_project_changes_name_their_data_dir(
+    project, isolated_home, monkeypatch, hold_data_dir, no_companion_url_env
+):
+    import tallyman_mcp.server as srv
+
+    hold_data_dir(isolated_home, port=17876)
+    posted: list = []
+    monkeypatch.setattr(srv.httpx, "Client", _CapturePosts(posted))
+
+    srv.project_switch("beta")
+    srv.project_new("gamma")
+
+    assert [url for url, _ in posted] == [
+        "http://127.0.0.1:17876/api/projects/switch",
+        "http://127.0.0.1:17876/api/projects/new",
+    ]
+    assert all(body["home"] == str(isolated_home.resolve()) for _, body in posted)
+
+
+def test_project_switch_and_new_from_another_data_dir_are_refused(project, isolated_home, tmp_path):
+    """A client of another data dir that reached this companion must not create projects here or switch this data
+    dir's active project (which reloads every browser tab of this data dir)."""
+    from fastapi.testclient import TestClient
+
+    from tallyman_companion import create_app
+    from tallyman_core import ensure_project
+    from tallyman_core.paths import projects_root
+
+    ensure_project("beta")
+    other = str(tmp_path / "another-data-dir")
+    c = TestClient(create_app(project))
+
+    switched = c.post("/api/projects/switch", json={"name": "beta", "home": other})
+    created = c.post("/api/projects/new", json={"name": "gamma", "home": other})
+
+    assert (switched.status_code, created.status_code) == (409, 409), (switched.text, created.text)
+    assert c.get("/api/projects").json()["active"] == project
+    assert not (projects_root() / "gamma").exists()
+
+    assert c.post("/api/projects/switch", json={"name": "beta", "home": str(isolated_home)}).status_code == 200
+
+
+def test_notify_from_this_data_dir_spelled_in_another_case_is_accepted(project, isolated_home):
+    """On a case-insensitive filesystem (macOS APFS by default) one directory has many spellings, and the claim treats
+    them as one data dir, so the home check must too. Path.resolve() keeps the spelling it was given."""
+    from fastapi.testclient import TestClient
+
+    from tallyman_companion import create_app
+
+    respelled = isolated_home.parent / isolated_home.name.swapcase()
+    if not respelled.exists() or not os.path.samefile(respelled, isolated_home):
+        pytest.skip("case-sensitive filesystem: another spelling is another directory")
+    c = TestClient(create_app(project))
+
+    accepted = c.post("/internal/notify", json={"kind": "new_entry", "home": str(respelled)})
+    assert accepted.status_code == 200, accepted.text
+    switched = c.post("/api/projects/switch", json={"name": project, "home": str(respelled)})
+    assert switched.status_code == 200, switched.text
+
+
+# ---------------------------------------------------------------------------
+# the port check sees a listener on an overlapping address
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("listen_on", "probe"), [("0.0.0.0", "127.0.0.1"), ("127.0.0.1", "0.0.0.0")])
+def test_port_in_use_sees_a_listener_on_an_overlapping_address(listen_on, probe):
+    """A listener on the wildcard address takes the port on the loopback too, and the other way round. On macOS a bind
+    with SO_REUSEADDR succeeds beside it anyway, so a bind alone reports the port free."""
+    from tallyman_companion.buckaroo_lifecycle import port_in_use
+
+    with socket.socket() as busy:
+        busy.bind((listen_on, 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        assert port_in_use(probe, port) is True
+    assert port_in_use(probe, port) is False  # nothing listens once it is closed
+
+
+def test_run_refuses_a_port_a_wildcard_listener_holds(project, isolated_home, run_calls):
+    """A second tallyman that forgot --port, next to one serving on 0.0.0.0:<port>, would bind the loopback beside it
+    and take over the first one's clients (they reach a wildcard bind on the loopback)."""
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+
+    with socket.socket() as busy:
+        busy.bind(("0.0.0.0", 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+
+        result = CliRunner().invoke(cli, ["run", "--project", project, "--host", "127.0.0.1", "--port", str(port)])
+
+    assert result.exit_code != 0, result.output
+    assert f"port {port}" in result.output and "in use" in result.output
+    assert run_calls.uvicorn == []
+
+
+# ---------------------------------------------------------------------------
+# SIGTERM shuts tallyman run down through its cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_sigterm_runs_the_cleanup_of_tallyman_run(project, isolated_home):
+    """uvicorn stops on SIGTERM and then re-raises it with the default handler, which kills the process before the
+    `finally` of `tallyman run` releases the claim and stops Buckaroo. The restart script stops the server this way."""
+    env = {**os.environ, "TALLYMAN_HOME": str(isolated_home)}
+    env.pop("TALLYMAN_COMPANION_URL", None)
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "tallyman_cli.main", "run", "--project", project, "--port", str(port), "--no-buckaroo"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            with socket.socket() as probe:
+                if probe.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            assert proc.poll() is None, proc.stdout.read()
+            assert time.monotonic() < deadline, "tallyman run did not start listening"
+            time.sleep(0.1)
+
+        proc.send_signal(signal.SIGTERM)
+        output, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=10)
+
+    assert "tallyman run · stopped" in output, output

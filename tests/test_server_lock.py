@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -211,10 +212,12 @@ def test_the_claim_descriptor_is_not_inherited(isolated_home, hold_data_dir):
 
 
 class _Calls:
-    """Stands in for BuckarooManager and uvicorn.run, and records whether either was touched."""
+    """Stands in for BuckarooManager and uvicorn.run, and records whether either was touched, and how Buckaroo was
+    configured."""
 
     def __init__(self):
         self.buckaroo: list[str] = []
+        self.buckaroo_kwargs: list[dict] = []
         self.uvicorn: list[tuple] = []
 
     def buckaroo_manager(self):
@@ -226,6 +229,7 @@ class _Calls:
 
             def __init__(self, **kwargs):
                 calls.buckaroo.append("init")
+                calls.buckaroo_kwargs.append(kwargs)
 
             def start(self):
                 calls.buckaroo.append("start")
@@ -254,6 +258,18 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def _has_ipv6_loopback() -> bool:
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as s:
+            s.bind(("::1", 0))
+    except OSError:
+        return False
+    return True
+
+
+_needs_ipv6_loopback = pytest.mark.skipif(not _has_ipv6_loopback(), reason="this machine has no IPv6 loopback")
 
 
 def test_run_refuses_a_data_dir_another_server_holds(project, isolated_home, hold_data_dir, run_calls):
@@ -301,6 +317,51 @@ def test_run_refuses_a_port_already_in_use_before_starting_anything(project, iso
     assert read_owner() is None  # the refused run gave the data dir back
 
 
+def test_run_with_no_active_project_says_to_pass_one(isolated_home, monkeypatch, run_calls):
+    """A fresh data dir has no active project: `tallyman init` makes a project without making it active. That is where
+    a second tallyman starts, and `tallyman run` there has to say to pass --project and name the projects it could
+    pass, not fail with a TypeError."""
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+    from tallyman_core import ensure_project
+    from tallyman_core.paths import resolve_project
+    from tallyman_core.server_lock import read_owner
+
+    monkeypatch.delenv("TALLYMAN_PROJECT", raising=False)
+    ensure_project("demo")
+    assert resolve_project() is None
+
+    result = CliRunner().invoke(cli, ["run", "--port", str(_free_port())])
+
+    assert isinstance(result.exception, SystemExit), repr(result.exception)
+    assert result.exit_code != 0
+    assert "no active project" in result.output
+    assert "--project" in result.output and "demo" in result.output
+    assert run_calls.buckaroo == []
+    assert run_calls.uvicorn == []
+    assert read_owner() is None  # the refused run gave the data dir back
+
+
+@_needs_ipv6_loopback
+def test_run_on_the_ipv6_wildcard_gives_buckaroo_a_companion_url_it_can_reach(
+    project, isolated_home, monkeypatch, run_calls
+):
+    """With --host ::, Buckaroo posts its telemetry to the companion on ::1: the wildcard is no address to connect to,
+    and `http://:::<port>` is no URL."""
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)  # `run` sets it in os.environ; this puts it back at teardown
+    port = _free_port()
+
+    result = CliRunner().invoke(cli, ["run", "--project", project, "--host", "::", "--port", str(port)])
+
+    assert result.exit_code == 0, result.output
+    assert [kw["companion_base_url"] for kw in run_calls.buckaroo_kwargs] == [f"http://[::1]:{port}"]
+
+
 # ---------------------------------------------------------------------------
 # clients find the companion of their own data dir
 # ---------------------------------------------------------------------------
@@ -328,6 +389,25 @@ def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(tmp_path
     assert companion_url() == "http://127.0.0.1:17873"
     monkeypatch.setenv("TALLYMAN_HOME", str(home_c))
     assert companion_url() is None
+
+
+@_needs_ipv6_loopback
+def test_companion_url_reaches_a_server_on_the_ipv6_wildcard(isolated_home, hold_data_dir):
+    """uvicorn binds through asyncio's create_server, which sets IPV6_V6ONLY on an IPv6 socket, so a server on `::`
+    listens on ::1 and not on 127.0.0.1. Its clients have to be sent to ::1."""
+    from tallyman_core.server_lock import companion_url
+
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server:
+        server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
+        server.bind(("::", 0))
+        server.listen()
+        port = server.getsockname()[1]
+        hold_data_dir(isolated_home, port=port, bind_host="::")
+
+        url = urlsplit(companion_url())
+        assert url.port == port
+        with socket.create_connection((url.hostname, url.port), timeout=5):
+            pass
 
 
 def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(project, isolated_home, monkeypatch, hold_data_dir):

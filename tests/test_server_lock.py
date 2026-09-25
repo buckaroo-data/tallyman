@@ -21,7 +21,6 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urlsplit
 
 import pytest
 
@@ -250,6 +249,8 @@ def run_calls(monkeypatch) -> _Calls:
     class FakeServer:
         """uvicorn.Server, which serves a socket tallyman bound itself."""
 
+        started = True
+
         def __init__(self, config):
             self.config = config
 
@@ -440,25 +441,6 @@ def test_companion_url_is_the_port_the_owner_of_this_data_dir_serves_on(tmp_path
     assert companion_url() == "http://127.0.0.1:17873"
     monkeypatch.setenv("TALLYMAN_HOME", str(home_c))
     assert companion_url() is None
-
-
-@_needs_ipv6_loopback
-def test_companion_url_reaches_a_server_on_the_ipv6_wildcard(isolated_home, hold_data_dir):
-    """uvicorn binds through asyncio's create_server, which sets IPV6_V6ONLY on an IPv6 socket, so a server on `::`
-    listens on ::1 and not on 127.0.0.1. Its clients have to be sent to ::1."""
-    from tallyman_core.server_lock import companion_url
-
-    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as server:
-        server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 1)
-        server.bind(("::", 0))
-        server.listen()
-        port = server.getsockname()[1]
-        hold_data_dir(isolated_home, port=port, bind_host="::")
-
-        url = urlsplit(companion_url())
-        assert url.port == port
-        with socket.create_connection((url.hostname, url.port), timeout=5):
-            pass
 
 
 def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(project, isolated_home, monkeypatch, hold_data_dir):

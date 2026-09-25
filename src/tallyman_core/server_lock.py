@@ -154,15 +154,12 @@ def companion_url(home: Path | str | None = None) -> str | None:
 def client_host(bind_host: str) -> str:
     """The host, as written in a URL, at which a process on this machine reaches a server bound to *bind_host*.
 
-    A wildcard is no address to connect to, so it becomes the loopback of its own family. For ``::`` that is ``::1``,
-    not 127.0.0.1: uvicorn binds through asyncio's ``create_server``, which sets IPV6_V6ONLY on an IPv6 socket, so a
-    server on ``::`` does not listen on IPv4 at all. An IPv6 address is bracketed.
+    A wildcard is no address to connect to, so it becomes 127.0.0.1, since local work defaults to IPv4. That holds for
+    ``::`` too, because ``tallyman run`` binds ``::`` dual-stack (IPv4 as well). An IPv6 address is bracketed.
     """
     host = bind_host.strip("[]")
-    if host in ("", "0.0.0.0"):
+    if host in ("", "0.0.0.0", "::"):
         return "127.0.0.1"
-    if host == "::":
-        return "[::1]"
     return f"[{host}]" if ":" in host else host
 
 

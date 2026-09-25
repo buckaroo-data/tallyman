@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import signal
+import socket
 from pathlib import Path
 
 import click
@@ -191,21 +192,20 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
                 f"port {port} on {host} is already in use. Pass --port to serve this data dir ({data_dir}) on another."
             )
         os.environ.setdefault("TALLYMAN_PROJECT", project_name)
-        click.echo(f"tallyman run · project={project_name} · data dir={data_dir} · http://{host}:{port}")
+        url = f"http://{client_host(host)}:{port}"  # where a process on this machine reaches the companion
+        click.echo(f"tallyman run · project={project_name} · data dir={data_dir} · {url}")
 
         from tallyman_companion import create_app
         from tallyman_companion.buckaroo_lifecycle import BuckarooManager, BuckarooUnavailable
 
         if buckaroo:
             buckaroo_log = project_dir(project_name) / "buckaroo.log"
-            # Address the Buckaroo subprocess uses to POST per-grid-load telemetry
-            # back to us (buckaroo#943). When bound to a wildcard (0.0.0.0, ::), the
-            # subprocess must still reach us on the loopback, not the wildcard.
-            companion_base_url = f"http://{client_host(host)}:{port}"
+            # The Buckaroo subprocess POSTs per-grid-load telemetry back to us there
+            # (buckaroo#943): on the loopback when we are bound to a wildcard.
             bk = BuckarooManager(
                 port=buckaroo_port,
                 log_file=buckaroo_log,
-                companion_base_url=companion_base_url,
+                companion_base_url=url,
             )
             try:
                 bk.start()
@@ -218,7 +218,7 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
 
         app = create_app(project_name, buckaroo=bk)
         served = True
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        _serve(app, host, port)
     finally:
         # Released only once uvicorn has returned. It closes the port first and then finishes in-flight requests
         # (a build, a recalc), which still write into the data dir, so a restart has to wait for this process to
@@ -230,6 +230,33 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         signal.signal(signal.SIGTERM, previous_sigterm)
         if served:
             click.echo(f"tallyman run · stopped · data dir={data_dir}")
+
+
+def _serve(app, host: str, port: int) -> None:
+    """Serve *app* on *host*:*port* until it shuts down.
+
+    A server on ``::`` takes IPv4 too: local work defaults to IPv4, and the local URL tallyman gives for any wildcard
+    is 127.0.0.1 (``server_lock.client_host``). uvicorn alone binds ``::`` through asyncio's ``create_server``, which
+    sets IPV6_V6ONLY, so that socket is bound here, dual-stack, and handed to uvicorn.
+    """
+    if host.strip("[]") != "::":
+        uvicorn.run(app, host=host, port=port, log_level="info")
+        return
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as asyncio binds
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        try:
+            sock.bind(("::", port))
+        except OSError as exc:
+            raise click.ClickException(f"port {port} on :: cannot be bound ({exc.strerror}). Pass --port.") from None
+        server = uvicorn.Server(uvicorn.Config(app, host="::", port=port, log_level="info"))
+        # What uvicorn.run does around Server.run: Ctrl-C is a normal stop, and a failed startup exits 3.
+        try:
+            server.run(sockets=[sock])
+        except KeyboardInterrupt:
+            pass
+        if not server.started:
+            raise SystemExit(3)
 
 
 def _exit_on_sigterm(signum: int, frame) -> None:

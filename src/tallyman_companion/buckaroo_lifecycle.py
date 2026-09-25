@@ -111,7 +111,8 @@ def port_in_use(host: str, port: int) -> bool:
     for Buckaroo): without it, a port a stopped server left in TIME_WAIT (its closed browser and WS connections) is
     reported busy for ~60s after a restart, though the server itself could bind it. And a connect, because on macOS
     that bind succeeds beside a live listener on an overlapping address: 127.0.0.1 next to 0.0.0.0, or the reverse.
-    A wildcard *host* is probed on the loopback, so a listener only on another interface's address is not seen.
+    A wildcard *host* is probed on the loopback, so a listener only on another interface's address is not seen. ``::``
+    is probed on both loopbacks, since ``tallyman run`` serves it dual-stack and its clients reach it on 127.0.0.1.
     A bind error other than EADDRINUSE (a *host* that is not an address of this machine) is left for the server to
     report.
     """
@@ -124,10 +125,14 @@ def port_in_use(host: str, port: int) -> bool:
         except OSError as exc:
             if exc.errno == errno.EADDRINUSE:
                 return True
-    target = {"": "127.0.0.1", "0.0.0.0": "127.0.0.1", "::": "::1"}.get(bare, bare)
-    with socket.socket(socket.AF_INET6 if ":" in target else socket.AF_INET, socket.SOCK_STREAM) as s:
+    targets = {"": ["127.0.0.1"], "0.0.0.0": ["127.0.0.1"], "::": ["::1", "127.0.0.1"]}.get(bare, [bare])
+    return any(_accepts(target, port) for target in targets)
+
+
+def _accepts(address: str, port: int) -> bool:
+    with socket.socket(socket.AF_INET6 if ":" in address else socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(1.0)
-        return s.connect_ex((target, port)) == 0
+        return s.connect_ex((address, port)) == 0
 
 
 class BuckarooUnavailable(RuntimeError):

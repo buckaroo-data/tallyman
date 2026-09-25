@@ -732,6 +732,22 @@ def test_port_in_use_sees_a_listener_on_an_overlapping_address(listen_on, probe)
     assert port_in_use(probe, port) is False  # nothing listens once it is closed
 
 
+@_needs_ipv6_loopback
+@pytest.mark.parametrize("listen_on", ["127.0.0.1", "0.0.0.0"])
+def test_port_in_use_on_the_ipv6_wildcard_sees_an_ipv4_listener(listen_on):
+    """A server on :: serves IPv4 too, and its clients reach it on 127.0.0.1. Beside an IPv4 listener on that port it
+    would start, and its clients would reach the other server."""
+    from tallyman_companion.buckaroo_lifecycle import port_in_use
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
+        busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as uvicorn binds
+        busy.bind((listen_on, 0))
+        busy.listen()
+        port = busy.getsockname()[1]
+        assert port_in_use("::", port) is True
+    assert port_in_use("::", port) is False  # nothing listens once it is closed
+
+
 def test_run_refuses_a_port_a_wildcard_listener_holds(project, isolated_home, run_calls):
     """A second tallyman that forgot --port, next to one serving on 0.0.0.0:<port>, would bind the loopback beside it
     and take over the first one's clients (they reach a wildcard bind on the loopback)."""

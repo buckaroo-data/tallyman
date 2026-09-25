@@ -37,7 +37,6 @@ from pathlib import Path
 from tallyman_core.paths import tallyman_home
 
 LOCK_FILENAME = "server.lock"
-_WILDCARD_HOSTS = frozenset({"", "0.0.0.0", "::", "[::]"})
 
 # How long a claim keeps retrying a lock it finds taken before it refuses. ``read_owner`` probes the lock by holding a
 # shared lock for the length of one syscall, and a claim that lands in that moment would otherwise be refused by a
@@ -149,12 +148,22 @@ def companion_url(home: Path | str | None = None) -> str | None:
     port = (owner or {}).get("port")
     if not isinstance(port, int):
         return None
-    host = str(owner.get("bind_host") or "")
-    if host in _WILDCARD_HOSTS:
-        host = "127.0.0.1"
-    elif ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    return f"http://{host}:{port}"
+    return f"http://{client_host(str(owner.get('bind_host') or ''))}:{port}"
+
+
+def client_host(bind_host: str) -> str:
+    """The host, as written in a URL, at which a process on this machine reaches a server bound to *bind_host*.
+
+    A wildcard is no address to connect to, so it becomes the loopback of its own family. For ``::`` that is ``::1``,
+    not 127.0.0.1: uvicorn binds through asyncio's ``create_server``, which sets IPV6_V6ONLY on an IPv6 socket, so a
+    server on ``::`` does not listen on IPv4 at all. An IPv6 address is bracketed.
+    """
+    host = bind_host.strip("[]")
+    if host in ("", "0.0.0.0"):
+        return "127.0.0.1"
+    if host == "::":
+        return "[::1]"
+    return f"[{host}]" if ":" in host else host
 
 
 def is_this_data_dir(home: Path | str) -> bool:

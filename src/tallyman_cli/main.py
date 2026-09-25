@@ -141,7 +141,7 @@ def revisions_label(step: int, name: str, project_opt: str | None) -> None:
 @click.option(
     "--project",
     default=None,
-    help="Project name (defaults to TALLYMAN_PROJECT env or 'spike').",
+    help="Project name (defaults to the data dir's active project, seeded from TALLYMAN_PROJECT).",
 )
 @click.option("--port", default=7860, type=int)
 @click.option("--host", default="127.0.0.1")
@@ -158,7 +158,8 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
     `tallyman run` on the same one is refused. A second tallyman runs on its own data dir and port.
     """
     from tallyman_companion.buckaroo_lifecycle import port_in_use
-    from tallyman_core.server_lock import DataDirInUse, claim_data_dir, release_data_dir
+    from tallyman_core.paths import list_projects
+    from tallyman_core.server_lock import DataDirInUse, claim_data_dir, client_host, release_data_dir
 
     try:
         claim = claim_data_dir(port=port, bind_host=host)
@@ -173,6 +174,15 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
     served = False
     try:
         project_name = resolve_project(project)
+        if project_name is None:
+            # A fresh data dir has none: `tallyman init` makes a project without making it active.
+            projects = list_projects()
+            hint = (
+                f"Pass --project with one of its projects: {', '.join(projects)}."
+                if projects
+                else "It has no projects: create one with `tallyman init <name>`, then pass --project <name>."
+            )
+            raise click.ClickException(f"no active project in data dir {data_dir}. {hint}")
         if not project_dir(project_name).exists():
             raise click.ClickException(f"project '{project_name}' not found. Run `tallyman init {project_name}` first.")
         # Checked before Buckaroo starts, so a refused run leaves nothing running.
@@ -189,10 +199,9 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         if buckaroo:
             buckaroo_log = project_dir(project_name) / "buckaroo.log"
             # Address the Buckaroo subprocess uses to POST per-grid-load telemetry
-            # back to us (buckaroo#943). When bound to 0.0.0.0 (all interfaces), the
+            # back to us (buckaroo#943). When bound to a wildcard (0.0.0.0, ::), the
             # subprocess must still reach us on the loopback, not the wildcard.
-            telemetry_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
-            companion_base_url = f"http://{telemetry_host}:{port}"
+            companion_base_url = f"http://{client_host(host)}:{port}"
             bk = BuckarooManager(
                 port=buckaroo_port,
                 log_file=buckaroo_log,

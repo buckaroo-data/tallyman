@@ -54,10 +54,16 @@ jobs:
       - name: build React SPA
         run: pnpm -C packages/app install --frozen-lockfile && pnpm -C packages/app build
       - name: vitest (React unit)
+        id: vitest
         run: pnpm -C packages/app test
+      # sync deps and pytest also run after a vitest failure, so it cannot
+      # hide the pytest result. A failed SPA build still stops the job.
       - name: sync deps
+        id: sync
+        if: success() || steps.vitest.outcome == 'failure'
         run: uv sync
       - name: pytest (fast)
+        if: success() || (steps.vitest.outcome == 'failure' && steps.sync.outcome == 'success')
         # Marker exclusions (integration, cache_lab) live in pyproject.toml's
         # addopts. Do NOT pass -m here: a command-line -m replaces the addopts
         # expression entirely (last -m wins), which is how the on-demand

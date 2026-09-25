@@ -349,7 +349,7 @@ def write_orders(data_dir: Path, name: str = "orders.parquet", *, n_rows: int = 
 
 
 def write_returns_csv(data_dir: Path, name: str = "returns.csv", *, n_rows: int = 600, seed: int = 3) -> Path:
-    """Returns against the shoe orders, as a CSV (the ``tallyman_read_csv`` path and its ordered copy)."""
+    """Returns against the shoe orders, as a CSV (imported with ``catalog_import_source``)."""
     import pandas as pd
 
     rng = np.random.default_rng(seed)

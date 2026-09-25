@@ -2,7 +2,8 @@
 
 A scenario (``tests/eval_scenarios.py``) is a script of the things a user and an LLM do over a working session:
 MCP tool calls with the prompts that asked for them, the SPA opening entries, Buckaroo painting grids, a reset to
-an earlier step in the middle, a source file edited on disk, the cache emptied, the companion restarted. The
+an earlier step in the middle, a source file edited on disk and imported again, the cache emptied, the companion
+restarted. The
 harness runs those steps in one process against an isolated ``TALLYMAN_HOME`` and, after each one, asks the oracle
 (``tests/eval_oracle.py``) whether the project still agrees with itself. The oracle keeps a ledger of what every
 content hash served the first time it was read, so a disagreement between step 3 and step 11 is caught, which a
@@ -118,6 +119,9 @@ class StepRecord:
     error: str | None = None
     step_before: int | None = None  # the catalog's git step before and after
     step_after: int | None = None
+    # How many step tags the step created. Not step_after - step_before: a checkpoint numbers its step one past the
+    # highest tag, so after a reset back the first new step is several numbers above the step it was taken from.
+    steps_added: int = 0
     findings: list[Finding] = field(default_factory=list)
 
 
@@ -401,10 +405,19 @@ class Session:
         except Exception:
             return None
 
+    def _step_tags(self) -> set[int]:
+        from tallyman_core.catalog_state import _step_tags
+
+        try:
+            return set(_step_tags(self.project))
+        except Exception:
+            return set()
+
     @contextlib.contextmanager
     def _step(self, kind: str, label: str, args: dict, *, mutating: bool, expect_error: bool = False):
         rec = StepRecord(index=len(self.steps), kind=kind, label=label, args=_short(args))
         rec.step_before = self._current_step()
+        tags_before = self._step_tags()
         self.steps.append(rec)
         pre = self.oracle.pre_step(rec)
         t0 = time.perf_counter()
@@ -423,6 +436,7 @@ class Session:
         finally:
             rec.seconds = round(time.perf_counter() - t0, 3)
             rec.step_after = self._current_step()
+            rec.steps_added = len(self._step_tags() - tags_before)
             self.oracle.post_step(rec, pre, mutating=mutating, expect_error=expect_error)
             if self.sweep_policy == "every" or (self.sweep_policy == "mutations" and mutating):
                 self.oracle.sweep(rec)
@@ -493,13 +507,15 @@ class Session:
 
     def replay(self, storyboard: dict, *, stop_before: int | None = None, start_at: int = 0) -> None:
         """Run a ``tallyman replay`` storyboard's steps (demo/storyboard.json) as MCP steps, with its narration
-        kept as notes. A ``cell_id`` of ``PLACEHOLDER`` is resolved to the notebook's last cell."""
+        kept as notes. ``${TALLYMAN_PROJECT_ROOT}`` in an argument is expanded as ``tallyman replay`` expands it,
+        and a ``cell_id`` of ``PLACEHOLDER`` is resolved to the notebook's last cell."""
+        from tallyman_cli.main import _expand_project_root
         from tallyman_core import notebook
 
         for step in storyboard["steps"][start_at:stop_before]:
             if step.get("skip"):
                 continue
-            args = dict(step.get("args", {}))
+            args = {k: _expand_project_root(v, self.project) for k, v in step.get("args", {}).items()}
             if args.get("cell_id") == "PLACEHOLDER":
                 cells = notebook.load(self.project).get("cells", [])
                 args["cell_id"] = cells[-1]["id"] if cells else "PLACEHOLDER"
@@ -627,33 +643,50 @@ class Session:
             label_step(self.project, self._current_step(), name)
 
     def edit_source(self, rel_path: str, change: Callable, *, label: str | None = None) -> None:
-        """The user overwrites a data file (``change`` maps the old dataframe to the new one)."""
+        """The user overwrites a data file that was imported (``change`` maps the old dataframe to the new one).
+
+        After an import the file is provenance only (ADR-011 D2): nothing reads it again until it is imported
+        again, so the edit must leave staleness exactly as it was. The ledger checks the rows on the next reads."""
         import pandas as pd
 
         from tallyman_core import data_dir
 
-        with self._step("edit_source", label or f"edit {rel_path}", {"rel_path": rel_path}, mutating=False):
+        with self._step("edit_source", label or f"edit {rel_path}", {"rel_path": rel_path}, mutating=False) as rec:
+            before = self.oracle.stale_hashes(rec)
             p = data_dir(self.project) / rel_path
             if p.suffix == ".csv":
                 change(pd.read_csv(p)).to_csv(p, index=False)
             else:
                 change(pd.read_parquet(p)).to_parquet(p)
-            self.oracle.sources_edited.add(rel_path)
+            after = self.oracle.stale_hashes(rec)
+            if after != before:
+                self.flag(
+                    "source_edit_leaked",
+                    "error",
+                    f"editing {rel_path} on disk changed staleness without an import",
+                    rec,
+                    newly_stale=sorted(after - before),
+                    no_longer_stale=sorted(before - after),
+                )
 
     def evict(self, what: str = "all", *, label: str | None = None) -> None:
-        """The user empties the cache from the Cache page, or deletes files by hand. ``what`` is ``all`` (the
-        whole ``compute_cache/``), ``snapshots``, ``ordered_copies``, or a ref whose snapshot alone goes."""
+        """The user empties the cache from the Cache page, or deletes files by hand. ``what`` is ``cache_page``
+        (``DELETE /api/result_cache/<hash>`` for every snapshot the page lists; it refuses a pinned one), ``all``
+        (the whole ``compute_cache/``, by hand), ``snapshots`` (every snapshot, sources' included, by hand), or a ref
+        whose snapshot alone goes."""
         from tallyman_core.paths import compute_cache_dir
         from tallyman_xorq.materialize import snapshot_path, snapshots_dir
-        from tallyman_xorq.ordered_copy import ordered_copies_dir
 
-        with self._step("evict", label or f"evict {what}", {"what": what}, mutating=False):
-            if what == "all":
+        with self._step("evict", label or f"evict {what}", {"what": what}, mutating=False) as rec:
+            if what == "cache_page":
+                listing = self._request("GET", f"/{self.project}/api/result_cache", None, rec).json()
+                for row in listing.get("entries", []):
+                    expect = (409,) if row.get("pinned") else (200,)
+                    self._request("DELETE", f"/{self.project}/api/result_cache/{row['hash']}", None, rec, expect=expect)
+            elif what == "all":
                 shutil.rmtree(compute_cache_dir(self.project), ignore_errors=True)
             elif what == "snapshots":
                 shutil.rmtree(snapshots_dir(self.project), ignore_errors=True)
-            elif what == "ordered_copies":
-                shutil.rmtree(ordered_copies_dir(self.project), ignore_errors=True)
             else:
                 snapshot_path(self.project, self.resolve(what)).unlink(missing_ok=True)
 
@@ -746,11 +779,15 @@ class Session:
             self.oracle.sweep(rec)
 
     def finish(self) -> None:
-        """The closing checks every scenario gets: a restart, a warm sweep, then everything read again from an
-        empty ``compute_cache/`` (I2's cold seam), the verify sweep, and a read from a fresh process."""
+        """The closing checks every scenario gets: a restart, a warm sweep, then everything read again after the
+        Cache page deleted every snapshot it may (I2's cold seam), the verify sweep, and a read from a fresh process.
+
+        The cold seam goes through the Cache page rather than ``rm -rf compute_cache/`` because a pinned snapshot
+        is the only copy of a non-reproducible entry's rows, not a cache, and the page refuses to delete it. A
+        scenario that deletes files by hand says so with ``evict("all")``."""
         self.restart(buckaroo=True, label="finish: restart")
         self.sweep("finish: warm sweep")
-        self.evict("all", label="finish: empty compute_cache")
+        self.evict("cache_page", label="finish: empty the cache from the Cache page")
         self.sweep("finish: cold sweep")
         with self._step("verify", "finish: verify results", {}, mutating=False) as rec:
             self.oracle.verify_results(rec)
@@ -796,6 +833,7 @@ def _summarize_tool(out) -> Any:
         "hash",
         "alias",
         "version",
+        "created",
         "row_count",
         "error",
         "status",
@@ -841,6 +879,9 @@ def cross_process_script() -> str:
 
 def run_cross_process(project: str, pages: dict[str, tuple[int, int]]) -> dict:
     env = {**os.environ}
+    # close_fds=False lets CPython start the child with posix_spawn on macOS instead of fork + exec. In a full run
+    # of the suite (not in one scenario alone) a forked child of this process segfaults before its exec, which the
+    # check would report as the fresh process failing with -11.
     proc = subprocess.run(
         [sys.executable, "-c", cross_process_script()],
         input=json.dumps({"project": project, "pages": pages}),
@@ -848,6 +889,7 @@ def run_cross_process(project: str, pages: dict[str, tuple[int, int]]) -> dict:
         text=True,
         env=env,
         timeout=600,
+        close_fds=False,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"fresh process failed ({proc.returncode}): {proc.stderr[-2000:]}")

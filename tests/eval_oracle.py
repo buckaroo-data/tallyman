@@ -49,7 +49,6 @@ Reads (I1, I2, I5, I6)
     snapshot_unfaithful      a snapshot's content digest differs from the manifest's result_digest
     snapshot_rowcount_mismatch
     snapshot_row_order_broken  a snapshot's __row_order is not 0..N-1 in file order, or not last
-    ordered_copy_row_order_broken
     unfaithful_heal          errors.jsonl gained an unfaithful_heal record
     error_recorded           warn: errors.jsonl gained a record during a step that succeeded
     error_message_unhelpful  warn: an expected error did not name what the LLM needs to fix the call
@@ -67,7 +66,8 @@ Buckaroo (the grid)
 Staleness and recalc
     staleness_failed         /api/staleness failed
     cascade_missed           with auto-recalc on, a live head is stale on the alias axis after the step settled
-    orphan_stale             warn: the scan-on-load backstop reports orphans with no source edit to explain them
+    orphan_stale             warn: the scan-on-load backstop reports orphans
+    source_edit_leaked       editing an imported file on disk changed staleness before any re-import (ADR-011 D2)
     recalc_noop_while_stale  a real recalc reported noop for an entry it also reported stale (seen in 6180b849)
     recalc_not_deterministic the same recalc from the same state minted different hashes
 
@@ -85,6 +85,7 @@ Concurrency and global state
 
 Scenario
     scenario_expectation     a scenario's own check on what a step produced (Session.expect) failed
+    source_type_changed      a source entry's column type differs from the imported file's (#197)
 """
 
 from __future__ import annotations
@@ -139,7 +140,6 @@ class Oracle:
         self.ledger: dict[str, dict] = {}
         self.diffs: dict[tuple[str, str], str] = {}
         self.recalcs: dict[str, dict] = {}  # fingerprint of the state a recalc started from -> its remap
-        self.sources_edited: set[str] = set()
         self._errors_seen = 0
         self._bk_failures_seen = 0
         self._notifies_seen = 0
@@ -162,11 +162,7 @@ class Oracle:
 
     def post_step(self, rec: StepRecord, pre: dict, *, mutating: bool, expect_error: bool) -> None:
         s = self.s
-        delta = None
-        if rec.step_before is not None and rec.step_after is not None:
-            delta = rec.step_after - rec.step_before
-        elif rec.step_after is not None and rec.step_before is None:
-            delta = 1
+        delta = rec.steps_added
         if rec.kind == "mcp":
             tool = rec.args.get("tool")
             if tool in READ_ONLY_TOOLS and delta:
@@ -300,7 +296,6 @@ class Oracle:
         for name in sorted(heads):
             self.open_entry(name, rec)
 
-        self._check_ordered_copies(rec)
         self._check_staleness(rec)
         for name, hashes in sorted(history.items()):
             if len(hashes) >= 2 and name in heads:
@@ -471,7 +466,17 @@ class Oracle:
             body = r.json()
             return fingerprint(_strip_timing(body.get("data", body.get("diff"))))
 
-        alone = {p: fetch(p) for p in dict.fromkeys(reqs)}
+        # Each request alone first, for the answer the concurrent ones must equal. The diff's key search is
+        # time-boxed, so a 504 there is diff_timeout (a warn, as in check_diff) and the diff sits out the run.
+        alone = {}
+        for p in dict.fromkeys(reqs):
+            try:
+                alone[p] = fetch(p)
+            except RuntimeError as exc:
+                if "/api/diff_data/" not in p or not str(exc).startswith("504"):
+                    raise
+                s.flag("diff_timeout", "warn", f"{p} alone: {str(exc)[:300]}", rec)
+        reqs = [p for p in reqs if p in alone]
         timings.clear()
         together = run_threads([lambda p=p: fetch(p) for p in reqs * threads], threads)
         slowest = max(timings, default=0.0)
@@ -598,20 +603,18 @@ class Oracle:
             self.recalcs.setdefault(state, remap)
 
     def state_fingerprint(self) -> str:
-        """What a recalc's outcome may depend on: the alias heads and histories and the bytes of every source."""
-        import hashlib
-
-        from tallyman_core import data_dir
+        """What a recalc's outcome may depend on: the alias heads and histories. A source is an alias too, and the
+        file it was imported from is never read again (ADR-011 D2), so no file on disk belongs here."""
         from tallyman_core.aliases import load_aliases, load_history
 
-        sources = {}
-        root = data_dir(self.project)
-        for p in sorted(root.rglob("*")):
-            if p.is_file() and ".cas" not in p.relative_to(root).parts:
-                sources[str(p.relative_to(root))] = hashlib.md5(p.read_bytes()).hexdigest()
-        return fingerprint(
-            {"heads": load_aliases(self.project), "history": load_history(self.project), "sources": sources}
-        )
+        return fingerprint({"heads": load_aliases(self.project), "history": load_history(self.project)})
+
+    def stale_hashes(self, rec: StepRecord) -> set[str]:
+        """The entries ``/api/staleness`` calls stale right now."""
+        resp = self.s._request("GET", f"/{self.project}/api/staleness", None, rec)
+        if resp.status_code != 200:
+            return set()
+        return {h for h, v in resp.json().get("entries", {}).items() if v.get("stale")}
 
     def _check_staleness(self, rec: StepRecord) -> None:
         s = self.s
@@ -631,8 +634,8 @@ class Oracle:
                         f"{alias_reasons[0]['now']}",
                         rec,
                     )
-            if body.get("orphan_stale") and not self.sources_edited:
-                s.flag("orphan_stale", "warn", f"orphans with no source edit: {body['orphan_stale']}", rec)
+            if body.get("orphan_stale"):
+                s.flag("orphan_stale", "warn", f"orphans: {body['orphan_stale']}", rec)
 
     # ------------------------------------------------------------------
     # files
@@ -664,24 +667,6 @@ class Oracle:
                 f"{h}: snapshot has {len(ro)} rows, manifest {m.get('row_count')}",
                 rec,
             )
-
-    def _check_ordered_copies(self, rec: StepRecord) -> None:
-        import pyarrow.parquet as pq
-
-        from tallyman_xorq.ordered_copy import ordered_copies_dir
-
-        d = ordered_copies_dir(self.project)
-        if not d.is_dir():
-            return
-        for f in sorted(d.glob("*.parquet")):
-            try:
-                names = pq.read_schema(f).names
-                ro = pq.read_table(f, columns=[ROW_ORDER]).column(0).to_pylist() if ROW_ORDER in names else None
-            except Exception as exc:
-                self.s.flag("ordered_copy_row_order_broken", "error", f"{f.name}: {exc}"[:300], rec)
-                continue
-            if ro is None or names[-1] != ROW_ORDER or ro != list(range(len(ro))):
-                self.s.flag("ordered_copy_row_order_broken", "error", f"{f.name}: {ROW_ORDER} not 0..N-1", rec)
 
     def compute_cache_listing(self) -> dict[str, int]:
         from tallyman_core.paths import compute_cache_dir

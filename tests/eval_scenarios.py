@@ -19,6 +19,12 @@ Origins (Claude Code transcripts under ``~/.claude/projects/``):
   cheap, raw parquet reads, the reset roundtrip that lost a clone, the pin lost across a reset, and polars
   changing source column types in the ordered copy.
 
+The recorded sessions predate ADR-011 (sources are aliases): they loaded files with ``catalog_load_parquet`` and
+read them with ``read_project_file``. Here every file enters by ``catalog_import_source`` and every recipe reads an
+alias. Where a session revised the alias it had loaded (``contracts``), the file is imported as ``nfl_contracts``
+and ``contracts`` is a catalog entry over it, so the revise and its cascade replay as they were recorded. An edit
+of a file on disk is followed by the re-import that a user now has to make for the catalog to see it.
+
 ``known`` maps a finding code to the open issue that explains it; the test reports those as known and does not fail
 on them, and says so when a known one stops reproducing.
 """
@@ -63,9 +69,14 @@ def _data_dir(s: Session):
 # Recipes, verbatim from the recorded sessions (session id and call number in each comment)
 # ---------------------------------------------------------------------------
 
-# f3a97dc8 #5 — "Value, Guaranteed, inflated_value, inflated guaranteed are numeric millions columns"
-CONTRACTS_RESCALE = """from tallyman_xorq.io import read_project_file
-expr = read_project_file('nfl_contracts.parquet')
+# The load of f3a97dc8 #1 as a catalog entry over the imported file, so a later call can revise it (ADR-011 D1
+# refuses a revise of the source alias itself).
+CONTRACTS = "from tallyman_xorq.io import tracked_expr_from_alias\nexpr = tracked_expr_from_alias('nfl_contracts')\n"
+
+# f3a97dc8 #5 — "Value, Guaranteed, inflated_value, inflated guaranteed are numeric millions columns" (it read the
+# file with read_project_file; the file is the nfl_contracts source now)
+CONTRACTS_RESCALE = """from tallyman_xorq.io import tracked_expr_from_alias
+expr = tracked_expr_from_alias('nfl_contracts')
 expr = expr.mutate(
     value=expr.value * 1_000_000,
     guaranteed=expr.guaranteed * 1_000_000,
@@ -673,16 +684,29 @@ PP_COUNTS = """def process(expr):
     return out
 """
 PP_ACTIVE_ONLY = "def process(expr):\n    return expr.filter(expr.is_active == True)\n"
+# The same with the guard catalog_add_post_processing's docstring asks for: it validates against a table of {a, b}.
+PP_ACTIVE_ONLY_GUARDED = (
+    'def process(expr):\n    if "is_active" not in expr.columns:\n        return expr\n'
+    "    return expr.filter(expr.is_active == True)\n"
+)
 
 
-ORDERS = "from tallyman_xorq.io import read_project_file\nt = read_project_file('orders.parquet')\n"
+ORDERS = "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('orders')\n"
 BY_REGION = ORDERS + "expr = t.group_by('region').aggregate(total=t.price.sum(), n=t.count())\n"
 
-# The unnest probe over the file rather than the alias, for a scenario that has no contracts entry to follow.
-UNNEST_FROM_FILE = UNNEST_PROBE.replace(
-    'from tallyman_xorq.io import tracked_expr_from_alias\n\ncontracts = tracked_expr_from_alias("contracts")',
-    "from tallyman_xorq.io import read_project_file\n\ncontracts = read_project_file('nfl_contracts.parquet')",
-)
+# The column types of tests/eval_data.py's returns.csv (catalog_import_source asks for a schema on every CSV).
+RETURNS_SCHEMA = {"order_id": "int64", "reason": "string", "refund": "float64"}
+
+
+def _import(s: Session, file: str, alias: str, prompt: str = "", **kw) -> dict:
+    """``catalog_import_source`` of a file the scenario wrote under the project's ``data/`` (any path would do)."""
+    return s.mcp("catalog_import_source", outside_path=str(_data_dir(s) / file), alias=alias, prompt=prompt, **kw)
+
+
+def _import_contracts(s: Session, prompt: str) -> None:
+    """The contracts file as the ``nfl_contracts`` source, and ``contracts`` as a revisable entry over it."""
+    _import(s, "nfl_contracts.parquet", "nfl_contracts", prompt)
+    s.mcp("catalog_create", name="contracts", code=CONTRACTS, prompt=prompt)
 
 
 # ---------------------------------------------------------------------------
@@ -699,12 +723,7 @@ UNNEST_FROM_FILE = UNNEST_PROBE.replace(
 def nfl_salaries_session(s: Session) -> None:
     write_nfl(_data_dir(s))
     s.note("f3a97dc8: 'lets start a new tallyman project. can you find me nfl salary information in a dataset?'")
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="nfl_contracts.parquet",
-        name="contracts",
-        prompt="nfl contracts (nflverse historical_contracts)",
-    )
+    _import_contracts(s, "nfl contracts (nflverse historical_contracts)")
     s.open("contracts")
     s.mcp("catalog_list_display_klasses")
     s.mcp(
@@ -722,12 +741,7 @@ def nfl_salaries_session(s: Session) -> None:
     s.mcp("catalog_list")
 
     s.note("'make a new QB only table with EPA, year, team, contract details'")
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="player_stats_season.parquet",
-        name="player_stats_season",
-        prompt="nflverse player stats, season level",
-    )
+    _import(s, "player_stats_season.parquet", "player_stats_season", "nflverse player stats, season level")
     s.mcp(
         "catalog_create",
         name="qb_epa_contracts",
@@ -816,35 +830,25 @@ def nfl_salaries_session(s: Session) -> None:
 
 @scenario(
     origin="63721a56, 0fcac6bb",
-    summary="The demo prompt in a fresh project: a load before the files are in "
-    "data/, grain probes, the post-processing sandbox, qb_epa and three revisions, the display prompt; a CLI "
+    summary="The demo prompt in a fresh project: an import before the files "
+    "exist, grain probes, the post-processing sandbox, qb_epa and three revisions, the display prompt; a CLI "
     "reset back to V1, a new revision on the branch that re-creates a retired version's hash, the "
     "'contract signed in the future' child, a snapshot eviction under the child, a restart.",
 )
 def nfl_demo_first_encounter(s: Session) -> None:
     s.mcp("project_list")
     s.mcp("catalog_list")
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="nfl_contracts.parquet",
-        name="contracts",
+    _import(
+        s,
+        "nfl_contracts.parquet",
+        "contracts",
+        "Load nfl_contracts.parquet as contracts",
         expect_error=True,
-        expect_message="data",
-        prompt="Load nfl_contracts.parquet as contracts",
+        expect_message="nfl_contracts.parquet",
     )
     write_nfl(_data_dir(s))
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="nfl_contracts.parquet",
-        name="contracts",
-        prompt="Load nfl_contracts.parquet as contracts",
-    )
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="player_stats_season.parquet",
-        name="player_stats",
-        prompt="Load player_stats_season.parquet as player_stats",
-    )
+    _import(s, "nfl_contracts.parquet", "contracts", "Load nfl_contracts.parquet as contracts")
+    _import(s, "player_stats_season.parquet", "player_stats", "Load player_stats_season.parquet as player_stats")
     s.mcp("catalog_run", code=GRAIN_PLAYER_SEASON, prompt="grain check: one row per QB per season?")
     s.mcp("catalog_run", code=GRAIN_ACTIVE, prompt="grain check: one active contract per player?")
     s.mcp("catalog_run_post_processing", entry="contracts", code=PP_ACTIVE_DUPES)
@@ -881,7 +885,14 @@ def nfl_demo_first_encounter(s: Session) -> None:
     s.diff("qb_epa", 1, 4, label="diff qb_epa V1 -> V4")
     s.mcp("catalog_diff", name="qb_epa")
     s.mcp("catalog_add_display_klass", name="money_and_year_styling", source=DISPLAY_MONEY_AND_YEAR)
-    s.mcp("catalog_add_post_processing", name="active_only", source=PP_ACTIVE_ONLY)
+    s.mcp(
+        "catalog_add_post_processing",
+        name="active_only",
+        source=PP_ACTIVE_ONLY,
+        expect_error=True,
+        expect_message="dry-run",
+    )
+    s.mcp("catalog_add_post_processing", name="active_only", source=PP_ACTIVE_ONLY_GUARDED)
     s.open("qb_epa")
     s.open("contracts")
 
@@ -922,13 +933,14 @@ def nfl_demo_first_encounter(s: Session) -> None:
     origin="6180b849",
     summary="Manual recalc: a two-level follower chain, a contracts revise with auto-recalc "
     "off, scan and recalc; a reset back, the same revise again and a recalc that must mint the same hashes; a "
-    "source edit on disk and a source-axis recalc; old versions must keep serving their rows.",
+    "source file edited on disk (nothing goes stale), then imported again and recalculated; old versions must keep "
+    "serving their rows.",
     auto_recalc=False,
 )
 def recalc_after_rescale(s: Session) -> None:
     write_nfl(_data_dir(s))
-    s.mcp("catalog_load_parquet", rel_path="nfl_contracts.parquet", name="contracts", prompt="contracts")
-    s.mcp("catalog_load_parquet", rel_path="player_stats_season.parquet", name="player_stats", prompt="stats")
+    _import_contracts(s, "contracts")
+    _import(s, "player_stats_season.parquet", "player_stats", "stats")
     s.mcp("catalog_create", name="qb_epa", code=QB_EPA_V1, prompt="qb epa per apy")
     s.mcp("catalog_create", name="qb_bang_for_buck", code=QB_BANG_FOR_BUCK, prompt="bang for buck per QB")
     s.open("qb_epa")
@@ -971,12 +983,19 @@ def recalc_after_rescale(s: Session) -> None:
     )
     s.open("qb_bang_for_buck")
 
-    s.note("the user overwrites player_stats_season.parquet: the source axis goes stale")
+    s.note(
+        "the user overwrites player_stats_season.parquet: nothing reads the file after its import, so nothing goes "
+        "stale (ADR-011 D2); importing it again mints player_stats V2, and qb_epa goes stale on the alias axis"
+    )
     s.edit_source("player_stats_season.parquet", lambda df: df.assign(passing_epa=df.passing_epa * 1.01))
     scan = s.mcp("catalog_scan_staleness")
+    s.expect(not scan.get("stale"), "an edit on disk made entries stale before any import", stale=scan.get("stale"))
+    out = _import(s, "player_stats_season.parquet", "player_stats", "stats, imported again after the edit")
+    s.expect(out.get("version") == 2, "the re-import of the edited file did not mint V2", reply=_brief(out))
+    scan = s.mcp("catalog_scan_staleness")
     s.expect(
-        get_alias(s.project, "player_stats") in (scan.get("stale") or []),
-        "player_stats is not stale after its file changed",
+        get_alias(s.project, "qb_epa") in (scan.get("stale") or []),
+        "qb_epa is not stale after player_stats advanced",
         stale=scan.get("stale"),
     )
     s.mcp("catalog_recalc", dry_run=False)
@@ -997,10 +1016,12 @@ def recalc_after_rescale(s: Session) -> None:
 def reset_roundtrip_with_grids(s: Session) -> None:
     write_orders(_data_dir(s))
     write_orders(_data_dir(s), "extra.parquet", seed=5)
+    _import(s, "orders.parquet", "orders", "orders")
     s.mcp("catalog_create", name="by_region", code=BY_REGION, prompt="orders by region")
     s.open("by_region")
     s.label_step("s1")
-    extra = "from tallyman_xorq.io import read_project_file\nt = read_project_file('extra.parquet')\n"
+    _import(s, "extra.parquet", "extra", "extra orders")
+    extra = "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('extra')\n"
     s.mcp(
         "catalog_create",
         name="extra_boots",
@@ -1028,6 +1049,7 @@ def reset_roundtrip_with_grids(s: Session) -> None:
     s.open_project()
     s.open("by_region")
     s.http("GET", f"/{s.project}/api/entry/extra_by_cat", expect=(404,), label="extra_by_cat is gone at s1")
+    s.http("GET", f"/{s.project}/api/entry/extra", expect=(404,), label="the extra source is gone at s1 (ADR-011 D7)")
     s.reset("s2", via="cli")
     for name in ("extra_boots", "extra_by_cat", "extra_top"):
         s.open(name)
@@ -1045,21 +1067,17 @@ def reset_roundtrip_with_grids(s: Session) -> None:
 
 @scenario(
     origin="PR #184 reviews (E1, C1), #168",
-    summary="A CSV source through tallyman_read_csv, a worthy float "
-    "aggregate and a join over it; the CSV edited on disk, scan and recalc; the diff promoted to an entry and "
-    "read from an empty cache; a reset back to before the edit, with the live file still edited.",
+    summary="A CSV imported as a source, a worthy float aggregate and a "
+    "join over it; the CSV edited on disk (nothing goes stale) and imported again, which cascades; the diff "
+    "promoted to an entry and read from an empty cache; a reset back to before the edit, with the file on disk "
+    "still edited.",
 )
 def csv_edit_and_promoted_diff(s: Session) -> None:
     d = _data_dir(s)
     write_orders(d)
     write_returns_csv(d)
-    s.mcp("catalog_load_parquet", rel_path="orders.parquet", name="orders", prompt="orders")
-    s.mcp(
-        "catalog_create",
-        name="returns",
-        prompt="returns",
-        code=f"from tallyman_xorq.io import tallyman_read_csv\nexpr = tallyman_read_csv({str(d / 'returns.csv')!r})\n",
-    )
+    _import(s, "orders.parquet", "orders", "orders")
+    _import(s, "returns.csv", "returns", "returns", schema=RETURNS_SCHEMA)
     s.mcp(
         "catalog_create",
         name="refunds_by_reason",
@@ -1079,16 +1097,27 @@ def csv_edit_and_promoted_diff(s: Session) -> None:
         s.open(name)
     s.label_step("before_edit")
 
+    s.note(
+        "the user edits returns.csv on disk; the catalog sees it only once the file is imported again, and the "
+        "import's auto-recalc carries both followers in the same revision"
+    )
     s.edit_source("returns.csv", lambda df: df.assign(refund=df.refund.round(0)))
     scan = s.mcp("catalog_scan_staleness")
-    from tallyman_core import get_alias
-
-    s.expect(
-        get_alias(s.project, "returns") in (scan.get("stale") or []),
-        "returns is not stale after the edit",
-        stale=scan.get("stale"),
+    s.expect(not scan.get("stale"), "an edit on disk made entries stale before any import", stale=scan.get("stale"))
+    out = _import(
+        s,
+        "returns.csv",
+        "returns",
+        "returns, imported again after the edit",
+        schema=RETURNS_SCHEMA,
     )
-    s.mcp("catalog_recalc", dry_run=False)
+    recalc = out.get("recalc") or {}
+    s.expect(
+        out.get("version") == 2 and recalc.get("status") == "ok" and len(recalc.get("remap") or {}) == 2,
+        "the re-import did not mint returns V2 and re-point both followers",
+        reply=_brief(out),
+        recalc=_brief(recalc),
+    )
     s.open("refunds_by_reason")
     s.diff("refunds_by_reason")
     s.page("returns-v1", label="returns V1 still serves the rows before the edit")
@@ -1097,7 +1126,7 @@ def csv_edit_and_promoted_diff(s: Session) -> None:
     s.evict("all")
     s.open("refunds_change", label="open the promoted diff from an empty cache")
     s.reset("before_edit", via="api")
-    s.open("refunds_by_reason", label="refunds_by_reason V1 after the reset (the live CSV is still edited)")
+    s.open("refunds_by_reason", label="refunds_by_reason V1 after the reset (the CSV on disk is still edited)")
     s.mcp("catalog_scan_staleness")
     s.finish()
 
@@ -1110,8 +1139,8 @@ def csv_edit_and_promoted_diff(s: Session) -> None:
 )
 def concurrency_under_load(s: Session) -> None:
     write_nfl(_data_dir(s))
-    s.mcp("catalog_load_parquet", rel_path="nfl_contracts.parquet", name="contracts", prompt="contracts")
-    s.mcp("catalog_load_parquet", rel_path="player_stats_season.parquet", name="player_stats", prompt="stats")
+    _import_contracts(s, "contracts")
+    _import(s, "player_stats_season.parquet", "player_stats", "stats")
     s.mcp("catalog_create", name="qb_epa", code=QB_EPA_V1, prompt="qb epa")
     s.mcp("catalog_revise", name="contracts", code=CONTRACTS_RESCALE, prompt="dollars")
     s.diff("contracts", label="diff contracts V1 -> V2 (no primary key: the search is time-boxed)")
@@ -1130,13 +1159,15 @@ def concurrency_under_load(s: Session) -> None:
 @scenario(
     origin="PR #184 second review, f3a97dc8 errors, ADR-008",
     summary="The authoring rules the redesign added, "
-    "each hit the way an LLM hits it: a self-referencing revise, a bare-alias pin, .cache(), a raw parquet "
-    "read, a three-way join without the drop, a sort that is not the last step, a tied sort under a limit, a "
-    "window and an unnest, ArrayFilter, float aggregates; then a reset and the cold closing checks.",
+    "each hit the way an LLM hits it: a self-referencing revise, a bare-hash and a bare-alias pin, .cache(), a "
+    "raw parquet read and a read_project_file, a revise of a source alias, an unchanged re-import, a three-way "
+    "join without the drop, a sort that is not the last step, a tied sort under a limit, a window and an unnest, "
+    "ArrayFilter, float aggregates; then a reset and the cold closing checks.",
 )
 def authoring_edge_cases(s: Session) -> None:
     write_orders(_data_dir(s))
     write_nfl(_data_dir(s))
+    _import(s, "orders.parquet", "orders", "orders")
     base = s.mcp("catalog_create", name="by_region", code=BY_REGION, prompt="by region")
     s.label_step("base")
     track = "from tallyman_xorq.io import tracked_expr_from_alias, pinned_expr_from_alias\n"
@@ -1151,8 +1182,16 @@ def authoring_edge_cases(s: Session) -> None:
     s.mcp(
         "catalog_revise",
         name="by_region",
-        prompt="only regions with more than 10 orders",
+        expect_error=True,
+        expect_message="-v",
         code=track + f"t = pinned_expr_from_alias({base.get('hash')!r})\nexpr = t.filter(t.n > 10)\n",
+        prompt="only regions with more than 10 orders (ADR-011 D5: a bare content hash)",
+    )
+    s.mcp(
+        "catalog_revise",
+        name="by_region",
+        prompt="only regions with more than 10 orders",
+        code=track + "t = pinned_expr_from_alias('by_region-v1')\nexpr = t.filter(t.n > 10)\n",
     )
     s.mcp(
         "catalog_run",
@@ -1171,12 +1210,31 @@ def authoring_edge_cases(s: Session) -> None:
     s.mcp(
         "catalog_run",
         expect_error=True,
-        expect_message="read_project_file",
+        expect_message="catalog_import_source",
         prompt="raw parquet read",
         code=f"import xorq.api as xo\nexpr = xo.deferred_read_parquet({str(_data_dir(s) / 'orders.parquet')!r})\n",
     )
-
-    s.mcp("catalog_load_parquet", rel_path="orders.parquet", name="orders", prompt="orders")
+    s.mcp(
+        "catalog_run",
+        expect_error=True,
+        expect_message="catalog_import_source",
+        prompt="read_project_file in a recipe (ADR-011 D2)",
+        code="from tallyman_xorq.io import read_project_file\nexpr = read_project_file('orders.parquet')\n",
+    )
+    s.mcp(
+        "catalog_revise",
+        name="orders",
+        expect_error=True,
+        expect_message="catalog_import_source",
+        code=ORDERS + "expr = t.filter(t.qty > 1)\n",
+        prompt="revise a source alias (ADR-011 D1)",
+    )
+    again = _import(s, "orders.parquet", "orders", "orders, imported again unchanged")
+    s.expect(
+        again.get("created") is False and again.get("version") == 1,
+        "importing unchanged bytes again minted a version (ADR-011 D3)",
+        reply=_brief(again),
+    )
     # cheap selects keep __row_order: a cheap entry that drops it is a build error (ADR-008)
     s.mcp(
         "catalog_create",
@@ -1226,17 +1284,17 @@ def authoring_edge_cases(s: Session) -> None:
         code=ORDERS + "expr = t.order_by('region').limit(50)\n",
     )
     s.expect(out.get("reproducible") is not False, "a tied sort under a limit was not made reproducible")
+    _import(s, "nfl_contracts.parquet", "contracts", "contracts")
+    _import(s, "player_stats_season.parquet", "player_stats", "stats")
     ranked = ORDERS + (
         "import xorq.vendor.ibis as ibis\n"
         "w = ibis.window(group_by='region', order_by='price')\n"
         "expr = t.mutate(rank=ibis.row_number().over(w))\n"
     )
-    for name, code in (("ranked", ranked), ("history_rows", UNNEST_FROM_FILE)):
+    for name, code in (("ranked", ranked), ("history_rows", UNNEST_PROBE)):
         s.mcp("catalog_create", name=name, code=code, prompt=f"{name} (B5: a window or an unnest must be worthy)")
         s.check(f"{name} is worthy", _expect_worthy(name))
 
-    s.mcp("catalog_load_parquet", rel_path="nfl_contracts.parquet", name="contracts", prompt="contracts")
-    s.mcp("catalog_load_parquet", rel_path="player_stats_season.parquet", name="player_stats", prompt="stats")
     s.mcp(
         "catalog_run",
         code=ARRAY_FILTER_PROBE,
@@ -1271,6 +1329,7 @@ def authoring_edge_cases(s: Session) -> None:
 )
 def pin_across_reset(s: Session) -> None:
     write_orders(_data_dir(s))
+    _import(s, "orders.parquet", "orders", "orders")
     s.mcp("catalog_create", name="by_region", code=BY_REGION, prompt="by region")
     s.label_step("base")
     out = s.mcp(
@@ -1316,8 +1375,9 @@ def pin_across_reset(s: Session) -> None:
 @scenario(
     origin="PR #189 review (memory pr-189-review-2026-09-21)",
     summary="Parquet sources whose column types "
-    "polars rewrites in the ordered copy (date64, map, time32, fixed_size_binary), and a decimal256 that makes "
-    "polars panic; each loaded, opened, and compared with the type the source file has.",
+    "polars rewrote when it wrote the ordered copy (date64, map, time32, fixed_size_binary; #197), and a "
+    "decimal256 that made polars panic (#198); each imported, opened, and compared with the type the file has.",
+    known={"tool_error_unexpected": "#224 (a fixed_size_binary column fails the import)"},
 )
 def source_types_survive_ingest(s: Session) -> None:
     import datetime
@@ -1335,24 +1395,35 @@ def source_types_survive_ingest(s: Session) -> None:
             "day": pa.array([datetime.date(2024, 1, 1 + i % 28) for i in range(n)], pa.date64()),
             "attrs": pa.array([[("k", i)] for i in range(n)], pa.map_(pa.string(), pa.int64())),
             "at": pa.array([datetime.time(9, i % 60) for i in range(n)], pa.time32("s")),
-            "code": pa.array([bytes([i % 256]) * 4 for i in range(n)], pa.binary(4)),
             "amount": pa.array([decimal.Decimal(i) / 4 for i in range(n)], pa.decimal128(12, 2)),
         }
     )
     pq.write_table(typed, d / "typed.parquet")
     pq.write_table(
+        pa.table(
+            {
+                "id": pa.array(range(n), pa.int64()),
+                "code": pa.array([bytes([i % 256]) * 4 for i in range(n)], pa.binary(4)),
+            }
+        ),
+        d / "fixed_binary.parquet",
+    )
+    pq.write_table(
         pa.table({"big": pa.array([decimal.Decimal(i) for i in range(n)], pa.decimal256(40, 0))}),
         d / "wide_decimal.parquet",
     )
 
-    s.mcp("catalog_load_parquet", rel_path="typed.parquet", name="typed", prompt="typed columns")
+    _import(s, "typed.parquet", "typed", "typed columns")
     s.open("typed")
 
     def same_types(ss, rec):
         import xorq.api as xo
 
+        from tallyman_core import get_alias
         from tallyman_xorq.result_cache import cached_result_expr
 
+        if get_alias(ss.project, "typed") is None:
+            return  # the import failed, which is its own finding
         source = xo.deferred_read_parquet(str(d / "typed.parquet")).schema()
         entry = cached_result_expr(ss.project, ss.resolve("typed")).schema()
         for col in source.names:
@@ -1369,20 +1440,15 @@ def source_types_survive_ingest(s: Session) -> None:
         "catalog_create",
         name="typed_filtered",
         prompt="a cheap filter over typed",
-        code="from tallyman_xorq.io import read_project_file\nt = read_project_file('typed.parquet')\n"
+        code="from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('typed')\n"
         "expr = t.filter(t.id > 3)\n",
     )
     s.open("typed_filtered")
+    _import(s, "fixed_binary.parquet", "fixed_binary", "a fixed_size_binary column")
+    s.open("fixed_binary")
     s.label_step("typed")
-    # Loading it may succeed or fail with a readable error; a polars panic escaping the tool is the defect.
-    s.mcp(
-        "catalog_load_parquet",
-        rel_path="wide_decimal.parquet",
-        name="wide_decimal",
-        prompt="decimal256",
-        expect_error=True,
-        expect_message="decimal",
-    )
+    # Importing it may succeed or fail with a readable error; a polars panic escaping the tool is the defect.
+    _import(s, "wide_decimal.parquet", "wide_decimal", "decimal256", expect_error=True, expect_message="decimal")
     s.reset("typed", via="api")
     s.finish()
 
@@ -1420,4 +1486,5 @@ def _expect_worthy(name: str):
 
 
 def _brief(report: dict) -> dict:
-    return {k: report.get(k) for k in ("status", "remap", "checkpoint_step", "error") if k in report}
+    keys = ("status", "remap", "checkpoint_step", "hash", "version", "created", "error")
+    return {k: report.get(k) for k in keys if k in report}

@@ -547,3 +547,142 @@ def test_a_raw_parquet_read_of_a_file_outside_the_project_is_a_build_error(proje
     with pytest.raises(BuildError) as exc:
         build_and_persist(project, code)
     _assert_names_the_import(str(exc.value), outside)
+
+
+# --------------------------------------------------------------------------- #
+# #228: a read under compute_cache is allowed only when tallyman handed it out
+# --------------------------------------------------------------------------- #
+_AGG = 't.group_by("region").aggregate(total=t.price.sum(), n=t.count())'
+
+
+def _raw_read(path: Path, body: str) -> str:
+    """A recipe that opens *path* with ``xo.deferred_read_parquet``: ``t`` is that read and ``expr`` is *body*."""
+    return f"import xorq.api as xo\nt = xo.deferred_read_parquet({str(path)!r})\nexpr = {body}\n"
+
+
+def test_a_raw_read_of_an_entry_snapshot_is_a_build_error_naming_its_version(project, orders_src):
+    """#228: reading ``agg-v1``'s snapshot by its path names the entry by a bare content hash (ADR-011 D5).
+
+    The build would record no parent edge, so the entry would not go stale when ``agg`` moves. The refusal names
+    the alias version to read instead.
+    """
+    agg = _create(project, "agg", _orders(project, _AGG))
+    snapshot = _snapshot_path(project, agg)
+    assert snapshot.exists()
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(snapshot, "t.filter(t.n > 0)"))
+    assert "pinned_expr_from_alias('agg-v1')" in str(exc.value), str(exc.value)
+
+
+def test_a_raw_read_of_a_source_version_snapshot_is_a_build_error_naming_the_source_alias(project, orders_src):
+    """#228: a source version's snapshot read by its path skips the source alias, so a re-import is never followed."""
+    from tallyman_core import get_alias
+
+    snapshot = _snapshot_path(project, get_alias(project, ORDERS_SRC))
+    assert snapshot.exists()
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(snapshot, 't.filter(t.category == "boots")'))
+    assert f"pinned_expr_from_alias('{ORDERS_SRC}-v1')" in str(exc.value), str(exc.value)
+
+
+def test_a_raw_read_of_a_parquet_file_copied_under_compute_cache_is_a_build_error(project, orders_parquet):
+    """#228: a file copied into the snapshot directory is not a snapshot of any entry, so it enters by an import.
+
+    Accepted, it had no digest and no clone, and once deleted nothing could make it again.
+    """
+    import shutil
+
+    from tallyman_xorq.materialize import snapshots_dir
+
+    copied = snapshots_dir(project) / "copied.parquet"
+    copied.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy(orders_parquet, copied)
+    with pytest.raises(BuildError) as exc:
+        build_and_persist(project, _raw_read(copied, 't.group_by("region").aggregate(n=t.count())'))
+    _assert_names_the_import(str(exc.value), copied)
+
+
+# The reads tallyman hands a recipe stay allowed. These pass before the fix and guard it.
+_AGG_V2 = 't.group_by("region").aggregate(total=t.price.sum() * 2, n=t.count())'
+
+
+def _edges(project: str, content_hash: str) -> list[tuple[str, str, bool]]:
+    """The entry's parent edges as ``(hash, ref, follow)``."""
+    return [(p.hash, p.ref, p.follow) for p in read_manifest(entry_dir(project, content_hash)).parents or []]
+
+
+def test_a_tracked_child_of_a_worthy_entry_still_builds(project, orders_src):
+    """#228: ``tracked_expr_from_alias`` hands the recipe a read of the parent's snapshot."""
+    agg = _create(project, "agg", _orders(project, _AGG))
+    res = build_and_persist(project, _over(project, "agg", "t.filter(t.n > 0)"))
+    assert _edges(project, res.content_hash) == [(agg, "agg", True)]
+
+
+def test_a_pinned_child_of_a_worthy_entry_still_builds(project, orders_src):
+    """#228: ``pinned_expr_from_alias`` hands the recipe the same read, with a pinned edge."""
+    agg = _create(project, "agg", _orders(project, _AGG))
+    code = (
+        "from tallyman_xorq.io import pinned_expr_from_alias\n"
+        f"t = pinned_expr_from_alias('agg-v1', project={project!r})\n"
+        'expr = t.group_by("region").aggregate(top=t.total.max())\n'
+    )
+    res = build_and_persist(project, code)
+    assert _edges(project, res.content_hash) == [(agg, "agg-v1", False)]
+
+
+def test_a_child_through_a_cheap_parent_still_builds(project, orders_src):
+    """#228: a cheap parent's plan reads its own parent's snapshot, and that read comes with the plan."""
+    _create(project, "agg", _orders(project, _AGG))
+    big = _create(project, "big", _over(project, "agg", "t.filter(t.n > 0)"))
+    assert not cache_worthy(project, big)
+    res = build_and_persist(project, _over(project, "big", "t.aggregate(total=t.total.sum())"))
+    assert _edges(project, res.content_hash) == [(big, "big", True)]
+
+
+def test_a_promoted_diff_still_builds_and_replays(project, orders_src, monkeypatch):
+    """#228: a promoted diff's ``build_diff_expr`` reads both sides through ``cached_result_expr``.
+
+    The key search runs under a 1s wall-clock budget, and its first ``execute()`` in a process imports geopandas
+    through ibis's pandas conversion: over 3s the first time a new venv loads those C extensions. The budget is not
+    what this test is about, so it is lifted.
+    """
+    from tallyman_mcp.server import catalog_create, catalog_promote_diff, catalog_revise
+    from tallyman_xorq import primary_key
+    from tallyman_xorq.recalc import _recipe_code
+
+    monkeypatch.setattr(primary_key, "PK_SEARCH_BUDGET_S", 60.0)
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _orders(project, _AGG))
+    catalog_revise("agg", _orders(project, _AGG_V2))
+    out = catalog_promote_diff("agg")
+    assert "error" not in out, out
+    assert build_and_persist(project, _recipe_code(project, out["hash"])).content_hash == out["hash"]
+
+
+def test_a_recalc_after_the_parent_is_revised_still_replays_a_chain_through_a_cheap_entry(
+    project, orders_src, monkeypatch
+):
+    """#228: the recalc replays each recipe through ``build_and_persist``, over the revised parent's snapshot."""
+    from tallyman_core import get_alias
+    from tallyman_mcp.server import catalog_create, catalog_revise
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    catalog_create("agg", _orders(project, _AGG))
+    big = catalog_create("big", _over(project, "agg", "t.filter(t.n > 0)"))["hash"]
+    top = catalog_create("top", _over(project, "big", "t.aggregate(total=t.total.sum())"))["hash"]
+    out = catalog_revise("agg", _orders(project, _AGG_V2))
+    assert out["recalc"]["status"] == "ok", out["recalc"]
+    assert set(out["recalc"]["remap"]) == {big, top}
+    assert _edges(project, get_alias(project, "big")) == [(get_alias(project, "agg"), "agg", True)]
+    assert _edges(project, get_alias(project, "top")) == [(get_alias(project, "big"), "big", True)]
+
+
+def test_reconstructing_a_cheap_entry_still_gives_its_content_hash(project, orders_src):
+    """#228: reconstruction (``result_cache._recipe_expr``, under ``_RECONSTRUCTING``) re-runs the recipe's readers."""
+    from tallyman_xorq.result_cache import _reconstructed_hash
+
+    _create(project, "agg", _orders(project, _AGG))
+    big = _create(project, "big", _over(project, "agg", "t.filter(t.n > 0)"))
+    assert not cache_worthy(project, big)
+    assert _reconstructed_hash(project, big) == big

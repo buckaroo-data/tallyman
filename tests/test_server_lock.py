@@ -247,9 +247,19 @@ def run_calls(monkeypatch) -> _Calls:
     import tallyman_companion
     import tallyman_companion.buckaroo_lifecycle as lifecycle
 
+    class FakeServer:
+        """uvicorn.Server, which serves a socket tallyman bound itself."""
+
+        def __init__(self, config):
+            self.config = config
+
+        def run(self, sockets=None):
+            calls.uvicorn.append(((self.config.app,), {"sockets": sockets}))
+
     calls = _Calls()
     monkeypatch.setattr(lifecycle, "BuckarooManager", calls.buckaroo_manager())
     monkeypatch.setattr(uvicorn, "run", lambda *a, **k: calls.uvicorn.append((a, k)))
+    monkeypatch.setattr(uvicorn, "Server", FakeServer)
     monkeypatch.setattr(tallyman_companion, "create_app", lambda *a, **k: object())
     return calls
 
@@ -347,8 +357,8 @@ def test_run_with_no_active_project_says_to_pass_one(isolated_home, monkeypatch,
 def test_run_on_the_ipv6_wildcard_gives_buckaroo_a_companion_url_it_can_reach(
     project, isolated_home, monkeypatch, run_calls
 ):
-    """With --host ::, Buckaroo posts its telemetry to the companion on ::1: the wildcard is no address to connect to,
-    and `http://:::<port>` is no URL."""
+    """With --host ::, Buckaroo posts its telemetry to the companion on 127.0.0.1, which a server on :: serves too:
+    the wildcard is no address to connect to, and `http://:::<port>` is no URL."""
     from click.testing import CliRunner
 
     from tallyman_cli.main import cli
@@ -359,7 +369,48 @@ def test_run_on_the_ipv6_wildcard_gives_buckaroo_a_companion_url_it_can_reach(
     result = CliRunner().invoke(cli, ["run", "--project", project, "--host", "::", "--port", str(port)])
 
     assert result.exit_code == 0, result.output
-    assert [kw["companion_base_url"] for kw in run_calls.buckaroo_kwargs] == [f"http://[::1]:{port}"]
+    assert [kw["companion_base_url"] for kw in run_calls.buckaroo_kwargs] == [f"http://127.0.0.1:{port}"]
+
+
+@_needs_ipv6_loopback
+def test_run_on_the_ipv6_wildcard_serves_ipv4_too(project, isolated_home):
+    """A server on --host :: serves IPv6 and IPv4 both, and every local URL tallyman gives for it is 127.0.0.1: local
+    work defaults to IPv4. uvicorn alone binds :: through asyncio's create_server, which sets IPV6_V6ONLY, and then
+    127.0.0.1 is refused."""
+    from tallyman_core.server_lock import companion_url
+
+    env = {**os.environ, "TALLYMAN_HOME": str(isolated_home)}
+    port = _free_port()
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "tallyman_cli.main", "run", "--project", project, "--host", "::", "--port", str(port)]
+        + ["--no-buckaroo"],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while True:
+            with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as probe:
+                if probe.connect_ex(("::1", port)) == 0:
+                    break
+            assert proc.poll() is None, proc.stdout.read()
+            assert time.monotonic() < deadline, "tallyman run did not start listening on ::1"
+            time.sleep(0.1)
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as ipv4:
+            assert ipv4.connect_ex(("127.0.0.1", port)) == 0, "a server on :: refuses 127.0.0.1"
+        assert companion_url() == f"http://127.0.0.1:{port}"
+
+        proc.send_signal(signal.SIGTERM)
+        output, _ = proc.communicate(timeout=30)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate(timeout=10)
+
+    assert f"http://127.0.0.1:{port}" in output, output  # the URL `run` prints to open
 
 
 # ---------------------------------------------------------------------------

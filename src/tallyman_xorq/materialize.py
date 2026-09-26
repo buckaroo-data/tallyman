@@ -408,6 +408,8 @@ def ensure_materialized(project: str, content_hash: str) -> None:
 
     Every caller that composes or executes an entry goes through here, so nothing ever runs over a file that is
     missing. When nothing can make a file again, the error names the source file.
+
+    An entry directory without a manifest is corrupt, and this raises before anything is loaded or written (#204).
     """
     _ensure(project, content_hash)
 

@@ -211,15 +211,18 @@ def test_the_claim_descriptor_is_not_inherited(isolated_home, hold_data_dir):
 
 
 class _Calls:
-    """Stands in for BuckarooManager and uvicorn.run, and records whether either was touched, and how Buckaroo was
-    configured."""
+    """Stands in for BuckarooManager and uvicorn.run, and records whether either was touched, how Buckaroo was
+    configured, and who held the data dir while Buckaroo was stopping."""
 
     def __init__(self):
         self.buckaroo: list[str] = []
         self.buckaroo_kwargs: list[dict] = []
+        self.owner_at_buckaroo_stop: list[dict | None] = []
         self.uvicorn: list[tuple] = []
 
     def buckaroo_manager(self):
+        from tallyman_core.server_lock import read_owner
+
         calls = self
 
         class FakeBuckaroo:
@@ -235,6 +238,7 @@ class _Calls:
 
             def stop(self):
                 calls.buckaroo.append("stop")
+                calls.owner_at_buckaroo_stop.append(read_owner())
 
         return FakeBuckaroo
 
@@ -300,6 +304,28 @@ def test_run_refuses_a_data_dir_another_server_holds(project, isolated_home, hol
     assert "TALLYMAN_HOME" in result.output and "--port" in result.output
     assert run_calls.buckaroo == []
     assert run_calls.uvicorn == []
+
+
+def test_a_refused_run_does_not_load_the_companion(project, isolated_home, hold_data_dir):
+    """A second `tallyman run` on a held data dir is refused before it imports the companion app (FastAPI, xorq,
+    Buckaroo). The only check it makes before the claim is a socket call, which needs none of that."""
+    hold_data_dir(isolated_home, port=17872)
+    code = (
+        "import sys\n"
+        "from click.testing import CliRunner\n"
+        "from tallyman_cli.main import cli\n"
+        f"result = CliRunner().invoke(cli, ['run', '--project', {project!r}, '--port', '17873'])\n"
+        "print('EXIT', result.exit_code, 'COMPANION_LOADED', 'tallyman_companion' in sys.modules)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code],
+        env={**os.environ, "TALLYMAN_HOME": str(isolated_home)},
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+
+    assert "EXIT 1 COMPANION_LOADED False" in done.stdout, done.stdout + done.stderr
 
 
 def test_run_refuses_a_port_already_in_use_before_starting_anything(project, isolated_home, run_calls):
@@ -371,6 +397,43 @@ def test_run_on_the_ipv6_wildcard_gives_buckaroo_a_companion_url_it_can_reach(
 
     assert result.exit_code == 0, result.output
     assert [kw["companion_base_url"] for kw in run_calls.buckaroo_kwargs] == [f"http://127.0.0.1:{port}"]
+
+
+@_needs_ipv6_loopback
+def test_run_on_a_bracketed_ipv6_address_serves_that_address(project, isolated_home, monkeypatch, run_calls):
+    """`--host [::1]` is an IPv6 address as a URL writes it. uvicorn resolves the host as given and cannot resolve the
+    brackets, so it would fail with a traceback after the claim and Buckaroo's start."""
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)  # `run` sets it in os.environ; this puts it back at teardown
+    port = _free_port()
+
+    result = CliRunner().invoke(cli, ["run", "--project", project, "--host", "[::1]", "--port", str(port)])
+
+    assert result.exit_code == 0, result.output
+    assert [kwargs["host"] for _, kwargs in run_calls.uvicorn] == ["::1"]
+    assert [kw["companion_base_url"] for kw in run_calls.buckaroo_kwargs] == [f"http://[::1]:{port}"]
+
+
+def test_run_holds_the_data_dir_until_buckaroo_has_stopped(project, isolated_home, monkeypatch, run_calls):
+    """Buckaroo reads and writes the data dir's entries (their stat caches) until it has stopped, and stopping it can
+    take ~5s after uvicorn returns. A server that claimed the data dir in that window would share it with this one's
+    Buckaroo, so `run` gives the data dir back only once Buckaroo has stopped."""
+    from click.testing import CliRunner
+
+    from tallyman_cli.main import cli
+    from tallyman_core.server_lock import read_owner
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)  # `run` sets it in os.environ; this puts it back at teardown
+
+    result = CliRunner().invoke(cli, ["run", "--project", project, "--port", str(_free_port())])
+
+    assert result.exit_code == 0, result.output
+    assert run_calls.buckaroo == ["init", "start", "stop"]
+    assert [owner and owner["pid"] for owner in run_calls.owner_at_buckaroo_stop] == [os.getpid()]
+    assert read_owner() is None  # given back once Buckaroo has stopped
 
 
 @_needs_ipv6_loopback

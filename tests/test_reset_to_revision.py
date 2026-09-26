@@ -445,11 +445,12 @@ def test_cli_genesis_revisions_label_and_reset(isolated_home):
     assert pp.list_post_processings("alpha") == []  # back to the empty genesis
 
 
-def test_cli_reset_notify_names_the_reset_project(isolated_home, monkeypatch):
+def test_cli_reset_notify_names_the_reset_project(isolated_home, running_server, monkeypatch):
     """`reset-to --project` must tell the companion *which* project was reset.
     The notify payload otherwise falls back to the companion's active project,
     so resetting a non-active project would reload the wrong sessions and
-    leave the reset project's buckaroo sessions stale."""
+    leave the reset project's buckaroo sessions stale. It also names its data dir,
+    so a companion serving another data dir refuses it (#183)."""
     import httpx
     from click.testing import CliRunner
 
@@ -462,7 +463,7 @@ def test_cli_reset_notify_names_the_reset_project(isolated_home, monkeypatch):
     assert runner.invoke(cli, ["init", "beta", "--no-fixture"]).exit_code == 0
     res = runner.invoke(cli, ["reset-to", "0", "--project", "beta"])
     assert res.exit_code == 0, res.output
-    assert sent["json"] == {"kind": "project_reset", "project": "beta"}
+    assert sent["json"] == {"kind": "project_reset", "project": "beta", "home": str(isolated_home.resolve())}
 
 
 def test_notify_honors_explicit_project(fresh_companion_app, project):

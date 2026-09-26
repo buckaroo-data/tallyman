@@ -372,15 +372,16 @@ def test_a_failed_first_create_leaves_no_snapshot_and_no_temp_file(project, orde
 
 def test_a_failed_retry_of_a_half_built_entry_keeps_its_snapshot(project, orders_src, monkeypatch):
     """ADR-007 D4, #193. A build killed after it made the entry directory and before it wrote the manifest leaves a
-    directory with no manifest. A snapshot already at the path, such as one a reset left, is still served
-    (``cache_worthy`` falls back to the file). A retry is a create, and one that fails removes the half-built directory
-    and leaves the snapshot as it was."""
+    directory with no manifest. That directory is not an entry (ADR-007 D6), so a read refuses it even with a snapshot
+    already at the path, such as one a reset left (#204). A retry is a create, and one that fails removes the
+    half-built directory and leaves the snapshot as it was."""
     code = _agg_code(project)
     h = build_and_persist(project, code).content_hash
     snap, digest = snapshot_path(project, h), _digest_of(project, h)
     (entry_dir(project, h) / "manifest.json").unlink()
     cached_result_expr.cache_clear()
-    assert len(cached_result_expr(project, h).execute()) > 0
+    with pytest.raises(BuildError, match="has no manifest.json"):
+        cached_result_expr(project, h)
 
     _disk_fills_at(monkeypatch, "first run")
     with pytest.raises(BuildError, match="No space left on device"):
@@ -407,6 +408,61 @@ def test_ensure_materialized_rewrites_a_missing_snapshot_and_verifies_it(project
     recorded = _digest_of(project, h)
     assert recorded and recorded.startswith("arrow-sha256:")
     assert snapshot_file_digest(snap) == recorded
+
+
+@pytest.mark.parametrize("kind", ["worthy", "cheap"])
+def test_reading_an_entry_that_lost_its_manifest_is_an_error_until_its_recipe_runs_again(project, orders_src, kind):
+    """#204. The manifest holds what a read needs: the worthy-or-cheap verdict, and the digest a heal is checked
+    against. An entry directory without one is corrupt, so a read raises before it loads or writes anything, for a
+    cheap entry as for a worthy one. A worthy entry that had also lost its snapshot used to be read as cheap: every
+    read re-ran its aggregate and nothing made the file again. Running the recipe again by hand writes the entry
+    again, under the same hash."""
+    from tallyman_xorq.materialize import ensure_materialized
+
+    code = _agg_code(project) if kind == "worthy" else _root_code(project)
+    built = build_and_persist(project, code)
+    h = built.content_hash
+    snap = snapshot_path(project, h)
+    (entry_dir(project, h) / "manifest.json").unlink()
+    snap.unlink(missing_ok=True)
+    cached_result_expr.cache_clear()
+
+    for read in (cached_result_expr, ensure_materialized):
+        with pytest.raises(BuildError) as info:
+            read(project, h)
+        assert str(info.value) == f"entry {h} in {project!r} has no manifest.json: {entry_dir(project, h)}"
+    assert not snap.exists()
+
+    assert build_and_persist(project, code).content_hash == h
+    assert read_manifest(entry_dir(project, h)).cache_worthy is (kind == "worthy")
+    assert snap.exists() is (kind == "worthy")
+    assert len(cached_result_expr(project, h).execute()) == built.row_count
+
+
+def test_a_child_of_an_entry_that_lost_its_manifest_raises_that_entrys_error(project, orders_src):
+    """#204. A worthy entry that lost its manifest and its snapshot used to look cheap. A child that reads its snapshot
+    asked for the file, nothing wrote it, and the read failed with "still missing after it was made again"; a new
+    child built over it inlined the aggregate as if it were cheap. Both raise now, with the parent's own error:
+    nothing on the way up catches it or adds to it."""
+    agg = _hash(catalog_create("agg", _agg_code(project)))
+    child = _hash(catalog_create("share", _cheap_child_code("agg")))
+    (entry_dir(project, agg) / "manifest.json").unlink()
+    snapshot_path(project, agg).unlink()
+    cached_result_expr.cache_clear()
+
+    with pytest.raises(BuildError) as info:
+        cached_result_expr(project, child)
+    assert str(info.value) == f"entry {agg} in {project!r} has no manifest.json: {entry_dir(project, agg)}"
+
+    res = catalog_create(
+        "busy",
+        """
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("agg")
+expr = t.filter(t.n > 1)
+""",
+    )
+    assert "has no manifest.json" in res.get("error", ""), res
 
 
 def test_files_exist_before_anything_runs(project, orders_src, monkeypatch):

@@ -21,8 +21,7 @@ Claude Code reads `.mcp.json` at the repo root, which registers one server named
 ```json
 { "command": "uv", "args": ["run", "tallyman", "mcp"],
   "cwd": "/Users/paddy/tallyman",
-  "env": { "TALLYMAN_PROJECT": "spike",
-           "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860" } }
+  "env": { "TALLYMAN_PROJECT": "spike" } }
 ```
 
 So Claude Code spawns `uv run tallyman mcp`. The `tallyman` entry point is
@@ -32,11 +31,17 @@ in `mcp.run()`. With no transport argument FastMCP defaults to **stdio**, so
 Claude Code talks to the server over the spawned process's stdin/stdout — one
 MCP process per Claude Code session, owned by Claude Code, not by the companion.
 
-The server reaches the companion through `COMPANION_URL`
-(`os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")`), firing
-best-effort `POST {COMPANION_URL}/internal/notify` calls so the FastAPI companion
-refreshes Buckaroo sessions and pushes SSE to open browsers. The companion need
-not be up; notifications that fail are logged and dropped.
+The server finds the companion per call with `companion_url()`
+(`src/tallyman_core/server_lock.py`): the port of the `tallyman run` that holds
+this data dir (`TALLYMAN_HOME`), read from its owner record in `server.lock`.
+There is no default port: with no server on the data dir there is no companion,
+so notifies are skipped, tool replies carry `url: null`, and `project_switch` /
+`project_new` return an error. It fires best-effort
+`POST <companion>/internal/notify` calls so the FastAPI companion refreshes
+Buckaroo sessions and pushes SSE to open browsers. Each notify, and each
+project switch or creation, names its data dir as `home`, and a companion
+serving another data dir answers 409 and changes nothing. Notifications that
+fail are logged and dropped.
 
 ## Cross-cutting behavior
 

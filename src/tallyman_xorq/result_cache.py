@@ -7,7 +7,8 @@ minting (build / revise / recalc) and in the structural-nondeterminism diagnosti
 is a hard error (ADR-006 D6), never a fallback.
 
 There is no xorq cache node in any build (ADR-007 D1). Whether an entry has a file of its own is one recorded fact,
-``manifest.cache_worthy``, decided once at build by ``worthiness.classify_expr`` (ADR-008 D4):
+``manifest.cache_worthy``, decided once at build by ``worthiness.classify_expr`` (ADR-008 D4). An entry directory
+without a manifest is corrupt, and reading it is an error (``entry_manifest``, #204):
 
   * **Worthy** entries do work that is expensive or that cannot inherit a row order (an aggregate, join, sort, window
     function, UDF, union). Tallyman materializes them: ``materialize`` writes
@@ -30,29 +31,41 @@ import logging
 import sys
 import time
 from pathlib import Path
-from typing import NamedTuple
+from typing import TYPE_CHECKING, NamedTuple
+
+if TYPE_CHECKING:
+    from tallyman_core.manifest import Manifest
 
 # Perf instrumentation rides a dedicated child namespace so it can be dialed up
 # independently of the rest of tallyman's logging (#60), via TALLYMAN_LOG_LEVEL.
 perf_log = logging.getLogger("tallyman.perf")
 
 
-def cache_worthy(project: str, content_hash: str) -> bool:
-    """Whether the entry is materialized, read from its manifest: the verdict recorded at build (ADR-008 D4).
+def entry_manifest(project: str, content_hash: str) -> Manifest:
+    """The entry's manifest. Reading an entry without one is an error (#204).
 
-    Nothing re-derives it: the manifest is the record, and ``expr.yaml`` is never parsed to work it out. An entry whose
-    manifest is gone (half-built, or pruned) still has its build and may still serve a page (#90), so a snapshot on disk
-    stands in for the verdict: it can only have been written for a worthy entry.
+    The manifest holds what a read needs: the worthy-or-cheap verdict, the digest a heal is checked against, the pin,
+    and a source version's provenance. An entry directory without one is corrupt, and a hash with no directory names
+    no entry. Nothing works around either one.
     """
     from tallyman_core import read_manifest
     from tallyman_core.paths import entry_dir
+    from tallyman_xorq.build import BuildError
 
+    path = entry_dir(project, content_hash)
     try:
-        return bool(read_manifest(entry_dir(project, content_hash)).cache_worthy)
-    except FileNotFoundError:
-        from tallyman_xorq.materialize import snapshot_path
+        return read_manifest(path)
+    except FileNotFoundError as exc:
+        raise BuildError(f"entry {content_hash} in {project!r} has no manifest.json: {path}") from exc
 
-        return snapshot_path(project, content_hash).exists()
+
+def cache_worthy(project: str, content_hash: str) -> bool:
+    """Whether the entry is materialized, read from its manifest: the verdict recorded at build (ADR-008 D4).
+
+    Nothing re-derives it and nothing stands in for it: the manifest is the record, ``expr.yaml`` is never parsed to
+    work it out, and a file at the snapshot path says nothing about it.
+    """
+    return bool(entry_manifest(project, content_hash).cache_worthy)
 
 
 # Entries currently being reconstructed by cached_result_expr, on this call
@@ -276,6 +289,10 @@ def stream_row_count(expr) -> int:
     failing cast / arithmetic at build time) and get the exact row count — the
     only obligation the build has for a cheap entry.  No digest is recorded for
     cheap entries; their result has no snapshot to hash.
+
+    It does not take ``execution_lock`` (#118). That lock guards the one shared default backend, and the build passes
+    the expression ``load_expr`` returned, which is bound to backends that load created, so nothing else executes on
+    them. Taking the lock would make every page read in the process wait for the whole stream.
     """
     n = 0
     for batch in expr.to_pyarrow_batches():

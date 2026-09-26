@@ -67,7 +67,7 @@ def test_project_list_active_none_when_no_active(isolated_home: Path):
 # ---------------------------------------------------------------------------
 
 
-def test_project_switch_happy_path(isolated_home: Path, monkeypatch):
+def test_project_switch_happy_path(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -88,7 +88,7 @@ def test_project_switch_happy_path(isolated_home: Path, monkeypatch):
     assert "error" not in out
 
 
-def test_project_switch_returns_error_when_unreachable(isolated_home: Path, monkeypatch):
+def test_project_switch_returns_error_when_unreachable(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -101,11 +101,13 @@ def test_project_switch_returns_error_when_unreachable(isolated_home: Path, monk
     out = srv.project_switch("beta")
     assert "error" in out
     assert "active" not in out
-    # The configured companion URL should appear so the LLM can diagnose.
-    assert srv.COMPANION_URL in out["error"]
+    # The companion URL it tried should appear so the LLM can diagnose.
+    from tallyman_core.server_lock import companion_url
+
+    assert companion_url() in out["error"]
 
 
-def test_project_switch_returns_error_on_http_error(isolated_home: Path, monkeypatch):
+def test_project_switch_returns_error_on_http_error(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -124,7 +126,7 @@ def test_project_switch_returns_error_on_http_error(isolated_home: Path, monkeyp
 # ---------------------------------------------------------------------------
 
 
-def test_project_new_happy_path_default_no_fixture(isolated_home: Path, monkeypatch):
+def test_project_new_happy_path_default_no_fixture(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -145,7 +147,7 @@ def test_project_new_happy_path_default_no_fixture(isolated_home: Path, monkeypa
     assert '"with_fixture": false' in captured["body"] or '"with_fixture":false' in captured["body"]
 
 
-def test_project_new_with_fixture_true(isolated_home: Path, monkeypatch):
+def test_project_new_with_fixture_true(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -163,7 +165,7 @@ def test_project_new_with_fixture_true(isolated_home: Path, monkeypatch):
     assert '"with_fixture": true' in captured["body"] or '"with_fixture":true' in captured["body"]
 
 
-def test_project_new_returns_error_on_409(isolated_home: Path, monkeypatch):
+def test_project_new_returns_error_on_409(isolated_home: Path, running_server, monkeypatch):
     from tallyman_mcp import server as srv
 
     ensure_project("alpha")
@@ -255,7 +257,7 @@ def test_external_disk_change_does_not_override_in_process_project(
     assert "warning" not in second
 
 
-def test_switch_warning_emitted_when_project_switch_called(isolated_home: Path, monkeypatch):
+def test_switch_warning_emitted_when_project_switch_called(isolated_home: Path, running_server, monkeypatch):
     """project_switch() updates _mcp_active_project so subsequent calls see
     the new project; the switch response itself carries the change warning."""
     from tallyman_mcp import server as srv

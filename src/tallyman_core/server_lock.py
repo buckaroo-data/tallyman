@@ -34,6 +34,7 @@ import sys
 import time
 from pathlib import Path
 
+from tallyman_core.net import client_host
 from tallyman_core.paths import tallyman_home
 
 LOCK_FILENAME = "server.lock"
@@ -149,18 +150,6 @@ def companion_url(home: Path | str | None = None) -> str | None:
     if not isinstance(port, int):
         return None
     return f"http://{client_host(str(owner.get('bind_host') or ''))}:{port}"
-
-
-def client_host(bind_host: str) -> str:
-    """The host, as written in a URL, at which a process on this machine reaches a server bound to *bind_host*.
-
-    A wildcard is no address to connect to, so it becomes 127.0.0.1, since local work defaults to IPv4. That holds for
-    ``::`` too, because ``tallyman run`` binds ``::`` dual-stack (IPv4 as well). An IPv6 address is bracketed.
-    """
-    host = bind_host.strip("[]")
-    if host in ("", "0.0.0.0", "::"):
-        return "127.0.0.1"
-    return f"[{host}]" if ":" in host else host
 
 
 def is_this_data_dir(home: Path | str) -> bool:

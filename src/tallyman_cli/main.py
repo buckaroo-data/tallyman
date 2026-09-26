@@ -158,10 +158,11 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
     One server runs per data dir (TALLYMAN_HOME, #183): it claims the data dir before anything else, and a second
     `tallyman run` on the same one is refused. A second tallyman runs on its own data dir and port.
     """
-    from tallyman_companion.buckaroo_lifecycle import port_in_use
+    from tallyman_core.net import client_host, port_in_use
     from tallyman_core.paths import list_projects
-    from tallyman_core.server_lock import DataDirInUse, claim_data_dir, client_host, release_data_dir
+    from tallyman_core.server_lock import DataDirInUse, claim_data_dir, release_data_dir
 
+    host = host.strip("[]")  # `[::1]` is an IPv6 address as a URL writes it; sockets and uvicorn take it bare
     try:
         claim = claim_data_dir(port=port, bind_host=host)
     except DataDirInUse as exc:
@@ -220,13 +221,13 @@ def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buc
         served = True
         _serve(app, host, port)
     finally:
-        # Released only once uvicorn has returned. It closes the port first and then finishes in-flight requests
-        # (a build, a recalc), which still write into the data dir, so a restart has to wait for this process to
-        # exit, not for the port to close. A crash or SIGKILL releases the claim too: the kernel drops the lock
-        # with the process.
-        release_data_dir(data_dir)
+        # Released only once uvicorn has returned and Buckaroo has stopped. uvicorn closes the port first and then
+        # finishes in-flight requests (a build, a recalc), and Buckaroo reads and writes the data dir's entries (their
+        # stat caches) until it exits, so a restart has to wait for this process to exit, not for the port to close.
+        # A crash or SIGKILL releases the claim too: the kernel drops the lock with the process.
         if bk is not None:
             bk.stop()
+        release_data_dir(data_dir)
         signal.signal(signal.SIGTERM, previous_sigterm)
         if served:
             click.echo(f"tallyman run · stopped · data dir={data_dir}")
@@ -236,10 +237,10 @@ def _serve(app, host: str, port: int) -> None:
     """Serve *app* on *host*:*port* until it shuts down.
 
     A server on ``::`` takes IPv4 too: local work defaults to IPv4, and the local URL tallyman gives for any wildcard
-    is 127.0.0.1 (``server_lock.client_host``). uvicorn alone binds ``::`` through asyncio's ``create_server``, which
+    is 127.0.0.1 (``net.client_host``). uvicorn alone binds ``::`` through asyncio's ``create_server``, which
     sets IPV6_V6ONLY, so that socket is bound here, dual-stack, and handed to uvicorn.
     """
-    if host.strip("[]") != "::":
+    if host != "::":
         uvicorn.run(app, host=host, port=port, log_level="info")
         return
     with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:

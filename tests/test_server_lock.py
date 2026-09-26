@@ -767,7 +767,7 @@ def test_notify_from_this_data_dir_spelled_in_another_case_is_accepted(project, 
 def test_port_in_use_sees_a_listener_on_an_overlapping_address(listen_on, probe):
     """A listener on the wildcard address takes the port on the loopback too, and the other way round. On macOS a bind
     with SO_REUSEADDR succeeds beside it anyway, so a bind alone reports the port free."""
-    from tallyman_companion.buckaroo_lifecycle import port_in_use
+    from tallyman_core.net import port_in_use
 
     with socket.socket() as busy:
         busy.bind((listen_on, 0))
@@ -782,7 +782,7 @@ def test_port_in_use_sees_a_listener_on_an_overlapping_address(listen_on, probe)
 def test_port_in_use_on_the_ipv6_wildcard_sees_an_ipv4_listener(listen_on):
     """A server on :: serves IPv4 too, and its clients reach it on 127.0.0.1. Beside an IPv4 listener on that port it
     would start, and its clients would reach the other server."""
-    from tallyman_companion.buckaroo_lifecycle import port_in_use
+    from tallyman_core.net import port_in_use
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as busy:
         busy.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as uvicorn binds

@@ -1,9 +1,32 @@
 # ADR: Tallyman owns result materialization (no xorq cache nodes in builds)
 
-- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
-  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
-  written; the differences between the text and the code are under "Implementation notes" below.
-  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, which added the governing rule, decisions D10 to D12, and the resolution recorded under D5, and again the same day after a review of PR #184: D10 moved out to #188, the verify sweep left D5's callers, D6's session-ending clause was dropped, and D12's rule was restated, and a third time that day after a second review of PR #184: two kinds of entry were confirmed (open question 1), D5 lost its accepted gap, D6 gained the klass reload, and D13 and D14 are new). Awaiting Paddy's review; nothing here is implemented. Supersedes two decisions of `plans/ADR-006-read-path-loads-builds.md`: its D4 (chaining inlines the parent's cache node) and its D8 (the manifest records the snapshot key and reads assert it). Five other ADR-006 decisions keep their intent: D5 (the canonical sort), D6 (a missing build is a hard error), D7 (verification runs in production and is loud), D10 (an unfaithful heal wipes the entry's Buckaroo state) and D12 (unfaithful entries are pinned and badged). The last three attach to `ensure_materialized`, which is this ADR's D5.
+- **Status:** Accepted (2026-09-22), implemented. Where the text below says a
+  decision is "not yet confirmed" or "Proposed", it was implemented as written;
+  the differences between the text and the code are under "Implementation
+  notes". Open defects: `docs/architecture.md` ("Known defects").
+- **Supersedes:** two decisions of `plans/ADR-006-read-path-loads-builds.md`:
+  ADR-006 D4 (chaining inlines the parent's cache node) and ADR-006 D8 (the
+  manifest records the snapshot key and reads assert it), since no build holds a
+  cache node. It changes two more. ADR-006 D2 (keep the facade, replace the
+  internals) keeps its facade, but the snapshot's path is a function of the
+  content hash (this ADR's D2) and no loader takes a `cache_dir`. ADR-006 D10 (an
+  unfaithful heal wipes the entry's Buckaroo state) keeps the wipe, but its
+  session eviction became a forced Buckaroo reload, since tallyman keeps no
+  record of sessions (this ADR's D6). ADR-006 D5 (the canonical sort) is amended
+  by ADR-008 and ADR-009, not by this ADR. These keep their intent: ADR-006 D3
+  (rebind composition onto the default backend, with a one-group guard), ADR-006
+  D6 (a missing or unloadable build is a hard error), ADR-006 D7 (verification
+  runs in production and is loud), ADR-006 D9 (no cheap-entry digests) and
+  ADR-006 D12 (unfaithful entries are pinned and badged). ADR-006 D7, D10 and D12
+  attach to `ensure_materialized`, which is this ADR's D5.
+- **Amended by:** `plans/ADR-011-sources-are-aliases.md`. A data file enters
+  only by an import, as a source entry whose snapshot takes the place of the
+  ordered copy. The implementation notes below that describe ordered copies
+  (`compute_cache/ordered_sources/`, the `<key>.digest` sidecar,
+  `manifest.sources`, `manifest.ordered_copies`, and `ordered_copy.py` making
+  and re-making copies) describe code ADR-011 removed. D13's rule (a file is
+  cache only if it can be re-created) holds for a source entry's snapshot,
+  which is re-created from its clone.
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
@@ -14,12 +37,14 @@
   possible for caching."
 - **Tickets:** #188 (diffs, moved out of this ADR), #186 (the waiting that
   D11's lock causes), #185 (non-pure recipes), #183 (two servers on one
-  project), #168 (CSV source identity, which the shared rebuild of D9 needs),
-  #118 (concurrent reads on the shared backend, which D11 does not cover),
-  #77 (an empty grid on a clone of the project at another path, which D2
-  closes), #76 (closed: how bare-read chaining failed the last time it was
-  tried, which D5 answers), #22 (the checkpoint's cost grows with the cache,
-  which D14 removes).
+  project, now refused per data dir), #168 (CSV source identity, which the
+  shared rebuild of D9 needs), #118 (concurrent executions on the shared
+  backend, which the project lock does not cover and a per-process execution
+  lock does), #77 (an empty grid on a clone of the project at another path,
+  which D2 closes), #76 (closed: how bare-read chaining failed the last time it
+  was tried, which D5 answers), #22 (the checkpoint's cost grows with the
+  cache, which D14 removes). D11 (one write at a time per project) records how
+  #183 and #118 are handled.
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`),
   `src/tallyman_xorq/result_cache.py` (`_resolve_result_plan`,
   `cached_result_expr`, `entry_graph_expr`, `baked_snapshot_path`,
@@ -567,9 +592,12 @@ discover them:
   lock cannot be held across an `await`.
 - Whether a recalc takes the lock once per build or once for the whole walk is
   left to the implementation. Either is correct.
-- The lock covers writes only. Concurrent reads on the shared default backend
-  fail with `RuntimeError: Already borrowed`. That is #118, and this ADR does
-  not change it.
+- The lock covers writes only. Two threads executing on a process's shared
+  default backend at once fail with `RuntimeError: Already borrowed`, so every
+  execution there holds a second lock, `execution.execution_lock`: one per
+  process, re-entrant, and ordered after the project lock. Anything that can
+  heal runs before it is taken, and `project_lock` raises in a thread that
+  holds it and would take a new file lock (#118, implemented by #242).
 
 The lock is blocking and has no timeout, and the work it now covers is long: a
 materialization runs single-partition, and a create runs its query twice
@@ -581,8 +609,14 @@ process. Paddy, 2026-09-20: correct first. #186 tracks the waiting.
 Two tallyman servers pointed at one project is unsupported. Paddy: "you have
 done something diabolical and deserve the results." The file lock would still
 serialize their writes on one machine, and nothing else about them is safe,
-because each holds in-process state the other never sees.
-buckaroo-data/tallyman#183 tracks detecting that case and refusing to start.
+because each holds in-process state the other never sees. So `tallyman run`
+claims its data dir (`TALLYMAN_HOME`, the directory that holds every project)
+with an exclusive `flock` on `<data dir>/server.lock`, and a second
+`tallyman run` on the same data dir is refused with a message naming the one
+that holds it. The MCP server finds its companion from the port recorded in that
+file, and with no server on the data dir it notifies nothing
+(buckaroo-data/tallyman#183, implemented by #241). `tallyman mcp` and
+`tallyman serve` claim nothing.
 
 ### D12. Files are deleted only by an explicit user action
 
@@ -854,6 +888,13 @@ What the implementation does that the text above does not say, or says different
   file no entry names `orphan`; the delete route answers 409 with the reason.
 - **The lock (D11).** `catalog_state.project_lock` is public and re-entrant per thread. `build_and_persist` holds it for
   the whole build, including the recipe import, so a chained build waits for its parent's materialization.
+- **A create publishes its snapshot last (D4).** The build calls `materialize(..., publish=False)`,
+  which leaves the file complete at its temp name, and moves it into place with `publish_snapshot` after the manifest
+  is written. A build that fails before then removes only its temp file, so a file already at the path, such as the
+  one a reset left on disk (D14), is kept. A heal publishes at once. A crash between the manifest write and the
+  publish leaves a complete entry over the file that was there before, or over none, which a heal then makes, and
+  leaves the temp file behind. A source entry's import needs no staging: it keeps a snapshot already at its path,
+  which holds the same rows, since that path is named by the bytes and the reader options.
 - **Clones (D13, D14).** `ensure_cas_path` clones to a unique temp name, since two builders cloning one source shared
   one. `gc_cas` moves clones into `<catalog>/bullpen/cas/` when given a bullpen.
 - **Not done here.** The independent bugs listed under D9 step 3 (the chart error loop, eager notebook sessions, the

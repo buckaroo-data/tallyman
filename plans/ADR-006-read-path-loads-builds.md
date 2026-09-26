@@ -1,15 +1,15 @@
 # ADR: Reads load the frozen build — the #163 read-path decisions
 
-- **Status:** Accepted (2026-07-30) — decided in the grilling session over
-  `docs/system-contract.md`. Supersedes the read-path behavior introduced by
-  #74/#75 (recipe re-import on read). All follow-up questions resolved
-  (D9–D12, and the D5 amendment); implemented on PR #167.
-  Two of its decisions are superseded by `plans/ADR-007-tallyman-owned-materialization.md` (implemented in
-  #189): D4 (chaining inlines the parent's cache node) and D8 (the manifest records the snapshot key and reads
-  assert it), since no build holds a cache node any more. D5 (the canonical sort) is amended by
-  `plans/ADR-008-row-order-of-reads.md` (every sort gets the natural order, a non-final sort is kept) and by
-  `plans/ADR-009-digest-stability.md` (`result_digest` is a content digest, no longer a file hash). D2, D3, D6,
-  D7, D10 and D12 keep their intent.
+- **Status:** Accepted (2026-07-30) — decided in the grilling session over `docs/system-contract.md`.
+  Supersedes the read-path behavior introduced by #74/#75 (recipe re-import on read). All follow-up questions
+  resolved (D9–D12, and the D5 amendment); implemented on PR #167. Two of its decisions are superseded by
+  `plans/ADR-007-tallyman-owned-materialization.md`: D4 (chaining inlines the parent's cache node) and D8 (the
+  manifest records the snapshot key and reads assert it), since no build holds a cache node any more. D5 (the
+  canonical sort) is amended by `plans/ADR-008-row-order-of-reads.md` (every sort gets the natural order, a
+  non-final sort is kept) and by `plans/ADR-009-digest-stability.md` (`result_digest` is a content digest, no
+  longer a file hash). D2 keeps its facade, but the snapshot's path is now a function of the content hash
+  (ADR-007 D2) and no loader takes a `cache_dir`. D10's session eviction became a forced Buckaroo reload,
+  since tallyman keeps no record of sessions (ADR-007 D6). D3, D6, D7, D9 and D12 keep their intent.
 - **Context ticket:** buckaroo-data/tallyman#163 (read path reconstructs from
   `expr.py`; a content hash does not name a fixed result). Normative design:
   `docs/system-contract.md`. Bug-class survey:

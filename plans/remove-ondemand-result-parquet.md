@@ -10,6 +10,15 @@ implementation and re-introduced part of the layer, so the work grew an
 and were corrected during implementation. Those deltas are called out in
 [What the #101 plan got wrong](#what-the-101-plan-got-wrong) rather than buried.
 
+Status note (2026-09-24): the removal of `result.parquet` still holds. Its
+premise that xorq's `ParquetSnapshotCache` is the single materialized copy was
+replaced by `plans/ADR-007-tallyman-owned-materialization.md`: no build holds a
+xorq cache node, and the single copy is tallyman's own snapshot,
+`compute_cache/result_cache/<content_hash>.parquet`, written by `materialize`.
+The source-identity `salt` mode discussed below is gone
+(`plans/ADR-011-sources-are-aliases.md` D8). `docs/caching.md` describes the
+current design.
+
 ## Goal
 
 Delete every "materialise a per-entry `result.parquet` on demand" path. xorq's

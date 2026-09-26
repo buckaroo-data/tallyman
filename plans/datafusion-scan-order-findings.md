@@ -1,6 +1,12 @@
 # DataFusion scan ordering — findings and decision
 
 - **Status:** Resolved (2026-06-25) — **stick with polars for the ingest reader.**
+- **Status note (2026-09-24):** the polars decision stands for CSV: polars parses
+  a CSV once, when it is imported (`plans/ADR-011-sources-are-aliases.md`), and
+  a parquet file is copied in file order by pyarrow, which keeps its types. The
+  row-index column is `__row_order`, not `original_row_order`, and
+  `result_digest` is a content digest of the snapshot read back, not a hash of
+  its bytes (`plans/ADR-009-digest-stability.md`).
 - **Origin:** Investigation behind `plans/ADR-004-result-digest-canonical-ordering.md`,
   prompted by datafusion's nondeterministic parallel scan order producing false
   "drift" on the order-sensitive result digest.

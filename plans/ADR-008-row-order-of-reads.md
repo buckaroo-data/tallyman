@@ -1,24 +1,29 @@
 # ADR: Row order of reads (every file carries `__row_order`, every page sorts by it)
 
-- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
-  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
-  written; the differences between the text and the code are under "Implementation notes" below.
-  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session, and again the same day after a review of PR #184, which made the fix for #168 a precondition of D2 and D7, and a third time that day after a second review: D4 and D6 were tightened, and D10 to D12 are new). Awaiting Paddy's review; nothing here is implemented. The first draft pinned row order with an engine setting. Paddy proposed baking a row-order column into every file tallyman writes and sorting every page by it. The measurements below favour that, so it is now the decision and the engine setting is the rejected alternative under D5. Amends `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position of the row-order column) and INV-2 (the trailing `order_by`). Corrects a threshold quoted in `plans/ADR-006-read-path-loads-builds.md` decision D5 (the canonical sort) and three other places.
-  **Extended by `plans/ADR-011-sources-are-aliases.md` (2026-09-22, PR #218).** D2 and D7 here make a raw
-  `xo.deferred_read_parquet` a build error, so that every source enters through an ordered copy. ADR-011 D2
-  applies the same rule to `read_project_file` and `tallyman_read_csv` themselves: there is now no way to
-  author a read of a file the catalog does not own, and the sanctioned route in is an explicit import.
-  The ordered copy is then not a separate kind of file. An imported source version is an ordinary entry
-  (ADR-011 D1) and the copy **is** that entry's snapshot: one parquet in
-  `compute_cache/result_cache/`, named by the entry's content hash, written by pyarrow in the pinned
-  layout of ADR-009. `compute_cache/ordered_sources/`, the `copy_key`
-  (`md5(digest ǀ reader signature)`) that named files in it, `manifest.ordered_copies` and the
-  `ensure_ordered_copy` / `existing_ordered_copy` / `recreate_ordered_copy` trio are all deleted.
-  What survives from `ordered_copy.py` is what describes a read rather than performs one:
-  `ORDERED_COPY_ROW_GROUP_ROWS`, the reader descriptors (`parquet_reader`, `csv_reader`) and the reader
-  signature that the source entry's hash is built from.
-  Everything this ADR decided about row order is unchanged: every file tallyman writes still carries
-  `__row_order` as a last `int64` column, `0..N-1`, and every page still sorts by it.
+- **Status:** Accepted (2026-09-22), implemented. Where the text below says a
+  decision is "not yet confirmed" or "Proposed", it was implemented as written;
+  the differences between the text and the code are under "Implementation
+  notes". Open defects touching it: #199, #200, #205 and #206.
+- **Amends:**
+  - `plans/ADR-005-intelligent-csv-import.md` INV-1 (the name and position of the
+    row-order column) and INV-2 (the trailing `order_by`).
+  - `plans/ADR-006-read-path-loads-builds.md` decision D5 (the canonical sort):
+    corrects a threshold it quotes, and three other places.
+- **Amended by:** `plans/ADR-011-sources-are-aliases.md`. The refusal of D2 and
+  D7 extends to `read_project_file` and `tallyman_read_csv`, so no recipe can
+  read a file the catalog does not own, and a file enters only by an explicit
+  import. The ordered copy of D2 is not a separate kind of file: an imported
+  source version is an ordinary entry (ADR-011 D1), and the copy is that entry's
+  snapshot, one parquet in `compute_cache/result_cache/` named by the entry's
+  content hash and written by pyarrow in the pinned layout of ADR-009.
+  `compute_cache/ordered_sources/`, the copy key, `manifest.ordered_copies` and
+  the functions that made and re-made copies do not exist. What remains of
+  `ordered_copy.py` describes a read rather than performing one:
+  `ORDERED_COPY_ROW_GROUP_ROWS`, the reader descriptors (`parquet_reader`,
+  `csv_reader`) and the reader signature the source entry's hash is built from.
+  Everything this ADR decides about row order holds: every file tallyman writes
+  carries `__row_order` as a last `int64` column, `0..N-1`, and every page sorts
+  by it.
 - **Context:** the 2026-09-18 cache audit (tallyman @ `a748ea6`, buckaroo
   0.15.4, xorq 0.3.26, xorq-datafusion 0.2.7).
 - **Tickets:** #168 (CSV sources bypass source identity; D2 and D7 depend on

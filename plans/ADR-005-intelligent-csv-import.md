@@ -1,25 +1,30 @@
 # ADR: Intelligent CSV import — a deterministic reader with a great error/suggestion contract
 
-- **Status:** Proposed (2026-06-26). Lands on top of #137 (the polars
-  order-stable reader swap), which is merged to `main` (`52afca7`). Resolves the
-  CSV-ingest-contract cluster filed during the #137 review: **#141, #143, #144,
-  #145**; **#142 is deferred** to the holistic edge-case pass (see below).
-  Amended by `plans/ADR-008-row-order-of-reads.md` (implemented in #189): INV-1's row-index column is named
-  `__row_order` (not `original_row_order`) and INV-2's trailing `order_by` is gone, so `tallyman_read_csv`
-  returns a plain read of an ordered copy that is keyed by the CSV's content.
-  Amended again by `plans/ADR-011-sources-are-aliases.md` (2026-09-22, PR #218): **this reader now runs at
-  import time, not in a recipe.** `tallyman_read_csv` is refused in an authored recipe alongside
-  `read_project_file` (ADR-011 D2) — both open a file the catalog does not own, and leaving the CSV reader
-  open would be a hole in the rule. A CSV enters through
-  `catalog_import_source(path, alias, separator=..., schema=...)`, and everything this ADR designed goes
-  with it: the schema DSL and its normaliser, the inference ladder (100 → 10k → whole file), the
-  suggestion engine and the error contract all run inside the import, over
-  `source_import._write_csv_snapshot`. The recipe then reads the resulting source alias.
-  Two consequences for the text below. The reader options are **fixed at import** and recorded on the
-  source entry (ADR-011 D12), so one file is read one way forever; to read it a second way, import it again
-  under a second alias. And the retry loop this ADR is built around — read, see the suggestion, adjust the
-  schema, read again — is a loop over imports, which is why ADR-011 keeps the raw bytes in the clone store
-  rather than only the parsed snapshot (its Open question 1).
+- **Status:** Implemented. It addresses #141, #143, #144 and #145, which are
+  still open on GitHub; #142 is deferred to the holistic edge-case pass (see
+  below).
+- **Amended by:**
+  - `plans/ADR-008-row-order-of-reads.md`: INV-1's row-index column is named
+    `__row_order` (not `original_row_order`), and INV-2's trailing `order_by` is
+    gone.
+  - `plans/ADR-011-sources-are-aliases.md`: **this reader runs at import time,
+    not in a recipe.** A CSV enters through `catalog_import_source(path, alias,
+    schema=..., reader_options={"separator": ...})`, and the schema DSL and its
+    normaliser, the inference ladder (100 → 10k → whole file), the suggestion
+    engine and the error contract all run inside the import
+    (`source_import._write_csv_snapshot`); `tallyman_read_csv` is refused in a
+    recipe, which reads the resulting source alias. The reader options are
+    fixed at import and recorded on the source entry (ADR-011 D12), so one file
+    is read one way; to read it a second way, import it again under a second
+    alias. The retry loop this ADR is built around (read, see the suggestion,
+    adjust the schema, read again) is a loop over imports, which is why ADR-011
+    keeps the raw bytes in the clone store. INV-3 holds: the parsed parquet is
+    the source entry's snapshot, `compute_cache/result_cache/<hash>.parquet`,
+    whose hash covers the CSV's digest and the reader options, and it is
+    re-created from the clone, never from the outside CSV. D5's drift check does
+    not exist, because staleness has one axis (ADR-011 D6): editing the outside
+    CSV changes nothing until it is imported again, which mints the next version
+    of its source alias.
 - **Affected code:** `src/tallyman_xorq/io.py` (`tallyman_read_csv`,
   `_polars_overrides`, `_IBIS_TO_POLARS`, a new schema-spec normaliser and a
   suggestion engine), `src/tallyman_mcp/server.py` (the `catalog_run` CSV

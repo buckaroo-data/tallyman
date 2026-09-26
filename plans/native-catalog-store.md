@@ -5,6 +5,14 @@ post-implementation bug-hunt + hardening pass (2026-06-17, see below). Refined
 through a parallel code investigation and a grilling pass; the decisions below
 are settled unless marked open.
 
+Status note (2026-09-24): `plans/ADR-007-tallyman-owned-materialization.md` D14
+(a reset leaves `compute_cache/` alone) retired `compute_cache.jsonl` and the
+reset's compute-cache prune and restore described below. `entries.jsonl` is the
+only pointer file, and a reset moves the source clones no surviving entry refers
+to into `bullpen/cas/` instead of deleting them. The source-identity `salt` mode
+and its salted hash, which the zip naming below allows for, are gone
+(`plans/ADR-011-sources-are-aliases.md` D8).
+
 ## Implementation notes (deviations from the plan as written)
 
 The cut landed as: `1a` failing-first markers → native recipe store + checkpoint

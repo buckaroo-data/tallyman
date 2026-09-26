@@ -1,31 +1,14 @@
 # ADR: A raw input is an alias, and files enter only by an explicit import
 
-- **Status:** Accepted (2026-09-22), implemented. Stage 1 — the import path and
-  the refusals (D1, D2, D3, D5, D9, D10, D12) — is PR #217, with two later
-  decisions of the same day folded into D1: the snapshot is written by pyarrow
-  in the pinned layout, and it is cache that `ensure_materialized` re-creates
-  from the clone. Stage 2 — D6, D8 and the rewrite of every call site that
-  authored a raw file read — is PR #218, stacked on it. The fixes from reviewing
-  both are PR #219, stacked on #218: one set of bytes is one version under one
-  alias, an alias's kind matches its entries' kind, a version is named by the
-  alias that holds it now, and a re-import that finds a version already there
-  rewrites nothing but a missing snapshot, verified like any heal (D1, D3, D11,
-  D12 and the PR #219 implementation notes). Amends
-  `plans/ADR-002-source-identity-content-hash.md` (its modes, its `sources` map
-  and its reconstruction caveat go; the clone store stays),
-  `plans/ADR-005-intelligent-csv-import.md` (its reader runs at import, not in
-  a recipe) and `plans/ADR-008-row-order-of-reads.md` (its refusal extends to
-  `read_project_file`, and the ordered copy becomes the source entry's
-  snapshot). Still outstanding: `docs/architecture.md`, `docs/caching.md`,
-  `docs/expression-lifecycle.md` and `docs/system-contract.md` all describe the
-  deleted source axis, and are left until PR #216 lands to avoid rewriting the
-  same four files twice.
-  Written from Paddy's design session the same day, after a review of PR #189
-  found that a child pinned to its parent by content hash is permanently stale
-  and reports itself as an UNEXPLAINED orphan. The direction is his: "treat the
-  orders.parquet like an alias that got updated externally", and "we want
-  people pointing at aliases not hashes. aliases are what gives us the dag,
-  hashes are brittle."
+- **Status:** Accepted (2026-09-22), implemented.
+- **Amends:**
+  - `plans/ADR-002-source-identity-content-hash.md` (its modes, its `sources` map
+    and its reconstruction caveat go; the clone store stays).
+  - `plans/ADR-005-intelligent-csv-import.md` (its reader runs at import, not in
+    a recipe).
+  - `plans/ADR-008-row-order-of-reads.md` (its refusal extends to
+    `read_project_file`, and the ordered copy becomes the source entry's
+    snapshot).
 - **Reading decision labels:** a bare label such as "D5" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.
@@ -33,34 +16,34 @@
   turned up a class of defect that no local fix addresses: staleness is
   computed on two axes, and the second one (a recorded source digest no longer
   matches the file on disk) asks a question the system cannot always answer.
-  This ADR removes the axis by making raw inputs first-class catalog objects.
-- **Tickets:** none filed yet. Supersedes the open design question in the #189
-  review notes ("a hash-pinned child stays stale on the source axis"), and
-  removes the cause of the staleness scan's digest-memo wipe
-  (`source_identity.py:87-101`).
-- **Affected code:** `src/tallyman_xorq/io.py` (`read_project_file`,
-  `tracked_expr_from_alias`, `pinned_expr_from_alias`,
-  `_note_parent_records`), `src/tallyman_xorq/source_identity.py` (`mode`,
-  `digest_for`, `ensure_cas_path`, `recon_cas_path`, `gc_cas`),
-  `src/tallyman_xorq/staleness.py` (axis 2, `_force_source_rehash`),
-  `src/tallyman_xorq/recalc.py` (`_classify_orphan`),
-  `src/tallyman_xorq/ordered_copy.py` (the copy key and its reader options),
-  `src/tallyman_core/aliases.py` (a second kind of alias),
-  `src/tallyman_core/manifest.py` (`sources`),
-  `src/tallyman_mcp/server.py` (`catalog_load_parquet`),
-  `docs/system-contract.md`.
-- **Related ADRs:** `plans/ADR-002-source-identity-content-hash.md` (the `.cas`
-  clone store this builds on; its `off` and `salt` modes go, and so does its
-  `sources` map, D6),
-  `plans/ADR-005-intelligent-csv-import.md` (reader options and the suggestion
-  contract, which move to import time),
-  `plans/ADR-008-row-order-of-reads.md` (its D2 and D7 — every source enters
-  through an ordered copy, a raw read is a build error — are the precedent this
-  extends to `read_project_file` itself),
+  The review found that a child pinned to its parent by content hash is
+  permanently stale and reports itself as an UNEXPLAINED orphan. This ADR
+  removes the axis by making raw inputs first-class catalog objects, the
+  direction Paddy set in the design session that followed: "treat the
+  orders.parquet like an alias that got updated externally", and "we want
+  people pointing at aliases not hashes. aliases are what gives us the dag,
+  hashes are brittle."
+- **Tickets:** none of its own. It removes the mechanisms that #191, #197,
+  #198, #207 and #211 were about (the source axis and the ordered copy).
+- **Code:** `src/tallyman_xorq/source_import.py` (the import: `update_and_depend`,
+  the entry hash, the refusals, the advised import call),
+  `src/tallyman_xorq/source_identity.py` (the clone store),
+  `src/tallyman_xorq/io.py` (reading aliases, and refusing raw reads),
+  `src/tallyman_xorq/build.py` (refusing `xo.deferred_read_*` of a file tallyman
+  did not write), `src/tallyman_xorq/staleness.py` (one axis),
+  `src/tallyman_xorq/materialize.py` (healing and pinning a source snapshot),
+  `src/tallyman_xorq/ordered_copy.py` (reader descriptors and the snapshot's
+  row-group size), `src/tallyman_core/aliases.py` (alias kinds),
+  `src/tallyman_core/manifest.py` (`provenance`),
+  `src/tallyman_core/catalog_state.py` (clone retention),
+  `src/tallyman_mcp/server.py` (`catalog_import_source`) and the companion's
+  code-edit and promote-diff routes.
+- **Related ADRs:** the three it amends, and
   `plans/ADR-007-tallyman-owned-materialization.md` (D13, a file is cache only
   if it can be re-created; a source version's snapshot passes that test, because
   the clone of the imported bytes re-creates it).
-- **Evidence:** the probes in the 2026-09-22 session, reproduced under Problem.
+- **Evidence:** the probes of the 2026-09-22 design session, reproduced under
+  Problem.
 
 ## Terms
 
@@ -90,7 +73,7 @@ That map is written as a retention record. `io._note_parent_records`
 `gc_cas` keeps the clones alive for as long as any live entry needs them. The
 scan then reads the same map as a freshness record. One field, two meanings.
 
-Probed on this branch, with a child pinned to its parent by hash:
+Probed on #189's code, with a child pinned to its parent by hash:
 
 ```
 parent 8bb2a4661c1a  worthy=True   sources={orders.parquet: 2d20a090}
@@ -149,10 +132,11 @@ existing `VERSION_REF_RE` and `resolve_version_ref` with no new syntax.
 
 A source alias is a distinct kind. `catalog_revise` is refused on one (there is
 no recipe to revise), as is promoting a diff onto it, on every surface that
-offers those (the MCP tools and the companion's code-edit and promote-diff
-routes, which refuse before building anything). Rename and unalias behave as
-they do for catalog aliases. The kind is recorded in the alias store so
-`catalog_list` can separate inputs from computations.
+offers those (the MCP tools, and the companion's code-edit and promote-diff
+routes, which answer 409). Every surface refuses before building anything, with
+one text (`aliases.source_alias_refusal`), so no entry is left behind under no
+alias. Rename and unalias behave as they do for catalog aliases. The kind is
+recorded in the alias store; `catalog_list` does not show it yet.
 
 **An alias's kind matches the kind of the entries it points at.** A catalog
 alias never points at a source entry (one whose manifest records `provenance`),
@@ -164,7 +148,7 @@ A source version's `provenance` keeps the name it was **imported as**. A rename
 moves the alias's history to a new name and an unalias drops it, and neither
 rewrites that record, so anything that names the version as it is now (the pin
 reason, the heal error and the import it advises, the rebuild's replay) asks
-the alias store which source alias holds it.
+the alias store which source alias holds it (`current_source_version`).
 
 Consequence: a child of a source records `{hash: <version's entry hash>, ref:
 "orders", follow: True}` — the same edge shape as any catalog parent. The DAG
@@ -192,19 +176,20 @@ never looks at it.
 Only when the clone is gone as well are the rows unrecoverable. Then the
 snapshot is the last copy, so it is pinned, the delete answers 409, and a read
 of an entry whose snapshot is already gone fails with an error naming the
-missing clone and the re-import that repairs it. A source version is therefore
+missing clone and the re-import that repairs it. For a version whose entry a
+reset retired, a clone the reset parked in the bullpen counts as present, since
+a reset forward brings both back. A source version is therefore
 the one kind of entry whose "cache or data" answer depends on a second file
 being present, which is the price of not storing the bytes three times.
 
 **One set of bytes, read one way, is one source version under one alias.**
 Importing bytes that another alias of the project already holds, at any version,
-is an error naming that alias and version. The likely way to get there is not
-knowing the bytes are already in the project, and letting two aliases share the
-entry meant one entry directory carrying one alias's name in its provenance and
-recipe while another alias pointed at it. (This document first said two such
-imports share one entry. PR #219 reversed that after the #217/#218 review found
-the second import rewrote the first alias's manifest, and a failure part-way
-deleted its entry.)
+is an error naming that alias and version (`_refuse_bytes_held_elsewhere`). The
+likely way to get there is not knowing the bytes are already in the project.
+Letting two aliases share the entry would leave one entry directory carrying one
+alias's name in its provenance and recipe while another alias pointed at it, and
+a second import over it could rewrite the first alias's manifest, or delete its
+entry by failing part-way.
 
 A second name for a source is a catalog entry whose recipe reads it:
 `catalog_create("orders_eu", "... expr = tracked_expr_from_alias('orders')")`.
@@ -255,7 +240,9 @@ that minted it. If its snapshot is gone, the import heals it the way
 `ensure_materialized` does, from the clone (restored from the caller's bytes
 first when it is gone too) and checked against the recorded `result_digest`, so
 a reader that now parses the bytes differently is recorded as an unfaithful heal
-rather than becoming the version's rows.
+and the manifest keeps the digest of the rows that were imported. A directory
+without a manifest, which a crash part-way through an import leaves, is not an
+entry, and the import writes it again.
 
 **Considered and not shipped: `import_once_and_depend(outside_path, alias)`.**
 An idempotent form for a standalone script that wants the same data wherever it
@@ -296,14 +283,15 @@ This alone removes the defect under Problem: the child that pinned
 Delete axis 2. An entry is stale when a followed alias has moved, and that is
 the only reason.
 
-`manifest.sources` goes with it, rather than merely narrowing. It exists as the
-retention closure `gc_cas` walks, and once every input is an entry the closure
-is the DAG: a source version's file is alive exactly while its entry is alive,
-which the parent edges already record. `manifest.ordered_copies` goes for the
-same reason (D1 makes the copy a snapshot), and `_note_parent_records`
-(`io.py:537`) — the function that folds a parent's sources and copies into its
-child, and so the immediate cause of the defect under Problem — is deleted
-entirely.
+`manifest.sources` goes with it, rather than merely narrowing. It existed as
+the retention closure `gc_cas` walks, and once every input is an entry the
+closure is the DAG: a source version's file is alive exactly while its entry is
+alive, which the parent edges already record, and `gc_cas` keeps the clones that
+surviving source entries name in `manifest.provenance`
+(`catalog_state._live_source_digests`). `manifest.ordered_copies` goes for the
+same reason (D1 makes the copy a snapshot), and so do `dependents.sources_of`
+and `_note_parent_records`, the function that folded a parent's sources and
+copies into its child and so the immediate cause of the defect under Problem.
 
 Deleted with them: `_force_source_rehash`, `source_digests.json`, `digest_for`'s
 stat memo, the `unknown` verdict for a removed source file, and the source-axis
@@ -337,8 +325,9 @@ disk now.
 
 The new MCP tool is `catalog_import_source(outside_path, alias,
 pinned_version=None, **reader_options)`, mapping to `update_and_depend`. The old
-tool's semantics change too much to keep the name: today re-running it with an
-existing alias is an error, and under this ADR it mints the next version.
+tool's semantics changed too much to keep the name: re-running it with an
+existing alias was an error, and an import under an existing alias mints the
+next version.
 
 ### D11. Version history is append-only and monotonic
 
@@ -367,7 +356,7 @@ options with it (`source_import.import_call`, in the MCP tool's `schema=` and
 `reader_options=` shapes), and a pinned import refused for naming another entry
 says the reader options may be what differs.
 
-This removes the hash fork found in the #215 review, where a function-valued
+This removes a hash fork, where a function-valued
 reader option's `repr` carries a memory address and re-derives a new copy key on
 every build. Options are evaluated once, at import, and stored.
 
@@ -376,9 +365,7 @@ every build. Options are evaluated once, at import, and stored.
 - A child of a source alias is stale after an import advances it, and clear
   after recalc. The permanently-stale case of Problem cannot be constructed,
   because D5 refuses the recipe.
-- Every row of D3's `update_and_depend` table, including the four errors. (The
-  `import_once_and_depend` test this list first named went with the function,
-  which D3 records as considered and not shipped.)
+- Every row of D3's `update_and_depend` table, including the four errors.
 - The same bytes under a second alias are refused, naming the alias and version
   that hold them, and the first alias's entry is left byte for byte as it was.
 - Two projects importing one file each hold their own entry, snapshot and
@@ -417,39 +404,40 @@ every build. Options are evaluated once, at import, and stored.
 
 ## Consequences
 
-- Every entry's hash changes, because a source entry's hash now stands between
-  a recipe and its data. The corpus is rebuilt once, as it is for ADR-007 D9.
-  Nothing is migrated: per the project rule, existing catalogs are rebuilt and
-  existing recipes are rewritten. In this repo that is 309 `read_project_file`
-  references across 55 test files, plus nine `src/` modules — the largest
-  single piece of work in the ADR, and mechanical.
-- The staleness scan stops touching the filesystem outside the arena, so its
-  cost becomes a read of `aliases.jsonl` and the manifests. The digest-memo
-  defect disappears rather than being fixed.
-- A source's history becomes inspectable: which versions existed, when each was
+- Every entry's hash depends on a source entry's hash, which stands between a
+  recipe and its data, so a corpus built before this design is rebuilt rather
+  than migrated, as for ADR-007 D9 (per the project rule, existing catalogs are
+  rebuilt and existing recipes rewritten).
+- The staleness scan does not touch the filesystem outside the arena, so its
+  cost is a read of `aliases.jsonl` and the manifests. There is no digest memo
+  for it to wipe.
+- A source's history is inspectable: which versions existed, when each was
   imported, what each was imported from, and which entries were built on each.
   Diffing v1 against v2 uses the existing diff, since both are entries.
-- Data no longer arrives by being dropped in `data/`. That is a real loss of
+- Data does not arrive by being dropped in `data/`. That is a real loss of
   convenience, and the import step is the price of the model.
-- `docs/architecture.md`, `docs/caching.md`, `docs/expression-lifecycle.md` and
-  `docs/system-contract.md` all describe the source axis and need rewriting.
 - ADR-002 is narrowed rather than superseded: its clone store survives, its
   modes and its `sources`-as-freshness reading do not.
 
 ## Implementation notes
 
-**Stage 1 (PR #217, 2026-09-22): the import path and the refusals — D1, D2, D3,
-D5, D9, D10, D12.** What the code does that this document did not say:
+Where the code says more than the decisions above.
 
 - **A source entry's content hash is `md5("source|<digest>|<reader signature>")`,
-  truncated to xorq's 12 hex.** It cannot come from `build_expr`, because the
-  generated recipe reads the snapshot and the snapshot is named by the hash. The
-  bytes and the reader options are the whole identity (`source_import.py`).
-- **The generated recipe still calls `read_project_file`**, and a contextvar
-  (`_SOURCE_ENTRY`) is what makes that call legal and resolves it to the entry's
-  own snapshot. `result_cache._recipe_expr` sets the same contextvar when it
-  reconstructs a source entry. The path in the recipe is provenance; nothing
-  opens it.
+  truncated to xorq's 12 hex characters** (`source_import.source_entry_hash`).
+  It cannot come from `build_expr`, because the generated recipe reads the
+  snapshot and the snapshot is named by the hash. The bytes and the reader
+  options are the whole identity. Reader options must be plain values the entry
+  can record; a callable option is refused.
+- **The generated recipe still calls `read_project_file`**, and a context
+  variable (`_SOURCE_ENTRY`) is what makes that call legal and resolves it to
+  the entry's own snapshot. `result_cache._recipe_expr` sets the same variable
+  when it reconstructs a source entry. The path in the recipe is provenance;
+  nothing opens it. The read follows the entry being minted, not the active
+  project, so `update_and_depend(path, alias, project=X)` works whichever
+  project is active.
+- **`tallyman_read_csv` is refused alongside `read_project_file`.** D2 names
+  only the latter, but both open a file the catalog does not own.
 - **pyarrow writes the snapshot; polars only parses a CSV.** `result_cache/`
   holds one shape of parquet file, so the import writes through the settings
   every computed snapshot uses (`materialize._PARQUET_OPTIONS`, via
@@ -461,146 +449,66 @@ D5, D9, D10, D12.** What the code does that this document did not say:
   which is the only reader that holds the file's row order and applies the schema
   DSL and inference ladder of ADR-005, and its batches go to the same writer
   through `collect_batches`, so nothing collects the whole frame.
-- **A newer polars would not have helped.** Checked 2026-09-22: 1.40.1 is
-  installed, 1.44.2 is the latest on PyPI, and neither exposes the parquet
-  format version or a page-index option — `sink_parquet` writes format 1.0 and
-  the request is pola-rs/polars#12752, still open. `use_pyarrow=True` is just
-  pyarrow doing the write. So there is no polars upgrade that reaches the pinned
-  layout, and writing the file twice to re-encode it was rejected.
+- **No polars version writes the pinned layout.** As of 2026-09-22 (1.40.1
+  installed, 1.44.2 the latest on PyPI), polars exposes neither the parquet
+  format version nor a page-index option: `sink_parquet` writes format 1.0, and
+  the request is pola-rs/polars#12752. `use_pyarrow=True` is just pyarrow doing
+  the write, and writing the file twice to re-encode it was rejected.
 - **The pinned layout costs size on high-cardinality numeric columns.** On the
   1.5M-row `tests/big_parquet.py` fixture (`id` sequential int64, `g` 200
-  values, `v` random float) the snapshot goes from 16,188,593 bytes (polars) to
-  25,495,419 (pyarrow), +57%, with the same 13 row groups of 122,880 rows.
-  Measured cause: pyarrow dictionary-encodes by default, one 122,880-row chunk
-  of int64 is ~983 KB, just under its 1 MB `dictionary_pagesize_limit`, so the
-  dictionary never overflows to PLAIN and the file carries both. The same data
-  is 16,205,749 bytes with `use_dictionary=False`, and 17,827,724 with
-  1,048,576-row groups (where the limit does kick in). That is a question about
-  `_PARQUET_OPTIONS` and about whether the two row-group sizes should be one,
-  which is ADR-009's to answer for every snapshot at once; nothing here writes a
-  source snapshot differently from a computed one to avoid it. Also measured:
-  the page index is present either way — polars writes one without being asked —
-  so the format version and the encoder are what actually differed.
-- **`SNAPSHOT_FORMAT_VERSION` stays 1**, as it did for the same change to the
-  ordered copies in #215, even though the bytes of a source snapshot do change.
-  A source entry imported before this change records the digest of the
-  polars-written file, so re-creating its snapshot now writes different bytes
-  and the heal is recorded as unfaithful, attributed to the recipe rather than to
-  the format. Bumping the version would attribute that one case correctly and
-  would misattribute every computed entry, whose layout did not change; per the
-  project rule the corpus is rebuilt instead, so there is no such entry.
+  values, `v` random float) the snapshot is 25,495,419 bytes written by pyarrow
+  against 16,188,593 written by polars, +57%, with the same 13 row groups of
+  122,880 rows. Measured cause: pyarrow dictionary-encodes by default, one
+  122,880-row chunk of int64 is ~983 KB, just under its 1 MB
+  `dictionary_pagesize_limit`, so the dictionary never overflows to PLAIN and
+  the file carries both. The same data is 16,205,749 bytes with
+  `use_dictionary=False`, and 17,827,724 with 1,048,576-row groups (where the
+  limit does kick in). That is a question about `_PARQUET_OPTIONS` and about
+  whether the two row-group sizes should be one, which is ADR-009's to answer for
+  every snapshot at once; nothing writes a source snapshot differently from a
+  computed one to avoid it. The page index is present either way.
+- **`SNAPSHOT_FORMAT_VERSION` is 1** for source snapshots written by pyarrow as
+  well as for the polars-written files they replaced. A heal of a polars-written
+  source snapshot would therefore be recorded as unfaithful and attributed to
+  the recipe rather than the format; bumping the version would have
+  misattributed every computed entry instead, whose layout did not change. Per
+  the project rule the corpus is rebuilt, so there is no such entry.
 - **Provenance lives in one manifest field**, `manifest.provenance`
   (`{alias, version, path, digest, suffix, reader, imported_at}`), and its
-  presence is what makes an entry a source entry. `manifest.sources` stays empty
-  for one, so `catalog_state._live_source_digests` had to learn to keep a clone
-  alive from `provenance.digest` as well — otherwise a reset retires the only
-  copy of the imported bytes.
-  Its `alias` and `version` are the name the version was imported as (D1): a
-  rename or unalias does not rewrite them.
-- **`entry_staleness` skips axis 2 for a source entry** rather than reporting it
-  unknown. A small piece of D6, forced: every source entry would otherwise carry
-  a permanent "source axis unknown".
-- **`data/` stops being special.** An import takes any path. A relative path
-  resolves against the working directory, and the replay CLI expands
+  presence is what makes an entry a source entry. Its `alias` and `version` are
+  the name the version was imported as (D1).
+- **`StaleReason.axis` is always `"alias"`.** The field is kept so a staleness
+  reason has the same shape in the API and the UI; a one-value field says the
+  axis is no longer a choice.
+- **`data/` is not special.** An import takes any path. A relative path resolves
+  against the working directory, and the replay CLI expands
   `${TALLYMAN_PROJECT_ROOT}` in storyboard arguments so `demo/storyboard.json`
   can name a file shipped with the project.
-- **Open question 1 is answered "keep both".** The imported bytes stay in
-  `data/.cas/<digest><suffix>` beside the ordered snapshot, because ADR-005's
-  suggestion-and-retry contract has to re-read the file as imported and the
-  outside path may be gone. Every import therefore stores the data twice, and
-  the second copy now earns its keep twice over: it is also what makes the
-  snapshot cache rather than data (D1). Dropping the clone would not halve the
-  storage, it would move the same bytes into the pinned column.
-- **`tallyman_read_csv` is refused alongside `read_project_file`.** D2 names only
-  the latter, but both open a file the catalog does not own, and leaving the CSV
-  reader open would be a hole in the rule.
-- A source entry keeps a real `xorq_build/`, so `load_entry_expr`, the diff and
-  the viewer treat it as an ordinary entry. Nothing reads it on the normal path:
-  a worthy entry whose snapshot exists is served by a bare read of that file.
-
-**Deliberate debt, now paid.** `TALLYMAN_LEGACY_FILE_READS=1` disabled D2's
-refusal for the whole suite so stage 1 could land before the call-site rewrite.
-Stage 2 deletes the variable, the `tests/conftest.py` line that set it and the
-branch in `io.py` that read it. There is no way to author a raw file read.
-
-**Stage 2 (PR #218, 2026-09-23): D6, D8 and the call-site rewrite.** What the
-code does that this document did not say:
-
-- **`manifest.sources` is deleted, not narrowed.** D6 says the field reverts to
-  being the retention closure; in the event it has no readers left at all, since
-  a source version is an entry and the closure is the DAG. `dependents.sources_of`
-  goes with it, and `io._note_parent_records` — the function whose folding of a
-  parent's digests into its child is the direct cause of the defect under
-  Problem — is deleted outright.
-- **`StaleReason.axis` survives as a field that is always `"alias"`.** Deleting
-  it would change the shape of every staleness reason in the API and the UI for
-  no gain; a one-value field reads the same and says the axis is no longer a
-  choice.
-- **The fixture split is `orders_parquet` and `orders_src`.** The first is the
-  file, for a test about the bytes; the second imports it and returns the alias,
-  for a test that needs a recipe. The alias is `orders_src` rather than `orders`
-  because several tests already create a catalog alias called `orders`, and a
-  name is one kind or the other and never both.
-- **An import must not depend on which project is active.** `update_and_depend(path,
-  alias, project=X)` failed whenever `X` was not the active project: the generated
-  recipe's `read_project_file` resolved the ambient project while `_SOURCE_ENTRY`
-  named `X`, so the importer's own recipe hit the refusal written for authored
-  recipes. The read follows the entry being minted. Every call site passed before
-  the rewrite because the `project` fixture also activates its project; the cache
-  lab, which warms xorq in a project of its own without activating it, is what
-  exposed it.
-- **Two test expectations changed because the behaviour is now right**, not to
-  keep them green. The page-load profiler measures three entries where it
-  measured two, because an imported source version is an entry. And the reset
-  round-trip has to import its second file *after* the first checkpoint: import
-  it before, and its source entry survives the reset back, so no clone is left
-  referenced only by a retired entry and the case ADR-007 D13 is about stops
-  being exercised at all. Arranged correctly, that test is the proof that a
-  backward reset parks a clone in the bullpen rather than unlinking it — the
-  failure mode that deleting `manifest.sources` could otherwise have caused
-  silently.
-
-**Review fixes (PR #219, 2026-09-24).** Found reviewing #217 and #218; each
-landed test first. What the code does that the decisions above did not say:
-
-- **Duplicate bytes were a shared entry.** Stage 1 let a second alias import
-  bytes another alias held, on the grounds that the hash made it one entry. The
-  second import re-ran `_mint` over that entry, rewriting the first alias's
-  provenance and recipe, and a failure part-way deleted the entry directory the
-  first alias pointed at. D1 now refuses the import (`_refuse_bytes_held_elsewhere`).
-- **The kind rule lives in `set_alias`** (D1), not in each tool, after
-  `catalog_alias` put a catalog name on a source entry and opened it to
-  `catalog_revise`. The companion's `PUT /api/code` and promote-diff routes had
-  no refusal at all: they built the entry, failed to point the source alias at
-  it and answered 500 with the entry left under no alias. They now refuse with
-  the tools' text (`aliases.source_alias_refusal`) before building, answering 409.
-- **A version is named by the alias that holds it now**
-  (`source_import.current_source_version`). Naming it by `provenance.alias`
-  made the heal advice mint a second alias under the old name after a rename,
-  and made `scripts/rebuild_native_catalog.py` replay a renamed source under the
-  old name: children reading the new name failed to rebuild, and the order of
-  the source's versions was lost.
-- **A repair import heals** (D3). It used to go through `_mint`, which rebuilt
-  the entry, rewrote the manifest and recorded whatever digest it wrote: a
-  probe with a reader that drops a row went from 10 rows to 9 under the same
-  hash with nothing recorded. An entry directory without a manifest, which a
-  crash part-way through an import leaves, is not an entry, and a re-import
-  writes it again.
-- **Advised imports carry the reader options** (D12). Without them the heal
-  error's advice for a CSV named another entry and was refused.
+- **A source entry keeps a real `xorq_build/`**, so `load_entry_expr`, the diff
+  and the viewer treat it as an ordinary entry. Nothing reads it on the normal
+  path: a worthy entry whose snapshot exists is served by a bare read of that
+  file.
+- **Test fixtures.** `orders_parquet` is the file, for a test about the bytes;
+  `orders_src` imports it and returns the alias, for a test that needs a recipe.
+  The alias is `orders_src` rather than `orders` because several tests create a
+  catalog alias called `orders`, and a name is one kind or the other. The
+  page-load profiler counts an imported source version as an entry. The reset
+  round-trip test imports its second file after the first checkpoint, so that a
+  backward reset leaves a clone referenced only by a retired entry and parks it
+  in the bullpen rather than unlinking it (the case of ADR-007 D13).
 
 ## Open questions
 
-1. ~~**Does a source version keep its raw bytes as well as its snapshot?**~~
-   **Answered 2026-09-22: keep both.** A CSV imported with the wrong schema
-   would otherwise be fixable only from the outside file, which may be gone,
-   and ADR-005's suggestion-and-retry contract assumes the bytes can be
-   re-read. Keeping the clone also decides D1's other half: the snapshot is
-   re-creatable from it, so it is cache in the sense of ADR-007 D13 rather than
-   irreplaceable data. Every import stores the data twice; the clone is
-   copy-on-write where the filesystem offers it, so the initial cost is near
-   zero, but the snapshot is a real second materialization. See the
-   implementation notes for the measured sizes.
+1. **Does a source version keep its raw bytes as well as its snapshot?**
+   Answered 2026-09-22: keep both. A CSV imported with the wrong schema would
+   otherwise be fixable only from the outside file, which may be gone, and
+   ADR-005's suggestion-and-retry contract assumes the bytes can be re-read.
+   Keeping the clone also decides D1's other half: the snapshot is re-creatable
+   from it, so it is cache in the sense of ADR-007 D13 rather than irreplaceable
+   data. Every import stores the data twice; the clone is copy-on-write where
+   the filesystem offers it, so the initial cost is near zero, but the snapshot
+   is a real second materialization. See the implementation notes for the
+   measured sizes.
 2. **Directories and multi-file datasets.** A dataset that arrives as
    `orders/part-0000.parquet`, `part-0001.parquet`, … rather than one file:
    does `update_and_depend("~/exports/orders/", "orders")` import the directory

@@ -1,9 +1,20 @@
 # ADR: Digest stability (a heal is flagged only when the result changed)
 
-- **Status:** Implemented in buckaroo-data/tallyman#189 (2026-09-21), at Paddy's request to implement the
-  set. Where this text says a decision is "not yet confirmed" or "Proposed", it was implemented as
-  written; the differences between the text and the code are under "Implementation notes" below.
-  Original status: Proposed (2026-09-18, revised 2026-09-20 in the grilling session: D3 gains two format requirements from `plans/ADR-008-row-order-of-reads.md`, D1 lost its speed gate, and D6 is new; and again the same day after a review of PR #184: D1 and D3 now say what single-partition execution leaves undetermined, and D6's cheap-entry half moved to #185; and a third time that day after a second review: D1 now says how a loaded build gets onto the single-partition connection, and D3's format version covers the ordered copies of sources). Awaiting Paddy's review; nothing here is implemented. Amends `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's "hash the snapshot bytes") and decision D5 of `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said "`result_digest` keeps its file-hash definition". The canonical sort itself is unchanged and is still required.
+- **Status:** Accepted (2026-09-22), implemented. Where the text below says a
+  decision is "not yet confirmed" or "Proposed", it was implemented as written;
+  the differences between the text and the code are under "Implementation
+  notes". Open defect touching it: #208 (an unfaithful heal reaches only the
+  healed entry).
+- **Amends:** `plans/ADR-004-result-digest-canonical-ordering.md` (Option A's
+  "hash the snapshot bytes") and decision D5 of
+  `plans/ADR-006-read-path-loads-builds.md` (the canonical sort), which said
+  "`result_digest` keeps its file-hash definition". The canonical sort itself is
+  unchanged and is still required.
+- **Amended by:** `plans/ADR-011-sources-are-aliases.md`. The ordered copy of a
+  source that this ADR mentions (written by polars, in its own layout) does not
+  exist: a source entry's snapshot is written by pyarrow with the settings of
+  every other snapshot, in row groups of 122,880 rows, and D3's format version
+  covers it.
 - **Reading decision labels:** a bare label such as "D2" in this document
   always means this ADR's own decision. Another ADR's decision is always
   written with its ADR number and a few words saying what it decides.

@@ -97,8 +97,7 @@ server:
       "args": ["run", "tallyman", "mcp"],
       "cwd": "<path-to-your-checkout>",
       "env": {
-        "TALLYMAN_PROJECT": "spike",
-        "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860"
+        "TALLYMAN_PROJECT": "spike"
       }
     }
   }
@@ -188,7 +187,7 @@ gone.
 |----------|---------|---------|
 | `TALLYMAN_HOME` | `~/.tallyman-notebooks` | Root for all project state |
 | `TALLYMAN_PROJECT` | none | Seeds the `active_project` file when that file does not exist yet and the named project does (see below) |
-| `TALLYMAN_COMPANION_URL` | `http://127.0.0.1:7860` | Where the MCP server and the CLI send notifications |
+| `TALLYMAN_COMPANION_URL` | the port in the data dir's `server.lock` | Where the MCP server and the CLI send notifications. Unset, they read the port of the `tallyman run` that holds `TALLYMAN_HOME`; with no server there they send nothing |
 | `TALLYMAN_AUTO_RECALC` | unset | `1`/`0` (or `true`/`false`) overrides the project's auto-recalc switch (on by default) |
 | `TALLYMAN_LOG_LEVEL` | `INFO` | Log level of the MCP server |
 
@@ -222,9 +221,16 @@ call and keeps using it for the rest of the Claude Code session, until
 - **`uv run tallyman` fails to resolve the command** — make sure you're in the
   checkout directory (or a subdirectory). `uv run` picks the venv from the
   nearest `pyproject.toml`.
-- **Port 7860 already in use** — another companion is running; stop it, or pass
-  `--port` to `tallyman run` and update `TALLYMAN_COMPANION_URL` to match. Two
-  companions on one project are not supported (#183).
+- **"data dir … is in use by another tallyman server"** — one `tallyman run`
+  serves a data dir (`TALLYMAN_HOME`) at a time, and the error names the one
+  that holds it (pid, port, start time). Stop it, or run the second tallyman on
+  its own data dir and port: `TALLYMAN_HOME=<another dir> uv run tallyman run
+  --port 7861`. An MCP server started with the same `TALLYMAN_HOME` finds that
+  companion's port by itself, from the `server.lock` the server writes in the
+  data dir. With no server on its data dir, the MCP server sends no updates,
+  its replies carry no entry links, and `project_switch` / `project_new` fail.
+- **Port 7860 already in use** — something else is listening there; pass
+  `--port` to `tallyman run`.
 - **An entry's data tab says "Buckaroo not available"** — the companion was
   started with `--no-buckaroo`, or Buckaroo failed to start; `tallyman run`
   prints why. If the tab shows an error instead, its detail says whether

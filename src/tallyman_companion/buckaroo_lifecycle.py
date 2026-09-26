@@ -38,7 +38,6 @@ import atexit
 import json
 import logging
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -54,8 +53,8 @@ from tallyman_core import (
     entry_stat_cache_dir,
     entry_view_build_dir,
 )
-from tallyman_core.manifest import read_manifest
-from tallyman_core.paths import artifacts_dir, entry_manifest_path, project_dir
+from tallyman_core.net import port_in_use
+from tallyman_core.paths import artifacts_dir, project_dir
 from tallyman_xorq.row_order import ROW_ORDER
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -102,28 +101,6 @@ def ensure_view_build(project: str, content_hash: str) -> Path:
             shutil.move(str(built), str(dest))
         marker.write_text(snap)
     return dest
-
-
-def _port_in_use(port: int) -> bool:
-    """Probe whether `port` is currently bound to a listener on localhost.
-
-    SO_REUSEADDR matches Tornado's own bind options — without it, the probe
-    false-positives for ~60s after a restart whenever the previous buckaroo
-    had any client connections (a browser WS, the embed) open at shutdown:
-    the closed connections' TIME_WAIT artifacts make a bare bind() fail with
-    EADDRINUSE even though no listener exists. The real Tornado server can
-    still bind such a port; the probe just disagreed and forced a port=0
-    fallback the user noticed as a fresh random port on each restart.
-    """
-    s = socket.socket()
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    try:
-        s.bind(("127.0.0.1", port))
-    except OSError:
-        return True
-    finally:
-        s.close()
-    return False
 
 
 class BuckarooUnavailable(RuntimeError):
@@ -208,7 +185,7 @@ class BuckarooManager:
         """Spawn the Buckaroo subprocess and wait for the handshake."""
         if self.is_running:
             return
-        if _port_in_use(self.requested_port):
+        if port_in_use("127.0.0.1", self.requested_port):
             log.warning(
                 "buckaroo port %d already in use; using --port=0 (random)",
                 self.requested_port,
@@ -480,13 +457,9 @@ class BuckarooManager:
         return self.load_session(content_hash, project, column_config_overrides)["session_id"]
 
     def _load_timeout(self, project: str, content_hash: str) -> float:
-        row_count = 0
-        mpath = entry_manifest_path(project, content_hash)
-        if mpath.exists():
-            try:
-                row_count = read_manifest(mpath.parent).row_count or 0
-            except Exception:
-                pass
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+        row_count = entry_manifest(project, content_hash).row_count or 0
         return 10.0 + row_count / 1_000_000
 
     def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None) -> dict:

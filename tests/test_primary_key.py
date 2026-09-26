@@ -78,8 +78,8 @@ def test_search_times_out_without_caching(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("dups", _dup_rows(project, orders_src))
     h = _current_hash(project)
-    # Each budget check costs the whole 1s budget, so the search stops before
-    # its first query.
+    # Each query is charged the whole 1s budget, so the search stops before
+    # its second query.
     monkeypatch.setattr(pk, "_clock", _ticking_clock(1.0))
     with pytest.raises(TimeoutError, match="primary key search"):
         resolve_primary_key(project, h)
@@ -107,3 +107,52 @@ def test_keyless_table_resolves_empty_without_timing_out(project, orders_src, mo
     assert resolve_primary_key(project, h) == []
     # A definite "no key" is cached, unlike a timeout.
     assert (entry_dir(project, h) / "primary_key.json").exists()
+
+
+def test_waiting_for_the_execution_lock_does_not_spend_the_budget(project, orders_src, monkeypatch):
+    """#118: the budget bounds the search's own queries. Another thread holds the execution lock for longer than the
+    whole budget; the search waits for it and then finds the key, instead of timing out on time it spent queueing."""
+    import threading
+
+    from tallyman_core.execution import execution_lock
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("rides", _select(project, orders_src, '"order_id", "region", "price", "__row_order"'))
+    h = _current_hash(project)
+
+    held, done = threading.Event(), threading.Event()
+
+    def _hold():
+        with execution_lock():
+            held.set()
+            done.wait(pk.PK_SEARCH_BUDGET_S * 1.5)
+
+    holder = threading.Thread(target=_hold)
+    holder.start()
+    held.wait()
+    try:
+        assert diff_keys(project, h, h) == ["order_id"]
+    finally:
+        done.set()
+        holder.join()
+
+
+def test_a_heal_before_the_search_does_not_spend_the_budget(project, orders_src, monkeypatch):
+    """#118: the budget starts when the search's queries execute. Reading the entry (cached_result_expr, which may
+    heal a snapshot) takes longer than the whole budget here, and the search still finds the key."""
+    import tallyman_xorq.result_cache as result_cache
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("rides", _select(project, orders_src, '"order_id", "region", "price", "__row_order"'))
+    h = _current_hash(project)
+
+    now = [0.0]
+    monkeypatch.setattr(pk, "_clock", lambda: now[0])
+    real = result_cache.cached_result_expr
+
+    def _slow_heal(*args, **kwargs):
+        now[0] += 5 * pk.PK_SEARCH_BUDGET_S
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(result_cache, "cached_result_expr", _slow_heal)
+    assert resolve_primary_key(project, h) == ["order_id"]

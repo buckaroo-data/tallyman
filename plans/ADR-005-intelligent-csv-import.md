@@ -245,6 +245,20 @@ converting (wrong only if naive-local data is mislabelled with a tz); (b) `ns`
 precision is silently truncated to `µs` by `scan_csv` (the `ns` dtype label is kept
 but sub-µs digits are dropped). Bad values still raise loudly, never null.
 
+**Implementation note (#231, 2026-09-24, polars 1.40.1).** Both (a) and (b) were
+wrong about the reader as installed. (a): the reader parses offset-less text as
+UTC and converts it, so `09:30` under `timestamp('America/New_York')` was stored as
+`04:30-05:00`. A zoned column is now read as text and parsed with
+`str.to_datetime(time_unit, time_zone=tz)` (`io._parse_zoned`), which does what (a)
+says: text with an offset is converted into the zone, text without one gets the
+zone attached. A wall-clock time the zone skips or repeats at a DST change raises,
+and so does a column that mixes text with and without an offset (polars infers one
+format per column from its first non-null value). That first value is checked
+before the read, because polars 1.40.1's streaming parse writes nulls instead of
+raising when it is not a timestamp. The error names the column, the row and the
+value. (b): `ns` digits survive the reader and the snapshot, for a naive, a UTC and
+a zoned column alike.
+
 ## Alternatives considered
 
 - **duckdb as the engine** (sniffer + reject tables for free). Rejected: reverses

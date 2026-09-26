@@ -276,11 +276,14 @@ its own snapshot, is on disk before anything executes:
    project lock and after re-checking that the file is still missing, and
    verifies it.
 
-Whether an entry is worthy comes from its manifest. When the manifest is
-missing (a half-built entry), a snapshot on disk stands in for the verdict, so a
-worthy entry that has lost both is read as cheap: its whole build re-runs on
-every read, and a child built earlier, whose build reads that snapshot, can no
-longer be read (#204).
+Whether an entry is worthy comes from its manifest (`cache_worthy`), and nothing
+stands in for it: a file at the snapshot path says nothing about the verdict. An
+entry directory with no manifest, which a build or import killed before its last
+write leaves, is refused. `result_cache.entry_manifest` raises a `BuildError`
+naming the missing `manifest.json` before anything is loaded or written, a child
+whose build reads that entry's snapshot raises the same error, and running the
+recipe again (or importing the file again, for a source entry) writes the entry
+again under the same hash.
 
 | File | Written by | If it is missing |
 |---|---|---|
@@ -400,8 +403,14 @@ companion, and it is re-entrant within a thread. It blocks with no timeout: a
 page read whose entry needs a heal waits behind any build in the other process
 (#186), and the companion's `PUT /code` and `POST /promote_diff` routes build on
 the event loop, so the whole UI stops answering while they wait or build (#190).
-It covers no reads. Concurrent reads on the shared default backend can still
-raise `Already borrowed` (#118).
+It covers no reads. Executions have a lock of their own,
+`execution.execution_lock`, one re-entrant lock per process, held around every
+execution on the process's shared default backend, which fails with
+`RuntimeError: Already borrowed` when two threads execute on it at once. A heal
+runs before that lock is taken, since the project lock comes first, and
+`project_lock` raises in a thread that holds the execution lock and would take a
+new file lock. A materialization's stream and a cheap entry's row count at build
+run on connections of their own and take no execution lock.
 
 `reset_to` (`src/tallyman_core/catalog_state.py`) returns the catalog with
 `git reset --hard` and reconciles entry directories through the bullpen (the

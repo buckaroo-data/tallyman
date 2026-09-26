@@ -37,12 +37,14 @@
   possible for caching."
 - **Tickets:** #188 (diffs, moved out of this ADR), #186 (the waiting that
   D11's lock causes), #185 (non-pure recipes), #183 (two servers on one
-  project), #168 (CSV source identity, which the shared rebuild of D9 needs),
-  #118 (concurrent reads on the shared backend, which D11 does not cover),
-  #77 (an empty grid on a clone of the project at another path, which D2
-  closes), #76 (closed: how bare-read chaining failed the last time it was
-  tried, which D5 answers), #22 (the checkpoint's cost grows with the cache,
-  which D14 removes).
+  project, now refused per data dir), #168 (CSV source identity, which the
+  shared rebuild of D9 needs), #118 (concurrent executions on the shared
+  backend, which the project lock does not cover and a per-process execution
+  lock does), #77 (an empty grid on a clone of the project at another path,
+  which D2 closes), #76 (closed: how bare-read chaining failed the last time it
+  was tried, which D5 answers), #22 (the checkpoint's cost grows with the
+  cache, which D14 removes). D11 (one write at a time per project) records how
+  #183 and #118 are handled.
 - **Affected code:** `src/tallyman_xorq/source_cache.py` (`rewrite_for_build`),
   `src/tallyman_xorq/result_cache.py` (`_resolve_result_plan`,
   `cached_result_expr`, `entry_graph_expr`, `baked_snapshot_path`,
@@ -590,9 +592,12 @@ discover them:
   lock cannot be held across an `await`.
 - Whether a recalc takes the lock once per build or once for the whole walk is
   left to the implementation. Either is correct.
-- The lock covers writes only. Concurrent reads on the shared default backend
-  fail with `RuntimeError: Already borrowed`. That is #118, and this ADR does
-  not change it.
+- The lock covers writes only. Two threads executing on a process's shared
+  default backend at once fail with `RuntimeError: Already borrowed`, so every
+  execution there holds a second lock, `execution.execution_lock`: one per
+  process, re-entrant, and ordered after the project lock. Anything that can
+  heal runs before it is taken, and `project_lock` raises in a thread that
+  holds it and would take a new file lock (#118, implemented by #242).
 
 The lock is blocking and has no timeout, and the work it now covers is long: a
 materialization runs single-partition, and a create runs its query twice
@@ -604,8 +609,14 @@ process. Paddy, 2026-09-20: correct first. #186 tracks the waiting.
 Two tallyman servers pointed at one project is unsupported. Paddy: "you have
 done something diabolical and deserve the results." The file lock would still
 serialize their writes on one machine, and nothing else about them is safe,
-because each holds in-process state the other never sees.
-buckaroo-data/tallyman#183 tracks detecting that case and refusing to start.
+because each holds in-process state the other never sees. So `tallyman run`
+claims its data dir (`TALLYMAN_HOME`, the directory that holds every project)
+with an exclusive `flock` on `<data dir>/server.lock`, and a second
+`tallyman run` on the same data dir is refused with a message naming the one
+that holds it. The MCP server finds its companion from the port recorded in that
+file, and with no server on the data dir it notifies nothing
+(buckaroo-data/tallyman#183, implemented by #241). `tallyman mcp` and
+`tallyman serve` claim nothing.
 
 ### D12. Files are deleted only by an explicit user action
 

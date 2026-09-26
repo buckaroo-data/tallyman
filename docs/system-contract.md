@@ -196,7 +196,10 @@ one. It enters the catalog by one explicit act, an **import**
 2. writes one parquet file of its rows, in file order plus a last `__row_order`
    column, `0..N-1`, to `compute_cache/result_cache/<content_hash>.parquet`:
    pyarrow copies a parquet file, keeping its types, and polars parses a CSV
-   under the schema and `scan_csv` options the call names;
+   under the schema and `scan_csv` options the call names (a timestamp column
+   whose schema type has a zone keeps the wall-clock time of text with no UTC
+   offset, converts text with one into the zone, and refuses a time the zone
+   skips or repeats and a column that mixes the two kinds of text);
 3. writes an entry, the **source entry**, with a generated recipe, a frozen
    build, a schema and a manifest whose `provenance` records the outside path,
    the digest, the reader options and the name it was imported as;
@@ -350,9 +353,11 @@ The manifest is the entry directory's last write, atomic: its presence is the
 it, to record `unfaithful_heal_digest`, by an atomic replace under the project
 lock. The recipe zip, written by the first checkpoint, keeps the manifest as it
 was at create. An entry directory without a manifest is treated as absent by the
-entry list, the checkpoint, recalc and the build, which builds it again. A page
-read still serves such a directory, with the snapshot's existence standing in
-for the missing `cache_worthy` (#204).
+entry list, the checkpoint, recalc and the build, which builds it again. Every
+read refuses it: `result_cache.entry_manifest` raises a `BuildError` naming the
+missing `manifest.json` before anything is loaded or written, a child that reads
+the entry raises the same error, and no route answers around it. Nothing stands
+in for the manifest's `cache_worthy`.
 
 ## Alias
 
@@ -497,8 +502,8 @@ exist, and every consumer that composes or executes an entry goes through it
    the same way.
 
 Whether the entry is worthy is read from the manifest, never derived again.
-(With the manifest missing, the code guesses from whether a snapshot exists,
-#204.)
+With the manifest missing the read raises; a file at the snapshot path says
+nothing about the verdict.
 
 A file is cache only if this function can re-create it from files that are not
 cache. Snapshots satisfy that, a source entry's included, and live under
@@ -542,7 +547,13 @@ the moment the entry is born.
 
 `build_and_persist(project, code)` holds the project's write lock for the whole
 build (one build at a time per project, so two builds of one entry cannot end
-with the failing one deleting the winner's directory):
+with the failing one deleting the winner's directory). The lock is a file lock,
+so it holds between the MCP server and the companion, which both build. One
+companion serves a data dir (the directory that holds every project,
+`TALLYMAN_HOME`): `tallyman run` holds an exclusive lock on
+`<data dir>/server.lock` while it serves, a second `tallyman run` on the same
+data dir is refused, and a client of the data dir reaches only the companion
+that lock names. The build:
 
 1. **Import the recipe** — the single moment of name resolution. During the
    import, `tracked_expr_from_alias` resolves each alias to its current head,
@@ -639,6 +650,17 @@ plan (and the bare snapshot read, so a snapshot has one table name in the shared
 backend) per `(project, content_hash)`. Removing the memo must change latency and
 nothing else. The per-call existence check stays outside the memo, because file
 existence is the one input that remains mutable.
+
+**One execution at a time per process.** A process's default backend is one
+DataFusion session, which fails with `Already borrowed` when two threads execute
+on it at once. So every execution on it (a page, a post-processing run, a
+primary-key probe, a diff's summaries) holds `execution.execution_lock`, one
+re-entrant lock per process. The read above comes first and the execution after,
+because a heal takes the project lock and the order is the project lock first,
+then the execution lock: `project_lock` raises in a thread that holds the
+execution lock and would take a new file lock. An execution on a connection of
+its own (a materialization's stream, a cheap entry's row count at build) needs
+no execution lock.
 
 **Chaining** (`tracked_expr_from_alias` at build time) uses the same read. A
 worthy parent, a source entry included, is a bare read of its snapshot, so the
@@ -867,9 +889,6 @@ wrong even if every test passes.
 Where the code breaks a rule above today. Each is an open issue; none is a
 change of the rule.
 
-- **Worthiness from the manifest.** With the manifest missing, the snapshot's
-  existence stands in for the verdict, so a worthy entry that has lost both is
-  read as cheap (#204).
 - **Verification reaches one entry.** An unfaithful heal of a worthy parent
   changes its cheap children's rows under their hashes without a record
   (#208), and the purity of an entry is not passed on to entries built on it,
@@ -888,14 +907,12 @@ change of the rule.
   companion's event loop (#201); Buckaroo is pointed at `artifacts/` and does
   not find the project's stats and post-processing functions (#170); the live
   diff grid is an unmaterialized join (#188).
-- **One writer at a time.** The project lock blocks with no timeout (#186), two
-  companion routes build on the event loop and freeze the UI while they wait
-  (#190), two servers on one project are not detected (#183), and concurrent
-  reads on the shared backend can fail (#118). The lock covers builds,
-  materializations, checkpoints and resets only: alias, notebook, chart,
-  display-config and `config.json` writes replace their file atomically without
-  it, so an MCP edit and a browser edit of the same file at the same moment can
-  lose one of the two (#240).
+- **One writer at a time.** The project lock blocks with no timeout (#186), and
+  two companion routes build on the event loop and freeze the UI while they wait
+  (#190). The lock covers builds, materializations, checkpoints and resets
+  only: alias, notebook, chart, display-config and `config.json` writes replace
+  their file atomically without it, so an MCP edit and a browser edit of the
+  same file at the same moment can lose one of the two (#240).
 - **Names resolve once, in the right project.** A recipe's alias readers
   (`tracked_expr_from_alias`, `pinned_expr_from_alias`) resolve the project from
   the `active_project` file, while the MCP tool builds into the session's own
@@ -931,8 +948,14 @@ section listed were fixed on the same branch: a failed build deleted the
 snapshot already at its path (#193, fixed in #222), and a reset could pair a
 non-reproducible entry's older manifest with its newer snapshot, a retired
 entry's snapshot lost its pin, and dismissing the error banner lifted an
-unfaithful heal's pin (#194, #195 and #196, fixed in #223). The wider audit of
-the same bug class is
+unfaithful heal's pin (#194, #195 and #196, fixed in #223). Three more were
+fixed later on the same branch: with its manifest missing, an entry's worthiness
+was guessed from whether its snapshot existed, so a worthy entry that had lost
+both was read as cheap (#204, fixed in #245, which makes every read refuse such
+a directory); two servers on one project went undetected (#183, fixed in #241,
+one server per data dir); and concurrent executions on a process's shared
+backend could fail with `Already borrowed` (#118, fixed in #242, the execution
+lock). The wider audit of the same bug class is
 [`plans/cache-soundness-audit.md`](../plans/cache-soundness-audit.md)
 (#168–#172, buckaroo#955–#957) — the contract's rules apply to those axes
 too.

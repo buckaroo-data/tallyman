@@ -21,8 +21,12 @@ views of it and editors of it. Each process keeps in-memory caches keyed by
 content hash, which change how fast an answer comes back and never what the
 answer is. Beyond those caches, the MCP server remembers which project its
 session is working on, and the companion holds its open SSE streams and the
-diff sessions it has opened in Buckaroo. Running two tallyman servers against
-one project is unsupported, and nothing detects it yet (#183).
+diff sessions it has opened in Buckaroo. So one server runs per **data dir**,
+the directory that holds every project (`~/.tallyman-notebooks` unless
+`TALLYMAN_HOME` names another): `tallyman run` holds an exclusive lock on
+`<data dir>/server.lock` while it serves, and a second `tallyman run` on the same
+data dir is refused with a message naming the one that holds it. See
+[One server per data dir](#one-server-per-data-dir).
 
 ### Terms
 
@@ -204,14 +208,18 @@ Claude Code talks to over stdio: 31 tools and one prompt. Every tool
 checkpoints after it succeeds unless it is on the `_NO_CHECKPOINT` list. The
 active project is sticky for the session: seeded on the first call, then
 changed only by `project_switch` or `project_new`, which go through the
-companion so that its SSE stream stays honest. Notifications to the companion
-are best effort and never raise. [mcp-server.md](mcp-server.md) documents every
-tool, its parameters and its side effects.
+companion so that its SSE stream stays honest. It finds the companion on each
+call from the port recorded in the data dir's `server.lock`; with no server on
+the data dir it sends no notifications, its replies carry no entry links, and
+`project_switch` and `project_new` return an error. Notifications to the
+companion are best effort and never raise. [mcp-server.md](mcp-server.md)
+documents every tool, its parameters and its side effects.
 
 **tallyman_cli** (`src/tallyman_cli/main.py`) is the Click command line,
 `tallyman`. `init` creates a project, with a synthetic `data/orders.parquet`
 unless given `--no-fixture` (written, not imported: a recipe reads it only after
-`catalog_import_source`), and records its step-000 checkpoint. `run` starts the
+`catalog_import_source`), and records its step-000 checkpoint. `run` claims the
+data dir, refusing to start when another server holds it, then starts the
 companion and, unless given `--no-buckaroo`, the Buckaroo subprocess
 (`python -m buckaroo.server --stdio-control`, which exits when its stdin
 closes) on port 8700, or on a random port if 8700 is taken. `mcp` starts the
@@ -237,10 +245,13 @@ A project lives at `~/.tallyman-notebooks/projects/<project>/`. The home root
 is `~/.tallyman-notebooks/` by default and can be moved with the
 `TALLYMAN_HOME` environment variable (`paths.tallyman_home`). The active
 project's name is the one line of `~/.tallyman-notebooks/active_project`.
+`server.lock` beside it is the claim of the `tallyman run` serving the data dir,
+and its owner record ([One server per data dir](#one-server-per-data-dir)).
 
 ```
 ~/.tallyman-notebooks/
   active_project                       # one line: the active project's name
+  server.lock                          # held by the running tallyman run; its pid, port and start time
   projects/<project>/
     artifacts/
       catalog/                         # git repo: the catalog
@@ -298,10 +309,12 @@ Key formats, and what is tracked:
   and `version` are the name it was imported as). It is the entry directory's
   last write, atomic, and its presence means the entry is complete: the entry
   list, the checkpoint, recalc and the build skip or rebuild a directory that
-  has none. A page read still serves such a directory, and #204 describes what
-  that means for a worthy entry. After create only an unfaithful heal rewrites
-  the manifest, to record `unfaithful_heal_digest`, atomically, under the
-  project lock.
+  has none. Every read refuses such a directory: `result_cache.entry_manifest`
+  raises a `BuildError` naming the missing `manifest.json` before anything is
+  loaded or written, the companion's entry routes answer 500, and running the
+  recipe again writes the entry again. After create only an unfaithful heal
+  rewrites the manifest, to record `unfaithful_heal_digest`, atomically, under
+  the project lock.
 - **`compute_cache/`** holds the files tallyman writes and can make again:
   snapshots, a source entry's included. It is untracked, a reset leaves it
   alone, and anything may delete it: the next read makes what it needs again.
@@ -475,9 +488,14 @@ Reader options are fixed at import (ADR-011 D12). A parquet file takes none: its
 snapshot is written by pyarrow in the file's order, so it keeps the file's
 types. A CSV is parsed by polars under the schema and `scan_csv` options named in
 the call, through ADR-005's schema language and inference ladder, and its rows
-go to the same pyarrow writer in batches. The options are recorded on the entry
-and are part of its hash, so a CSV read two ways is two imports under two
-aliases. A source entry's snapshot is written with the same pyarrow settings as
+go to the same pyarrow writer in batches. A timestamp column whose schema type
+has a zone is read as text and parsed in that zone (`io._parse_zoned`): text with
+a UTC offset is converted into the zone, and text without one keeps its
+wall-clock time. Offset-less text that names a time the zone skips or repeats at
+a daylight-saving change, and a column that mixes text with and without an
+offset, are errors naming the column, row and value. The options are recorded
+on the entry and are part of its hash, so a CSV read two ways is two imports
+under two aliases. A source entry's snapshot is written with the same pyarrow settings as
 any other snapshot, in row groups of 122,880 rows rather than 1,048,576.
 
 The build refuses every other way of reading a file: `read_project_file`,
@@ -588,8 +606,43 @@ process (#186), and the two companion routes that build on the event loop,
 build (#190). Smaller writes to tracked files (aliases, notebook cells, charts,
 display configs, `config.json`) take no lock: each replaces its whole file
 atomically, so two processes editing the same file at the same moment can lose
-one of the edits. The lock covers no reads either: concurrent reads on the shared
-DataFusion backend can fail with `Already borrowed` (#118).
+one of the edits. The lock covers no reads either; they have the execution lock,
+below.
+
+### The execution lock
+
+Each process executes reads on one DataFusion session, xorq's default backend,
+and two threads executing on it at once fail with
+`RuntimeError: Already borrowed`. The companion serves requests from FastAPI's
+thread pool and the MCP server runs tool calls on FastMCP's, so
+`execution.execution_lock`, one re-entrant lock per process, is held around
+every execution on that backend: a `/api/data` page, a post-processing run, a
+primary-key probe and `full_diff`'s Buckaroo helpers. Executions in one process
+run one at a time, and another
+process has its own backend and lock. The project lock comes first: anything
+that can heal (`cached_result_expr`, `ensure_materialized`) runs before the
+execution lock is taken, and `project_lock` raises in a thread that holds the
+execution lock and would take a new file lock. A materialization's stream and a
+cheap entry's row count at build run on connections of their own and take no
+execution lock, so a build does not hold up page reads.
+`tests/test_execution_lock.py` checks in the source that every other execution
+sits inside `with execution_lock():`.
+
+### One server per data dir
+
+`tallyman run` claims its data dir before it starts anything else
+(`tallyman_core/server_lock.py`): an exclusive `flock` on
+`<data dir>/server.lock`, held on a descriptor the server keeps open, so the
+kernel drops it however the process exits. The file also holds an owner record
+(pid, host, port, bind address, start time, data dir, command line), which names
+the holder when a second `tallyman run` on the same data dir is refused. The MCP
+server and `tallyman reset-to` find their companion from that record's port
+(`companion_url()`), and believe it only while the lock is held; no default port
+or environment variable stands in. Each notify, project switch and project
+creation names its data dir as `home`, and a companion serving another data dir
+answers 409. `tallyman mcp` and `tallyman serve` claim nothing. A second tallyman
+runs on its own data dir and port:
+`TALLYMAN_HOME=<another dir> tallyman run --port <port>`.
 
 ### Live updates over SSE
 
@@ -760,8 +813,6 @@ Writes, the lock and processes:
   one process blocks page reads in the other.
 - #190: `PUT /code` and `POST /promote_diff` build on the companion's event
   loop, which freezes the UI while they wait for the lock or build.
-- #183: two tallyman servers on one project are unsupported, and nothing
-  detects it.
 
 Row order and diffs:
 
@@ -781,8 +832,6 @@ Heals and Buckaroo:
 - #203: an unfaithful heal runs its checks and the forced Buckaroo reload while
   holding the project lock, and the reload opens a session for an entry nobody
   has open.
-- #204: with its manifest gone, an entry's worthiness is guessed from whether a
-  snapshot exists, so a worthy entry that has lost both is served as cheap.
 - #208: an unfaithful heal of a worthy parent changes its cheap children's rows
   under their hashes; only the parent is flagged.
 - #209: a copied project keeps reading the old path through its expanded
@@ -797,15 +846,14 @@ Found while checking these docs (#233): a recipe's
 the `active_project` file, not the MCP session's own project, so the two can
 disagree after another session switches projects and a recipe then looks its
 aliases up in the other project (related to #39).
-Older open issues in the same areas: #118 (concurrent reads can fail with
-`Already borrowed`), #170 (Buckaroo is not pointed at the project's stats and
-post-processing functions) and #157 (Buckaroo's on-disk statistics cache has not
-been seen to give a first-load hit).
+Older open issues in the same areas: #170 (Buckaroo is not pointed at the
+project's stats and post-processing functions) and #157 (Buckaroo's on-disk
+statistics cache has not been seen to give a first-load hit).
 
 Filed on 2026-09-24 against the same code, and described one by one in
 [architecture-new.md](architecture-new.md#13-known-defects) and
 [plans/open-bugs-2026-09-24.md](../plans/open-bugs-2026-09-24.md): wrong rows or
-edges without an error (#228, #229, #231, #232), the import (#224, #225, #227,
+edges without an error (#228, #229, #232), the import (#224, #225, #227,
 #234, #237, #239), writes and leftovers (#226, #230, #240), recalc of a source
 entry (#238), the SPA's missing SSE listeners (#235) and ADR-011 leftovers in
 the code (#236).
@@ -821,11 +869,24 @@ files), and the two staleness defects the first version of this list named (the
 scan wiping the source-digest memo, and a hash-pinned child stale for good on
 the source axis).
 
-Fixed on this branch: #193 by #222 (a failed build deleted the snapshot already
-on disk for its hash), and #194, #195 and #196 by #223 (a reset could pair a
-non-reproducible entry's older manifest with its newer snapshot, a retired
-entry's snapshot lost its pin, and the pin from an unfaithful heal lived in
-`errors.jsonl`, so dismissing the error banner lifted it).
+Fixed on this branch:
+
+- #193 by #222: a failed build deleted the snapshot already on disk for its
+  hash.
+- #194, #195 and #196 by #223: a reset could pair a non-reproducible entry's
+  older manifest with its newer snapshot, a retired entry's snapshot lost its
+  pin, and the pin from an unfaithful heal lived in `errors.jsonl`, so
+  dismissing the error banner lifted it.
+- #118 by #242: concurrent executions on a process's shared backend failed with
+  `Already borrowed`. See [The execution lock](#the-execution-lock).
+- #183 by #241: two servers on one project went undetected. See
+  [One server per data dir](#one-server-per-data-dir).
+- #204 by #245: with its manifest gone, an entry's worthiness was guessed from
+  whether a snapshot existed, so a worthy entry that had lost both was served
+  as cheap. Every read now refuses such a directory, which reverses #95, where
+  `/api/data` served it with a total of 0.
+- #231 by #244: a zoned timestamp in a CSV schema read offset-less text as UTC
+  and converted it, so `09:30` in New York was stored as `04:30-05:00`.
 
 ## Related documentation
 

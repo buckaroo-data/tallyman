@@ -187,7 +187,6 @@ gone.
 |----------|---------|---------|
 | `TALLYMAN_HOME` | `~/.tallyman-notebooks` | Root for all project state |
 | `TALLYMAN_PROJECT` | none | Seeds the `active_project` file when that file does not exist yet and the named project does (see below) |
-| `TALLYMAN_COMPANION_URL` | the port in the data dir's `server.lock` | Where the MCP server and the CLI send notifications. Unset, they read the port of the `tallyman run` that holds `TALLYMAN_HOME`; with no server there they send nothing |
 | `TALLYMAN_AUTO_RECALC` | unset | `1`/`0` (or `true`/`false`) overrides the project's auto-recalc switch (on by default) |
 | `TALLYMAN_LOG_LEVEL` | `INFO` | Log level of the MCP server |
 
@@ -196,6 +195,7 @@ gone.
 ```
 ~/.tallyman-notebooks/
 ├── active_project          # one-line plain text; the active project
+├── server.lock             # held by the `tallyman run` serving this data dir; names its pid and port
 └── projects/
     └── <name>/             # catalog, notebook, build artifacts per project
 ```

@@ -30,7 +30,7 @@ server, draws each entry's rows.
 | Process | Started by | Owns |
 |---|---|---|
 | MCP server, `src/tallyman_mcp/server.py` | Claude Code runs `tallyman mcp`, one per session, over stdio | the session's active project; the builds and imports the agent asks for |
-| Companion, `src/tallyman_companion/app.py` | `tallyman run`, a FastAPI app on port 7860 | the API and event stream the browser uses; the builds, recalcs and resets the browser asks for; the Cache page's delete; the Buckaroo subprocess |
+| Companion, `src/tallyman_companion/app.py` | `tallyman run`, a FastAPI app on port 7860 unless `--port` names another | the API and event stream the browser uses; the builds, recalcs and resets the browser asks for; the Cache page's delete; the Buckaroo subprocess |
 | Buckaroo | the companion, through `BuckarooManager` (`buckaroo_lifecycle.py`) | grid sessions and their queries: paging, sorting, search and summary statistics |
 
 **The MCP server** has 31 tools and one prompt. It remembers the session's
@@ -40,7 +40,8 @@ companion. `_with_checkpoint` commits a checkpoint (one git commit of the
 catalog, section 10) after every tool that returns without an error, except
 those in `_NO_CHECKPOINT`: most read-only tools, the project tools, and
 `catalog_recalc` and `catalog_promote_diff`, which commit their own. After a
-change the server posts to the companion's `/internal/notify`, best effort.
+change the server posts to the companion's `/internal/notify`, best effort, and
+it posts nothing when no companion serves its projects (below).
 
 **The companion** serves the React app, a JSON API under `/{project}/api/`, and
 a stream of Server-Sent Events (SSE, named messages on an HTTP response the
@@ -50,6 +51,29 @@ browser keeps open) at `/{project}/api/sse`. It builds through
 `_checkpoint_after_mutation` commits a checkpoint after every successful non-GET
 request, except on routes that commit their own or change no authored state.
 `tallyman serve <dir>` runs a read-only companion with no Buckaroo.
+
+**One server per data dir.** The **data dir** is the directory that holds every
+project, `~/.tallyman-notebooks` unless `TALLYMAN_HOME` names another.
+`tallyman run` claims it before it starts anything else
+(`tallyman_core/server_lock.py`): it takes an exclusive `flock` on
+`<data dir>/server.lock` and holds it on a descriptor it keeps open while it
+serves, so the kernel drops the lock however the process exits. The file also
+holds the **owner record**, JSON naming the server's pid, host, port, bind
+address, start time, data dir and command line. A second `tallyman run` on the
+same data dir is refused with a message that names the holder and says how to
+run a second tallyman on its own data dir and port. Each server holds state no
+other process sees (its SSE subscribers, its Buckaroo sessions, its memos), so
+two serving one project would each show a view the other's writes never reach.
+The MCP server and `tallyman reset-to` find their companion on each call with
+`server_lock.companion_url()`, from the owner record's port, and believe the
+record only while its lock is held. Nothing else names the companion: no
+default port and no environment variable. With no server on the data dir there
+is no companion, so notifies are skipped, tool replies carry `url: null`, and
+`project_switch` and `project_new` return an error. Each notify, project switch
+and project creation carries its data dir as `home`, and a companion serving
+another data dir answers 409 and changes nothing; the browser sends no `home`
+and is not checked. `tallyman mcp`, one per Claude Code session, and
+`tallyman serve` claim nothing.
 
 **Buckaroo** runs as `python -m buckaroo.server --port 8700 --no-browser
 --stdio-control` and exits when its stdin closes. It displays, and queries only
@@ -75,6 +99,26 @@ section 7), checkpoints and resets happen one at a time. It is re-entrant within
 a thread and blocks with no timeout. Smaller writes (an alias, a notebook cell, a
 chart, a display config, `config.json`) take no lock and replace their whole
 file atomically.
+
+**The execution lock.** Each process executes reads on one DataFusion session,
+xorq's default backend (`xorq.config.default_backend()`), and two threads
+executing on it at once fail with `RuntimeError: Already borrowed`. Both
+processes run work on thread pools (FastAPI's for requests, FastMCP's for tool
+calls), so every execution on that backend holds `execution.execution_lock`, one
+re-entrant lock per process: `/api/data` pages, post-processing runs, the
+primary-key probes and `full_diff`'s Buckaroo helpers. Executions in one process
+therefore run one at a time, and a long one, such as a diff's summaries, makes
+that process's page reads wait. Another process has its own backend and its own
+lock. The project lock comes first: anything that can heal
+(`cached_result_expr`, `ensure_materialized`) runs before the execution lock is
+taken, and `project_lock` raises `RuntimeError` in a thread that holds the
+execution lock and would take a new `flock`. Two executions run on connections
+of their own and take no execution lock, so a build or heal does not hold up
+page reads: a materialization's stream (`materialize._stream_to_parquet`) and a
+cheap entry's row count at build (`result_cache.stream_row_count`).
+`tests/test_execution_lock.py` checks the rule in the source: every execution in
+`src/` sits inside `with execution_lock():` or is one of those two, and nothing
+that can take a project lock is called inside that block.
 
 ## 3. The project on disk
 
@@ -108,6 +152,12 @@ catalog repository does not recreate entry directories. The logs sit outside the
 repository, so a reset does not rewind them, and `errors.jsonl` holds no state:
 dismissing the error banner deletes it. `tallyman init` writes a fixture at
 `data/orders.parquet`, which no build reads until it is imported.
+
+Two files sit at the top of the data dir, outside every project:
+`active_project`, the name of the active project, and `server.lock`, the claim
+and owner record of the `tallyman run` serving the data dir (section 2). A
+server that exits leaves its record in the file, and nothing believes it once
+the lock is gone.
 
 ## 4. Core objects
 
@@ -315,6 +365,21 @@ order and runs ADR-005's schema language and inference ladder (100 rows, then
 10,000, then the whole file, unless every column is pinned), and whose batches
 reach the writer through `collect_batches` without the frame being held whole.
 
+**Zoned timestamps in a CSV.** A column whose schema type is a timestamp with a
+zone, such as `timestamp('America/New_York')`, is read as text and parsed after
+the scan (`io._parse_zoned`), because polars' CSV reader would parse text with no
+UTC offset as UTC and convert it. Text with an offset is an instant and is
+converted into the zone. Text without one is a wall-clock time in the zone and
+keeps it, so `09:30` stays `09:30` New York time. This is ADR-005's rule for a
+zoned schema on offset-less text (its D9(a): attach the zone, do not convert).
+The import raises, naming the column, the row and the value, for offset-less
+text that names a time the zone skips or repeats at a daylight-saving change,
+for a column that mixes text with and without an offset (polars infers one
+format per column from its first non-null value), and for text that is not a
+timestamp. The first non-null value is checked before the read, since polars
+1.40.1 writes nulls instead of raising when that value matches no format. The
+declared precision is kept, `ns` included.
+
 **The entry.** `_mint` writes a generated `expr.py` whose header records the
 path, digest and reader options, a real `xorq_build/`, `schema.json`, and last
 the manifest, which marks the entry worthy and records the snapshot's
@@ -400,9 +465,10 @@ the tool returns, and is taken even when nothing changed.
 - From step 6 on, the build removes the directory it created and its temporary
   file; the file already at the snapshot path is untouched.
 - A killed process can leave a directory with no manifest, which every writer
-  treats as absent, and a `.<hash>.<uuid>.tmp` file in `result_cache/` that
-  nothing removes. Killed between steps 8 and 9, it leaves a complete entry over
-  whatever file was at the path, or none, which the next read heals.
+  treats as absent and every read refuses (section 7), and a `.<hash>.<uuid>.tmp`
+  file in `result_cache/` that nothing removes. Killed between steps 8 and 9, it
+  leaves a complete entry over whatever file was at the path, or none, which the
+  next read heals.
 - The MCP tools record the failure in `errors.jsonl`, add a `build_error` event,
   notify `build_failed` and skip the checkpoint; `PUT /code` answers 400.
 - A revision refused for following its own alias is already built, so its entry
@@ -439,6 +505,22 @@ entry reads, and its own snapshot, on disk before anything runs:
 3. Otherwise the build is loaded, and each missing file it reads, always another
    entry's snapshot, is made by recursing on the hash in its name (`_recreate`).
 4. A worthy entry whose snapshot is missing is healed (`_heal`).
+
+**A directory with no manifest is refused.** The manifest holds what a read
+needs: the worthy-or-cheap verdict, the digest a heal is checked against, the
+pin, and a source entry's provenance. `result_cache.entry_manifest` reads it and,
+when the file is missing, raises `BuildError` with the message
+`entry <hash> in '<project>' has no manifest.json: <entry dir>`. A hash with no
+directory at all gets the same error. `cache_worthy` reads only the manifest, so
+a file at the snapshot path says nothing about the verdict.
+`cached_result_expr` and `ensure_materialized` raise before they load or write
+anything, and a child that reads such an entry raises the parent's error as it
+is. Nothing answers around the error: `/api/data`, `/api/entry`,
+`/api/entry_cache` and `/api/notebook_full` answer 500, and `/api/session`
+answers status `error` with the message. (`/api/data`, `/api/entry` and
+`/api/entry_cache` answer 404 for a hash with no directory, which they check
+first.) Running the recipe again, or importing the file again for a source
+entry, writes the entry again under the same hash.
 
 A **heal** re-creates a missing snapshot and checks it against `result_digest`.
 A computed entry heals by running `materialize` once. A source entry heals from
@@ -647,8 +729,9 @@ deleted instead of showing ones from the old rows. The hook also publishes
 
 **Diffs.** `GET /{project}/api/diff_data/{alias}/{va}/{vb}` reads two versions
 through `cached_result_expr`, finds a join key (`primary_key.diff_keys`, cached in
-`primary_key.json`; a search over one second answers 504), and computes the
-summaries (`tallyman_xorq.diff.full_diff`). For the grid,
+`primary_key.json`; a search whose queries run longer than one second in total
+answers 504, and time spent waiting for the execution lock does not count), and
+computes the summaries (`tallyman_xorq.diff.full_diff`). For the grid,
 `tallyman_companion.diff.build_compare_expr` builds an outer join on the key,
 with `__row_order` dropped from both sides and `membership`, `_eq`, `_pct_delta`
 and `_abs_delta` columns, posted as session `diff-<a12>-<b12>`. Diff sessions,
@@ -684,7 +767,8 @@ Where the code breaks one of these, section 13 names the issue.
 - **Names resolve once**, when an entry is minted, and no read, heal or grid
   hand-off resolves a name to decide rows.
 - **The manifest completes an entry**: it is the last write, atomic, and a
-  directory without one is not an entry.
+  directory without one is not an entry. Writers build over it, and every read
+  refuses it; nothing stands in for the manifest's verdict.
 - **A snapshot changes only by an atomic replace of a complete file**, under the
   project lock.
 - **Two routines write result bytes**, `materialize` and the import's
@@ -701,24 +785,33 @@ Where the code breaks one of these, section 13 names the issue.
   an import.
 - **A source alias's history only grows**, and no two of its versions hold the
   same bytes read the same way.
+- **An import never shifts a zoned CSV time**: offset-less text keeps its
+  wall-clock time in the column's zone, and a wall-clock time the zone skips or
+  repeats is an error.
 - **Staleness has one axis**: a followed alias that points somewhere new.
 - **One operation, one checkpoint**: a head move and its cascade commit together.
 - **One write at a time per project**: builds, imports, heals, checkpoints and
   resets hold the project lock.
+- **One execution at a time per process** on its shared default backend, under
+  the execution lock, and a thread that holds it takes no new project lock.
+- **One server per data dir**: `tallyman run` holds `server.lock` while it
+  serves, and a client of a data dir reaches only that data dir's companion.
 
 ## 13. Known defects
 
-The open issues that touch this design, as of `1f8cb02`. The full list, including
+The open issues that touch this design, as of `63bcdd6`. The full list, including
 the viewer, export and hint issues, with a priority for each, is
-[`plans/open-bugs-2026-09-24.md`](../plans/open-bugs-2026-09-24.md).
+[`plans/open-bugs-2026-09-24.md`](../plans/open-bugs-2026-09-24.md), made at
+`1f8cb02`. Since then four were fixed on this branch, and the sections above
+describe the fixed behaviour: #118 by #242 (the execution lock, section 2), #183
+by #241 (one server per data dir, section 2), #204 by #245 (a directory with no
+manifest is refused, section 7) and #231 by #244 (zoned CSV times, section 5).
 
 Wrong rows, pins or edges without an error:
 
 - #229: a pinned child and a tracked child with the same query compile to one content hash, so they are one entry and the first build's edge wins; a pinned alias can then move when its parent is revised.
 - #228: `build._raw_parquet_read_check` allows `xo.deferred_read_parquet` of any file under `compute_cache/`, so a recipe can read a snapshot by its path: a bare content hash, with no parent edge and no `ensure_materialized` first.
-- #231: a tz-aware timestamp in an import schema reads text with no UTC offset as UTC and converts it, so `09:30` in New York is stored as `04:30-05:00`.
 - #232: an unfaithful heal of a source entry is attributed to a graph that runs differently each time ("or source drift under off"), though the likely cause is a reader change; a corrupt clone is healed from and pinned.
-- #204: with its manifest gone, an entry's worthiness is guessed from whether its snapshot exists, so a worthy entry that has lost both is served as cheap.
 - #205: the canonical sort leaves nested columns out of its tie-break, so rows tied on every sortable column can come out in either order.
 - #206: the snapshot writer drops any column named `__row_order_right`, including one the author made.
 - #208: an unfaithful heal of a worthy parent changes its cheap children's rows under their hashes, and only the parent is flagged and reloaded.
@@ -740,7 +833,6 @@ Writes, the lock and processes:
 - #240: alias, notebook and `config.json` writes load, change and replace the file without the project lock, so two overlapping writers lose one change.
 - #233: a recipe's alias reads take the project from the `active_project` file, while the MCP tool builds into its session's project and a companion route into the project in its URL.
 - #186: the project lock blocks with no timeout, so a page read that needs a heal waits behind any build in the other process.
-- #183: two tallyman servers on one project are not detected, and each holds in-process state the other never sees.
 - #190: `PUT /code` and `POST /promote_diff` build on the companion's event loop, so the whole UI stops answering while they wait for the lock or build.
 - #226: a writer killed mid-write leaves a `.tmp` in `result_cache/` or `data/.cas/` that nothing lists or deletes.
 - #230: every failed build leaves its temporary `tallyman_expr_<uuid>.py` in the OS temp directory.
@@ -754,7 +846,6 @@ Recalc and row order:
 
 The viewer:
 
-- #118: concurrent reads on the shared default backend can fail with `Already borrowed`.
 - #170: Buckaroo is pointed at `artifacts/`, so it never finds the project's statistics and post-processing functions under `artifacts/catalog/`.
 - #172: diff sessions are keyed by the two hashes with no project, so two projects holding the same source versions can share one.
 - #188: the live diff grid hands Buckaroo an unmaterialized join, which Buckaroo runs for every query.

@@ -329,6 +329,23 @@ def test_every_mcp_tool_is_checkpoint_wrapped():
     assert server._NO_CHECKPOINT.isdisjoint(mutating)
 
 
+def test_every_list_returning_tool_skips_the_checkpoint():
+    """A tool that returns a list is a reader: it lists or reports and changes nothing, so it must not append a
+    revision. It could not stop one on its own error either: ``_tag_project`` folds a list reply into
+    ``{"project", "items"}``, and ``_with_checkpoint`` looks for ``error`` only at the top of the reply."""
+    import inspect
+
+    from tallyman_mcp import server
+
+    list_tools = {
+        name
+        for name in server._CHECKPOINTED_TOOLS
+        if str(inspect.signature(getattr(server, name)).return_annotation).startswith("list")
+    }
+    assert list_tools  # the scan found the tools it guards
+    assert list_tools <= server._NO_CHECKPOINT, sorted(list_tools - server._NO_CHECKPOINT)
+
+
 def test_mcp_mutating_tool_checkpoints_once(project):
     from tallyman_mcp.server import catalog_add_post_processing, catalog_list
 
@@ -340,6 +357,32 @@ def test_mcp_mutating_tool_checkpoints_once(project):
 
     catalog_list()  # read-only: denylisted, no revision
     assert _steps(project) == after
+
+
+def test_mcp_list_display_klasses_adds_no_revision(project):
+    from tallyman_mcp.server import catalog_list_display_klasses
+
+    base = _steps(project)
+    catalog_list_display_klasses()
+    assert _steps(project) == base
+
+
+def test_mcp_chart_errors_adds_no_revision(project, orders_parquet):
+    from tallyman_mcp.server import catalog_chart_errors, catalog_create
+
+    assert "error" not in catalog_create(name="agg", code=_agg_code(orders_parquet))
+    base = _steps(project)
+    assert catalog_chart_errors("agg")["items"] == []
+    assert _steps(project) == base
+
+
+def test_mcp_chart_errors_own_error_adds_no_revision(project):
+    """Its error arrives as a list item (``{"items": [{"error": ...}]}``), which ``_with_checkpoint`` does not see."""
+    from tallyman_mcp.server import catalog_chart_errors
+
+    base = _steps(project)
+    assert "error" in catalog_chart_errors("no_such_alias")["items"][0]
+    assert _steps(project) == base
 
 
 def test_mcp_multi_mutator_tool_is_one_step(project, orders_parquet):

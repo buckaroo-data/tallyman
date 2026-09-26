@@ -182,7 +182,9 @@ def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, orde
     assert captured["step"] == out["checkpoint_step"]
 
 
-def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_parquet, orders_src, monkeypatch):
+def test_recalc_notify_wire_delivers_remap_to_the_real_handler(
+    project, orders_parquet, orders_src, running_server, monkeypatch
+):
     # End-to-end across the seam the mocked tests miss: the exact JSON
     # tallyman_mcp._notify puts on the wire, fed to the REAL /internal/notify
     # handler, must deliver remap + step to the republished SSE event. Previously

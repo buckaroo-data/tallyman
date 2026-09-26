@@ -10,25 +10,27 @@ checkpoint, so neither double-commits nor misses).
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 from tallyman_cli.fixtures import write_shoe_orders
-from tallyman_core import data_dir, paths
+from tallyman_core import paths
 from tallyman_core.aliases import get_alias
+from tallyman_xorq.source_import import update_and_depend
 
 
 def _base_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
+expr = t.select("region", "price", "__row_order")
 """
 
 
 def _base_code_v2(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
-expr = t.select("region", "price").mutate(extra=1)
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
+expr = t.select("region", "price", "__row_order").mutate(extra=1)
 """
 
 
@@ -46,8 +48,13 @@ def _steps(project: str) -> set[str]:
     return set(out.split())
 
 
-def _edit_source(project: str) -> None:
-    write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=250, seed=7)
+def _advance_source(project: str, path: Path) -> None:
+    """Re-import the orders file with different rows: the ``orders_src`` alias advances (ADR-011 D3).
+
+    Editing the file alone is invisible to the catalog — a build reads an alias, never a path.
+    """
+    write_shoe_orders(path, n_rows=250, seed=7)
+    update_and_depend(path, "orders_src", project=project)
 
 
 # ---------------------------------------------------------------------------
@@ -55,35 +62,34 @@ def _edit_source(project: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_mcp_scan_staleness_lists_drifted_entries(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_mcp_scan_staleness_lists_drifted_entries(project, orders_parquet, orders_src):
     from tallyman_mcp.server import catalog_create, catalog_scan_staleness
 
     a = catalog_create("a", _base_code(project))["hash"]
     b = catalog_create("b", _child_code("a"))["hash"]
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     out = catalog_scan_staleness()
-    # a is directly stale on the source axis; b is a cheap child that inlines a's
-    # recipe, so a's source leaks into b's manifest.sources — b is directly stale
-    # too (see test_recalc on the cheap-chain leak).
-    assert a in out["stale"] and b in out["stale"]
+    # a reads orders_src, which the re-import advanced: a is directly stale. b reads
+    # the alias "a", which has not moved, so b is only carried — transitively stale.
+    assert a in out["stale"]
+    assert b not in out["stale"] and b in out["transitively_stale"]
     assert out["entries"][a]["stale"] is True
-    assert out["entries"][a]["reasons"][0]["axis"] == "source"
+    assert out["entries"][a]["reasons"][0]["axis"] == "alias"
+    assert out["entries"][a]["reasons"][0]["ref"] == "orders_src"
 
 
-def test_mcp_scan_staleness_classifies_orphans_when_auto_recalc_on(project, orders_parquet, monkeypatch):
-    # D5 scan-on-load backstop: bypasses (and source drift) leave entries stale
+def test_mcp_scan_staleness_classifies_orphans_when_auto_recalc_on(project, orders_parquet, orders_src, monkeypatch):
+    # D5 scan-on-load backstop: bypasses (and re-imports) leave entries stale
     # without a triggering revise, so no auto-recalc ever classifies them. The
     # scan-on-load surface runs the same orphan classification so a project load
     # surfaces them even when no revise has happened since.
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)  # default ON
     from tallyman_mcp.server import catalog_create, catalog_scan_staleness
 
     a = catalog_create("a", _base_code(project))["hash"]
     catalog_create("b", _child_code("a"))
-    _edit_source(project)  # a (and its cheap child) directly source-stale; no revise fired
+    _advance_source(project, orders_parquet)  # a directly stale; no revise fired
 
     out = catalog_scan_staleness()
     assert a in out["stale"]
@@ -93,16 +99,15 @@ def test_mcp_scan_staleness_classifies_orphans_when_auto_recalc_on(project, orde
     assert "UNEXPLAINED" in orphans[a]["explanation"]
 
 
-def test_mcp_scan_staleness_no_orphans_when_auto_recalc_off(project, orders_parquet, monkeypatch):
+def test_mcp_scan_staleness_no_orphans_when_auto_recalc_off(project, orders_parquet, orders_src):
     # Manual mode (flag off) owns its own staleness: the explicit scan→recalc
     # workflow expects directly-stale followers as an intermediate state, so the
     # scan surface must NOT flag them as orphan/UNEXPLAINED ("file a bug").
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     from tallyman_core.config import set_auto_recalc
     from tallyman_mcp.server import catalog_create, catalog_scan_staleness
 
     a = catalog_create("a", _base_code(project))["hash"]
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
     set_auto_recalc(project, False)
 
     out = catalog_scan_staleness()
@@ -110,13 +115,12 @@ def test_mcp_scan_staleness_no_orphans_when_auto_recalc_off(project, orders_parq
     assert out["orphan_stale"] == []  # but no orphan classification in manual mode
 
 
-def test_mcp_recalc_dry_run_previews_and_checkpoints_nothing(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_mcp_recalc_dry_run_previews_and_checkpoints_nothing(project, orders_parquet, orders_src):
     from tallyman_mcp.server import catalog_create, catalog_recalc
 
     a = catalog_create("a", _base_code(project))["hash"]
     catalog_create("b", _child_code("a"))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     base = _steps(project)
     out = catalog_recalc(dry_run=True)  # roots default to the stale set
@@ -128,13 +132,12 @@ def test_mcp_recalc_dry_run_previews_and_checkpoints_nothing(project, orders_par
     assert get_alias(project, "a") == a  # nothing rebuilt
 
 
-def test_mcp_recalc_commit_is_exactly_one_revision(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_mcp_recalc_commit_is_exactly_one_revision(project, orders_parquet, orders_src):
     from tallyman_mcp.server import catalog_create, catalog_recalc
 
     a = catalog_create("a", _base_code(project))["hash"]
     catalog_create("b", _child_code("a"))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     base = _steps(project)
     out = catalog_recalc(dry_run=False)
@@ -144,8 +147,7 @@ def test_mcp_recalc_commit_is_exactly_one_revision(project, orders_parquet, monk
     assert len(_steps(project)) == len(base) + 1  # one revision for the whole walk
 
 
-def test_mcp_recalc_no_stale_reports_nothing(project, orders_parquet, monkeypatch):
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
+def test_mcp_recalc_no_stale_reports_nothing(project, orders_src):
     from tallyman_mcp.server import catalog_create, catalog_recalc
 
     catalog_create("a", _base_code(project))
@@ -156,11 +158,10 @@ def test_mcp_recalc_no_stale_reports_nothing(project, orders_parquet, monkeypatc
     assert _steps(project) == base
 
 
-def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, monkeypatch):
+def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, orders_src, monkeypatch):
     # A committed recalc must hand the companion BOTH the remap and the checkpoint
     # `step`, so the republished SSE event carries the normalized {kind, remap,
     # step} shape the in-process /api/recalc route emits (not just remap).
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     import tallyman_mcp.server as server
     from tallyman_mcp.server import catalog_create, catalog_recalc
 
@@ -169,7 +170,7 @@ def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, monk
 
     catalog_create("a", _base_code(project))
     catalog_create("b", _child_code("a"))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     out = catalog_recalc(dry_run=False)
     assert out["status"] == "ok"
@@ -181,7 +182,9 @@ def test_mcp_recalc_notify_forwards_remap_and_step(project, orders_parquet, monk
     assert captured["step"] == out["checkpoint_step"]
 
 
-def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_parquet, monkeypatch):
+def test_recalc_notify_wire_delivers_remap_to_the_real_handler(
+    project, orders_parquet, orders_src, running_server, monkeypatch
+):
     # End-to-end across the seam the mocked tests miss: the exact JSON
     # tallyman_mcp._notify puts on the wire, fed to the REAL /internal/notify
     # handler, must deliver remap + step to the republished SSE event. Previously
@@ -194,7 +197,6 @@ def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_p
     from tallyman_companion import create_app
     from tallyman_mcp.server import catalog_create, catalog_recalc
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
 
     sent: dict = {}
 
@@ -216,7 +218,7 @@ def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_p
 
     catalog_create("a", _base_code(project))
     catalog_create("b", _child_code("a"))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
     out = catalog_recalc(dry_run=False)  # the real call site fires _notify("recalc", ...)
     assert out["remap"] and sent.get("kind") == "recalc"
 
@@ -241,14 +243,13 @@ def test_recalc_notify_wire_delivers_remap_to_the_real_handler(project, orders_p
 # ---------------------------------------------------------------------------
 
 
-def test_companion_staleness_endpoint(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_companion_staleness_endpoint(fresh_companion_app, project, orders_parquet, orders_src):
     from fastapi.testclient import TestClient
 
     from tallyman_mcp.server import catalog_create
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     a = catalog_create("a", _base_code(project))["hash"]
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/staleness")
@@ -258,17 +259,18 @@ def test_companion_staleness_endpoint(fresh_companion_app, project, orders_parqu
     assert body["entries"][a]["stale"] is True
 
 
-def test_companion_staleness_classifies_orphans(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_companion_staleness_classifies_orphans(
+    fresh_companion_app, project, orders_parquet, orders_src, monkeypatch
+):
     # Parity with the MCP scan-on-load surface: /api/staleness returns the same
     # classified orphan_stale so the SPA can surface unexplained staleness on load.
     from fastapi.testclient import TestClient
 
     from tallyman_mcp.server import catalog_create
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)  # default ON
     a = catalog_create("a", _base_code(project))["hash"]
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/staleness")
@@ -281,16 +283,15 @@ def test_companion_staleness_classifies_orphans(fresh_companion_app, project, or
 
 
 def test_companion_recalc_commit_is_one_revision_and_repoints(
-    fresh_companion_app, project, orders_parquet, monkeypatch
+    fresh_companion_app, project, orders_parquet, orders_src
 ):
     from fastapi.testclient import TestClient
 
     from tallyman_mcp.server import catalog_create
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     a = catalog_create("a", _base_code(project))["hash"]
     catalog_create("b", _child_code("a"))
-    _edit_source(project)
+    _advance_source(project, orders_parquet)
 
     c = TestClient(fresh_companion_app)
     base = _steps(project)
@@ -315,12 +316,11 @@ def test_companion_recalc_commit_is_one_revision_and_repoints(
 # ---------------------------------------------------------------------------
 
 
-def test_companion_revise_cascades_and_is_one_revision(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_companion_revise_cascades_and_is_one_revision(fresh_companion_app, project, orders_src, monkeypatch):
     from fastapi.testclient import TestClient
 
     from tallyman_mcp.server import catalog_create
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
     a = catalog_create("a", _base_code(project))["hash"]
     b = catalog_create("b", _child_code("a"))["hash"]
@@ -339,14 +339,13 @@ def test_companion_revise_cascades_and_is_one_revision(fresh_companion_app, proj
     assert len(_steps(project)) == len(base) + 1
 
 
-def test_companion_revise_publishes_recalc_event(project, orders_parquet, monkeypatch):
+def test_companion_revise_publishes_recalc_event(project, orders_src, monkeypatch):
     from fastapi.testclient import TestClient
 
     import tallyman_companion.app as appmod
     from tallyman_companion import create_app
     from tallyman_mcp.server import catalog_create
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
     catalog_create("a", _base_code(project))
     b = catalog_create("b", _child_code("a"))["hash"]
@@ -372,7 +371,7 @@ def test_companion_revise_publishes_recalc_event(project, orders_parquet, monkey
     assert step is None
 
 
-def test_companion_promote_diff_is_one_revision(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_companion_promote_diff_is_one_revision(fresh_companion_app, project, orders_src, monkeypatch):
     # Finding #1: the companion POST /api/promote_diff route self-checkpoints
     # (app.py) AND was not in _checkpoint_exempt, so the dispatch middleware
     # checkpointed it a second time — a double-commit (trailing empty revision),
@@ -382,7 +381,6 @@ def test_companion_promote_diff_is_one_revision(fresh_companion_app, project, or
 
     from tallyman_mcp.server import catalog_create, catalog_revise
 
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "cas")
     monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
     catalog_create("ss", _base_code(project))  # v1
     catalog_revise("ss", _base_code_v2(project))  # v2 → a diff exists between v1 and v2

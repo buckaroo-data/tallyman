@@ -17,6 +17,11 @@ don't exist, and `load_expr` fails. The fix is symmetric:
   `xorq_build/database_tables/` reads that source from the expanded dir at
   execute time — which happens long after load. Tearing the dir down first
   makes the read silently yield zero rows.
+
+A build holds no cache node (ADR-007 D1), so nothing in it needs a cache directory
+at load time; the only paths in a child's `expr.yaml` that name project files are
+the literal paths of its parent's snapshot and of ordered copies of sources, which
+the `${TALLYMAN_PROJECT_ROOT}` placeholder covers.
 """
 
 from __future__ import annotations
@@ -75,37 +80,6 @@ def expand_into_dir(build_dir: Path, project_root: Path, target: Path) -> None:
         (target / item.name).write_text(text.replace(PLACEHOLDER, project_root_str))
 
 
-def rewrite_cache_dirs(expr, cache_dir: Path):
-    """Point every ``CachedNode``'s storage at *cache_dir* — nested nodes included.
-
-    xorq's own ``load_expr(cache_dir=…)`` rewrite (``ExprLoader.replace_base_path``)
-    walks the graph with vendored ibis's ``.replace``, which does not descend into
-    opaque ``Expr``-typed fields — so a cache node nested inside another cache
-    node's ``parent`` (a chained parent's cache traveling in a child's build, ADR
-    D4) keeps whatever base path the build serialized. This deep variant runs the
-    same storage rewrite through xorq's ``replace_nodes``, whose traversal does
-    descend ``CachedNode.parent``, so every cache node in the closure lands in the
-    project's compute cache regardless of nesting depth or where the build was
-    written.
-    """
-    from attr import evolve
-    from xorq.common.utils.graph_utils import replace_nodes
-    from xorq.expr.relations import CachedNode
-
-    cache_dir = Path(cache_dir)
-
-    def replacer(node, kwargs):
-        if isinstance(node, CachedNode):
-            storage = getattr(node.cache, "storage", None)
-            if storage is not None and Path(str(storage.base_path)) != cache_dir:
-                evolved = evolve(node.cache, storage=evolve(storage, base_path=cache_dir))
-                return node.__recreate__(dict(zip(node.__argnames__, node.__args__)) | {"cache": evolved})
-            return node
-        return node.__recreate__(kwargs) if kwargs else node
-
-    return replace_nodes(replacer, expr).to_expr()
-
-
 def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -> Path:
     """Expand `${TALLYMAN_PROJECT_ROOT}` placeholders into a stable, persistent dir.
 
@@ -117,9 +91,9 @@ def ensure_expanded_build(build_dir: Path, project_root: Path, expanded: Path) -
       this dir (when the source is snapshotted into `database_tables/`). The
       read happens at execute time — diff/viewer time, long after load — so
       deleting the dir first yields a silent zero-row read.
-    * xorq embeds the build dir path in the expression hash used by
-      `ParquetSnapshotCache`, so a stable path keeps stat-cache lookups hitting
-      rather than missing on every fresh tmp path.
+    * Buckaroo's summary-stat keys include the build directory's path, so a
+      stable path keeps stat-cache lookups hitting rather than missing on
+      every fresh tmp path.
 
     A sibling `.complete` marker, written last, gates reuse: an expansion
     interrupted by a crash/OOM leaves a partial dir with no marker and is

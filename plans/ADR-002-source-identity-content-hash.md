@@ -1,9 +1,31 @@
 # ADR: Content-addressed source reads (CAS) so `content_hash` tracks source data
 
-- **Status:** Accepted (2026-06-18 — default flipped `off` → `cas` in #86, with
-  `cp --reflink=auto` on Linux and `.cas` GC wired into `reset_to`; supersedes
-  the 2026-06-10 Proposed draft below. See the reconstruction caveat under
-  Consequences.)
+- **Status:** Accepted (2026-06-18). It supersedes the 2026-06-10 Proposed
+  draft below. The clone store is the only mode (see "Narrowed by"), and
+  `reset_to` parks the clones no surviving entry names in the bullpen.
+- **Narrowed by:** `plans/ADR-011-sources-are-aliases.md`, which keeps the clone
+  store and removes the machinery around it. What stands is the substance of
+  this ADR: content-addressed clones under `data/.cas/<digest><suffix>`, written
+  copy-on-write where the filesystem offers it, parked in the bullpen by a reset
+  rather than unlinked. What is gone:
+  - The mode switch. `TALLYMAN_SOURCE_IDENTITY`, its `off` and `salt` modes and
+    `salted_hash` do not exist (ADR-011 D8). An import digests the bytes and
+    clones them, always.
+  - `manifest.sources` (ADR-011 D6). It served as the retention closure `gc_cas`
+    walks and was read by the staleness scan as a freshness record, and that
+    second reading is the defect ADR-011 exists to remove. Retention is the
+    DAG: a source version is an entry, so its clone is alive exactly while that
+    entry is (`catalog_state._live_source_digests` collects
+    `manifest.provenance.digest`).
+  - `digest_for` and its `source_digests.json` stat memo. Nothing digests a file
+    outside an import, and the staleness scan touches no file at all.
+  - The reconstruction caveat under Consequences. Reads load the frozen build and
+    do not re-run recipes (`plans/ADR-006-read-path-loads-builds.md`, #163), a
+    recipe reads no file, and a source entry's snapshot is re-created from its
+    clone. When the clone is gone the snapshot is pinned as the last copy;
+    nothing serves live bytes in its place (ADR-011 D9).
+- **Also out of date below:** there is no `result.parquet`, and xorq's snapshot
+  cache is not used (`plans/ADR-007-tallyman-owned-materialization.md`).
 - **Context ticket:** buckaroo-data/tallyman#30 (precondition for the
   result-cache rubric's content-stable `content_hash` key)
 - **Affected code:** `src/tallyman_xorq/source_identity.py` (new),

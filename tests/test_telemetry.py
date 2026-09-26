@@ -17,7 +17,6 @@ import json
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -139,7 +138,7 @@ def test_endpoint_read_empty_trace(project: str, fresh_companion_app):
     assert got["spans"] == []
 
 
-def test_ingest_does_not_checkpoint_the_catalog(project: str, orders_parquet, fresh_companion_app):
+def test_ingest_does_not_checkpoint_the_catalog(project: str, orders_src: str, fresh_companion_app):
     """A telemetry POST must be exempt from the dispatch-boundary catalog
     checkpoint. The middleware checkpoints every non-GET project route by
     default (so new authored-state routes can't silently skip it), but spans
@@ -150,7 +149,7 @@ def test_ingest_does_not_checkpoint_the_catalog(project: str, orders_parquet, fr
     # Build one entry so the project has a catalog with a real step counter.
     from tallyman_xorq import build_and_persist
 
-    build_and_persist(project, _code_for(project))
+    build_and_persist(project, _code_for(project, orders_src))
 
     c = TestClient(fresh_companion_app)
     before = current_step(project)
@@ -188,33 +187,33 @@ def _running_manager(monkeypatch, **kwargs) -> tuple[BuckarooManager, dict]:
     return mgr, captured
 
 
-def test_load_session_includes_telemetry_url_when_companion_known(project, orders_parquet, monkeypatch):
+def test_load_session_includes_telemetry_url_when_companion_known(project, orders_src, monkeypatch):
     from tallyman_xorq import build_and_persist
 
-    res = build_and_persist(project, _code_for(project))
+    res = build_and_persist(project, _code_for(project, orders_src))
     mgr, captured = _running_manager(monkeypatch, companion_base_url="http://127.0.0.1:7860/")
     mgr.load_session(res.content_hash, project)
     # Trailing slash on the base url is normalized; the path is per-project.
     assert captured["json"]["telemetry_url"] == f"http://127.0.0.1:7860/{project}/api/telemetry"
 
 
-def test_load_session_omits_telemetry_url_when_companion_unknown(project, orders_parquet, monkeypatch):
+def test_load_session_omits_telemetry_url_when_companion_unknown(project, orders_src, monkeypatch):
     from tallyman_xorq import build_and_persist
 
-    res = build_and_persist(project, _code_for(project))
+    res = build_and_persist(project, _code_for(project, orders_src))
     mgr, captured = _running_manager(monkeypatch)  # no companion_base_url
     mgr.load_session(res.content_hash, project)
     assert "telemetry_url" not in captured["json"]
 
 
-def test_grid_load_event_records_session_id_for_join(project, orders_parquet, monkeypatch):
+def test_grid_load_event_records_session_id_for_join(project, orders_src, monkeypatch):
     """The buckaroo activity event must carry the session_id so the Log UI can
     join it to the firstpull.* spans (keyed by that id as their `trace`)."""
     from tallyman_companion import create_app
     from tallyman_core.events import read_events
     from tallyman_xorq import build_and_persist
 
-    res = build_and_persist(project, _code_for(project))
+    res = build_and_persist(project, _code_for(project, orders_src))
 
     class _StubBuckaroo:
         bound_port = 8700
@@ -232,10 +231,10 @@ def test_grid_load_event_records_session_id_for_join(project, orders_parquet, mo
     assert evs and evs[0]["session_id"] == "sess-join"
 
 
-def _code_for(project: str) -> str:
+def _code_for(project: str, src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -267,7 +266,7 @@ class _CaptureHandler(BaseHTTPRequestHandler):
 
 
 @pytest.mark.integration
-def test_integration_buckaroo_posts_firstpull_spans(project: str, orders_parquet: Path):
+def test_integration_buckaroo_posts_firstpull_spans(project: str, orders_src: str):
     """End-to-end: a real buckaroo 0.15.3 server, told a ``telemetry_url`` on
     ``/load_expr``, fire-and-forget POSTs ``firstpull.*`` perf spans back in the
     OTel-shaped record this module reads (``{trace, source, name, t_start_ms,
@@ -276,7 +275,7 @@ def test_integration_buckaroo_posts_firstpull_spans(project: str, orders_parquet
     (summary_stats, ws_first_payload) need a widget and aren't asserted."""
     from tallyman_xorq import build_and_persist
 
-    res = build_and_persist(project, _code_for(project))
+    res = build_and_persist(project, _code_for(project, orders_src))
 
     _CaptureHandler.captured = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _CaptureHandler)

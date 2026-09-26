@@ -57,7 +57,7 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
     # All tools from server.py should be present.
     for required in {
         "catalog_run",
-        "catalog_load_parquet",
+        "catalog_import_source",
         "catalog_create",
         "catalog_revise",
         "catalog_alias",
@@ -74,12 +74,12 @@ def test_stdio_lists_tools(isolated_home: Path, project: str):
 
 @pytest.mark.integration
 @needs_uv
-def test_stdio_round_trips_catalog_load_parquet(isolated_home: Path, project: str, orders_parquet: Path):
+def test_stdio_round_trips_catalog_import_source(isolated_home: Path, project: str, orders_parquet: Path):
     async def go():
         async with _client(project, isolated_home) as client:
             result = await client.call_tool(
-                "catalog_load_parquet",
-                {"rel_path": "orders.parquet", "prompt": "raw"},
+                "catalog_import_source",
+                {"outside_path": str(orders_parquet), "alias": "orders", "prompt": "raw"},
             )
             return result.data
 
@@ -93,14 +93,20 @@ def test_stdio_round_trips_catalog_load_parquet(isolated_home: Path, project: st
 def test_stdio_create_revise_diff_round_trip(isolated_home: Path, project: str, orders_parquet: Path):
     async def go():
         async with _client(project, isolated_home) as client:
-            code1 = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+            # A recipe cannot open a file (ADR-011 D2): the data enters through an import, over the same
+            # stdio transport, and the recipes below read the source alias it creates.
+            await client.call_tool(
+                "catalog_import_source",
+                {"outside_path": str(orders_parquet), "alias": "orders_src", "prompt": "raw"},
+            )
+            code1 = """
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src")
 expr = t.group_by("region").aggregate(n=t.count())
 """
-            code2 = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+            code2 = """
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src")
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """

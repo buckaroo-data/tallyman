@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from tallyman_xorq.row_order import ROW_ORDER
+
 
 def _is_comparable(dt_a: Any, dt_b: Any) -> bool:
     """True if two dtypes can be compared with ibis ``==`` without a XorqTypeError.
@@ -39,8 +41,8 @@ def _classify_shared(a_schema: Any, b_schema: Any, keys: list[str]) -> tuple[lis
     numeric_shared ⊆ eq_shared.  A name-shared column in neither set changed to
     an incomparable dtype and renders side-by-side with no equality term.
     """
-    a_non_keys = [c for c in a_schema if c not in keys]
-    b_non_keys = [c for c in b_schema if c not in keys]
+    a_non_keys = [c for c in a_schema if c not in keys and c != ROW_ORDER]
+    b_non_keys = [c for c in b_schema if c not in keys and c != ROW_ORDER]
     shared = [c for c in a_non_keys if c in b_non_keys]
     numeric_shared = {c for c in shared if a_schema[c].is_numeric() and b_schema[c].is_numeric()}
     eq_shared = {c for c in shared if _is_comparable(a_schema[c], b_schema[c])}
@@ -153,6 +155,11 @@ def build_compare_expr(a_expr: Any, b_expr: Any, keys: list[str]) -> tuple[Any, 
     import xorq.vendor.ibis as ibis
     from buckaroo.compare import _align_backends
 
+    # A diff has no row-order column of its own from either side (ADR-008 D6): each side's positions mean nothing to
+    # the other, and the join would leave a ``__row_order_v2`` behind. A promoted diff is a worthy entry, since it
+    # contains a join, and gets its own when it is materialized.
+    a_expr = a_expr.drop(ROW_ORDER) if ROW_ORDER in a_expr.columns else a_expr
+    b_expr = b_expr.drop(ROW_ORDER) if ROW_ORDER in b_expr.columns else b_expr
     a_schema = a_expr.schema()
     b_schema = b_expr.schema()
     a_non_keys, b_non_keys, numeric_shared, eq_shared = _classify_shared(a_schema, b_schema, keys)

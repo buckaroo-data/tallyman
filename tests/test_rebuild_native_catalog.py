@@ -37,11 +37,11 @@ def _load_rebuild():
     return mod
 
 
-def _agg(parquet: Path, *, avg: bool = False) -> str:
+def _agg(source: str, *, avg: bool = False) -> str:
     extra = ", avg=t.price.mean()" if avg else ""
     return (
-        "import xorq.api as xo\n"
-        f"t = xo.deferred_read_parquet({str(parquet)!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({source!r})\n"
         f"expr = t.group_by('region').aggregate(n=t.count(){extra})\n"
     )
 
@@ -53,11 +53,11 @@ def _child(alias: str, project: str) -> str:
     )
 
 
-def _build_corpus(project: str, parquet: Path) -> dict:
+def _build_corpus(project: str, source: str) -> dict:
     cs.genesis(project)
-    a = build_and_persist(project, _agg(parquet), prompt="agg by region")
+    a = build_and_persist(project, _agg(source), prompt="agg by region")
     al.set_alias(project, "regions", a.content_hash)
-    a2 = build_and_persist(project, _agg(parquet, avg=True), prompt="add avg")
+    a2 = build_and_persist(project, _agg(source, avg=True), prompt="add avg")
     al.set_alias(project, "regions", a2.content_hash)  # revision: history [a, a2]
     b = build_and_persist(project, _child("regions", project), prompt="filter regions")
     from tallyman_core.charts import set_chart
@@ -67,14 +67,16 @@ def _build_corpus(project: str, parquet: Path) -> dict:
     return {"a": a.content_hash, "a2": a2.content_hash, "b": b.content_hash}
 
 
-def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parquet):
+def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_src):
     rb = _load_rebuild()
-    before = _build_corpus(project, orders_parquet)
+    before = _build_corpus(project, orders_src)
+    source_hash = al.get_alias(project, orders_src)
 
     remap = rb.rebuild_project(project, log=lambda *a: None)
 
-    # Every original entry was rebuilt.
-    assert set(remap) == set(before.values())
+    # Every original entry was rebuilt, the imported source among them.
+    assert set(remap) == set(before.values()) | {source_hash}
+    assert remap[source_hash] == source_hash
     # A same-path rebuild is hash-stable for the recipe-deterministic roots. The
     # tracked_expr_from_alias child bakes its aggregate parent's snapshot, whose bytes are
     # not datafusion-order-deterministic, so its hash may drift — the rebuild
@@ -101,16 +103,17 @@ def test_rebuild_preserves_entries_aliases_charts_prompts(project, orders_parque
         assert len(cached_result_expr(project, h).execute()) >= 0
 
 
-def test_rebuild_dry_run_writes_nothing(project, orders_parquet):
+def test_rebuild_dry_run_writes_nothing(project, orders_src):
     rb = _load_rebuild()
-    before = _build_corpus(project, orders_parquet)
+    before = _build_corpus(project, orders_src)
+    expected = set(before.values()) | {al.get_alias(project, orders_src)}
     head_before = cs.list_revisions(project)
 
     remap = rb.rebuild_project(project, dry_run=True, log=lambda *a: None)
 
     assert remap == {}  # nothing rebuilt
     # Catalog untouched: same entries, same revision timeline.
-    assert set(cs.read_tallyman_state(project)["entry_hashes"]) == set(before.values())
+    assert set(cs.read_tallyman_state(project)["entry_hashes"]) == expected
     assert cs.list_revisions(project) == head_before
 
 
@@ -178,3 +181,123 @@ def test_read_old_catalog_reads_catalog_yaml_era(project):
     assert oc.post_processing.get("pp1")
     assert oc.stats.get("st1")
     assert [c["alias"] for c in oc.notebook_cells] == ["thing"]
+
+
+def test_rebuild_replays_a_source_entry_as_an_import(project, tmp_path):
+    """A source entry has no recipe to re-exec, so the rebuild imports it again (ADR-011).
+
+    ``build_and_persist`` cannot rebuild one: the generated recipe reads the entry's own snapshot, which
+    the rebuild has just wiped, and a raw read is a build error anywhere else. The replay therefore goes
+    through ``update_and_depend``, from the provenance path when it still holds the imported bytes and
+    from the clone in ``data/.cas`` when it does not. The hash is a function of the bytes and the reader
+    options, so it survives the round-trip unchanged even though the outside file is gone.
+    """
+    import pandas as pd
+
+    from tallyman_core.aliases import SOURCE_KIND, alias_kind, history_for
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import update_and_depend
+
+    rb = _load_rebuild()
+    cs.genesis(project)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pd.DataFrame({"region": ["n", "s", "n"], "price": [1.0, 2.0, 3.0]}).to_parquet(src)
+
+    v1 = update_and_depend(src, "orders", project=project)
+    child = build_and_persist(
+        project,
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias('orders', {project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n",
+        prompt="count by region",
+    )
+    al.set_alias(project, "regions", child.content_hash)
+    cs.checkpoint_catalog(project, "corpus")
+    src.unlink()  # the outside file is provenance; the clone is what the rebuild reads
+
+    remap = rb.rebuild_project(project, log=lambda *a: None)
+
+    assert set(remap) == {v1["hash"], child.content_hash}
+    assert remap[v1["hash"]] == v1["hash"], "a source entry's hash is its bytes and its reader options"
+    assert alias_kind(project, "orders") == SOURCE_KIND
+    assert history_for(project, "orders") == [v1["hash"]]
+    provenance = read_manifest(entry_dir(project, v1["hash"])).provenance
+    assert provenance is not None and provenance.alias == "orders" and provenance.version == 1
+    assert len(cached_result_expr(project, remap[child.content_hash]).execute()) == 2
+
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == set(remap.values())
+    catalog.assert_catalog_consistent(project, pointers)
+
+
+def test_toposort_orders_a_renamed_sources_versions_by_the_alias_that_holds_them(project):
+    """A source version follows the previous version of the alias that holds it now (ADR-011).
+
+    ``provenance["alias"]`` is the name the version was imported under. After a rename no alias has that name, so
+    ordering by it gave v1 and v2 no edge and left them in hash order. Here v2's hash sorts first, and hash order
+    would replay v2's bytes as the renamed alias's v1.
+    """
+    rb = _load_rebuild()
+    v1, v2 = "bbbbbbbbbbbb", "aaaaaaaaaaaa"
+    recipes = {v1: "# a source version\n", v2: "# a source version\n"}
+    provenance = {v1: {"alias": "a_src", "version": 1}, v2: {"alias": "a_src", "version": 2}}
+    history = {"renamed_src": [v1, v2]}
+
+    assert rb.toposort(recipes, {"renamed_src": v2}, history, provenance) == [v1, v2]
+
+
+def test_rebuild_replays_a_renamed_source_under_the_name_it_has_now(project, tmp_path):
+    """A renamed source is re-imported under its alias now, so a child reading that alias rebuilds (ADR-011).
+
+    Replaying under ``provenance["alias"]`` minted the import-time name, ``a_src``, and never made ``renamed_src``
+    until the final alias write, after every child had tried to build.
+    """
+    import pandas as pd
+    import pytest
+
+    from tallyman_core.aliases import SOURCE_KIND, load_kinds, rename_alias
+    from tallyman_core.manifest import read_manifest
+    from tallyman_core.paths import entry_dir
+    from tallyman_xorq.source_import import update_and_depend
+
+    rb = _load_rebuild()
+    cs.genesis(project)
+    outside = tmp_path / "outside"
+    outside.mkdir(parents=True, exist_ok=True)
+    src = outside / "orders.parquet"
+    pd.DataFrame({"region": ["n", "s", "n"], "price": [1.0, 2.0, 3.0]}).to_parquet(src)
+    v1 = update_and_depend(src, "a_src", project=project)
+    pd.DataFrame({"region": ["n", "s", "e", "e"], "price": [1.0, 2.0, 3.0, 4.0]}).to_parquet(src)
+    v2 = update_and_depend(src, "a_src", project=project)
+    rename_alias(project, "a_src", "renamed_src")
+    child = build_and_persist(
+        project,
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias('renamed_src', {project!r})\n"
+        "expr = t.group_by('region').aggregate(n=t.count())\n",
+        prompt="count by region",
+    )
+    al.set_alias(project, "regions", child.content_hash)
+    cs.checkpoint_catalog(project, "corpus")
+    logged: list[str] = []
+
+    try:
+        remap = rb.rebuild_project(project, log=logged.append)
+    except Exception as exc:  # noqa: BLE001
+        pytest.fail(f"the rebuild failed after a rename: {exc!r}")
+
+    assert remap[v1["hash"]] == v1["hash"] and remap[v2["hash"]] == v2["hash"]
+    assert load_kinds(project) == {"renamed_src": SOURCE_KIND, "regions": "catalog"}
+    assert al.history_for(project, "renamed_src") == [v1["hash"], v2["hash"]]
+    provenance = read_manifest(entry_dir(project, v1["hash"])).provenance
+    assert (provenance.alias, provenance.version) == ("renamed_src", 1)
+    # v1's outside path now holds v2's bytes, so v1 came from its clone, and the log says under which name.
+    assert any("renamed_src-v1" in line for line in logged), logged
+    assert len(cached_result_expr(project, remap[child.content_hash]).execute()) == 3
+
+    pointers = set(cs.read_tallyman_state(project)["entry_hashes"])
+    assert pointers == set(remap.values())
+    catalog.assert_catalog_consistent(project, pointers)

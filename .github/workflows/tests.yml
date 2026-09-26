@@ -4,7 +4,8 @@ on:
   push:
     branches: [main, "spike/**"]
   pull_request:
-    branches: [main]
+    # feat/** too: fix PRs stacked on a feature branch (e.g. PRs into #189's branch) need CI for the red/green cycle.
+    branches: [main, "feat/**"]
 
 # CI runs three sequential jobs: lint → fast tests → integration tests.
 #

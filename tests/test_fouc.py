@@ -7,17 +7,15 @@ and project validation is enforced at the API layer.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi.testclient import TestClient
 
 from tallyman_mcp.server import catalog_create
 
 
-def _agg(project: str) -> str:
+def _agg(project: str, src: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -77,10 +75,10 @@ def test_unknown_api_path_404s(fresh_companion_app, project: str):
     assert '<div id="root">' in r2.text
 
 
-def test_entry_detail_api_returns_entry_data(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_entry_detail_api_returns_entry_data(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Entry detail data is served via JSON API, not server-rendered HTML."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    out = catalog_create("shoe_sales", _agg(project))
+    out = catalog_create("shoe_sales", _agg(project, orders_src))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{out['hash']}")
     assert r.status_code == 200

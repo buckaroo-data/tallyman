@@ -1,6 +1,16 @@
 # ADR: Result digest as a row-multiset, and canonical snapshot ordering
 
-- **Status:** Proposed (2026-06-25)
+- **Status:** Implemented (Option A below).
+- **Superseded in part by:**
+  - `plans/ADR-009-digest-stability.md` D2: `result_digest` is a digest of the
+    snapshot's Arrow content read back, `arrow-sha256:<hex>`, not a SHA-256 of
+    the file's bytes, which is what Option A recommends.
+  - `plans/ADR-008-row-order-of-reads.md`: the synthetic row-index column is
+    `__row_order` (ADR-008 D2), the last, visible column of every file tallyman
+    writes, so decision 4 below ("not a data column") no longer holds; it is
+    appended, then the remaining columns, to every sort in a recipe (ADR-008
+    D10), and a sort that is not the recipe's last step is kept (ADR-008 D11). A
+    deterministic total order before the snapshot is written still stands.
 - **Affected code:** `src/tallyman_xorq/result_cache.py` (`_digest_update`,
   `count_and_result_digest`, `result_digest`, `verify_result_faithful`),
   `src/tallyman_xorq/build.py` (`build_and_persist` execute path,

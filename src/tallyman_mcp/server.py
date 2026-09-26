@@ -14,6 +14,7 @@ from fastmcp import FastMCP
 
 from tallyman_core import (
     AliasExists,
+    AliasKindMismatch,
     AliasNotFound,
     CellNotFound,
     ChartSpecError,
@@ -51,12 +52,15 @@ from tallyman_core import (
     write_stat,
 )
 from tallyman_core.events import record_event
+from tallyman_core.server_lock import companion_url, resolved_home
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
-COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
+# The companion is found per call with ``companion_url()``: the port the server holding this data dir serves on, from
+# its owner record, so a second tallyman on its own data dir is notified and linked, not the one on 7860. With no server
+# on this data dir there is no companion: notifies are skipped, replies carry no link, project changes fail (#183).
 
 # Identifies this MCP process in the project activity log. Claude Code spawns one
 # `tallyman mcp` per session, so one process == one session; multiple sessions
@@ -214,13 +218,23 @@ mcp.tool = _checkpointing_tool
 
 
 def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
-    """Best-effort POST to the companion's /internal/notify. Never raise."""
+    """Best-effort POST to the companion's /internal/notify. Never raise.
+
+    ``home`` names this data dir, so a companion serving another one refuses the notify (409) instead of publishing
+    this project's events to its own browsers (#183).
+    """
+    base = companion_url()
+    if base is None:
+        return  # no server on this data dir: no browsers to tell
+    url = f"{base}/internal/notify"
     try:
         with httpx.Client(timeout=2.0) as client:
-            client.post(
-                f"{COMPANION_URL}/internal/notify",
-                json={"kind": kind, "hash": content_hash, "extra": extra or None},
+            resp = client.post(
+                url,
+                json={"kind": kind, "hash": content_hash, "extra": extra or None, "home": str(resolved_home())},
             )
+            if resp.status_code >= 400:
+                print(f"[tallyman_mcp] notify {kind} refused by {url}: {resp.status_code} {resp.text}", file=sys.stderr)
     except Exception as exc:
         # Companion may not be up; that's allowed. Log and move on.
         print(f"[tallyman_mcp] notify failed ({kind}): {exc}", file=sys.stderr)
@@ -253,6 +267,16 @@ def _auto_recalc_after_head_advance(project: str, name: str, *, tool: str) -> di
     return report
 
 
+def _source_alias_refusal(project: str, name: str, doing: str) -> str | None:
+    """The error for an operation aimed at a source alias, or None when *name* is not one (ADR-011 D1).
+
+    The text lives in ``tallyman_core.aliases.source_alias_refusal`` so the companion's routes refuse with it too.
+    """
+    from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
+
+    return source_alias_refusal(project, name, doing)
+
+
 @mcp.tool()
 @_tag_project
 def catalog_run(code: str, prompt: str = "") -> dict:
@@ -263,19 +287,17 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     PREFERRED pattern:
 
-        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias
+        from tallyman_xorq.io import tracked_expr_from_alias
         import xorq.vendor.ibis as ibis
-        t = tracked_expr_from_alias("alias_name")      # named catalog entry by alias (records lineage)
-        t = read_project_file("file.parquet")          # raw file under <project>/data/
+        t = tracked_expr_from_alias("alias_name")      # a catalog entry OR an imported source, by alias
         expr = t.filter(t.col > 0).group_by("region").aggregate(n=t.count())
 
     THREE NAMESPACES — mixing these up is the #1 build failure:
 
-        import xorq.api as xo            # backends + deferred reads:
-                                         # xo.memtable, xo.deferred_read_parquet, xo.connect
+        import xorq.api as xo            # backends: xo.memtable, xo.connect
         import xorq.vendor.ibis as ibis  # the expression API: ibis._, ibis.cases,
                                          # ibis.window, ibis.literal, ibis.coalesce, ibis.desc
-        from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, tallyman_read_csv   # reading data
+        from tallyman_xorq.io import tracked_expr_from_alias, pinned_expr_from_alias   # reading data
 
         t.mutate(pk=ibis._.a + "_" + ibis._.b)   # deferred string concat via ibis._
         # NEVER `import xorq` then `xorq.<fn>`: bare xorq.read_parquet / xorq.memtable /
@@ -283,30 +305,50 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         # NEVER bare `import ibis` / `from ibis ...`: it builds but fails at save time
         #   with a vendored-Expr class error. Always `import xorq.vendor.ibis as ibis`.
         # Math is a COLUMN METHOD: col.sin(), col.log(), col.sqrt() — not ibis.sin(col).
-        # Read data only via read_project_file / tracked_expr_from_alias (no xo.read_parquet / ibis.read_parquet).
+        # Read data ONLY via tracked_expr_from_alias / pinned_expr_from_alias. A recipe never opens
+        #   a file: read_project_file, tallyman_read_csv, xo.read_parquet, xo.deferred_read_parquet and
+        #   ibis.read_parquet are all build errors. Import the file first (catalog_import_source).
 
     ONLY BACKEND — xorq's built-in datafusion; there is NO duckdb. Do not use
     `ibis.duckdb`, a duckdb connection, `.sql()`, or `con.register()`. Build
-    everything with the ibis expression API over read_project_file/tracked_expr_from_alias.
+    everything with the ibis expression API over tracked_expr_from_alias.
 
-    DATA SOURCING — four functions, each with a distinct role:
-      - `tracked_expr_from_alias("name")` reads a catalog entry by alias and records it
-        as a parent in the lineage DAG. Use this for normal recipe chaining — the
-        standard way to build on top of another catalog entry.
-      - `read_project_file("file.parquet")` reads raw files under `<project>/data/`.
-        Use this only for raw files visible on disk (not catalog aliases).
-      - `tallyman_read_csv("/abs/path/to/file.csv", schema=...)` reads a CSV and
-        injects ``original_row_order`` so the snapshot is byte-stable across builds.
-        Use this for ALL CSV ingests instead of ``xo.deferred_read_csv``.
-      - `pinned_expr_from_alias(<hash or "name-vN">)` reads a catalog entry by
-        content hash or explicit version reference (e.g. "shoe_sales-v2") and
-        records a pinned (follow=False) parent edge. Use when you want to stay on
-        a specific version — recalc will find the entry but won't advance it when
-        the parent alias moves. A bare alias is rejected (#166): a pin must name
-        the same entry forever, so say which version you mean.
-      - When in doubt, call `catalog_list` first. A name that looks like a file
-        is often actually an alias — `read_project_file` on an alias raises
-        `ProjectDataNotFound`.
+    DATA SOURCING — a recipe names aliases and never a file or a hash (ADR-011):
+      - `tracked_expr_from_alias("name")` reads an alias — a catalog entry or an
+        imported source — and records it as a parent in the lineage DAG. It follows
+        the alias: when the parent is revised or the source re-imported, recalc
+        advances this entry. The standard way to build on anything.
+      - `pinned_expr_from_alias("name-vN")` reads one version and records a pinned
+        (follow=False) parent edge, so recalc finds the entry but never advances it.
+        A bare alias is rejected (#166) and so is a bare content hash: a pin must
+        name the same entry forever, and it must say which alias and which version.
+      - A RAW FILE IS NOT A RECIPE INPUT. Import it once, with
+        `catalog_import_source("/abs/path/orders.parquet", "orders")`, and read the
+        source alias. The import copies the bytes into the catalog, so editing or
+        deleting the original afterwards changes nothing; re-importing an edited
+        file mints `orders` v2 and everything downstream goes stale.
+      - When in doubt, call `catalog_list` first.
+
+    ROW ORDER — every entry carries a last column, `__row_order`:
+
+        `__row_order` is each row's position in the entry's file (0..N-1, int64, always
+        the LAST column, visible in the grid). Pages of every entry are ordered by it,
+        so paging is repeatable. Rules:
+        - A filter / select / computed column keeps it. A `select` that lists columns
+          and leaves it out is a BUILD ERROR (the error shows the fix), because such an
+          entry has no file of its own and pages by its parent's column:
+              t.select("region", "price", "__row_order")     # not t.select("region", "price")
+        - An aggregate, join, sort, window function, union, distinct, unnest or UDF
+          makes the entry materialized: its file is written when it is created, and
+          `__row_order` is renumbered to match the order of the result.
+        - To change the order rows are shown in, sort them (`order_by`): the column is
+          renumbered in that order. Never assign to `__row_order` (build error). To keep
+          the parent's positions, copy them: `t.mutate(__row_order_v1=t["__row_order"])`.
+        - Joining three entries in ONE recipe: drop the column from the right-hand
+          inputs, `a.join(b.drop("__row_order"), k).join(c.drop("__row_order"), k)`.
+          Joining a join entry to another entry needs nothing.
+        - An `order_by` that is followed by more steps is kept, if its key columns are
+          still there (a build error names the key otherwise).
 
     COLUMN NAMES — do not guess. The source step returns a `schema`, and
     `catalog_list` shows each entry's columns as a compact `name:type, ...`
@@ -333,19 +375,21 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     LOADING RAW CSV FILES — always inspect first:
 
-        Use ``tallyman_read_csv`` (not ``xo.deferred_read_csv``) for all CSV
-        ingests. It adds an ``original_row_order`` column that makes the
-        snapshot byte-stable across builds:
+        Import CSVs with ``catalog_import_source``, which reads the file once, in
+        file order, with a last ``__row_order`` column holding each row's position
+        (0..N-1), and mints a source alias the recipe then reads:
 
-            from tallyman_xorq.io import tallyman_read_csv
-            import xorq.vendor.ibis as ibis
-            schema = ibis.schema({"Date": "date", "Close": "float64"})
-            t = tallyman_read_csv("/abs/path/to/file.csv", schema=schema)
+            catalog_import_source("/abs/path/to/file.csv", "prices",
+                                  schema={"Date": "date", "Close": "float64"})
+            # then, in the recipe:
+            from tallyman_xorq.io import tracked_expr_from_alias
+            t = tracked_expr_from_alias("prices")
 
-        Extra keyword arguments are forwarded to ``polars.scan_csv`` as reader
-        options (``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
-        ``has_header``, ``encoding``, ...), e.g.
-        ``tallyman_read_csv(path, schema=schema, separator=";", skip_rows=2)``.
+        Extra keyword arguments to the import are forwarded to ``polars.scan_csv``
+        as reader options (``separator``, ``skip_rows``, ``null_values``,
+        ``quote_char``, ``has_header``, ``encoding``, ...). They are recorded on the
+        source entry and never re-derived, so one file is read exactly one way; to
+        read it a second way, import it again under a second alias.
 
         Before writing a schema, run `head -5 <file>` to verify the actual
         column names and order. Do NOT guess — yfinance and similar sources
@@ -359,7 +403,7 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         - The first column is often literally named "Price" in raw yfinance output,
           not "Date".
 
-        ALWAYS use an explicit schema with tallyman_read_csv — without one, type
+        ALWAYS pass an explicit schema when importing a CSV — without one, type
         inference silently misassigns types (e.g. date columns become timestamps).
 
         DATE-ONLY COLUMNS — use 'date', never 'timestamp':
@@ -498,8 +542,8 @@ def catalog_run(code: str, prompt: str = "") -> dict:
         - fabricate placeholder values that look like real output (e.g. a
           memtable of zeros) when you cannot compute the requested result —
           return an error or a clearly-labelled column instead.
-        - pass a project= argument to read_project_file/tracked_expr_from_alias; the active
-          project is implicit.
+        - pass a project= argument to tracked_expr_from_alias; the active project
+          is implicit.
 
     Args:
         code: A self-contained Python script that binds `expr`.
@@ -520,44 +564,112 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
 @mcp.tool()
 @_tag_project
-def catalog_load_parquet(rel_path: str, prompt: str = "", name: str = "") -> dict:
-    """Register a parquet file from the project's data/ directory as a catalog entry.
+def catalog_import_source(
+    outside_path: str,
+    alias: str,
+    pinned_version: int | None = None,
+    prompt: str = "",
+    schema: dict | list | None = None,
+    reader_options: dict | None = None,
+) -> dict:
+    """Import a data file into the catalog and point a source alias at it (ADR-011).
 
-    Use this for simple "load this file" steps. The agent does not need to write
-    any xorq code — pass a path relative to the project's `data/` directory.
+    THE ONLY WAY A FILE ENTERS THE CATALOG. A recipe never opens a file: it reads
+    an alias. This copies the bytes in, writes one snapshot of them in file order
+    with a `__row_order` column, and mints a version of the source alias `alias`,
+    which recipes then read with `tracked_expr_from_alias(alias)`.
+
+    After the import the original path is provenance only. Editing, moving or
+    deleting it changes nothing. To pick up new data, run this again on the same
+    alias: the bytes differ, so it mints the next version, and every entry
+    downstream goes stale and is recalculated (the same cascade a revise triggers).
+
+    Re-running it with UNCHANGED bytes is a no-op that returns the current version,
+    so it is safe in a script that runs repeatedly.
 
     Args:
-        rel_path: Path relative to `<project>/data/`. Example: "orders.parquet".
+        outside_path: Any path to a parquet or CSV file. It does not have to live
+            under the project's `data/` directory.
+        alias: The source alias. Must not already name a catalog alias, and the
+            bytes must not already be a version of another alias — the error
+            names that alias. For a second name, catalog_create an entry whose
+            recipe is `tracked_expr_from_alias(<that alias>)`.
+        pinned_version: The version you claim this file is. Given, it is checked:
+            if the file is that version the call is a no-op, and if it is not you
+            get an error instead of an accidental new version. Use it in a script
+            that must reproduce a known state.
         prompt: Optional human-readable description (the user's intent).
-        name: Optional alias to register the entry under. If provided, the
-            entry behaves like one created by `catalog_create` (named, appended
-            to the notebook). Errors if the alias already exists.
+        schema: For a CSV, the column types — a dict `{"Date": "date", ...}`, or
+            the positional DSL `[["Date", "date"], ["&rest", "infer"]]`. ALWAYS
+            pass one for a CSV; see the LOADING RAW CSV FILES section of
+            `catalog_run` for how to inspect the file first.
+        reader_options: For a CSV, `polars.scan_csv` options — `separator`,
+            `skip_rows`, `null_values`, `quote_char`, `has_header`, `encoding`.
+            Recorded on the entry and never re-derived, so the file is read one
+            way forever; to read it a second way, import it again under a second
+            alias.
 
     Returns:
-        Same shape as catalog_run, plus `alias`/`version` when `name` is set.
+        dict with keys: hash, alias, version, created, row_count, schema, path,
+        digest, url — plus `recalc` when advancing the alias cascaded.
     """
+    from tallyman_xorq.source_import import SourceImportError, update_and_depend  # noqa: PLC0415
+
     project = _resolve_active_project()
-    if name and get_alias(project, name) is not None:
-        return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
-    code = f"from tallyman_xorq.io import read_project_file\nexpr = read_project_file({rel_path!r})\n"
-    out = _run_and_record(project, code, prompt, tool="catalog_load_parquet")
-    if "error" in out:
-        return out
-    out.pop("_build", None)
-    if name:
-        info = set_alias(project, name, out["hash"], expect_exists=False)
-        notebook.append(project, name, markdown=prompt or "")
-        out["alias"] = info["name"]
-        out["version"] = info["version"]
-        _notify("new_entry", content_hash=out["hash"], alias=name, version=info["version"])
+    if schema is not None and isinstance(schema, list):
+        schema = tuple(tuple(cell) for cell in schema)
+    try:
+        out = update_and_depend(
+            outside_path,
+            alias,
+            pinned_version,
+            project=project,
+            prompt=prompt or None,
+            schema=schema,
+            **(reader_options or {}),
+        )
+    except (SourceImportError, BuildError, OSError) as exc:
+        rec = record_error(project, code="", message=str(exc), prompt=prompt or None, tool="catalog_import_source")
+        record_event(
+            project,
+            "build_error",
+            session=SESSION_ID,
+            tool="catalog_import_source",
+            prompt=prompt or None,
+            message=str(exc),
+            error_id=rec["id"],
+        )
+        _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
+        return {"error": str(exc), "error_id": rec["id"]}
+
+    out["url"] = _entry_url(project, out["hash"])
+    if not out["created"]:
+        return out  # nothing moved, so nothing to record, notify or cascade
+
+    # An import is a catalog operation (ADR-011 D7): it emits the events a revise emits, and the dispatch-boundary
+    # decorator commits it — the head advance and any cascade — as ONE revision.
+    record_event(
+        project, "alias_set", session=SESSION_ID, tool="catalog_import_source",
+        alias=alias, version=out["version"], hash=out["hash"], prompt=prompt or None,
+    )
+    if out["version"] == 1:
+        notebook.append(project, alias, markdown=prompt or "")
         _notify("notebook_changed")
     else:
-        _notify("new_entry", content_hash=out["hash"])
+        carried = carry_forward_entry_config(project, history_for(project, alias)[-2], out["hash"])
+        if carried:
+            out["carried_over"] = carried
+    _notify("new_entry", content_hash=out["hash"], alias=alias, version=out["version"])
+    recalc_report = _auto_recalc_after_head_advance(project, alias, tool="catalog_import_source")
+    if recalc_report is not None:
+        out["recalc"] = recalc_report
     return out
 
 
-def _entry_url(project: str, content_hash: str) -> str:
-    return f"{COMPANION_URL}/{project}/catalog/{content_hash}"
+def _entry_url(project: str, content_hash: str) -> str | None:
+    """The entry's page on the companion of this data dir, or None when no server is running on it."""
+    base = companion_url()
+    return None if base is None else f"{base}/{project}/catalog/{content_hash}"
 
 
 def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
@@ -591,6 +703,9 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
     }
     if result.lint_warnings:
         reply["lint_warnings"] = result.lint_warnings
+    if result.reproducible is False:
+        reply["reproducible"] = False
+        reply["nonreproducible_columns"] = result.nonreproducible_columns
     return reply
 
 
@@ -615,6 +730,9 @@ def catalog_create(name: str, code: str, prompt: str = "") -> dict:
         Same shape as catalog_run, plus `alias` and `version`.
     """
     project = _resolve_active_project()
+    refusal = _source_alias_refusal(project, name, "created as a catalog entry")
+    if refusal:
+        return {"error": refusal}
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists. Use catalog_revise to update it."}
     try:
@@ -652,11 +770,11 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
     (`tracked_expr_from_alias("<name>")` / `pinned_expr_from_alias("<name>")`) is
     rejected (#135) — it makes an opaque, follows-its-own-head entry. Two good
     shapes instead:
-      - source-shaped entry -> inline the source: `read_project_file(...)` /
-        `read_csv` plus the transforms, then your change.
+      - source-shaped entry -> start from the source alias:
+        `tracked_expr_from_alias("<source>")` plus the transforms, then your change.
       - expensive parent (Aggregate/Join/Sort/window/UDF) -> reference the
-        previous version by its content HASH: `pinned_expr_from_alias("<hash>")`,
-        which reads its baked snapshot instead of re-running the computation.
+        previous version: `pinned_expr_from_alias("<name>-v<N>")`, which reads its
+        baked snapshot instead of re-running the computation.
 
     Code conventions and gotchas are documented in `catalog_run`.
 
@@ -666,6 +784,9 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
         prompt: Optional human-readable description of what changed.
     """
     project = _resolve_active_project()
+    refusal = _source_alias_refusal(project, name, "revised")
+    if refusal:
+        return {"error": refusal}
     prev_hash = get_alias(project, name)
     if prev_hash is None:
         return {"error": f"alias {name!r} does not exist. Use catalog_create to create it."}
@@ -676,8 +797,8 @@ def catalog_revise(name: str, code: str, prompt: str = "") -> dict:
         msg = (
             f"this revision references its own alias {name!r}, which makes an opaque, "
             f"permanently-stale (follows-its-own-head) entry. Write a self-contained recipe: "
-            f"inline the source (read_project_file / read_csv …) for a source-shaped entry, or "
-            f"reference the previous version by hash with pinned_expr_from_alias({prev_hash!r}) "
+            f"start from the source alias (tracked_expr_from_alias) for a source-shaped entry, or "
+            f"reference the previous version with pinned_expr_from_alias('{name}-v{len(history_for(project, name))}') "
             f"for an expensive one."
         )
         rec = record_error(project, code=code, message=msg, prompt=prompt or None, tool="catalog_revise")
@@ -722,13 +843,25 @@ def catalog_alias(hash: str, name: str) -> dict:
 
     Use this when an entry was created via `catalog_run` and you decide
     post-hoc that it deserves a name. Errors if the alias already exists.
+
+    The entry must be a computed one. A source entry (a version of an imported
+    file) belongs to its source alias and cannot take a catalog name (ADR-011
+    D1); to give a source a second name, `catalog_create` an entry whose recipe
+    is `tracked_expr_from_alias("<source alias>")`, which follows the source
+    when it is imported again.
     """
     project = _resolve_active_project()
+    refusal = _source_alias_refusal(project, name, "given to another entry")
+    if refusal:
+        return {"error": refusal}
     if not entry_dir(project, hash).exists():
         return {"error": f"no catalog entry for hash {hash!r}"}
     if get_alias(project, name) is not None:
         return {"error": f"alias {name!r} already exists"}
-    info = set_alias(project, name, hash, expect_exists=False)
+    try:
+        info = set_alias(project, name, hash, expect_exists=False)
+    except AliasKindMismatch as exc:  # a source entry: the message names its source alias-version and the steer
+        return {"error": str(exc)}
     notebook.append(project, name)
     _notify("alias_changed", content_hash=hash, alias=name, version=info["version"])
     _notify("notebook_changed")
@@ -967,6 +1100,9 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     from tallyman_xorq.result_cache import cached_result_expr
 
     project = _resolve_active_project()
+    refusal = _source_alias_refusal(project, alias or "", "the target of a promoted diff") if alias else None
+    if refusal:
+        return {"error": refusal}
     hashes = history_for(project, name)
     if not hashes:
         return {"error": f"alias {name!r} has no history"}
@@ -997,6 +1133,9 @@ def catalog_promote_diff(name: str, va: int = -2, vb: int = -1, alias: str | Non
     column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
     target_alias = alias or f"diff_{name}_v{a_idx}_v{b_idx}"
+    refusal = _source_alias_refusal(project, target_alias, "the target of a promoted diff")
+    if refusal:
+        return {"error": refusal}
     keys_repr = repr(keys)
     code = textwrap.dedent(f"""\
         # auto-generated — diff of {name} V{a_idx} → V{b_idx}
@@ -1084,11 +1223,14 @@ def catalog_scan_staleness(verify_results: bool = False) -> dict:
     ``catalog_recalc`` to act.
 
     ``verify_results=True`` additionally sweeps result faithfulness: every entry
-    with a recorded ``result_digest`` has its baked snapshot re-hashed and
-    compared. Adds a ``verify`` key — ``{results: {hash: bool|null}, unfaithful:
-    [hashes], errors: {hash: message}}`` — where ``false`` means the snapshot's
-    bytes are not what the build recorded (a nondeterministic recompute healed it
-    to different bytes). Hashes every snapshot file, so opt-in.
+    with a recorded ``result_digest`` has its snapshot's content digest compared
+    with it. Adds a ``verify`` key — ``{results: {hash: bool|null}, unfaithful:
+    [hashes], absent: [hashes], errors: {hash: message}}`` — where ``false`` means
+    the snapshot's rows are not what the build recorded (a nondeterministic
+    recompute healed it to different rows), and ``absent`` lists entries whose
+    snapshot file is missing. The sweep reads and never writes: a missing snapshot
+    stays missing and is checked when it is next made. Reads every snapshot file,
+    so opt-in.
 
     Returns:
         stale: hashes that are directly stale (the natural recalc roots).
@@ -1549,14 +1691,23 @@ def _companion_post(path: str, payload: dict) -> dict:
     ``{"error": ...}`` dict that the MCP caller can render. The companion
     URL is included so the LLM can tell the user which endpoint to bring
     up if the request failed."""
-    url = f"{COMPANION_URL}{path}"
+    base = companion_url()
+    if base is None:
+        return {
+            "error": (
+                f"no tallyman server is running on data dir {resolved_home()}. "
+                f"Project lifecycle tools require 'tallyman run' to be active on it."
+            )
+        }
+    url = f"{base}{path}"
     try:
         with httpx.Client(timeout=10.0) as client:
-            resp = client.post(url, json=payload)
+            # `home` names this data dir, so a companion serving another one refuses the change (#183).
+            resp = client.post(url, json={**payload, "home": str(resolved_home())})
     except httpx.HTTPError as exc:
         return {
             "error": (
-                f"companion not reachable at {COMPANION_URL}: {exc!s}. "
+                f"companion not reachable at {base}: {exc!s}. "
                 f"Project lifecycle tools require 'tallyman run' to be active."
             )
         }
@@ -1666,7 +1817,7 @@ def ds_modeling_workflow(dataset: str, target: str = "") -> str:
     tgt = target or "<target column>"
     return (
         f"Build a modeling workflow on {dataset!r} predicting {tgt!r} using the tallyman catalog tools.\n"
-        "1. catalog_load_parquet the dataset under a name.\n"
+        "1. catalog_import_source the dataset file under a source alias.\n"
         "2. catalog_create an engineered-feature entry — new computed columns first, "
         "ibis.cases() for encodings, and add a stable row id for splitting/diffing.\n"
         "3. Fit the model AS A CATALOG ENTRY with xorq.ml (deferred_fit_predict_sklearn + "

@@ -34,13 +34,14 @@ from tallyman_core import (
     list_errors,
     load_aliases,
     notebook,
-    read_manifest,
     resolve_project,
     version_of_hash,
 )
 from tallyman_core.events import list_sessions, read_events, record_event
+from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
+from tallyman_core.server_lock import is_this_data_dir, resolved_home
 from tallyman_core.telemetry import read_spans, record_span
 from tallyman_core.version import git_revision, version_info
 from tallyman_xorq import (
@@ -49,7 +50,8 @@ from tallyman_xorq import (
     read_prompts,
 )
 from tallyman_xorq.primary_key import PrimaryKeySearchTimeout, diff_keys
-from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+from tallyman_xorq.result_cache import cached_result_expr, entry_manifest
+from tallyman_xorq.row_order import page as row_order_page
 
 log = logging.getLogger("tallyman.companion")
 
@@ -67,6 +69,25 @@ class NotifyPayload(BaseModel):
     hash: str | None = None
     project: str | None = None  # explicit target; absent → the active project
     extra: dict | None = None
+    # The sender's data dir (TALLYMAN_HOME). A notify from a client of another data dir is refused (#183); absent → not
+    # checked.
+    home: str | None = None
+
+
+def _refuse_another_data_dir(what: str, home: str | None) -> None:
+    """409 when a client names a data dir (``home``) other than the one this companion serves (#183).
+
+    A client of another data dir reached this companion (a second tallyman on its own data dir). Its projects are not
+    this data dir's, so it must not reload, publish to or switch anything here. A client that names no data dir (the
+    browser) is not checked.
+    """
+    if home is None or is_this_data_dir(home):
+        return
+    raise HTTPException(
+        409,
+        f"{what} from data dir {home} refused: this companion serves data dir {resolved_home()}. A client reaches the "
+        "companion of its own data dir through the server.lock of that data dir.",
+    )
 
 
 def _broadcaster() -> tuple[asyncio.Queue, list]:
@@ -206,24 +227,21 @@ def _compute_disk_usage(project: str) -> dict:
 
 
 def _snapshot_cache_path(project: str, content_hash: str):
-    """Resolve the xorq snapshot-cache path for one entry, without materialising.
+    """Resolve the snapshot path for one entry, without materialising.
 
     Returns ``(applicable, path | None, note)``. Delegates to
-    ``result_cache.baked_snapshot_path``, which returns None for an entry that
-    bakes no snapshot — a cheap expression, salt identity mode, or a worthiness
-    disagreement — and the snapshot path otherwise (the very file a cold read
-    returns). It never calls ``.execute()``, so a cold expensive entry reports an
-    absent (0 B) snapshot rather than being forced to materialise just because
-    someone opened the metadata tab.
+    ``result_cache.baked_snapshot_path``, which returns None for a cheap entry,
+    which has no snapshot, and the snapshot path otherwise (a function of the
+    content hash and the manifest's ``cache_worthy``). It loads and writes
+    nothing, so a worthy entry whose file was deleted reports an absent (0 B)
+    snapshot rather than being forced to materialise just because someone opened
+    the metadata tab. An entry without a manifest raises (#204).
     """
-    try:
-        from tallyman_xorq.result_cache import baked_snapshot_path  # noqa: PLC0415
+    from tallyman_xorq.result_cache import baked_snapshot_path  # noqa: PLC0415
 
-        path = baked_snapshot_path(project, content_hash)
-    except Exception as exc:  # noqa: BLE001 — best-effort sizing, never 500 the tab
-        return True, None, f"snapshot path unresolved: {type(exc).__name__}"
+    path = baked_snapshot_path(project, content_hash)
     if path is None:
-        return False, None, "cheap entry — recomputed from the build, no snapshot copy"
+        return False, None, "cheap entry — a small plan over files that exist, no snapshot"
     return True, path, ""
 
 
@@ -265,14 +283,14 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     components.append(
         {
             "key": "snapshot_cache",
-            "label": "xorq snapshot cache",
+            "label": "snapshot",
             "kind": "cache",
             "reclaimable": True,
             "applicable": applicable,
             "exists": snap_exists,
             "bytes": snap_size,
             "formatted": _fmt_bytes(snap_size),
-            "detail": note or "expensive entry — a cached copy in compute_cache/, recomputed on a miss",
+            "detail": note or "materialized entry — its result in compute_cache/, made again and verified on a miss",
         }
     )
 
@@ -333,12 +351,9 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     diff_cache_bytes = sum(d["bytes"] for d in diff_caches)
 
     total_bytes = cache_bytes + artifact_bytes + diff_cache_bytes
-    try:
-        from tallyman_xorq.result_cache import cache_worthy as _cw  # noqa: PLC0415
+    from tallyman_xorq.result_cache import cache_worthy as _cw  # noqa: PLC0415
 
-        worthy = _cw(project, content_hash)
-    except Exception:  # noqa: BLE001
-        worthy = False
+    worthy = _cw(project, content_hash)
 
     # Enrichment (#134): the recipe's raw source files, last-modified, the
     # cheap/expensive reason, and clickable lineage (parents + dependent
@@ -346,27 +361,31 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     # single-user scale; revisit if it ever paginates.
     from datetime import datetime, timezone  # noqa: PLC0415
 
-    from tallyman_core.paths import data_dir as _data_dir  # noqa: PLC0415
-    from tallyman_xorq.dependents import dependents_index, parents_of, sources_of  # noqa: PLC0415
+    from tallyman_xorq.dependents import dependents_index, parents_of  # noqa: PLC0415
 
-    manifest: dict = {}
-    try:
-        manifest = json.loads((entry / "manifest.json").read_text())
-    except (OSError, ValueError):
-        pass
+    manifest = json.loads((entry / "manifest.json").read_text())
 
-    # Raw source files the recipe reads. None under source-identity mode=off —
-    # kept distinct from "reads no files" so the UI can say "not tracked".
-    src_digests = sources_of(project, content_hash)
+    # The raw bytes this entry holds, which is a question only a source version has an answer to
+    # (ADR-011 D6: a computed entry reads aliases, never a file). For one it is the clone of the
+    # imported file under data/.cas — the copy that makes the snapshot re-creatable — listed under the
+    # provenance path it came from, which may be long gone.
     sources: list[dict] = []
     source_bytes = 0
-    if src_digests is not None:
-        dd = _data_dir(project)
-        for rel in sorted(src_digests):
-            sp = dd / rel
-            sz = _path_size(sp)
-            source_bytes += sz
-            sources.append({"path": rel, "bytes": sz, "formatted": _fmt_bytes(sz), "exists": sp.exists()})
+    provenance = manifest.get("provenance")
+    if provenance:
+        from tallyman_core.manifest import SourceProvenance  # noqa: PLC0415
+        from tallyman_xorq.source_import import source_clone_path  # noqa: PLC0415
+
+        clone = source_clone_path(project, SourceProvenance.model_validate(provenance))
+        source_bytes = _path_size(clone)
+        sources.append(
+            {
+                "path": provenance["path"],
+                "bytes": source_bytes,
+                "formatted": _fmt_bytes(source_bytes),
+                "exists": clone.exists(),
+            }
+        )
 
     # Last-modified across the entry's on-disk artifacts (a snapshot self-heal
     # makes this later than created_at).
@@ -405,7 +424,7 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
         "diff_cache_formatted": _fmt_bytes(diff_cache_bytes),
         "source_bytes": source_bytes,
         "source_formatted": _fmt_bytes(source_bytes),
-        "source_tracked": src_digests is not None,
+        "source_tracked": bool(sources),
         "sources": sources,
         "parents": parents,
         "children": children,
@@ -444,12 +463,12 @@ def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str,
 def _invalidate_reset_caches(project: str | None = None) -> None:
     """Drop the companion's process-global result/compare caches after a reset.
 
-    A reset prunes baked snapshots (``catalog_state.reset_to`` →
-    ``prune_compute_cache``). ``_build_compare_expr`` serializes those snapshot
-    paths into a build with no per-call ``exists()`` recheck, so a warmed diff
-    pair would otherwise serve a build over a parquet the prune deleted —
-    buckaroo reads zero files → empty compare grid (#80). ``cached_result_expr``
-    self-heals on every read so clearing its memo is hygiene, not load-bearing,
+    A reset changes which entries exist (``catalog_state.reset_to`` retires and
+    restores entry dirs, and leaves ``compute_cache/`` alone, ADR-007 D14).
+    ``_build_compare_expr`` serializes snapshot paths into a build with no
+    per-call ``exists()`` recheck, so a warmed diff pair is dropped rather than
+    served over entries the reset retired (#80). ``cached_result_expr`` makes its
+    files exist on every read, so clearing its memo is hygiene, not load-bearing,
     but we clear it for parity. Blunt global clear is correct and cheap: entries
     are content-addressed, so the next call rebuilds an identical expression.
 
@@ -671,13 +690,11 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
-    # ADR D7/D10: when a self-heal fails verification (result_cache writes the
-    # durable errors.jsonl record and wipes the entry's stat cache itself), the
-    # companion additionally evicts the entry's Buckaroo session — an open
-    # session's row cache would show the pre-heal rows beside fresh stats — and
-    # pushes the SSE event the UI badges from. Registered on startup (the hook
-    # needs the running loop to publish from the sync heal path) and removed on
-    # shutdown so test-created apps don't pile up dead hooks.
+    # ADR-006 D7/D10: when a self-heal fails verification (result_cache writes the durable errors.jsonl record and
+    # wipes the entry's stat cache itself), the companion additionally forces Buckaroo to re-run its pipeline for the
+    # entry's grid, since an open session holds stats computed from the old rows (ADR-007 D6), and pushes the SSE event
+    # the UI badges from. Registered on startup (the hook needs the running loop to publish from the sync heal path)
+    # and removed on shutdown so test-created apps don't pile up dead hooks.
     @app.on_event("startup")
     async def _register_unfaithful_heal_hook():
         from tallyman_xorq.result_cache import UNFAITHFUL_HEAL_HOOKS  # noqa: PLC0415
@@ -686,7 +703,7 @@ def create_app(
 
         def _on_unfaithful_heal(project: str, content_hash: str) -> None:
             if buckaroo:
-                buckaroo.evict_session(content_hash)
+                buckaroo.force_reload_session(project, content_hash)
             asyncio.run_coroutine_threadsafe(
                 publish({"kind": "unfaithful_heal", "hash": content_hash, "project": project}),
                 loop,
@@ -792,7 +809,12 @@ def create_app(
 
     @app.on_event("startup")
     async def _warm_expr_cache():
+        """Load the frozen builds of cheap entries into the in-process memo, so the first page request does not pay
+        for the load. It never writes a file (ADR-007 D12): a worthy entry is served from its snapshot without loading
+        its build, and a snapshot the user deleted stays deleted until something is about to read it."""
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+        from tallyman_xorq.result_cache import cache_worthy, preload_plan  # noqa: PLC0415
 
         project = _current_project()
         if project is None:
@@ -823,7 +845,9 @@ def create_app(
                     )
                     return
                 try:
-                    cached_result_expr(project, h)
+                    if cache_worthy(project, h):
+                        continue
+                    preload_plan(project, h)
                     warmed += 1
                     log.debug(
                         "expr cache warmed %s (%.0fms, %.0fms elapsed)",
@@ -912,22 +936,18 @@ def create_app(
 
         if not entry_build_dir(project, content_hash).is_dir():
             raise HTTPException(404, "no entry")
-        # #90: serve the page off the entry's expression. cached_result_expr
-        # already hands back the result as a live single-backend expression, so
-        # the window pushes down (expensive → windowed read of the baked snapshot,
-        # cheap → limit pushed through to the source read) and nothing is written.
-        # The old path called ensure_result, materialising the entry's entire
-        # result to disk to serve one page. total is the manifest's row_count
-        # (recorded at build; api_entry_detail reads it the same way), so no file
-        # is needed to populate it. The manifest is written after the build dir
-        # exists (build.py), so guard the read: a half-built or pruned entry still
-        # serves its page off the expression with a best-effort total of 0 rather
-        # than 500ing on a missing manifest — cached_result_expr needs none.
-        manifest_path = entry_dir(project, content_hash) / ENTRY_MANIFEST_FILENAME
-        total = 0
-        if manifest_path.exists():
-            total = json.loads(manifest_path.read_text()).get("row_count") or 0
-        df = cached_result_expr(project, content_hash).limit(limit, offset=offset).execute()
+        # A page is a function of (content_hash, sort, offset, limit) (ADR-008 D1, D5): ``ORDER BY __row_order``, or
+        # the user's keys and then ``__row_order``, so the same request returns the same rows in any process and any
+        # cache state. cached_result_expr hands back the result as a live single-backend expression over files that
+        # exist (ensure_materialized ran first), so the window pushes down and nothing is written here. total is the
+        # manifest's row_count, recorded at build. An entry directory without a manifest is corrupt, and this raises
+        # (#204).
+        total = entry_manifest(project, content_hash).row_count or 0
+        # The page runs on the process's shared backend, one execution at a time (#118). cached_result_expr may heal,
+        # and a heal takes the project lock, which comes before the execution lock, so it runs first.
+        expr = row_order_page(cached_result_expr(project, content_hash), offset=offset, limit=limit)
+        with execution_lock():
+            df = expr.execute()
         return {
             "data": json.loads(df.to_json(orient="records")),
             "offset": offset,
@@ -1131,11 +1151,10 @@ def create_app(
             buckaroo_session = None
             if latest is not None:
                 entry = entry_dir(project, latest)
-                if (entry / ENTRY_MANIFEST_FILENAME).exists():
-                    entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
-                    schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
-                    # #73: row count from the manifest, not a result.parquet.
-                    total_rows = entry_meta.get("row_count", 0)
+                entry_meta = json.loads((entry / ENTRY_MANIFEST_FILENAME).read_text())
+                schema = json.loads((entry / ENTRY_SCHEMA_FILENAME).read_text())
+                # #73: row count from the manifest, not a result.parquet.
+                total_rows = entry_meta.get("row_count", 0)
                 chart_spec = get_chart(project, latest)
                 if buckaroo_available:
                     buckaroo_session = buckaroo.ensure_session(latest, project)
@@ -1313,6 +1332,12 @@ def create_app(
         column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
         target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
+        # The generated name can already be a source alias: refuse before building the diff, as the MCP tool does.
+        from tallyman_core.aliases import source_alias_refusal  # noqa: PLC0415
+
+        refusal = source_alias_refusal(project, target_alias, "the target of a promoted diff")
+        if refusal:
+            raise HTTPException(409, refusal)
         keys_repr = repr(keys)
         code = textwrap.dedent(f"""\
             # auto-generated — diff of {alias} V{a_idx} → V{b_idx}
@@ -1501,70 +1526,82 @@ def create_app(
         project = _validate_project(project)
         import datetime  # noqa: PLC0415
 
-        from tallyman_core.paths import entries_dir as _entries_dir  # noqa: PLC0415
+        from tallyman_xorq.materialize import pinned_reason_of, snapshot_manifest, snapshots_dir  # noqa: PLC0415
 
-        root = _entries_dir(project)
+        # The page lists the snapshot files that exist on disk right now: the rows the delete button can actually
+        # evict (ADR-007 D2, D12). An entry's snapshot is a function of its hash, so nothing is derived or loaded. A
+        # file whose entry a reset retired (ADR-007 D14) is listed from the manifest the reset parked in the bullpen,
+        # marked retired, and that manifest still decides its pin (#195). A file no entry names, live or parked, is an
+        # orphan. Both get a row, since nothing else lists them and the user has to be able to delete them. The pin is
+        # read from the manifest alone, so the listing never reads errors.jsonl (#196).
         entries = []
-        if root.is_dir():
-            for entry in root.iterdir():
-                if not entry.is_dir():
-                    continue
+        root = snapshots_dir(project)
+        for snap in sorted(root.glob("*.parquet")) if root.is_dir() else []:
+            content_hash = snap.stem
+            try:
+                size = snap.stat().st_size
+            except OSError:
+                continue
+            m, retired = snapshot_manifest(project, content_hash)
+            if m is None:
+                mtime = datetime.datetime.fromtimestamp(snap.stat().st_mtime, tz=datetime.timezone.utc)
                 try:
-                    m = read_manifest(entry)
+                    import pyarrow.parquet as pq  # noqa: PLC0415
+
+                    row_count = int(pq.ParquetFile(snap).metadata.num_rows)
                 except Exception:
-                    continue
-                content_hash = entry.name
-                # The page lists the baked snapshots that exist on disk right now —
-                # the rows the delete button can actually evict. cache_bytes (#87) is
-                # a cheap pre-filter: None for a cheap entry (bakes nothing), so skip
-                # it without deriving a path. For an expensive entry, resolve the
-                # snapshot and skip it when the file is gone — a delete unlinks the
-                # snapshot but leaves cache_bytes set, so keying the listing on
-                # cache_bytes alone showed a phantom row (stale size, freed bytes
-                # still in the total, a delete button that 404s) until the entry was
-                # next viewed and re-baked. Size from the live file so the figure
-                # tracks disk. baked_snapshot_path re-imports the recipe, but only
-                # for the (few) expensive entries the pre-filter lets through, and
-                # this admin page isn't on a hot path.
-                if m.cache_bytes is None:
-                    continue
-                try:
-                    snap = baked_snapshot_path(project, content_hash)
-                    if snap is None or not snap.exists():
-                        continue
-                    size = snap.stat().st_size
-                except Exception:
-                    continue
-                # created_at is an ISO-8601 UTC string; render it in the table's
-                # existing "%Y-%m-%d %H:%M:%S" shape (CachePage renders `created`
-                # verbatim) so the Created column is unchanged.
-                try:
-                    created = datetime.datetime.fromisoformat(m.created_at).strftime("%Y-%m-%d %H:%M:%S")
-                except (ValueError, TypeError):
-                    created = m.created_at or ""
-                alias = alias_for_hash(project, content_hash)
-                info = version_of_hash(project, content_hash)
-                version = info[1] if info else None
-                is_current = alias is not None
-                if not is_current and info is not None:
-                    alias = info[0]
-                    is_current = False
+                    row_count = 0
                 entries.append(
                     {
                         "hash": content_hash,
                         "size": size,
                         "size_formatted": _fmt_bytes(size),
-                        # row_count is int|None on the manifest, but CacheEntry
-                        # types it number and CachePage calls .toLocaleString()
-                        # with no null guard — coerce so a null can't reach JS.
-                        "row_count": int(m.row_count or 0),
-                        "created": created,
-                        "alias": alias,
-                        "version": version,
-                        "is_current": is_current,
-                        "prompt": m.prompt,
+                        "row_count": row_count,
+                        "created": mtime.strftime("%Y-%m-%d %H:%M:%S"),
+                        "alias": None,
+                        "version": None,
+                        "is_current": False,
+                        "prompt": None,
+                        "orphan": True,
+                        "retired": False,
+                        "pinned": False,
+                        "pinned_reason": None,
                     }
                 )
+                continue
+            # created_at is an ISO-8601 UTC string; render it in the table's existing "%Y-%m-%d %H:%M:%S" shape
+            # (CachePage renders `created` verbatim) so the Created column is unchanged.
+            try:
+                created = datetime.datetime.fromisoformat(m.created_at).strftime("%Y-%m-%d %H:%M:%S")
+            except (ValueError, TypeError):
+                created = m.created_at or ""
+            alias = alias_for_hash(project, content_hash)
+            info = version_of_hash(project, content_hash)
+            version = info[1] if info else None
+            is_current = alias is not None
+            if not is_current and info is not None:
+                alias = info[0]
+                is_current = False
+            reason = pinned_reason_of(project, content_hash, m, retired=retired)
+            entries.append(
+                {
+                    "hash": content_hash,
+                    "size": size,
+                    "size_formatted": _fmt_bytes(size),
+                    # row_count is int|None on the manifest, but CacheEntry types it number and CachePage calls
+                    # .toLocaleString() with no null guard — coerce so a null can't reach JS.
+                    "row_count": int(m.row_count or 0),
+                    "created": created,
+                    "alias": alias,
+                    "version": version,
+                    "is_current": is_current,
+                    "prompt": m.prompt,
+                    "orphan": False,
+                    "retired": retired,
+                    "pinned": reason is not None,
+                    "pinned_reason": reason,
+                }
+            )
         entries.sort(key=lambda e: -e["size"])
         total = sum(e["size"] for e in entries)
         return {
@@ -1582,24 +1619,25 @@ def create_app(
         # Reject a non-hex hash up front: a 400 reads truer than the
         # "already evicted" 404 below (see _require_hash).
         _require_hash(content_hash)
-        # Evict the baked .cache() snapshot — the single materialised copy. None
-        # for a cheap entry (nothing to delete) or one already evicted; reading
-        # the entry's viewer page afterward self-heals (re-bakes) it.
-        p = baked_snapshot_path(project, content_hash)
-        if p is None or not p.exists():
-            raise HTTPException(404, "no baked snapshot for this entry")
+        from tallyman_xorq.materialize import pinned_reason, snapshot_path  # noqa: PLC0415
+
+        # Delete the entry's snapshot, or the file of a retired entry or an orphan: the single materialized copy. A file
+        # is deleted only by an explicit user action (ADR-007 D12), and reading the entry afterward makes it again and
+        # verifies it. A file that cannot be made again faithfully is pinned (ADR-009 D6), as its manifest says, the
+        # parked one for a retired entry (#195), and this leaves it alone, with the reason.
+        p = snapshot_path(project, content_hash)
+        if not p.exists():
+            raise HTTPException(404, "no snapshot for this entry")
+        reason = pinned_reason(project, content_hash)
+        if reason:
+            raise HTTPException(409, f"not deleted: {reason}")
         try:
             p.unlink()
         except OSError as exc:
             raise HTTPException(500, str(exc))
-        # Defense-in-depth, not load-bearing for correctness: since ee0a90a,
-        # cached_result_expr is a thin non-memoised wrapper that re-checks
-        # path.exists() and self-heals on every read, so the next viewer read
-        # (api_data) / ensure_session heal re-bakes the evicted snapshot even with a
-        # warm memo left in place (proven by
-        # test_cached_result_expr_self_heals_after_warm_then_evict). We still clear
-        # it because it's cheap for an admin delete: content-addressed entries just
-        # re-reconstruct (and the evicted one re-bakes) on the next read.
+        # The memoised read of the snapshot outlives the file, but every read goes through ensure_materialized first,
+        # so the next read of the entry makes it again. Clearing the memo is hygiene: content-addressed entries just
+        # reload an identical plan.
         cached_result_expr.cache_clear()
         return {"ok": True, "hash": content_hash}
 
@@ -1636,6 +1674,12 @@ def create_app(
         prev_hash = _get_alias(project, alias)
         if prev_hash is None:
             raise HTTPException(404, f"alias {alias!r} not found")
+        # A source alias's versions are imported files: refuse before building, as catalog_revise does (ADR-011 D1).
+        from tallyman_core.aliases import source_alias_refusal as _source_alias_refusal  # noqa: PLC0415
+
+        refusal = _source_alias_refusal(project, alias, "revised")
+        if refusal:
+            raise HTTPException(409, refusal)
         code = payload.get("code", "")
         if not code.strip():
             raise HTTPException(400, "code is empty")
@@ -1655,8 +1699,8 @@ def create_app(
             msg = (
                 f"this revision references its own alias {alias!r}, which makes an opaque, "
                 f"permanently-stale (follows-its-own-head) entry. Write a self-contained recipe: "
-                f"inline the source (read_project_file / read_csv …) for a source-shaped entry, or "
-                f"reference the previous version by hash with pinned_expr_from_alias({prev_hash!r}) "
+                f"start from the source alias (tracked_expr_from_alias) for a source-shaped entry, or "
+                f"reference the previous version with pinned_expr_from_alias('{alias}-v{len(history_for(project, alias))}') "  # noqa: E501
                 f"for an expensive one."
             )
             rec = _record_error(project, code=code, message=msg, tool="api_code")
@@ -1803,6 +1847,7 @@ def create_app(
 
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
+        _refuse_another_data_dir("notify", payload.home)
         # The payload may name its project (CLI `reset-to --project` can target
         # a non-active project); only fall back to the active one when it doesn't.
         project_name = payload.project or _require_project()
@@ -1823,7 +1868,7 @@ def create_app(
             if payload.kind in ("project_reset", "recalc"):
                 # project_reset: out-of-process CLI `reset-to` ran reset_to in the
                 # CLI process, so this long-lived companion's result/compare LRUs
-                # are still warm and may point at snapshots the prune deleted.
+                # are still warm and may name entries the reset retired.
                 # recalc: an MCP-driven catalog_recalc (arriving here via _notify,
                 # not the in-process /api/recalc route) re-pointed aliases and
                 # rebuilt entries. Either way, clear the LRUs and reload sessions —
@@ -1842,7 +1887,7 @@ def create_app(
             extra = payload.extra or {}
             event = _recalc_sse_event(extra.get("remap", {}), extra.get("step"))
         else:
-            event = payload.model_dump()
+            event = payload.model_dump(exclude={"home"})
         await publish(event)
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 
@@ -1859,6 +1904,7 @@ def create_app(
     async def api_projects_switch(payload: dict):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
+        _refuse_another_data_dir("project switch", (payload or {}).get("home"))
         name = (payload or {}).get("name", "")
         try:
             from tallyman_core.paths import set_active_project as _sap  # noqa: PLC0415
@@ -1879,6 +1925,7 @@ def create_app(
     async def api_projects_new(payload: dict):
         if read_only:
             raise HTTPException(403, "companion is in read-only (serve) mode")
+        _refuse_another_data_dir("new project", (payload or {}).get("home"))
         from tallyman_core import ensure_project as _ensure_project  # noqa: PLC0415
         from tallyman_core.paths import projects_root as _projects_root  # noqa: PLC0415
         from tallyman_core.paths import set_active_project as _sap  # noqa: PLC0415

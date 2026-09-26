@@ -159,28 +159,28 @@ def test_mcp_remove_nonexistent_returns_error(project: str):
 # ---------------------------------------------------------------------------
 
 
-def _agg_code(project: str) -> str:
+def _agg_code(project: str, src: str) -> str:
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file('orders.parquet', project={project!r})\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({src!r}, project={project!r})\n"
         "expr = t.group_by('region').aggregate(n=t.count())\n"
     )
 
 
-def _cheap_code(project: str) -> str:  # parquet read + projection → cheap, bakes no snapshot
+def _cheap_code(project: str, src: str) -> str:  # source read + projection → cheap, bakes no snapshot
     return (
-        "from tallyman_xorq.io import read_project_file\n"
-        f"t = read_project_file('orders.parquet', project={project!r})\n"
-        "expr = t.select('region', 'price')\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        f"t = tracked_expr_from_alias({src!r}, project={project!r})\n"
+        "expr = t.select('region', 'price', '__row_order')\n"
     )
 
 
-def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch):
+def test_run_post_processing_by_alias(project: str, orders_src: str, monkeypatch):
     """run_post_processing resolves an alias and returns filtered rows."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
-    catalog_create("agg", _agg_code(project))
+    catalog_create("agg", _agg_code(project, orders_src))
     resp = catalog_run_post_processing(
         code="def process(expr):\n    return expr\n",
         entry="agg",
@@ -191,12 +191,12 @@ def test_run_post_processing_by_alias(project: str, orders_parquet, monkeypatch)
     assert isinstance(resp["preview"], list)
 
 
-def test_run_post_processing_by_hash(project: str, orders_parquet, monkeypatch):
+def test_run_post_processing_by_hash(project: str, orders_src: str, monkeypatch):
     """run_post_processing accepts a raw content hash."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
-    out = catalog_create("agg2", _agg_code(project))
+    out = catalog_create("agg2", _agg_code(project, orders_src))
     resp = catalog_run_post_processing(
         code="def process(expr):\n    return expr\n",
         entry=out["hash"],
@@ -205,12 +205,12 @@ def test_run_post_processing_by_hash(project: str, orders_parquet, monkeypatch):
     assert resp["entry"] == out["hash"]
 
 
-def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, monkeypatch):
+def test_run_post_processing_filter_reduces_rows(project: str, orders_src: str, monkeypatch):
     """A filter in process() produces fewer rows than the original."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
-    catalog_create("agg3", _agg_code(project))
+    catalog_create("agg3", _agg_code(project, orders_src))
     all_rows = catalog_run_post_processing("def process(expr):\n    return expr\n", "agg3")
     filtered = catalog_run_post_processing("def process(expr):\n    return expr.filter(expr.n > 9999)\n", "agg3")
     assert "error" not in all_rows
@@ -218,12 +218,12 @@ def test_run_post_processing_filter_reduces_rows(project: str, orders_parquet, m
     assert filtered["row_count"] < all_rows["row_count"]
 
 
-def test_run_post_processing_bad_code_returns_error(project: str, orders_parquet, monkeypatch):
+def test_run_post_processing_bad_code_returns_error(project: str, orders_src: str, monkeypatch):
     """Syntax errors in the process function surface as error dict."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
-    catalog_create("agg4", _agg_code(project))
+    catalog_create("agg4", _agg_code(project, orders_src))
     resp = catalog_run_post_processing("def process(expr):\n    return 42\n", "agg4")
     assert "error" in resp
 
@@ -237,7 +237,7 @@ def test_run_post_processing_unknown_entry_returns_error(project: str, monkeypat
     assert "error" in resp
 
 
-def test_run_post_processing_writes_no_result_parquet(project: str, orders_parquet, monkeypatch):
+def test_run_post_processing_writes_no_result_parquet(project: str, orders_src: str, monkeypatch):
     """Post-processing reads the entry's cache-resolving expression, not an
     on-demand ``result.parquet``. A cheap entry recomputes and an expensive one
     reads its baked snapshot — neither materialises a per-entry parquet on disk
@@ -248,7 +248,7 @@ def test_run_post_processing_writes_no_result_parquet(project: str, orders_parqu
     from tallyman_mcp.server import catalog_create, catalog_run_post_processing
 
     noop = "def process(expr):\n    return expr\n"
-    for alias, code in (("cheap_pp", _cheap_code(project)), ("agg_pp", _agg_code(project))):
+    for alias, code in (("cheap_pp", _cheap_code(project, orders_src)), ("agg_pp", _agg_code(project, orders_src))):
         out = catalog_create(alias, code)
         assert "error" not in out, out
         h = out["hash"]
@@ -256,23 +256,3 @@ def test_run_post_processing_writes_no_result_parquet(project: str, orders_parqu
         assert "error" not in resp, resp
         assert resp["row_count"] > 0
         assert not (entry_dir(project, h) / "result.parquet").exists()
-
-
-def test_run_post_processing_under_salt_writes_no_result_parquet(project: str, orders_parquet, monkeypatch):
-    """salt source-identity mode used to route reads through an on-demand
-    ``result.parquet`` (path-only snapshot keys collide across salted entries).
-    With the on-demand layer gone, a salted entry recomputes through the same
-    cheap/expensive path as off-mode and writes no per-entry parquet.
-    """
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    monkeypatch.setenv("TALLYMAN_SOURCE_IDENTITY", "salt")
-    from tallyman_core import entry_dir
-    from tallyman_mcp.server import catalog_create, catalog_run_post_processing
-
-    out = catalog_create("salted_pp", _agg_code(project))
-    assert "error" not in out, out
-    h = out["hash"]
-    resp = catalog_run_post_processing(code="def process(expr):\n    return expr\n", entry="salted_pp")
-    assert "error" not in resp, resp
-    assert resp["row_count"] > 0
-    assert not (entry_dir(project, h) / "result.parquet").exists()

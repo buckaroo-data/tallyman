@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_mcp.server import catalog_create, catalog_promote_diff, catalog_revise
@@ -156,6 +157,52 @@ def test_build_compare_expr_key_col_uses_categorical_colormap(project: str, orde
     _, overrides = build_compare_expr(a_expr, b_expr, ["region"])
     assert overrides["region"]["color_map_config"]["color_rule"] == "color_categorical"
     assert overrides["region"]["color_map_config"]["val_column"] == "membership"
+
+
+def _parquet_expr(tmp_path: Path, name: str, cols: dict):
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    import xorq.api as xo
+
+    path = tmp_path / f"{name}.parquet"
+    pq.write_table(pa.table(cols), path)
+    return xo.deferred_read_parquet(str(path))
+
+
+def _membership_by_key(expr, key: str) -> dict:
+    df = expr.execute()
+    return {k: int(m) for k, m in zip(df[key], df["membership"])}
+
+
+@pytest.mark.parametrize(
+    "a_cols, b_cols",
+    [
+        ({"k": [1, 2]}, {"k": [2, 3]}),
+        ({"k": [1, 2], "v": [10, 20]}, {"k": [2, 3]}),
+    ],
+    ids=["both-sides-key-only", "b-side-key-only"],
+)
+def test_build_compare_expr_key_only_side_buckets_rows(tmp_path: Path, a_cols: dict, b_cols: dict):
+    # #13: membership (1 a-only, 2 b-only, 3 both) was read off a data column being null on the absent side, and a
+    # side with no data column fell back to the join key. The a-side key is not null for an a-only row, so a-only
+    # rows came out as both and b-only rows as a-only.
+    from tallyman_companion.diff import build_compare_expr
+
+    a = _parquet_expr(tmp_path, "a", a_cols)
+    b = _parquet_expr(tmp_path, "b", b_cols)
+    expr, _ = build_compare_expr(a, b, ["k"])
+    assert _membership_by_key(expr, "k") == {1: 1, 2: 3, 3: 2}
+
+
+def test_build_compare_expr_null_in_first_data_column_keeps_bucket(tmp_path: Path):
+    # #13: a row present on both sides with a null in the first non-key column was bucketed by that null: a null on
+    # the b side read as a-only, a null on the a side as b-only.
+    from tallyman_companion.diff import build_compare_expr
+
+    a = _parquet_expr(tmp_path, "a", {"k": [1, 2, 3, 4, 5], "v": [None, 20, None, 40, 50], "w": list("abcde")})
+    b = _parquet_expr(tmp_path, "b", {"k": [1, 2, 3, 4, 6], "v": [11, None, None, 40, 60], "w": list("abcdf")})
+    expr, _ = build_compare_expr(a, b, ["k"])
+    assert _membership_by_key(expr, "k") == {1: 3, 2: 3, 3: 3, 4: 3, 5: 1, 6: 2}
 
 
 # ---------------------------------------------------------------------------
@@ -305,6 +352,26 @@ def test_catalog_promote_diff_negative_indices(project: str, orders_src: str, mo
     out = catalog_promote_diff("shoe_sales", va=-2, vb=-1)
     assert "error" not in out
     assert out["va"] == 1 and out["vb"] == 2
+
+
+def test_catalog_promote_diff_key_only_entry_buckets_rows(project: str, orders_src: str, monkeypatch):
+    # #13 end to end: a promoted diff of an entry with no data column (a distinct over the key). V1 drops NE and V2
+    # drops S, so S is only in V1, NE only in V2, and MW and W are in both.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+
+    def regions_without(region: str) -> str:
+        return f"""
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
+expr = t.filter(t.region != {region!r}).select("region").distinct()
+"""
+
+    catalog_create("regions", regions_without("NE"))
+    catalog_revise("regions", regions_without("S"))
+    out = catalog_promote_diff("regions")
+    assert "error" not in out, out
+    promoted = cached_result_expr(project, out["hash"])
+    assert _membership_by_key(promoted, "region") == {"S": 1, "NE": 2, "MW": 3, "W": 3}
 
 
 # ---------------------------------------------------------------------------

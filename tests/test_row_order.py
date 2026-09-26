@@ -418,6 +418,15 @@ def test_a_diff_carries_no_row_order_column_from_either_side(project, orders_src
     assert not [c for c in promoted.columns if c.startswith(ROW_ORDER)], list(promoted.columns)
 
 
+def test_a_diff_leaves_out_the_reserved_names_and_keeps_an_authors_copy(tmp_path):
+    """ADR-008 D6: only ``__row_order`` and ibis's join copy of it are tallyman's. ``__row_order_v1`` is data (#200)."""
+    from tallyman_xorq.row_order import without_row_order
+
+    path = tmp_path / "t.parquet"
+    pq.write_table(pa.table({"k": [1], "__row_order_v1": [0], ROW_ORDER: [0], ROW_ORDER_RIGHT: [0]}), path)
+    assert list(without_row_order(xo.deferred_read_parquet(str(path))).columns) == ["k", "__row_order_v1"]
+
+
 # --------------------------------------------------------------------------- #
 # ADR-008 D6: joins
 # --------------------------------------------------------------------------- #

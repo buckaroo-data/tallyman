@@ -45,6 +45,22 @@ def project(isolated_home: Path) -> str:
 
 
 @pytest.fixture
+def running_server(isolated_home: Path):
+    """Claim the tmp data dir the way `tallyman run` does, on port 0, and give it back at teardown.
+
+    A client of a data dir reaches its companion only through the owner record of the server holding it
+    (``server_lock.companion_url``); with none it sends nothing and links nothing. Port 0 is one nothing listens on,
+    so a test that does not stub httpx still reaches no companion. The claim is this process's own: ``read_owner``
+    probes it on another descriptor, which ``flock`` treats like another process.
+    """
+    from tallyman_core.server_lock import claim_data_dir, release_data_dir
+
+    record = claim_data_dir(port=0, bind_host="127.0.0.1")
+    yield record
+    release_data_dir()
+
+
+@pytest.fixture
 def orders_parquet(project: str) -> Path:
     """Generate a deterministic shoe-orders fixture under project/data/.
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core import entry_dir
@@ -170,16 +171,15 @@ expr = t.select("order_id", "region", "price", "__row_order")
     assert page2 == full[50:100]
 
 
-def test_api_data_missing_manifest_serves_page_without_500(
-    fresh_companion_app, project: str, orders_src: str, monkeypatch
+@pytest.mark.parametrize("route", ["data", "entry", "entry_cache"])
+def test_entry_routes_error_on_an_entry_with_no_manifest(
+    fresh_companion_app, project: str, orders_src: str, monkeypatch, route: str
 ):
-    """#90: a missing manifest must not 500 the row read.
+    """#204, reversing #90, which served the row read with a total of 0 here.
 
-    The build dir is written before manifest.json (build.py creates the dir, then
-    writes the manifest after executing), so a half-built or pruned entry can pass
-    the build-dir check yet have no manifest. cached_result_expr needs none — only
-    ``total`` reads it — so the read must be guarded: serve the page with a
-    best-effort total rather than raising FileNotFoundError on the manifest read.
+    An entry directory without a manifest is corrupt. Reading it is a server error: no route answers around it, and
+    none maps it to something softer than a 500. For a worthy entry whose snapshot was gone too, the row read used to
+    re-run its aggregate as if it were cheap.
     """
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
@@ -188,15 +188,11 @@ t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.select("region", "price", "__row_order")
 """
     h = build_and_persist(project, code, prompt="cols").content_hash
-    (entry_dir(project, h) / "manifest.json").unlink()  # half-built / pruned entry
+    (entry_dir(project, h) / "manifest.json").unlink()
 
-    c = TestClient(fresh_companion_app)
-    r = c.get(f"/{project}/api/data/{h}?offset=0&limit=10")
-    assert r.status_code == 200  # served off the expression, not the manifest
-    body = r.json()
-    assert len(body["data"]) == 10
-    assert set(body["data"][0]) == {"region", "price", "__row_order"}
-    assert body["total"] == 0  # no manifest → best-effort total, not a crash
+    c = TestClient(fresh_companion_app, raise_server_exceptions=False)
+    r = c.get(f"/{project}/api/{route}/{h}")
+    assert r.status_code == 500, (r.status_code, r.text[:500])
 
 
 def test_entry_detail_sidebar_lists_all_entries_with_current_highlighted(

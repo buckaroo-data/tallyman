@@ -122,6 +122,10 @@ def _polars_dtype(dtype):
     schema's intent). ``decimal`` reads as ``float64`` for now — exact-decimal
     parsing is deferred to a future UI-driven buckaroo autoclean step (#150).
     An unmapped type still raises loudly, so a schema mistake fails fast.
+
+    A timestamp with a zone is the type the column ends up with, and is not what
+    the reader is given: ``_materialize_ordered`` reads that column as text and
+    ``_parse_zoned`` parses it (#231).
     """
     import polars as pl
 
@@ -376,6 +380,168 @@ def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] 
     return repr(pairs)
 
 
+def _zoned_columns(overrides: dict) -> dict:
+    """The pinned columns whose timestamp type carries a zone, as ``{header_name: pl.Datetime}``."""
+    import polars as pl
+
+    return {name: dt for name, dt in overrides.items() if isinstance(dt, pl.Datetime) and dt.time_zone is not None}
+
+
+def _zoned_text_value(name: str):
+    """Zoned column *name*, which the scan read as text, with an empty cell as null.
+
+    ``missing_utf8_is_empty_string`` reads an empty cell of a string column as ``""``. It is meant for the file's
+    string columns, and an empty cell of a zoned column stays null, as it was when polars' reader parsed the column.
+    """
+    import polars as pl
+
+    return pl.when(pl.col(name) != "").then(pl.col(name))
+
+
+def _parse_zoned(lf, zoned: dict):
+    """Parse each zoned column of *lf*, which the scan read as text, into its declared type (ADR-005 D9(a), #231).
+
+    polars' CSV reader, given a ``Datetime`` with a zone, parses text with no UTC offset as UTC and converts it into
+    the zone, so ``09:30`` under America/New_York was stored as ``04:30-05:00``. ``str.to_datetime`` with
+    ``time_zone`` reads it the way D9(a) says: text with an offset is an instant and is converted into the zone, and
+    text without one is a wall-clock time in the zone, which gets the zone attached. The declared unit is kept, so
+    ``ns`` digits survive (#145).
+
+    It raises rather than shift a value:
+
+    - offset-less text that names a time the zone skips or repeats at a daylight-saving change, since no instant, or
+      two, fit it (``ambiguous="raise"``; a skipped time raises by default);
+    - a column that mixes text with and without an offset. The streaming engine infers one format per column, from
+      its first non-null value in file order, and parses every later batch with it (polars' ``strptime-infer``
+      node), so text of the other kind fails wherever it first appears;
+    - text that is not a timestamp, once the format is known.
+
+    The one gap is before the format is known: polars 1.40.1 turns a batch into nulls, without an error, when the
+    first non-null value it sees matches no format (fixed upstream in pola-rs/polars#28986). The file's first
+    non-null value is that value, so ``_unreadable_first_zoned_value`` checks it before the read.
+    """
+    return lf.with_columns(
+        _zoned_text_value(name).str.to_datetime(time_unit=dt.time_unit, time_zone=dt.time_zone, ambiguous="raise")
+        for name, dt in zoned.items()
+    )
+
+
+# Text ending in a UTC offset after a time of day: Z, +hh, +hhmm or +hh:mm. polars does the parsing; this only sorts
+# rows into the two kinds, to explain a failed read of a zoned column.
+_UTC_OFFSET = r"\d:\d{2}(?::\d{2}(?:[.,]\d+)?)?\s*(?:[Zz]|[+-]\d{2}(?::?\d{2})?)$"
+
+
+def _zoned_text(src: Path, scan_kwargs: dict, name: str):
+    """The non-null text of column *name* of *src*, with its row number counted from 1 after the header.
+
+    The row index is added after the select, so a column of the file's own named ``row`` does not collide with it.
+    """
+    import polars as pl
+
+    return (
+        pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs)
+        .select(_zoned_text_value(name).alias("text"))
+        .with_row_index("row", offset=1)
+        .filter(pl.col("text").is_not_null())
+    )
+
+
+def _cell(found) -> str:
+    """The value and row number of the one-row frame *found*, for an error message."""
+    return f"{found['text'][0]!r} (row {found['row'][0]})"
+
+
+def _zoned_label(name: str, dt, rename: dict) -> str:
+    """How an error names a zoned column: by its schema name, and its header when a positional schema renamed it."""
+    column = repr(name) if rename.get(name, name) == name else f"{rename[name]!r} (header {name!r})"
+    return f"tallyman_read_csv: column {column} is a timestamp with the zone {dt.time_zone!r}"
+
+
+def _not_a_timestamp(label: str, found) -> str:
+    return f"{label}, and {_cell(found)} is not a timestamp. Correct the value, or declare the column as a string."
+
+
+# The two ways offset-less text can name no single instant in a zone, as the error words them.
+_SKIPPED = "does not exist in {tz}: the clocks skip it at a daylight-saving change, so no instant matches it"
+_REPEATED = (
+    "occurs twice in {tz}: the clocks pass it twice at a daylight-saving change, once at each offset, so it names "
+    "two instants"
+)
+
+
+def _unreadable_first_zoned_value(src: Path, scan_kwargs: dict, zoned: dict, rename: dict) -> str | None:
+    """An error message when a zoned column's first non-null value is not a timestamp, else None.
+
+    ``_parse_zoned`` infers the column's format from that value, and polars 1.40.1 writes nulls instead of raising
+    when it matches no format. An eager parse of the one value raises in exactly that case. Reads the file only up to
+    the first non-null value of each zoned column.
+    """
+    import polars as pl
+
+    for name, dt in zoned.items():
+        first = _zoned_text(src, scan_kwargs, name).head(1).collect()
+        if first.is_empty():
+            continue
+        try:
+            first["text"].str.to_datetime(time_unit=dt.time_unit)
+        except pl.exceptions.PolarsError:
+            return _not_a_timestamp(_zoned_label(name, dt, rename), first)
+    return None
+
+
+def _explain_zoned_failure(src: Path, scan_kwargs: dict, zoned: dict, rename: dict) -> str | None:
+    """Why the zoned columns of *src* did not parse, as an error message, or None when they are not the reason.
+
+    Runs only after a read has failed. It reads each zoned column again as text and looks, in file order, for the
+    failures of ``_parse_zoned``: a row whose text has a UTC offset when the column's first value has none (or the
+    other way round), offset-less text that names a time the zone skips or repeats, and text that is not a timestamp.
+    """
+    import polars as pl
+
+    for name, dt in zoned.items():
+        tz, label = dt.time_zone, _zoned_label(name, dt, rename)
+        text = _zoned_text(src, scan_kwargs, name).with_columns(offset=pl.col("text").str.contains(_UTC_OFFSET))
+        try:
+            first = text.head(1).collect()
+            if first.is_empty():
+                continue
+            other = text.filter(pl.col("offset") != first["offset"][0]).head(1).collect()
+            if not other.is_empty():
+                with_offset, without = (first, other) if first["offset"][0] else (other, first)
+                return (
+                    f"{label} and mixes text with a UTC offset and text without one: {_cell(with_offset)} has an "
+                    f"offset and {_cell(without)} does not. Text with an offset is an instant, converted into the "
+                    "zone; text without one is a wall-clock time in the zone. A column is read one way, so write "
+                    "every value with its offset, or none of them."
+                )
+            if not first["offset"][0]:
+                wall = pl.col("text").str.to_datetime(time_unit=dt.time_unit, strict=False)
+                earliest = wall.dt.replace_time_zone(tz, ambiguous="earliest", non_existent="null")
+                unique = wall.dt.replace_time_zone(tz, ambiguous="null", non_existent="null")
+                found = (
+                    text.with_columns(
+                        skipped=wall.is_not_null() & earliest.is_null(),
+                        repeated=earliest.is_not_null() & unique.is_null(),
+                    )
+                    .filter(pl.col("skipped") | pl.col("repeated"))
+                    .head(1)
+                    .collect()
+                )
+                if not found.is_empty():
+                    why = (_SKIPPED if found["skipped"][0] else _REPEATED).format(tz=tz)
+                    return (
+                        f"{label}, where text with no UTC offset is a wall-clock time, and {_cell(found)} {why}. "
+                        "tallyman does not pick an instant for it. Correct the value, or write it with its UTC offset."
+                    )
+            parsed = pl.col("text").str.to_datetime(time_unit=dt.time_unit, time_zone=tz, strict=False)
+            found = text.filter(parsed.is_null()).head(1).collect()
+        except pl.exceptions.PolarsError:
+            continue  # the text defeats this explanation too, and the caller's general error stands
+        if not found.is_empty():
+            return _not_a_timestamp(label, found)
+    return None
+
+
 def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *, write) -> None:
     """Read *src* (a CSV) into a row-order-stable parquet at *tmp_path* (#143).
 
@@ -418,13 +584,22 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *
                 f"schema output column name. Rename that column to something other than {ROW_ORDER!r} in the schema."
             )
         explicit_only = plan["all_pinned"]
+    # A zoned column is read as text and parsed after the scan: the reader itself would convert offset-less text
+    # from UTC (#231).
+    zoned = _zoned_columns(plan["overrides"]) if plan else {}
+    if zoned:
+        unreadable = _unreadable_first_zoned_value(src, scan_kwargs, zoned, plan["rename"])
+        if unreadable is not None:
+            raise ValueError(unreadable)
 
     def _ordered(infer_len):
         if schema is None:
             lf = pl.scan_csv(str(src), infer_schema_length=infer_len, **scan_kwargs)
         else:
             il = 0 if plan["all_pinned"] else infer_len
-            lf = pl.scan_csv(str(src), schema_overrides=plan["overrides"], infer_schema_length=il, **scan_kwargs)
+            overrides = {**plan["overrides"], **dict.fromkeys(zoned, pl.String)}
+            lf = pl.scan_csv(str(src), schema_overrides=overrides, infer_schema_length=il, **scan_kwargs)
+            lf = _parse_zoned(lf, zoned)
         if has_row_order:
             lf = lf.drop(ROW_ORDER)  # overwritten by the fresh index below
         lf = lf.with_row_index(ROW_ORDER)
@@ -443,8 +618,12 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *
         try:
             write(_ordered(infer_len), tmp_path)
             return
-        except pl.exceptions.ComputeError as exc:
+        # InvalidOperationError is how str.to_datetime reports text that does not match the column's format.
+        except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
             last_exc = exc
+    zone_problem = _explain_zoned_failure(src, scan_kwargs, zoned, plan["rename"]) if zoned else None
+    if zone_problem is not None:
+        raise ValueError(zone_problem) from last_exc
     raise ValueError(
         f"tallyman_read_csv: the schema does not parse {src.name}: {last_exc}. "
         f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs, reserved)}"

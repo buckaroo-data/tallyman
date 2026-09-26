@@ -23,6 +23,7 @@ from buckaroo.compare import (
     stats_diff_xorq,
 )
 
+from tallyman_core.execution import execution_lock
 from tallyman_core.paths import ENTRY_SCHEMA_FILENAME
 from tallyman_xorq.row_order import without_row_order
 
@@ -133,9 +134,12 @@ def full_diff(
         )
 
     a_expr, b_expr = without_row_order(a_expr), without_row_order(b_expr)
-    stats = stats_diff_xorq(a_expr, b_expr)
-    head = head_diff_xorq(a_expr, b_expr)
-    keyed = None if keys == [] else key_diff_xorq(a_expr, b_expr, keys=keys)
+    # buckaroo's helpers execute both sides on the shared backend, one execution at a time per process (#118). The
+    # caller resolved a_expr and b_expr (which may heal, under the project lock) before this point.
+    with execution_lock():
+        stats = stats_diff_xorq(a_expr, b_expr)
+        head = head_diff_xorq(a_expr, b_expr)
+        keyed = None if keys == [] else key_diff_xorq(a_expr, b_expr, keys=keys)
 
     return {
         "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),

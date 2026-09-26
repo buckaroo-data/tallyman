@@ -225,3 +225,201 @@ def test_ordinary_reader_kwarg_still_forwarded(project):
     out = _import(project, "semicsv", p, separator=";")
     types = _types_of(project, out)
     assert "a" in types and "b" in types  # split into two columns, not one "a;b"
+
+
+# --------------------------------------------------------------------------- #
+# #231 — a zone on text with no UTC offset is attached, not converted (ADR-005 D9(a))
+# --------------------------------------------------------------------------- #
+NY = "America/New_York"
+
+
+def _zoned_snapshot(project: str, name: str, lines: list[str], dtype: str = f"timestamp({NY!r})"):
+    """Import a one-column CSV of *lines* under ``{"ts": dtype}`` and return the snapshot's ``ts`` column.
+
+    Read back with pyarrow, straight from the file the import wrote, so the test sees the stored instants and the
+    stored type with nothing between them and the assertion.
+    """
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    p = data_dir(project) / f"{name}.csv"
+    p.write_text("ts\n" + "\n".join(lines) + "\n")
+    out = _import(project, name, p, {"ts": dtype})
+    return pq.read_table(snapshot_path(project, out["hash"])).column("ts")
+
+
+def test_a_zone_attaches_to_offsetless_text(project):
+    """#231: ``09:30`` under America/New_York is 09:30 there, in winter and in summer.
+
+    polars' reader parsed it as UTC and converted, so it came out as 04:30-05:00 and 05:30-04:00. An empty field
+    stays null.
+    """
+    ts = _zoned_snapshot(project, "tz_wall", ["2024-01-02 09:30:00", "", "2024-07-02 09:30:00"])
+    assert str(ts.type) == f"timestamp[us, tz={NY}]"
+    assert [v and v.isoformat() for v in ts.to_pylist()] == [
+        "2024-01-02T09:30:00-05:00",
+        None,
+        "2024-07-02T09:30:00-04:00",
+    ]
+
+
+def test_a_zoned_nanosecond_column_keeps_its_digits(project):
+    """#231 with #145: a zone attached to offset-less text keeps the declared ``ns`` unit and every digit."""
+    import pyarrow as pa
+
+    ts = _zoned_snapshot(project, "tz_ns", ["2024-01-02 09:30:00.123456789"], f"timestamp({NY!r}, 9)")
+    assert str(ts.type) == f"timestamp[ns, tz={NY}]"
+    # 09:30:00.123456789 in New York in January is 14:30:00.123456789 UTC.
+    assert ts.cast(pa.int64()).to_pylist() == [1_704_205_800_123_456_789]
+
+
+def test_a_wall_clock_time_the_zone_skips_raises(project):
+    """#231: 02:30 on 2024-03-10 never happens in New York, so no instant is right for it and the import raises.
+
+    polars' reader read it as UTC and stored 2024-03-09 21:30-05:00.
+    """
+    lines = ["2024-03-09 12:00:00", "2024-03-10 01:59:59", "2024-03-10 02:30:00", "2024-03-10 03:00:00"]
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_gap", lines)
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "'2024-03-10 02:30:00' (row 3)" in err
+    assert f"does not exist in {NY}" in err
+
+
+def test_a_wall_clock_time_the_zone_repeats_raises(project):
+    """#231: 01:30 on 2024-11-03 happens twice in New York, once at -04:00 and once at -05:00, so the import raises
+    rather than picking one."""
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_overlap", ["2024-11-02 12:00:00", "2024-11-03 01:30:00"])
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "'2024-11-03 01:30:00' (row 2)" in err
+    assert f"occurs twice in {NY}" in err
+
+
+@pytest.mark.parametrize(
+    ("lines", "offset_row", "offsetless_row"),
+    [
+        (["2024-01-02 09:30:00", "2024-01-02T09:30:00+00:00"], 2, 1),
+        (["2024-01-02T09:30:00+00:00", "2024-01-02 09:30:00"], 1, 2),
+        # Far past the first morsel polars parses, so the rule is the column's, not a batch's.
+        (["2024-01-02 09:30:00"] * 50_000 + ["2024-01-02T09:30:00+00:00"], 50_001, 1),
+    ],
+    ids=["offset-second", "offset-first", "offset-late"],
+)
+def test_a_zoned_column_mixing_offset_and_offsetless_text_raises(project, lines, offset_row, offsetless_row):
+    """#231: text with an offset is an instant and text without one is a wall-clock time, and one column is read
+    one way, so a column with both raises an error that names the column and a row of each kind."""
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_mixed", lines)
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert "mixes text with a UTC offset and text without one" in err
+    assert f"'{lines[offset_row - 1]}' (row {offset_row})" in err
+    assert f"'{lines[offsetless_row - 1]}' (row {offsetless_row})" in err
+
+
+# These pass before and after the #231 fix: the parse of a zoned column moved out of polars' reader, and they pin what
+# it must keep doing.
+def test_offset_text_converts_into_the_zone(project):
+    """#231: text that carries an offset names an instant, which is converted into the zone."""
+    ts = _zoned_snapshot(project, "tz_offset", ["2024-01-02T09:30:00+00:00", "2024-07-02T09:30:00Z"])
+    assert str(ts.type) == f"timestamp[us, tz={NY}]"
+    assert [v.isoformat() for v in ts.to_pylist()] == ["2024-01-02T04:30:00-05:00", "2024-07-02T05:30:00-04:00"]
+
+
+def test_utc_reads_offsetless_text_as_utc(project):
+    """#231: under UTC, attaching the zone and reading as UTC are the same thing. A leading null is skipped when the
+    column's format is inferred."""
+    ts = _zoned_snapshot(project, "tz_utc", ["", "2024-01-02 09:30:00"], "timestamp('UTC')")
+    assert str(ts.type) == "timestamp[us, tz=UTC]"
+    assert [v and v.isoformat() for v in ts.to_pylist()] == [None, "2024-01-02T09:30:00+00:00"]
+
+
+def test_a_naive_timestamp_stays_naive(project):
+    """#231: a timestamp with no zone is read by polars' reader as before, and has no zone."""
+    ts = _zoned_snapshot(project, "naive_ts", ["2024-01-02 09:30:00"], "timestamp")
+    assert str(ts.type) == "timestamp[us]"
+    assert [v.isoformat() for v in ts.to_pylist()] == ["2024-01-02T09:30:00"]
+
+
+def test_a_zoned_column_renamed_by_position_beside_inferred_columns(project):
+    """#231: the zoned parse is keyed on the header name and runs before a positional rename, in inference mode."""
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    p = data_dir(project) / "tz_pos.csv"
+    p.write_text("ts,v\n2024-01-02 09:30:00,1\n")
+    out = _import(project, "tz_pos", p, (("when", "timestamp('UTC')"), ("&rest", "infer")))
+    table = pq.read_table(snapshot_path(project, out["hash"]))
+    assert [v.isoformat() for v in table.column("when").to_pylist()] == ["2024-01-02T09:30:00+00:00"]
+    assert table.column("v").to_pylist() == [1]
+
+
+@pytest.mark.parametrize(
+    "lines",
+    [["hello", "2024-01-02 09:30:00"], ["2024-01-02 09:30:00", "not a time"]],
+    ids=["first-value", "later-value"],
+)
+def test_text_that_is_not_a_timestamp_raises_in_a_zoned_column(project, lines):
+    """#231: a value that is not a timestamp raises and is never stored as null.
+
+    The first case is the one polars 1.40.1's streaming parse gets wrong on its own: it infers the column's format
+    from the first value, finds none, and writes the whole batch as nulls, including the good value after it.
+    """
+    bad = next(v for v in lines if not v.startswith("2024"))
+    with pytest.raises(ValueError) as exc:
+        _zoned_snapshot(project, "tz_junk", lines)
+    err = str(exc.value)
+    assert "'ts'" in err
+    assert bad in err
+
+
+# Found in review of #244: reading a zoned column as text must not change which CSVs import.
+def _csv_snapshot(project: str, name: str, text: str, schema, **reader_options):
+    """Import *text* as a CSV under *schema* and return the snapshot the import wrote, read with pyarrow."""
+    import pyarrow.parquet as pq
+
+    from tallyman_xorq.materialize import snapshot_path
+
+    p = data_dir(project) / f"{name}.csv"
+    p.write_text(text)
+    out = _import(project, name, p, schema, **reader_options)
+    return pq.read_table(snapshot_path(project, out["hash"]))
+
+
+ROW_AND_ZONED = {"row": "int64", "ts": f"timestamp({NY!r})"}
+
+
+def test_a_zoned_column_beside_a_column_named_row(project):
+    """A header named ``row`` is the file's own column, and the zoned column beside it imports."""
+    table = _csv_snapshot(project, "tz_row", "row,ts\n7,2024-01-02 09:30:00\n", ROW_AND_ZONED)
+    assert table.column("row").to_pylist() == [7]
+    assert [v.isoformat() for v in table.column("ts").to_pylist()] == ["2024-01-02T09:30:00-05:00"]
+
+
+def test_a_zoned_failure_beside_a_column_named_row_is_explained(project):
+    """The explanation of a failed zoned column reads the file again; a ``row`` header does not defeat it."""
+    with pytest.raises(ValueError) as exc:
+        _csv_snapshot(project, "tz_row_gap", "row,ts\n1,2024-03-10 01:59:59\n2,2024-03-10 02:30:00\n", ROW_AND_ZONED)
+    assert f"'2024-03-10 02:30:00' (row 2) does not exist in {NY}" in str(exc.value)
+
+
+@pytest.mark.parametrize(
+    ("text", "ts", "s"),
+    [
+        ("ts,s\n,a\n2024-01-02 09:30:00,\n", [None, "2024-01-02T09:30:00-05:00"], ["a", ""]),
+        ("ts,s\n2024-01-02 09:30:00,\n,a\n", ["2024-01-02T09:30:00-05:00", None], ["", "a"]),
+    ],
+    ids=["empty-first", "empty-later"],
+)
+def test_an_empty_zoned_cell_is_null_when_empty_strings_are_kept(project, text, ts, s):
+    """``missing_utf8_is_empty_string`` keeps an empty cell as ``""`` in a string column. A zoned column is read as
+    text, but an empty cell in it is still null, as it was when polars' reader parsed it."""
+    schema = {"ts": f"timestamp({NY!r})", "s": "string"}
+    table = _csv_snapshot(project, "tz_empty", text, schema, missing_utf8_is_empty_string=True)
+    assert [v and v.isoformat() for v in table.column("ts").to_pylist()] == ts
+    assert table.column("s").to_pylist() == s

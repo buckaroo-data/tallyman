@@ -52,12 +52,15 @@ from tallyman_core import (
     write_stat,
 )
 from tallyman_core.events import record_event
+from tallyman_core.server_lock import companion_url, resolved_home
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
 
 log = logging.getLogger("tallyman_mcp")
-COMPANION_URL = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
+# The companion is found per call with ``companion_url()``: the port the server holding this data dir serves on, from
+# its owner record, so a second tallyman on its own data dir is notified and linked, not the one on 7860. With no server
+# on this data dir there is no companion: notifies are skipped, replies carry no link, project changes fail (#183).
 
 # Identifies this MCP process in the project activity log. Claude Code spawns one
 # `tallyman mcp` per session, so one process == one session; multiple sessions
@@ -215,13 +218,23 @@ mcp.tool = _checkpointing_tool
 
 
 def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
-    """Best-effort POST to the companion's /internal/notify. Never raise."""
+    """Best-effort POST to the companion's /internal/notify. Never raise.
+
+    ``home`` names this data dir, so a companion serving another one refuses the notify (409) instead of publishing
+    this project's events to its own browsers (#183).
+    """
+    base = companion_url()
+    if base is None:
+        return  # no server on this data dir: no browsers to tell
+    url = f"{base}/internal/notify"
     try:
         with httpx.Client(timeout=2.0) as client:
-            client.post(
-                f"{COMPANION_URL}/internal/notify",
-                json={"kind": kind, "hash": content_hash, "extra": extra or None},
+            resp = client.post(
+                url,
+                json={"kind": kind, "hash": content_hash, "extra": extra or None, "home": str(resolved_home())},
             )
+            if resp.status_code >= 400:
+                print(f"[tallyman_mcp] notify {kind} refused by {url}: {resp.status_code} {resp.text}", file=sys.stderr)
     except Exception as exc:
         # Companion may not be up; that's allowed. Log and move on.
         print(f"[tallyman_mcp] notify failed ({kind}): {exc}", file=sys.stderr)
@@ -653,8 +666,10 @@ def catalog_import_source(
     return out
 
 
-def _entry_url(project: str, content_hash: str) -> str:
-    return f"{COMPANION_URL}/{project}/catalog/{content_hash}"
+def _entry_url(project: str, content_hash: str) -> str | None:
+    """The entry's page on the companion of this data dir, or None when no server is running on it."""
+    base = companion_url()
+    return None if base is None else f"{base}/{project}/catalog/{content_hash}"
 
 
 def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
@@ -1676,14 +1691,23 @@ def _companion_post(path: str, payload: dict) -> dict:
     ``{"error": ...}`` dict that the MCP caller can render. The companion
     URL is included so the LLM can tell the user which endpoint to bring
     up if the request failed."""
-    url = f"{COMPANION_URL}{path}"
+    base = companion_url()
+    if base is None:
+        return {
+            "error": (
+                f"no tallyman server is running on data dir {resolved_home()}. "
+                f"Project lifecycle tools require 'tallyman run' to be active on it."
+            )
+        }
+    url = f"{base}{path}"
     try:
         with httpx.Client(timeout=10.0) as client:
-            resp = client.post(url, json=payload)
+            # `home` names this data dir, so a companion serving another one refuses the change (#183).
+            resp = client.post(url, json={**payload, "home": str(resolved_home())})
     except httpx.HTTPError as exc:
         return {
             "error": (
-                f"companion not reachable at {COMPANION_URL}: {exc!s}. "
+                f"companion not reachable at {base}: {exc!s}. "
                 f"Project lifecycle tools require 'tallyman run' to be active."
             )
         }

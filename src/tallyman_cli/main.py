@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import signal
+import socket
 from pathlib import Path
 
 import click
@@ -81,9 +83,17 @@ def _notify_companion_reset(project: str) -> None:
     """
     import httpx
 
-    url = os.environ.get("TALLYMAN_COMPANION_URL", "http://127.0.0.1:7860")
+    from tallyman_core.server_lock import companion_url, resolved_home
+
+    url = companion_url()
+    if url is None:
+        return  # no server on this data dir, so no browsers or Buckaroo sessions to reload
+    # `home` names this data dir, so a companion serving another one refuses the notify (#183).
+    payload = {"kind": "project_reset", "project": project, "home": str(resolved_home())}
     try:
-        httpx.post(f"{url}/internal/notify", json={"kind": "project_reset", "project": project}, timeout=2.0)
+        resp = httpx.post(f"{url}/internal/notify", json=payload, timeout=2.0)
+        if resp.status_code == 409:
+            click.echo(f"the companion at {url} refused the reload: {resp.json().get('detail')}")
     except Exception:
         pass  # companion may not be running; the reset itself already landed
 
@@ -132,7 +142,7 @@ def revisions_label(step: int, name: str, project_opt: str | None) -> None:
 @click.option(
     "--project",
     default=None,
-    help="Project name (defaults to TALLYMAN_PROJECT env or 'spike').",
+    help="Project name (defaults to the data dir's active project, seeded from TALLYMAN_PROJECT).",
 )
 @click.option("--port", default=7860, type=int)
 @click.option("--host", default="127.0.0.1")
@@ -143,44 +153,115 @@ def revisions_label(step: int, name: str, project_opt: str | None) -> None:
 )
 @click.option("--buckaroo-port", default=8700, type=int)
 def run_companion(project: str | None, port: int, host: str, buckaroo: bool, buckaroo_port: int) -> None:
-    """Start the companion FastAPI app."""
-    project_name = resolve_project(project)
-    if not project_dir(project_name).exists():
-        raise click.ClickException(f"project '{project_name}' not found. Run `tallyman init {project_name}` first.")
-    os.environ.setdefault("TALLYMAN_PROJECT", project_name)
-    click.echo(f"tallyman run · project={project_name} · http://{host}:{port}")
+    """Start the companion FastAPI app.
 
-    from tallyman_companion import create_app
-    from tallyman_companion.buckaroo_lifecycle import BuckarooManager, BuckarooUnavailable
+    One server runs per data dir (TALLYMAN_HOME, #183): it claims the data dir before anything else, and a second
+    `tallyman run` on the same one is refused. A second tallyman runs on its own data dir and port.
+    """
+    from tallyman_core.net import client_host, port_in_use
+    from tallyman_core.paths import list_projects
+    from tallyman_core.server_lock import DataDirInUse, claim_data_dir, release_data_dir
 
-    bk: BuckarooManager | None = None
-    if buckaroo:
-        buckaroo_log = project_dir(project_name) / "buckaroo.log"
-        # Address the Buckaroo subprocess uses to POST per-grid-load telemetry
-        # back to us (buckaroo#943). When bound to 0.0.0.0 (all interfaces), the
-        # subprocess must still reach us on the loopback, not the wildcard.
-        telemetry_host = "127.0.0.1" if host in ("0.0.0.0", "") else host
-        companion_base_url = f"http://{telemetry_host}:{port}"
-        bk = BuckarooManager(
-            port=buckaroo_port,
-            log_file=buckaroo_log,
-            companion_base_url=companion_base_url,
-        )
-        try:
-            bk.start()
-            # T-35: include PID + bound port so `ps`/`lsof` disambiguation is
-            # trivial when stale buckaroos linger from earlier debugging.
-            click.echo(f"  buckaroo · {bk.base_url} pid={bk.proc.pid if bk.proc else '?'} (log: {buckaroo_log})")
-        except BuckarooUnavailable as exc:
-            click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
-            bk = None
-
-    app = create_app(project_name, buckaroo=bk)
+    host = host.strip("[]")  # `[::1]` is an IPv6 address as a URL writes it; sockets and uvicorn take it bare
     try:
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        claim = claim_data_dir(port=port, bind_host=host)
+    except DataDirInUse as exc:
+        raise click.ClickException(str(exc)) from None
+    data_dir = Path(claim["data_dir"])
+
+    # uvicorn shuts down on SIGTERM and then re-raises it with the handler it found installed. Python's default kills
+    # the process there, before the `finally` below releases the claim and stops Buckaroo; this one exits through it.
+    previous_sigterm = signal.signal(signal.SIGTERM, _exit_on_sigterm)
+    bk = None  # the BuckarooManager once started, stopped on the way out
+    served = False
+    try:
+        project_name = resolve_project(project)
+        if project_name is None:
+            # A fresh data dir has none: `tallyman init` makes a project without making it active.
+            projects = list_projects()
+            hint = (
+                f"Pass --project with one of its projects: {', '.join(projects)}."
+                if projects
+                else "It has no projects: create one with `tallyman init <name>`, then pass --project <name>."
+            )
+            raise click.ClickException(f"no active project in data dir {data_dir}. {hint}")
+        if not project_dir(project_name).exists():
+            raise click.ClickException(f"project '{project_name}' not found. Run `tallyman init {project_name}` first.")
+        # Checked before Buckaroo starts, so a refused run leaves nothing running.
+        if port_in_use(host, port):
+            raise click.ClickException(
+                f"port {port} on {host} is already in use. Pass --port to serve this data dir ({data_dir}) on another."
+            )
+        os.environ.setdefault("TALLYMAN_PROJECT", project_name)
+        url = f"http://{client_host(host)}:{port}"  # where a process on this machine reaches the companion
+        click.echo(f"tallyman run · project={project_name} · data dir={data_dir} · {url}")
+
+        from tallyman_companion import create_app
+        from tallyman_companion.buckaroo_lifecycle import BuckarooManager, BuckarooUnavailable
+
+        if buckaroo:
+            buckaroo_log = project_dir(project_name) / "buckaroo.log"
+            # The Buckaroo subprocess POSTs per-grid-load telemetry back to us there
+            # (buckaroo#943): on the loopback when we are bound to a wildcard.
+            bk = BuckarooManager(
+                port=buckaroo_port,
+                log_file=buckaroo_log,
+                companion_base_url=url,
+            )
+            try:
+                bk.start()
+                # T-35: include PID + bound port so `ps`/`lsof` disambiguation is
+                # trivial when stale buckaroos linger from earlier debugging.
+                click.echo(f"  buckaroo · {bk.base_url} pid={bk.proc.pid if bk.proc else '?'} (log: {buckaroo_log})")
+            except BuckarooUnavailable as exc:
+                click.echo(f"  buckaroo failed to start: {exc} (continuing without it)")
+                bk = None
+
+        app = create_app(project_name, buckaroo=bk)
+        served = True
+        _serve(app, host, port)
     finally:
+        # Released only once uvicorn has returned and Buckaroo has stopped. uvicorn closes the port first and then
+        # finishes in-flight requests (a build, a recalc), and Buckaroo reads and writes the data dir's entries (their
+        # stat caches) until it exits, so a restart has to wait for this process to exit, not for the port to close.
+        # A crash or SIGKILL releases the claim too: the kernel drops the lock with the process.
         if bk is not None:
             bk.stop()
+        release_data_dir(data_dir)
+        signal.signal(signal.SIGTERM, previous_sigterm)
+        if served:
+            click.echo(f"tallyman run · stopped · data dir={data_dir}")
+
+
+def _serve(app, host: str, port: int) -> None:
+    """Serve *app* on *host*:*port* until it shuts down.
+
+    A server on ``::`` takes IPv4 too: local work defaults to IPv4, and the local URL tallyman gives for any wildcard
+    is 127.0.0.1 (``net.client_host``). uvicorn alone binds ``::`` through asyncio's ``create_server``, which
+    sets IPV6_V6ONLY, so that socket is bound here, dual-stack, and handed to uvicorn.
+    """
+    if host != "::":
+        uvicorn.run(app, host=host, port=port, log_level="info")
+        return
+    with socket.socket(socket.AF_INET6, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)  # as asyncio binds
+        sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        try:
+            sock.bind(("::", port))
+        except OSError as exc:
+            raise click.ClickException(f"port {port} on :: cannot be bound ({exc.strerror}). Pass --port.") from None
+        server = uvicorn.Server(uvicorn.Config(app, host="::", port=port, log_level="info"))
+        # What uvicorn.run does around Server.run: Ctrl-C is a normal stop, and a failed startup exits 3.
+        try:
+            server.run(sockets=[sock])
+        except KeyboardInterrupt:
+            pass
+        if not server.started:
+            raise SystemExit(3)
+
+
+def _exit_on_sigterm(signum: int, frame) -> None:
+    raise SystemExit(128 + signum)
 
 
 @cli.command("mcp")

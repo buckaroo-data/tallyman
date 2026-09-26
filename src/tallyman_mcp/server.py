@@ -143,6 +143,8 @@ _NO_CHECKPOINT = frozenset(
         "catalog_promote_diff",  # self-checkpoints one tx for the promote + cascade (no double-commit)
         "catalog_list_summary_stats",
         "catalog_list_post_processings",
+        "catalog_list_display_klasses",
+        "catalog_chart_errors",  # reads the error log; its own error is a list item, not a top-level "error"
         "catalog_run_post_processing",  # preview, persists nothing
         "catalog_export_marimo",  # export artifact, not state
         "project_list",

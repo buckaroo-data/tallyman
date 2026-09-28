@@ -478,6 +478,26 @@ table.data-table th { background: #0a0c12; position: sticky; top: 0; }
   min-height: 240px;
 }
 .buckaroo-embed.nb-buckaroo { height: auto; }
+/* Pinned-row line charts in diff views: lineRed is the new side, lineGray the
+   old. Buckaroo's ChartCell draws its fixed line slots with gray last, so the
+   old series paints over the new one. Make red brighter and heavier, and the
+   gray translucent so red reads through. (1px strokes and no dots come from
+   buckaroo >= 0.15.6.) */
+.buckaroo-embed .histogram-component path.recharts-line-curve[stroke="red"] {
+  stroke: #ff4a3d;
+  stroke-width: 2;
+}
+.buckaroo-embed .histogram-component path.recharts-line-curve[stroke="gray"] {
+  stroke: rgba(158, 163, 173, 0.55);
+}
+/* Buckaroo's hidden YAxis pads the plot 2px, which isn't enough for the 2px
+   red stroke: a series sitting at dataMin still loses half its stroke to the
+   SVG clip and sits flush on the row border. Let strokes overflow the SVG,
+   and lift line charts (only) a hair off the border. */
+.buckaroo-embed .histogram-component svg.recharts-surface { overflow: visible; }
+.buckaroo-embed .histogram-component svg.recharts-surface:has(.recharts-line-curve) {
+  transform: translateY(-2px);
+}
 
 /* ── Buttons ── */
 .edit-code-btn {

@@ -82,6 +82,33 @@ expr = t.mutate(built_at=ibis.now())
     assert any("now()" in w for w in out["lint_warnings"])
 
 
+# DataFusion's SanityCheckPlan rejects a window keyed on .contains() (strpos) or .re_search(): the SortExec below
+# the window sorts on the same expression, but the check does not see the ordering as satisfied.
+_WINDOW_ON_COMPUTED_KEY = {
+    "order_by": 'ibis.window(group_by="region", order_by=[t.category.contains("a").cast("int8"), t.order_id])',
+    "group_by": 'ibis.window(group_by=t.category.re_search("a"), order_by=t.order_id)',
+}
+
+
+@pytest.mark.parametrize("window", list(_WINDOW_ON_COMPUTED_KEY.values()), ids=list(_WINDOW_ON_COMPUTED_KEY))
+def test_a_window_keyed_on_a_computed_expression_fails_with_a_hint_to_mutate_it_first(
+    project: str, orders_src: str, monkeypatch, window: str
+):
+    """The error names a physical plan node, not the recipe line. The hint says to mutate the key into a column and
+    window over that column, which builds."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
+expr = t.mutate(rn=ibis.row_number().over({window}))
+"""
+    out = catalog_run(code, prompt="window on a computed key")
+    assert "SanityCheckPlan" in out["error"]
+    assert "hint" in out
+    assert "mutate" in out["hint"]
+
+
 def test_catalog_import_source_repeated_on_unchanged_bytes_is_a_noop(project: str, orders_parquet, monkeypatch):
     """The old catalog_load_parquet errored on an existing alias; an import of the same bytes is idempotent."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)

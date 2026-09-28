@@ -1494,11 +1494,38 @@ def catalog_add_display_klass(name: str, source: str) -> dict:
                 {'primary_key_val': 'most_freq',  'displayer_args': {'displayer': 'inherit'}},
             ]
 
-    Pinned-row displayer options:
-      - ``'inherit'``  — use the column's natural type displayer (recommended)
-      - ``'obj'``      — render as a raw Python object (fallback)
-      - ``'float'``    — fixed decimal places (for numeric stats)
-      - ``'histogram'``— histogram bar (only for the ``histogram`` stat key)
+    PER-COLUMN FORMATTING — override ``style_column`` and set ``displayer_args``::
+
+        class Money(DefaultMainStyling):
+            df_display_name = "main"
+
+            @classmethod
+            def style_column(cls, col, column_metadata):
+                cc = super().style_column(col, column_metadata)
+                name = column_metadata.get("orig_col_name", col)  # col is a short id: "a", "b", ...
+                if name == "season":  # 2024, not 2,024
+                    cc["displayer_args"] = {"displayer": "string"}
+                elif name == "revenue_m":  # 55.0 -> $55.0M
+                    cc["displayer_args"] = {"displayer": "float", "min_fraction_digits": 1,
+                                            "max_fraction_digits": 1, "prefix": "$", "suffix": "M"}
+                elif name == "payroll":  # 34400000 -> $34.4M
+                    cc["displayer_args"] = {"displayer": "compact_number", "prefix": "$"}
+                return cc
+
+    Displayers (the numeric ones always group thousands, en-US; there is no option to turn it off):
+      - ``integer``        — ``max_digits`` (pad width). 2024 -> "2,024".
+      - ``float``          — ``min_fraction_digits``, ``max_fraction_digits``. Integer columns default to 0/0.
+      - ``compact_number`` — no args; K/M/B from the raw value, at most 1 decimal: 34400000 -> "34.4M", 53.1 -> "53.1".
+      - ``string``         — ``max_length``. Shows a number as is and null as blank: use it for years and ids.
+      - ``obj``            — Python-style text; null shows "None".
+      - ``prefix``/``suffix`` wrap any of these; ``string`` skips them for a non-string value.
+    Pinned rows take the same displayers, plus ``inherit`` (the column's own displayer; recommended) and
+    ``histogram`` (the ``histogram`` stat only). ``column_metadata`` also holds the column's summary stats
+    (``min``, ``max``, ``_type``, ...).
+
+    This tool only execs the class. ``style_column`` first runs when a table renders, with a small builtins
+    whitelist: no ``any``, ``all``, ``sorted``, ``getattr`` or ``hasattr``. A column whose ``style_column`` raises
+    keeps the parent class's styling, logged as "styling failed" in ``~/.buckaroo/logs/server.log``.
 
     The ``df_display_name`` must match an existing display slot:
       - ``"main"``     — the primary table view (override DefaultMainStyling)

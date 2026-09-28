@@ -109,6 +109,30 @@ expr = t.mutate(rn=ibis.row_number().over({window}))
     assert "mutate" in out["hint"]
 
 
+def test_an_error_with_no_known_fix_and_a_build_that_succeeds_carry_no_hint(project: str, orders_src: str, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    assert "hint" not in catalog_run("expr = nope", prompt="broken")
+    code = f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
+t = t.mutate(k=t.category.contains("a"))
+expr = t.mutate(rn=ibis.row_number().over(ibis.window(group_by="region", order_by=[t.k, t.order_id])))
+"""
+    out = catalog_run(code, prompt="the key mutated first")
+    assert "error" not in out
+    assert "hint" not in out
+
+
+def test_the_window_hint_matches_the_error_as_the_arrow_reader_wraps_it():
+    """A transcript saw the same failure raised through the Arrow C stream, prefixed and naming the bounded node."""
+    from tallyman_mcp.hints import hint_for
+
+    message = 'Arrow error: C Data interface error: Invalid: SanityCheckPlan\nPlan: ["BoundedWindowAggExec: ...'
+    assert "mutate" in hint_for(message)
+    assert hint_for('SanityCheckPlan\ncaused by\nPlan: ["SortExec: ...') is None
+
+
 def test_catalog_import_source_repeated_on_unchanged_bytes_is_a_noop(project: str, orders_parquet, monkeypatch):
     """The old catalog_load_parquet errored on an existing alias; an import of the same bytes is idempotent."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)

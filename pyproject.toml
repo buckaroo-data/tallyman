@@ -4,6 +4,8 @@ version = "0.0.1"
 description = "tallyman — deconstructed notebook platform"
 requires-python = ">=3.13,<3.14"
 readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
 dependencies = [
     "xorq==0.3.26",
     "fastmcp>=2.0",

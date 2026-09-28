@@ -608,6 +608,14 @@ def create_app(
     read_only: bool = False,
     buckaroo: "BuckarooManager | None" = None,
 ) -> FastAPI:
+    # xorq's build_expr forks a bare `git` for provenance, and a fork from this multithreaded server can die with
+    # SIGSEGV on macOS (plans/ADR-001-git-subprocess-threading.md, #267). The companion builds too: a grid's view
+    # build, a diff's compare build and the re-hash after an unfaithful heal. Catalog writes, which also install the
+    # guard, usually run in the MCP process, so the companion installs it itself.
+    from tallyman_xorq._git_state_guard import install_git_state_guard
+
+    install_git_state_guard()
+
     # ``project`` (if given) seeds the active-project file on startup but is
     # never the runtime source of truth — every route re-resolves via
     # ``_current_project()`` so dropdown switches take effect without

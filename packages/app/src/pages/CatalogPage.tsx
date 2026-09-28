@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
-import { useSSE } from "../SSEContext";
+import { useSSE, useSSEEvents } from "../SSEContext";
 import { recalcTarget } from "../recalcRefresh";
 import { CatalogSidebar } from "../components/CatalogSidebar";
 import { BuckarooEmbed } from "../components/BuckarooEmbed";
@@ -633,7 +633,7 @@ export function CatalogPage() {
     hash?: string;
     errorId?: string;
   }>();
-  const { version, lastEvent } = useSSE();
+  const { version } = useSSE();
   const navigate = useNavigate();
   const [entries, setEntries] = useState<Entry[]>([]);
   const [errors, setErrors] = useState<AppError[]>([]);
@@ -650,19 +650,21 @@ export function CatalogPage() {
   // A recalc re-points aliases to recomputed hashes; if the open entry view is
   // one of them (and this tab is backgrounded — see recalcTarget), navigate to
   // the new hash so the detail pane (keyed on the URL hash) refetches the fresh
-  // result. Process each SSE version at most once (StrictMode double-fires
-  // effects), mirroring NewEntryPill. Seed `seen` with the mount-time version so
-  // a recalc that fired before this page mounted isn't replayed on first render.
-  const seenRecalc = useRef(version);
-  useEffect(() => {
-    if (version === seenRecalc.current) return;
-    seenRecalc.current = version;
-    if (!project || !lastEvent || lastEvent.kind !== "recalc") return;
+  // result. useSSEEvents hands over every recalc since mount, even one followed
+  // at once by another event (a promote that re-points an alias sends `recalc`
+  // then `entry_added`). `viewed` follows a navigation made in this same batch,
+  // before the URL change renders, so a second recalc chains from its target.
+  const viewed = useRef(hash);
+  viewed.current = hash;
+  useSSEEvents((event) => {
+    if (!project || event.kind !== "recalc") return;
     const focused = typeof document !== "undefined" && document.hasFocus();
-    const target = recalcTarget(hash, lastEvent.remap as Record<string, string> | undefined, focused);
-    if (target && target !== hash) navigate(`/${project}/catalog/${target}`);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [version]);
+    const target = recalcTarget(viewed.current, event.remap as Record<string, string> | undefined, focused);
+    if (target && target !== viewed.current) {
+      viewed.current = target;
+      navigate(`/${project}/catalog/${target}`);
+    }
+  });
 
   useEffect(() => {
     localStorage.setItem("catalog.sidebarCollapsed", sidebarCollapsed ? "1" : "0");

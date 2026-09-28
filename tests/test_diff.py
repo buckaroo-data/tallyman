@@ -136,6 +136,98 @@ def test_full_diff_against_two_builds(project: str, orders_src: str):
     assert diff["keyed"] is not None  # region is a shared key
 
 
+def _one_row_inserted(project: str, tmp_path: Path) -> str:
+    """Import V1 of a source alias ``rows`` and a V2 that is V1 with one row inserted at the front.
+
+    Only ``id`` is a key: ``name`` and ``v`` repeat, alone and together. Returns the alias.
+    """
+    import pyarrow as pa
+
+    from tallyman_xorq.source_import import update_and_depend
+
+    v1 = {"id": [1, 2, 3, 4, 5], "name": ["x", "x", "y", "y", "x"], "v": [1, 1, 2, 2, 1]}
+    v2 = {col: [new, *vals] for (col, vals), new in zip(v1.items(), (0, "y", 2))}
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    for n, cols in ((1, v1), (2, v2)):
+        path = incoming / f"rows_v{n}.parquet"
+        pq.write_table(pa.table(cols), path)
+        update_and_depend(path, "rows", project=project)
+    return "rows"
+
+
+def _html_table(html: str) -> tuple[list[str], list[list[str]]]:
+    """The header and body cells of the one table ``DataFrame.to_html`` wrote."""
+    from html.parser import HTMLParser
+
+    class _Cells(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[str]] = []
+            self._text: list[str] | None = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self.rows.append([])
+            elif tag in ("td", "th"):
+                self._text = []
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self._text is not None:
+                self.rows[-1].append("".join(self._text).strip())
+                self._text = None
+
+        def handle_data(self, data):
+            if self._text is not None:
+                self._text.append(data)
+
+    parser = _Cells()
+    parser.feed(html)
+    return parser.rows[0], parser.rows[1:]
+
+
+def _cell(text: str):
+    """A rendered cell as a comparable value: null, a number (``1`` and ``1.0`` agree), or the text."""
+    if text in ("", "NaN", "None", "<NA>", "NaT"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def test_full_diff_one_inserted_row_is_the_only_row_that_differs(project: str, tmp_path: Path):
+    # #200: __row_order is a row's position in its entry's file, so a row inserted at the front moves every later row
+    # by one. A keyed diff that compares it as data shows every matched row as changed. Only the inserted row differs.
+    from tallyman_core import entry_dir
+    from tallyman_core.aliases import history_for
+    from tallyman_xorq.primary_key import diff_keys
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    alias = _one_row_inserted(project, tmp_path)
+    a_hash, b_hash = history_for(project, alias)
+    diff = full_diff(
+        entry_dir(project, a_hash),
+        entry_dir(project, b_hash),
+        a_expr=cached_result_expr(project, a_hash),
+        b_expr=cached_result_expr(project, b_hash),
+        keys=diff_keys(project, a_hash, b_hash),
+    )
+    keyed = diff["keyed"]
+    assert keyed["keys"] == ["id"]
+    assert (keyed["matched"], keyed["only_before"], keyed["only_after"]) == (5, 0, 1)
+
+    header, rows = _html_table(keyed["table_html"])
+    assert len(rows) == 6
+    compared = [c.removesuffix("_before") for c in header if c.endswith("_before")]
+
+    def differs(row: list[str]) -> bool:
+        return any(_cell(row[header.index(f"{c}_before")]) != _cell(row[header.index(f"{c}_after")]) for c in compared)
+
+    assert [_cell(row[header.index("id")]) for row in rows if differs(row)] == [0.0]
+    assert "__row_order" not in {s["name"] for s in diff["stats"]}
+
+
 # ---------------------------------------------------------------------------
 # catalog_diff MCP tool
 # ---------------------------------------------------------------------------
@@ -157,6 +249,19 @@ def test_catalog_diff_explicit_versions(project: str, orders_src: str, monkeypat
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_diff("shoe_sales", 1, 2)
     assert "error" not in out
+
+
+def test_catalog_diff_one_inserted_row_reports_one_added_row_and_no_row_order(
+    project: str, tmp_path: Path, monkeypatch
+):
+    # #200 end to end through the MCP tool: the stats cover the data columns only, and the keyed summary counts the
+    # inserted row as the one added row.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    alias = _one_row_inserted(project, tmp_path)
+    out = catalog_diff(alias, 1, 2)
+    assert "error" not in out, out
+    assert [s["name"] for s in out["stats"]] == ["id", "name", "v"]
+    assert out["keyed_summary"] == {"keys": ["id"], "only_before": 0, "only_after": 1, "matched": 5}
 
 
 def test_catalog_diff_no_history(project: str, monkeypatch):

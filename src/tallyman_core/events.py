@@ -22,6 +22,7 @@ from tallyman_core.paths import artifacts_dir, ensure_project
 _CATEGORY = {
     "build_ok": "mcp",
     "build_error": "mcp",
+    "after_import_error": "mcp",
     "alias_set": "alias",
     "buckaroo": "buckaroo",
 }
@@ -32,9 +33,10 @@ def _events_path(project: str):
 
 
 def record_event(project: str, kind: str, **fields) -> dict:
-    """Append one event. ``kind`` is one of build_ok / build_error / alias_set /
-    buckaroo; ``fields`` carries the kind-specific payload (session, tool, alias,
-    version, hash, prompt, code, message, traceback, status, detail, *_ms …).
+    """Append one event. ``kind`` is one of build_ok / build_error /
+    after_import_error / alias_set / buckaroo; ``fields`` carries the
+    kind-specific payload (session, tool, alias, version, hash, prompt, code,
+    message, traceback, status, detail, *_ms …).
     Best-effort and never raises — logging must not break a build or a page."""
     ev = {
         "ts": datetime.now(timezone.utc).isoformat(),

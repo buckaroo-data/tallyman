@@ -341,8 +341,9 @@ def test_suggested_schema_recovery_is_pasteable_with_reserved_column(project):
     assert alias_kind(project, "suggest_oro") is None, "a failed import must not claim the alias"
     assert list_entries(project) == [], "a failed import must not leave a half-written entry"
 
-    # The suggestion must paste back and parse.
-    suggested = ast.literal_eval(msg.rsplit("schema=", 1)[-1].strip())
+    # The suggestion must paste back and parse. It arrives as the import to run (#227), whose schema= is the suggestion.
+    call = ast.parse(msg[msg.index("catalog_import_source(") :].rstrip("."), mode="eval").body
+    suggested = next(ast.literal_eval(k.value) for k in call.keywords if k.arg == "schema")
     out = update_and_depend(p, "suggest_oro", project=project, schema=suggested)
     assert (out["version"], out["created"]) == (1, True)
     types = {name: str(dtype) for name, dtype in cached_result_expr(project, out["hash"]).schema().items()}

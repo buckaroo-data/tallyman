@@ -611,14 +611,22 @@ def catalog_import_source(
 
     Returns:
         dict with keys: hash, alias, version, created, row_count, schema, path,
-        digest, url — plus `recalc` when advancing the alias cascaded.
+        digest, url — plus `recalc` when advancing the alias cascaded. A parquet
+        column xorq has no type for is left out of the entry, and named in
+        `omitted_columns` and a `warning`: TELL THE USER which columns are missing.
+        `after_import_error` ({error, error_id}) means the import happened but a
+        step after it (the notebook, carrying config forward, the recalc) failed.
     """
     from tallyman_xorq.source_import import SourceImportError, update_and_depend  # noqa: PLC0415
 
     project = _resolve_active_project()
-    if schema is not None and isinstance(schema, list):
-        schema = tuple(tuple(cell) for cell in schema)
     try:
+        if schema is not None and isinstance(schema, list):
+            if not all(isinstance(cell, list | tuple) and len(cell) == 2 for cell in schema):
+                raise SourceImportError(
+                    f"schema={schema!r} is not a schema: pass a dict {{name: type}}, or a list of [name, type] pairs."
+                )
+            schema = tuple(tuple(cell) for cell in schema)
         out = update_and_depend(
             outside_path,
             alias,
@@ -628,42 +636,109 @@ def catalog_import_source(
             schema=schema,
             **(reader_options or {}),
         )
-    except (SourceImportError, BuildError, OSError) as exc:
-        rec = record_error(project, code="", message=str(exc), prompt=prompt or None, tool="catalog_import_source")
-        record_event(
-            project,
-            "build_error",
-            session=SESSION_ID,
-            tool="catalog_import_source",
-            prompt=prompt or None,
-            message=str(exc),
-            error_id=rec["id"],
-        )
-        _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
-        return {"error": str(exc), "error_id": rec["id"]}
+    except Exception as exc:  # every failure is recorded and answered with an error_id, as the other tools do (#227)
+        expected = isinstance(exc, (SourceImportError, BuildError, OSError))
+        return _record_import_failure(project, prompt, str(exc) if expected else f"{type(exc).__name__}: {exc}")
 
     out["url"] = _entry_url(project, out["hash"])
     if not out["created"]:
         return out  # nothing moved, so nothing to record, notify or cascade
 
     # An import is a catalog operation (ADR-011 D7): it emits the events a revise emits, and the dispatch-boundary
-    # decorator commits it — the head advance and any cascade — as ONE revision.
+    # decorator commits it — the head advance and any cascade — as ONE revision. The head has advanced, so the import
+    # happened and the reply is not an error. Each step after it runs whether or not the one before it failed: a
+    # failed notebook append or config carry-forward must not skip the recalc, or everything over the source stays on
+    # the old version's rows. What failed is recorded, as one failure after the import (#227).
     record_event(
         project, "alias_set", session=SESSION_ID, tool="catalog_import_source",
         alias=alias, version=out["version"], hash=out["hash"], prompt=prompt or None,
     )
-    if out["version"] == 1:
-        notebook.append(project, alias, markdown=prompt or "")
-        _notify("notebook_changed")
-    else:
+    failed: list[tuple[str, str]] = []
+
+    def step(what: str, run) -> None:
+        try:
+            run()
+        except Exception as exc:
+            failed.append((f"{what} failed: {type(exc).__name__}: {exc}", traceback.format_exc()))
+
+    def carry_forward() -> None:
         carried = carry_forward_entry_config(project, history_for(project, alias)[-2], out["hash"])
         if carried:
             out["carried_over"] = carried
+
+    def recalc() -> None:
+        report = _auto_recalc_after_head_advance(project, alias, tool="catalog_import_source")
+        if report is not None:
+            out["recalc"] = report
+
+    if out["version"] == 1:
+        step("appending it to the notebook", lambda: notebook.append(project, alias, markdown=prompt or ""))
+        _notify("notebook_changed")
+    else:
+        step("carrying the previous version's display config forward", carry_forward)
     _notify("new_entry", content_hash=out["hash"], alias=alias, version=out["version"])
-    recalc_report = _auto_recalc_after_head_advance(project, alias, tool="catalog_import_source")
-    if recalc_report is not None:
-        out["recalc"] = recalc_report
+    step("recalculating what reads it", recalc)
+    if failed:
+        out["after_import_error"] = _record_after_import_failure(
+            project,
+            prompt,
+            out["hash"],
+            f"{alias}-v{out['version']} was imported, then " + "; ".join(what for what, _tb in failed) + ".",
+            "\n".join(tb for _what, tb in failed),
+        )
     return out
+
+
+def _record_import_failure(project: str, prompt: str, message: str) -> dict:
+    """Record a failure of ``catalog_import_source`` as ``_run_and_record`` records a build's; the ``{error,
+    error_id}`` to answer with. Called from inside the ``except`` that caught it, for the traceback."""
+    tb = traceback.format_exc()
+    rec = record_error(
+        project, code="", message=message, prompt=prompt or None, tool="catalog_import_source", traceback=tb
+    )
+    record_event(
+        project,
+        "build_error",
+        session=SESSION_ID,
+        tool="catalog_import_source",
+        prompt=prompt or None,
+        message=message,
+        traceback=tb,
+        error_id=rec["id"],
+    )
+    _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
+    return {"error": message, "error_id": rec["id"]}
+
+
+def _record_after_import_failure(project: str, prompt: str, content_hash: str, message: str, tb: str) -> dict:
+    """Record steps that failed after an import that happened; the ``{error, error_id}`` for the reply.
+
+    Not a ``build_error``: the Log would show a failed build for a version that was imported and committed. The
+    record carries the new entry's hash, so a dependent the failure left stale is tied back to it (``error_for_hash``).
+    ``build_failed`` is still sent, as it is the notification that makes the companion reload its error banner.
+    """
+    rec = record_error(
+        project,
+        code="",
+        message=message,
+        prompt=prompt or None,
+        tool="catalog_import_source",
+        hash=content_hash,
+        traceback=tb,
+    )
+    record_event(
+        project,
+        "after_import_error",
+        session=SESSION_ID,
+        tool="catalog_import_source",
+        prompt=prompt or None,
+        hash=content_hash,
+        message=message,
+        traceback=tb,
+        error_id=rec["id"],
+    )
+    _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
+    return {"error": message, "error_id": rec["id"]}
 
 
 def _entry_url(project: str, content_hash: str) -> str | None:

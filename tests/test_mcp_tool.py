@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from tallyman_mcp.server import catalog_import_source, catalog_list, catalog_run
 
 
@@ -100,3 +102,71 @@ def test_catalog_import_source_records_no_project_argument(project: str, orders_
     code = (entry_dir(project, out["hash"]) / "expr.py").read_text()
     assert "project=" not in code
     assert "read_project_file(" in code
+
+
+def _docstrings(tree) -> set[int]:
+    """The ids of the string constants that are module, class or function docstrings."""
+    import ast
+
+    owners = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+    return {
+        id(node.body[0].value)
+        for node in ast.walk(tree)
+        if isinstance(node, owners)
+        and node.body
+        and isinstance(node.body[0], ast.Expr)
+        and isinstance(node.body[0].value, ast.Constant)
+    }
+
+
+def _unknown_catalog_names(src: Path, tools: set[str]) -> dict[str, list[str]]:
+    """Each ``catalog_*`` name a string under *src* quotes (a message, not a docstring) that is neither in *tools*
+    nor a module, function or class under *src*, with where it is quoted. A variable, parameter or attribute of the
+    same spelling is not something a message can send an agent to."""
+    import ast
+    import re
+
+    defined: set[str] = set()
+    quoted: dict[str, list[str]] = {}
+    for path in sorted(src.rglob("*.py")):
+        tree = ast.parse(path.read_text())
+        defined.add(path.stem)
+        docstrings = _docstrings(tree)
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                defined.add(node.name)
+            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
+                for name in re.findall(r"\bcatalog_[a-z_]+\b", node.value):
+                    quoted.setdefault(name, []).append(f"{path.relative_to(src)}:{node.lineno}")
+    return {name: where for name, where in quoted.items() if name not in tools | defined}
+
+
+def test_every_catalog_name_a_message_in_src_quotes_is_a_tool_or_a_python_name():
+    """#234: an import refusal sent agents to ``catalog_reset_to``, which is no tool. A ``catalog_*`` name in a string
+    the code builds (a message, not a docstring) is either a registered MCP tool or a name defined in ``src/``, such
+    as the ``catalog_state`` module. Docstrings are left out, since they may name functions that were deleted."""
+    import asyncio
+
+    from tallyman_mcp.server import mcp
+
+    tools = {tool.name for tool in asyncio.run(mcp.list_tools())}
+    src = Path(__file__).resolve().parent.parent / "src"
+
+    assert _unknown_catalog_names(src, tools) == {}
+
+
+_SAME_SPELLING = {
+    "a parameter": "def undo(catalog_reset_to=None):\n    return 'call catalog_reset_to'\n",
+    "a local variable": "catalog_reset_to = 1\nMESSAGE = 'call catalog_reset_to'\n",
+    "an attribute": "def undo(ops):\n    ops.catalog_reset_to()\n    return 'call catalog_reset_to'\n",
+}
+
+
+@pytest.mark.parametrize("body", list(_SAME_SPELLING.values()), ids=list(_SAME_SPELLING))
+def test_the_guard_catches_a_stale_tool_name_spelled_like_a_variable(tmp_path: Path, body: str):
+    """#234 review. The guard counted every name, attribute and parameter under ``src/`` as defined, so a message
+    naming a tool that does not exist passed whenever some variable was spelled the same way. Only modules,
+    functions and classes are names a message can mean."""
+    (tmp_path / "ops.py").write_text(body)
+
+    assert list(_unknown_catalog_names(tmp_path, tools=set())) == ["catalog_reset_to"]

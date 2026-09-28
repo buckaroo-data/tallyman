@@ -121,7 +121,8 @@ def _docstrings(tree) -> set[int]:
 
 def _unknown_catalog_names(src: Path, tools: set[str]) -> dict[str, list[str]]:
     """Each ``catalog_*`` name a string under *src* quotes (a message, not a docstring) that is neither in *tools*
-    nor defined under *src*, with where it is quoted."""
+    nor a module, function or class under *src*, with where it is quoted. A variable, parameter or attribute of the
+    same spelling is not something a message can send an agent to."""
     import ast
     import re
 
@@ -134,12 +135,6 @@ def _unknown_catalog_names(src: Path, tools: set[str]) -> dict[str, list[str]]:
         for node in ast.walk(tree):
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                 defined.add(node.name)
-            elif isinstance(node, ast.Name):
-                defined.add(node.id)
-            elif isinstance(node, ast.Attribute):
-                defined.add(node.attr)
-            elif isinstance(node, ast.arg):
-                defined.add(node.arg)
             elif isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
                 for name in re.findall(r"\bcatalog_[a-z_]+\b", node.value):
                     quoted.setdefault(name, []).append(f"{path.relative_to(src)}:{node.lineno}")

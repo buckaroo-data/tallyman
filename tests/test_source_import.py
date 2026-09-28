@@ -2059,3 +2059,74 @@ def test_a_failure_after_the_head_advanced_is_recorded_and_the_advance_is_commit
     assert [r["id"] for r in list_errors(project, limit=1000)] == [failure["error_id"]]
     assert get_alias(project, "orders") == out["hash"] != first["hash"]
     assert current_step(project) is not None and current_step(project) != step
+
+
+def _orders_by_region() -> str:
+    return (
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "t = tracked_expr_from_alias('orders')\n"
+        "expr = t.group_by('region').aggregate(total=t.n.sum())\n"
+    )
+
+
+def test_a_failed_step_after_the_import_does_not_skip_the_recalc_or_the_notification(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227 review. The steps after the import shared one ``try``, so carrying the entry's config forward failing
+    skipped the ``new_entry`` notification and the recalc. The head had moved to v2 and was committed, and every entry
+    over the source stayed on v1's rows, with nothing in the reply's top level to say so."""
+    from tallyman_mcp import server
+    from tallyman_xorq.staleness import scan
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    monkeypatch.delenv("TALLYMAN_AUTO_RECALC", raising=False)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1)])
+    _call_import({"outside_path": str(src), "alias": "orders"})
+    child = server.catalog_create("by_region", _orders_by_region())
+    assert "error" not in child, child
+    _write_csv(src, [("east", 1), ("west", 2)])
+
+    def fails(*args, **kwargs):
+        raise RuntimeError("carrying the config forward failed")
+
+    monkeypatch.setattr(server, "carry_forward_entry_config", fails)
+    out = _call_import({"outside_path": str(src), "alias": "orders"}).data
+
+    assert (out["version"], out["created"]) == (2, True), out
+    assert "RuntimeError" in out["after_import_error"]["error"], out
+    assert ("new_entry", {"alias": "orders", "version": 2}) in notified, notified
+    assert out.get("recalc", {}).get("status") == "ok", out
+    assert get_alias(project, "by_region") != child["hash"]
+    assert [h for h, verdict in scan(project).items() if verdict.stale] == []
+
+
+def test_a_failure_after_the_import_is_recorded_as_one_after_an_import_not_as_a_failed_build(
+    project: str, tmp_path: Path, monkeypatch, notified
+):
+    """#227 review. A step after the import failing was recorded the way a failed build is, with a ``build_error``
+    event and a message that did not say the import happened, so the Log showed a failed build for an import that
+    was committed. The record also carried no hash, so the entry's stale dependents could not be tied back to it. It
+    is still recorded, with the error_id the reply carries, and it says which version was imported."""
+    from tallyman_core.errors import list_errors
+    from tallyman_core.events import read_events
+    from tallyman_mcp import server
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    src = _write_csv(_outside(tmp_path) / "orders.csv", [("east", 1)])
+    _call_import({"outside_path": str(src), "alias": "orders"})
+    _write_csv(src, [("east", 1), ("west", 2)])
+
+    def fails(*args, **kwargs):
+        raise RuntimeError("carrying the config forward failed")
+
+    monkeypatch.setattr(server, "carry_forward_entry_config", fails)
+    out = _call_import({"outside_path": str(src), "alias": "orders"}).data
+
+    failure = out["after_import_error"]
+    [record] = list_errors(project, limit=1000)
+    assert record["id"] == failure["error_id"]
+    assert record["hash"] == out["hash"], record
+    assert "orders-v2 was imported" in record["message"], record
+    assert "RuntimeError" in record["message"], record
+    kinds = [e["kind"] for e in read_events(project) if e.get("error_id") == failure["error_id"]]
+    assert kinds and "build_error" not in kinds, kinds

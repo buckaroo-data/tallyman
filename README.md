@@ -206,3 +206,7 @@ project's cheap entries read from the original location; see
 uv run pytest                       # full suite
 uv run pytest tests/test_pack.py    # the pack / portability proof
 ```
+
+## License
+
+Tallyman is licensed under the GNU Affero General Public License, version 3 only (`AGPL-3.0-only`). The full text is in [LICENSE](LICENSE).

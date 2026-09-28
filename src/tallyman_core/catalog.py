@@ -55,7 +55,6 @@ TRACKED_SURFACE = (
     "config.json",
     "notebook.jsonl",
     "entries.jsonl",
-    "compute_cache.jsonl",
     "prompts/*.jsonl",
     "post_processing/*.py",
     "post_processing/_disabled/*.py",
@@ -68,8 +67,7 @@ TRACKED_SURFACE = (
 # The repo .gitignore: keep the heavy/derived artifacts out of ``git add -A``.
 # Trailing-slash patterns match directories only, so ``entries/*/`` ignores the
 # build dirs while ``entries/<hash>.zip`` files stay trackable, and
-# ``compute_cache/`` ignores the cache dir while ``compute_cache.jsonl`` (the
-# pointer file) stays trackable.
+# ``compute_cache/`` ignores the cache dir.
 GITIGNORE_LINES = (
     "entries/*/",
     "bullpen/",

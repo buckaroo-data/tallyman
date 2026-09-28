@@ -2,6 +2,8 @@
 
 Generated 2026-05-30. Five DS-oriented demo scripts on freshly-downloaded public datasets, chosen by a fan-out design pass + critic for distinct DS techniques, plotting variety, and coverage of the recently-changed code (diff backends, result cache, primary-key inference, post-processing live-reload).
 
+Status note (2026-09-24): the probes below describe the code of 2026-05-30. Their statements about `result.parquet`, the `ParquetSnapshotCache` result cache, `classify_build` and `ensure_result` no longer match the code, and the scripts' `catalog_load_parquet` and `read_project_file` calls no longer run: a file enters only through `catalog_import_source`, and a recipe reads it by alias (`plans/ADR-011-sources-are-aliases.md`). `docs/caching.md` describes the current design.
+
 **Datasets** are staged at `/tmp/tallyman_demo_data/`. Before running a script, copy its parquet(s) into the target project: `cp /tmp/tallyman_demo_data/<file> ~/.tallyman/projects/<project>/data/`.
 
 **Verified blocker (post_processing.py:35-61,110-119):** the `process(expr)` sandbox builds `__builtins__` from a fixed allowlist with no `__import__`, so `import numpy/scipy/sklearn/pandas` fails inside any post-processing function. The pandas-DataFrame return path only works via `expr.execute()` + DataFrame methods; third-party stats/ML is unreachable. Scripts 2 and 5 are designed to hit this wall.

@@ -45,9 +45,53 @@ def project(isolated_home: Path) -> str:
 
 
 @pytest.fixture
+def running_server(isolated_home: Path):
+    """Claim the tmp data dir the way `tallyman run` does, on port 0, and give it back at teardown.
+
+    A client of a data dir reaches its companion only through the owner record of the server holding it
+    (``server_lock.companion_url``); with none it sends nothing and links nothing. Port 0 is one nothing listens on,
+    so a test that does not stub httpx still reaches no companion. The claim is this process's own: ``read_owner``
+    probes it on another descriptor, which ``flock`` treats like another process.
+    """
+    from tallyman_core.server_lock import claim_data_dir, release_data_dir
+
+    record = claim_data_dir(port=0, bind_host="127.0.0.1")
+    yield record
+    release_data_dir()
+
+
+@pytest.fixture
 def orders_parquet(project: str) -> Path:
-    """Generate a deterministic shoe-orders fixture under project/data/."""
+    """Generate a deterministic shoe-orders fixture under project/data/.
+
+    The file only. A recipe cannot read it (ADR-011 D2) — depend on ``orders_src`` for that, and use
+    this where the test is about the file itself: editing it, importing it under an alias of the test's own (not
+    alongside ``orders_src``, since one set of bytes goes under one alias), or
+    asserting on the bytes.
+    """
     return write_shoe_orders(data_dir(project) / "orders.parquet", n_rows=200, seed=0)
+
+
+ORDERS_SRC = "orders_src"
+
+
+@pytest.fixture
+def orders_src(orders_parquet: Path, project: str) -> str:
+    """The shoe-orders fixture imported as a source alias, and the alias name (ADR-011 D1).
+
+    A recipe never opens a file: it reads an alias. Depend on this wherever a test needs a recipe over
+    the orders data, and read it in the recipe with ``tracked_expr_from_alias("orders_src")``. The
+    import mints one ordinary entry — a content hash, a manifest, a snapshot carrying ``__row_order``
+    — so a project that uses this fixture has one more entry and one more alias than it did before the
+    rewrite, which is what the DAG gaining its roots looks like.
+
+    The name is ``orders_src`` rather than ``orders`` because several tests already create a catalog
+    alias called ``orders``, and one name is one kind or the other but never both.
+    """
+    from tallyman_xorq.source_import import update_and_depend
+
+    update_and_depend(orders_parquet, ORDERS_SRC, project=project)
+    return ORDERS_SRC
 
 
 @pytest.fixture

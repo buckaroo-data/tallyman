@@ -27,16 +27,16 @@ from tallyman_xorq import (
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _filter_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(total=filtered.price.sum(), n=filtered.count())
 """
@@ -117,7 +117,7 @@ def test_key_diff_detects_unique_numeric_key():
 # ---------------------------------------------------------------------------
 
 
-def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
+def test_full_diff_against_two_builds(project: str, orders_src: str):
     from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
@@ -136,12 +136,104 @@ def test_full_diff_against_two_builds(project: str, orders_parquet: Path):
     assert diff["keyed"] is not None  # region is a shared key
 
 
+def _one_row_inserted(project: str, tmp_path: Path) -> str:
+    """Import V1 of a source alias ``rows`` and a V2 that is V1 with one row inserted at the front.
+
+    Only ``id`` is a key: ``name`` and ``v`` repeat, alone and together. Returns the alias.
+    """
+    import pyarrow as pa
+
+    from tallyman_xorq.source_import import update_and_depend
+
+    v1 = {"id": [1, 2, 3, 4, 5], "name": ["x", "x", "y", "y", "x"], "v": [1, 1, 2, 2, 1]}
+    v2 = {col: [new, *vals] for (col, vals), new in zip(v1.items(), (0, "y", 2))}
+    incoming = tmp_path / "incoming"
+    incoming.mkdir()
+    for n, cols in ((1, v1), (2, v2)):
+        path = incoming / f"rows_v{n}.parquet"
+        pq.write_table(pa.table(cols), path)
+        update_and_depend(path, "rows", project=project)
+    return "rows"
+
+
+def _html_table(html: str) -> tuple[list[str], list[list[str]]]:
+    """The header and body cells of the one table ``DataFrame.to_html`` wrote."""
+    from html.parser import HTMLParser
+
+    class _Cells(HTMLParser):
+        def __init__(self) -> None:
+            super().__init__()
+            self.rows: list[list[str]] = []
+            self._text: list[str] | None = None
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "tr":
+                self.rows.append([])
+            elif tag in ("td", "th"):
+                self._text = []
+
+        def handle_endtag(self, tag):
+            if tag in ("td", "th") and self._text is not None:
+                self.rows[-1].append("".join(self._text).strip())
+                self._text = None
+
+        def handle_data(self, data):
+            if self._text is not None:
+                self._text.append(data)
+
+    parser = _Cells()
+    parser.feed(html)
+    return parser.rows[0], parser.rows[1:]
+
+
+def _cell(text: str):
+    """A rendered cell as a comparable value: null, a number (``1`` and ``1.0`` agree), or the text."""
+    if text in ("", "NaN", "None", "<NA>", "NaT"):
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return text
+
+
+def test_full_diff_one_inserted_row_is_the_only_row_that_differs(project: str, tmp_path: Path):
+    # #200: __row_order is a row's position in its entry's file, so a row inserted at the front moves every later row
+    # by one. A keyed diff that compares it as data shows every matched row as changed. Only the inserted row differs.
+    from tallyman_core import entry_dir
+    from tallyman_core.aliases import history_for
+    from tallyman_xorq.primary_key import diff_keys
+    from tallyman_xorq.result_cache import cached_result_expr
+
+    alias = _one_row_inserted(project, tmp_path)
+    a_hash, b_hash = history_for(project, alias)
+    diff = full_diff(
+        entry_dir(project, a_hash),
+        entry_dir(project, b_hash),
+        a_expr=cached_result_expr(project, a_hash),
+        b_expr=cached_result_expr(project, b_hash),
+        keys=diff_keys(project, a_hash, b_hash),
+    )
+    keyed = diff["keyed"]
+    assert keyed["keys"] == ["id"]
+    assert (keyed["matched"], keyed["only_before"], keyed["only_after"]) == (5, 0, 1)
+
+    header, rows = _html_table(keyed["table_html"])
+    assert len(rows) == 6
+    compared = [c.removesuffix("_before") for c in header if c.endswith("_before")]
+
+    def differs(row: list[str]) -> bool:
+        return any(_cell(row[header.index(f"{c}_before")]) != _cell(row[header.index(f"{c}_after")]) for c in compared)
+
+    assert [_cell(row[header.index("id")]) for row in rows if differs(row)] == [0.0]
+    assert "__row_order" not in {s["name"] for s in diff["stats"]}
+
+
 # ---------------------------------------------------------------------------
 # catalog_diff MCP tool
 # ---------------------------------------------------------------------------
 
 
-def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -151,12 +243,25 @@ def test_catalog_diff_default_compares_n_minus_one_to_n(project: str, orders_par
     assert out["after"]["version"] == 2
 
 
-def test_catalog_diff_explicit_versions(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_diff_explicit_versions(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
     out = catalog_diff("shoe_sales", 1, 2)
     assert "error" not in out
+
+
+def test_catalog_diff_one_inserted_row_reports_one_added_row_and_no_row_order(
+    project: str, tmp_path: Path, monkeypatch
+):
+    # #200 end to end through the MCP tool: the stats cover the data columns only, and the keyed summary counts the
+    # inserted row as the one added row.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    alias = _one_row_inserted(project, tmp_path)
+    out = catalog_diff(alias, 1, 2)
+    assert "error" not in out, out
+    assert [s["name"] for s in out["stats"]] == ["id", "name", "v"]
+    assert out["keyed_summary"] == {"keys": ["id"], "only_before": 0, "only_after": 1, "matched": 5}
 
 
 def test_catalog_diff_no_history(project: str, monkeypatch):
@@ -165,7 +270,7 @@ def test_catalog_diff_no_history(project: str, monkeypatch):
     assert "error" in out
 
 
-def test_catalog_diff_out_of_range(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_diff_out_of_range(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     out = catalog_diff("shoe_sales", 1, 5)
@@ -177,7 +282,7 @@ def test_catalog_diff_out_of_range(project: str, orders_parquet: Path, monkeypat
 # ---------------------------------------------------------------------------
 
 
-def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_diff_route_default(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -192,7 +297,7 @@ def test_diff_route_default(fresh_companion_app, project: str, orders_parquet: P
     assert "head" in body["diff"]
 
 
-def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_diff_route_explicit(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
     catalog_revise("shoe_sales", _filter_code(project))
@@ -203,7 +308,7 @@ def test_diff_route_explicit(fresh_companion_app, project: str, orders_parquet: 
     assert body["va"] == 1 and body["vb"] == 2
 
 
-def test_diff_route_single_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_diff_route_single_version_400(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     # Only 1 version: requesting vb=2 is out of range → 404.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
@@ -212,7 +317,7 @@ def test_diff_route_single_version_400(fresh_companion_app, project: str, orders
     assert r.status_code == 404
 
 
-def test_diff_route_pk_search_timeout_504(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_diff_route_pk_search_timeout_504(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     # A primary-key search that blows the budget → 504 with a detail the diff
     # page renders, instead of grinding for minutes.
     import itertools
@@ -221,8 +326,8 @@ def test_diff_route_pk_search_timeout_504(fresh_companion_app, project: str, ord
 
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     dup = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 u = t.union(t, distinct=False)
 expr = u
 """
@@ -238,8 +343,8 @@ expr = u
 
 def _dup_versions(project: str) -> None:
     dup = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 u = t.union(t, distinct=False)
 expr = u
 """
@@ -259,7 +364,7 @@ def _forbid_buckaroo_pk_search(monkeypatch) -> None:
 
 
 def test_diff_route_keyless_entry_skips_keyed_diff(
-    fresh_companion_app, project: str, orders_parquet: Path, monkeypatch
+    fresh_companion_app, project: str, orders_src: str, monkeypatch
 ):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     _dup_versions(project)
@@ -272,7 +377,7 @@ def test_diff_route_keyless_entry_skips_keyed_diff(
     assert "stats" in body["diff"] and "head" in body["diff"]
 
 
-def test_catalog_diff_keyless_entry_skips_buckaroo_search(project: str, orders_parquet: Path, monkeypatch):
+def test_catalog_diff_keyless_entry_skips_buckaroo_search(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     _dup_versions(project)
     _forbid_buckaroo_pk_search(monkeypatch)
@@ -286,7 +391,7 @@ def test_diff_route_no_alias_404(fresh_companion_app, project: str):
     assert c.get(f"/{project}/api/diff_data/missing/1/2").status_code == 404
 
 
-def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_parquet: Path, monkeypatch):
+def test_diff_route_same_version_400(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     # Diffing a version against itself is rejected.
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
@@ -346,7 +451,7 @@ def test_key_diff_polars_detects_unique_numeric_key():
     assert d["only_after"] == 3
 
 
-def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path, tmp_path: Path):
+def test_head_diff_polars_reads_n_rows(project: str, orders_src: str, tmp_path: Path):
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
 
@@ -364,7 +469,7 @@ def test_head_diff_polars_reads_n_rows(project: str, orders_parquet: Path, tmp_p
 # ---------------------------------------------------------------------------
 
 
-def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path, tmp_path: Path):
+def test_stats_diff_xorq_matches_pandas(project: str, orders_src: str, tmp_path: Path):
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
 
@@ -387,7 +492,7 @@ def test_stats_diff_xorq_matches_pandas(project: str, orders_parquet: Path, tmp_
             assert abs(pd_result[col]["before"]["numeric"]["sum"] - xq_result[col]["before"]["numeric"]["sum"]) < 1e-6
 
 
-def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path, tmp_path: Path):
+def test_head_diff_xorq_reads_n_rows(project: str, orders_src: str, tmp_path: Path):
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
 
@@ -399,7 +504,7 @@ def test_head_diff_xorq_reads_n_rows(project: str, orders_parquet: Path, tmp_pat
     assert "<table" in d["before"]
 
 
-def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
+def test_key_diff_xorq_membership(project: str, orders_src: str):
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
 
@@ -418,7 +523,7 @@ def test_key_diff_xorq_membership(project: str, orders_parquet: Path):
     assert "<table" in d["table_html"]
 
 
-def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
+def test_full_diff_xorq_backend(project: str, orders_src: str):
     from tallyman_core import entry_dir
     from tallyman_xorq import build_and_persist
     from tallyman_xorq.result_cache import cached_result_expr
@@ -436,7 +541,7 @@ def test_full_diff_xorq_backend(project: str, orders_parquet: Path):
     assert "stats" in diff
 
 
-def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders_parquet: Path):
+def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders_src: str):
     # #73: the wired diff path passes both entries' cache-resolving expressions,
     # which compose at the expression level. full_diff must NOT eagerly
     # materialise a result.parquet for either entry — those parquets are never
@@ -460,7 +565,7 @@ def test_full_diff_xorq_with_exprs_writes_no_result_parquet(project: str, orders
     assert not (b_dir / "result.parquet").exists()
 
 
-def test_full_diff_requires_exprs(project: str, orders_parquet: Path):
+def test_full_diff_requires_exprs(project: str, orders_src: str):
     # full_diff is xorq-only: it composes the two passed cache-resolving
     # expressions. With the on-demand result.parquet writer gone there is no
     # file to fall back to, so calling it without a_expr/b_expr must raise a
@@ -477,7 +582,7 @@ def test_full_diff_requires_exprs(project: str, orders_parquet: Path):
     assert not (b_dir / "result.parquet").exists()
 
 
-def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parquet: Path):
+def test_build_compare_expr_reuses_session_build_dir(project: str, orders_src: str):
     # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
     # Re-rendering the same diff must reuse one session-scoped build dir, not
     # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
@@ -491,7 +596,7 @@ def test_build_compare_expr_reuses_session_build_dir(project: str, orders_parque
     assert p1 == p2
 
 
-def test_build_compare_expr_magnitude_coloring(project: str, orders_parquet: Path):
+def test_build_compare_expr_magnitude_coloring(project: str, orders_src: str):
     # Numeric value-column coloring is applied per-view by the diff display
     # klasses (main/detailed_pct color by pct_delta, detailed_absolute by
     # abs_delta), NOT by the shared global override — which would clobber the

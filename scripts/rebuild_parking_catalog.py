@@ -42,7 +42,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-# The three raw sources the recipes read via `read_project_file(...)`.
+# The three raw files. Each is imported once (ADR-011 D2) under a source alias named after it with a
+# "_src" suffix, and the tier-0 recipes read that alias; a recipe never opens a file.
 SOURCES = (
     "camera_select_columns.parquet",
     "camera_violations.parquet",
@@ -61,16 +62,17 @@ class Step:
 # is built before any dependent reads it, so `tracked_expr_from_alias(alias)` resolves to the
 # intended head. Codes are the recipes recovered from the original entry dirs.
 STEPS: tuple[Step, ...] = (
-    # --- Tier 0: raw sources (read_project_file) ---
+    # --- Tier 0: one catalog alias per imported source ---
     Step(
         "camera_select_columns",
         "create",
-        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('camera_select_columns.parquet')\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "expr = tracked_expr_from_alias('camera_select_columns_src')\n",
     ),
     Step(
         "camera_select_columns",
         "revise",
-        "from tallyman_xorq.io import read_project_file\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
         "import xorq.vendor.ibis as ibis\n"
         "def parse_issue_date(t):\n"
         "    return (\n"
@@ -80,29 +82,31 @@ STEPS: tuple[Step, ...] = (
         "        .else_(t.issue_date.to_date('%m/%d/%Y'))\n"
         "        .end()\n"
         "    )\n"
-        "expr = read_project_file('camera_select_columns.parquet').mutate(issue_date=parse_issue_date)\n",
+        "expr = tracked_expr_from_alias('camera_select_columns_src').mutate(issue_date=parse_issue_date)\n",
     ),
     Step(
         "camera_violations",
         "create",
-        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('camera_violations.parquet')\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "expr = tracked_expr_from_alias('camera_violations_src')\n",
     ),
     Step(
         "camera_violations",
         "revise",
-        "from tallyman_xorq.io import read_project_file\n"
-        "expr = read_project_file('camera_violations.parquet').limit(10_000_000)\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "expr = tracked_expr_from_alias('camera_violations_src').limit(10_000_000)\n",
     ),
     Step(
         "camera_violations",
         "revise",
-        "from tallyman_xorq.io import read_project_file\n"
-        "expr = read_project_file('camera_violations.parquet').limit(5_000_000)\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "expr = tracked_expr_from_alias('camera_violations_src').limit(5_000_000)\n",
     ),
     Step(
         "parking_plt_only4",
         "create",
-        "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('parking_plt_only4.parquet')\n",
+        "from tallyman_xorq.io import tracked_expr_from_alias\n"
+        "expr = tracked_expr_from_alias('parking_plt_only4_src')\n",
     ),
     # --- Tier 1: depend on tier-0 aliases ---
     Step(
@@ -312,12 +316,17 @@ STEPS: tuple[Step, ...] = (
 )
 
 
-def _stage_sources(src_dir: Path, project: str, rows: int) -> None:
-    """Place the raw sources into <project>/data/, truncated to `rows` if > 0."""
+def _stage_sources(src_dir: Path, project: str, rows: int) -> list[Path]:
+    """Place the raw sources into <project>/data/, truncated to `rows` if > 0; return where they landed.
+
+    ``data/`` is not special any more (ADR-011): the files are staged here only so the rebuild is
+    self-contained and re-runnable, and they enter the catalog by the import that follows.
+    """
     from tallyman_core.paths import data_dir
 
     dst = data_dir(project)
     dst.mkdir(parents=True, exist_ok=True)
+    staged: list[Path] = []
     for name in SOURCES:
         src = src_dir / name
         if not src.is_file():
@@ -345,6 +354,8 @@ def _stage_sources(src_dir: Path, project: str, rows: int) -> None:
         else:
             shutil.copy2(src, target)
             print(f"  staged {name}: full copy")
+        staged.append(target)
+    return staged
 
 
 def _verify(project: str) -> None:
@@ -387,7 +398,7 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
     ensure_project(project)
     ensure_catalog_repo(project)
     genesis(project)
-    # read_project_file/tracked_expr_from_alias inside recipe code resolve the active project with
+    # tracked_expr_from_alias inside recipe code resolves the active project with
     # no explicit arg, and resolve_project() reads the active_project file *before*
     # TALLYMAN_PROJECT (env is only a one-shot seed when the file is absent). Write
     # the file so resolution is deterministic even when a different project was
@@ -395,7 +406,15 @@ def rebuild(src_dir: Path, project: str, rows: int) -> None:
     set_active_project(project)
 
     print(f"staging sources (rows={'full' if not rows else rows}):")
-    _stage_sources(src_dir, project, rows)
+    staged = _stage_sources(src_dir, project, rows)
+
+    print(f"importing {len(staged)} sources:")
+    from tallyman_xorq.source_import import update_and_depend
+
+    for path in staged:
+        out = update_and_depend(path, f"{path.stem}_src", project=project, prompt="rebuild: import")
+        print(f"  {out['alias']}-v{out['version']} -> {out['hash']} ({out['row_count']} rows)")
+    checkpoint_catalog(project, "rebuild: import sources")
 
     print(f"building {len(STEPS)} entries:")
     for i, step in enumerate(STEPS, 1):

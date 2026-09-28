@@ -4,7 +4,6 @@ Layout (per-project):
 
     ~/.tallyman/
     ├── active_project                 # one-line plain text; source of truth
-    ├── buckaroo_sessions.json         # global Buckaroo session map
     └── projects/<name>/
         ├── artifacts/                 # everything the system produces
         │   ├── catalog/               # the native catalog git repo
@@ -16,7 +15,7 @@ Layout (per-project):
         │   │   ├── display_configs/<hash>.json
         │   │   ├── post_processing/<name>.py , stats/<name>.py
         │   │   ├── prompts/<hash>.jsonl
-        │   │   └── entries.jsonl , compute_cache.jsonl   # untracked-artifact pointers
+        │   │   └── entries.jsonl                         # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
         └── data/                      # input parquets (fixtures or user)
@@ -53,16 +52,6 @@ def active_project_file_path() -> Path:
     return tallyman_home() / "active_project"
 
 
-def buckaroo_sessions_path() -> Path:
-    """Global Buckaroo session table (one file, all projects).
-
-    Schema: ``{<content_hash>: {session_id, project, buckaroo_started_at}}``.
-    Migrates to a Buckaroo-side enumeration endpoint once
-    buckaroo-data/buckaroo#860 lands.
-    """
-    return tallyman_home() / "buckaroo_sessions.json"
-
-
 # ---------------------------------------------------------------------------
 # Layout segment + per-entry artifact/cache names (single source of truth)
 # ---------------------------------------------------------------------------
@@ -74,8 +63,10 @@ ARTIFACTS_DIRNAME = "artifacts"
 CATALOG_DIRNAME = "catalog"
 ENTRIES_DIRNAME = "entries"
 
-# Per-entry artifacts: immutable build outputs. Safe to symlink read-only into a
-# write-isolated overlay (the perf harness) because nothing rewrites them.
+# Per-entry artifacts: build outputs. Safe to symlink read-only into a
+# write-isolated overlay (the perf harness): the one later write, an unfaithful
+# heal recording its pin in manifest.json (#196), is an atomic replace, which
+# swaps the overlay's link for a file and leaves the linked original alone.
 ENTRY_BUILD_DIRNAME = "xorq_build"
 ENTRY_MANIFEST_FILENAME = "manifest.json"
 ENTRY_SCHEMA_FILENAME = "schema.json"
@@ -84,6 +75,9 @@ ENTRY_SCHEMA_FILENAME = "schema.json"
 # first hit is honestly cold; production deletes them to recompute.
 ENTRY_STAT_CACHE_DIRNAME = ".buckaroo_stat_cache"
 ENTRY_EXPANDED_BUILD_DIRNAME = ".xorq_build_expanded"
+# The "view build" a worthy entry's grid is handed: a build whose whole graph is one bare read of the entry's snapshot
+# (ADR-007 D6). Derived from the snapshot's path, so it is regenerated on demand like the expanded build.
+ENTRY_VIEW_BUILD_DIRNAME = ".xorq_view_build"
 # No per-entry result.parquet exists: an expensive entry's rows live in its baked
 # result cache (under the per-project compute_cache), a cheap entry recomputes on
 # read. The single materialised copy is the xorq .cache() snapshot — nothing
@@ -104,6 +98,7 @@ ENTRY_ARTIFACT_NAMES = (
 ENTRY_CACHE_NAMES = (
     ENTRY_STAT_CACHE_DIRNAME,
     ENTRY_EXPANDED_BUILD_DIRNAME,
+    ENTRY_VIEW_BUILD_DIRNAME,
 )
 
 
@@ -206,23 +201,33 @@ def entry_expanded_build_dir(project: str, content_hash: str) -> Path:
     return entry_dir(project, content_hash) / ENTRY_EXPANDED_BUILD_DIRNAME
 
 
-def compute_cache_dir(project: str) -> Path:
-    """Per-project xorq compute cache, redirected off the global ``~/.cache/xorq``.
+def entry_view_build_dir(project: str, content_hash: str) -> Path:
+    """Stable per-entry dir holding the view build of the entry's snapshot (regenerated on demand)."""
+    return entry_dir(project, content_hash) / ENTRY_VIEW_BUILD_DIRNAME
 
-    Lives inside the catalog dir so it travels with the project. ``reset-to``
-    prunes it to the revision's recorded warm-set, so a baseline expression
-    stays warm while a freshly added one computes cold — the honest cold add
-    the demo is built to show. Untracked by git (content-addressed parquet).
+
+def compute_cache_dir(project: str) -> Path:
+    """Per-project directory of files tallyman can make again: one snapshot per worthy entry.
+
+    ``result_cache/<content_hash>.parquet`` holds each worthy entry's snapshot (ADR-007 D2, D13),
+    including a source version's, whose rows are an imported file rather than a computation and whose
+    snapshot is re-created from the clone of those bytes (ADR-011 D1).
+    Lives inside the catalog dir so it travels with the project, and is untracked by git
+    (content-addressed parquet). Everything in it is cache, so anything may delete it:
+    ``ensure_materialized`` makes a missing file again and checks it. A reset leaves it
+    alone (ADR-007 D14).
     """
     return catalog_dir(project) / "compute_cache"
 
 
 def bullpen_dir(project: str) -> Path:
-    """Holding area for artifacts a reset evicts (untracked, content-addressed).
+    """Holding area for artifacts a reset retires (untracked, content-addressed).
 
-    A backward reset moves pruned entries/caches here instead of deleting
-    them; a forward reset copies the step's recorded set back. Live
-    operations never read it, so an evicted entry still re-adds cold.
+    A backward reset moves entry dirs, and the source clones (``data/.cas``) no surviving
+    entry refers to, here instead of deleting them; a forward reset copies the step's
+    recorded set back. The one live reader is the Cache page, which reads a retired
+    entry's parked manifest, and a retired source version's parked clone, to decide its
+    snapshot's pin (#195). ``compute_cache/`` is not managed by a reset (ADR-007 D14).
     """
     return catalog_dir(project) / "bullpen"
 

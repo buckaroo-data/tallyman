@@ -12,18 +12,51 @@ from __future__ import annotations
 from pathlib import Path
 
 from tallyman_core import data_dir, entry_dir, get_alias, resolve_project
+from tallyman_xorq.row_order import ROW_ORDER
 
 
 class ProjectDataNotFound(FileNotFoundError):
     pass
 
 
+def _source_entry_read(fn: str, path: str):
+    """The expression a raw read resolves to (ADR-011 D2).
+
+    A file enters the catalog by an explicit import and by nothing else, so a raw read is a build error in an
+    authored recipe. It survives in exactly one place: the recipe the importer generates for a source entry, where
+    it resolves to that entry's own snapshot.
+
+    The entry being minted names its own project, and the read follows it rather than the ambient active project:
+    ``update_and_depend(path, alias, project=X)`` is an override, so an import must work whichever project happens
+    to be active. Resolving the ambient one instead made the importer's own recipe hit the refusal below.
+    """
+    from tallyman_xorq.source_import import source_entry_context
+
+    ctx = source_entry_context()
+    if ctx is not None:
+        from xorq.expr.api import deferred_read_parquet
+
+        from tallyman_xorq.materialize import snapshot_path
+
+        owner, content_hash = ctx
+        return deferred_read_parquet(str(snapshot_path(owner, content_hash)))
+    from tallyman_xorq.build import BuildError
+
+    raise BuildError(
+        f"{fn}({path!r}) reads a file tallyman does not own, which is not allowed in a recipe: the entry's rows "
+        "would depend on a file anyone can edit or delete, and nothing would record which bytes it was built from. "
+        f"Import the file first — catalog_import_source({path!r}, '<alias>') — and then read it in the recipe with "
+        "tracked_expr_from_alias('<alias>'), which follows the alias, or pinned_expr_from_alias('<alias>-v<N>') to "
+        "pin one version of it."
+    )
+
+
 def project_path(rel_path: str, project: str | None = None, must_exist: bool = True) -> Path:
     """Resolve `rel_path` against the project's data dir. Raises if absent.
 
-    Pass ``must_exist=False`` for digest-pinned reconstruction: it serves the frozen
-    ``.cas`` clone (``recon_cas_path``) and must not require the live source to still
-    be present. The traversal guard still applies regardless.
+    Pass ``must_exist=False`` to name a file that may not be there. The traversal
+    guard still applies regardless. Nothing in a build calls this: a recipe reads
+    aliases, and ``data/`` stopped being special with ADR-011 D2.
     """
     proj = resolve_project(project)
     base = data_dir(proj)
@@ -39,61 +72,18 @@ def project_path(rel_path: str, project: str | None = None, must_exist: bool = T
 
 
 def read_project_file(rel_path: str, project: str | None = None):
-    """Load a raw data file from `<project>/data/<rel_path>` as a xorq expression.
+    """The raw read of a parquet file, which only a source entry's own recipe may do (ADR-011 D2).
 
-    Use this to bring raw input files (parquet, csv, etc.) into the catalog's
-    expression layer. This is the root of the dependency DAG — the file has no
-    catalog hash, no recipe, no lineage entry. Everything built on top of it
-    flows through tracked_expr_from_alias.
+    In an authored recipe this raises a ``BuildError`` naming the import to use instead. A file enters the
+    catalog through ``catalog_import_source`` / ``update_and_depend`` and by no other route, and a recipe
+    reads the resulting source alias with ``tracked_expr_from_alias``.
 
-    Source-content identity (see tallyman_xorq.source_identity): in `cas`
-    mode the read goes through a content-addressed clone so the path xorq
-    hashes embeds the content digest; in `salt` mode the digest is recorded
-    for build_and_persist to mix into the entry hash; `off` is the plain
-    path read.
+    It survives as a callable because the recipe the importer generates for a source entry calls it, and
+    a contextvar (``source_import._SOURCE_ENTRY``) resolves that call to the entry's own snapshot. The
+    path in the generated recipe is provenance; nothing opens it.
     """
-    from xorq.expr.api import deferred_read_parquet
+    return _source_entry_read("read_project_file", rel_path)
 
-    from tallyman_xorq import source_identity as si
-
-    proj = resolve_project(project)
-    if si.mode() == "cas":
-        recorded = _reconstructing_source_digest(proj, rel_path)
-        if recorded is not None:
-            # Reconstruction (#115): this read_project_file is re-running an already-built
-            # entry's recipe (expr.py), not authoring a new entry. Resolve to the FROZEN
-            # .cas clone the entry was built from — named by the digest in its
-            # manifest.sources — instead of re-digesting the live file, which may have
-            # been edited in place since the build. Note that same frozen digest (the
-            # source collector is independent of tracked_expr_from_alias's _RECONSTRUCTING-gated
-            # parent capture, so both fire) so a child build reconstructing this entry
-            # records the frozen digest and gc_cas keeps the clone alive.
-            #
-            # must_exist=False: recon_cas_path serves the frozen clone without the live
-            # source, so a moved/deleted source must not defeat the pinned read. This
-            # block MUST run before the existence-requiring project_path below.
-            recon_path = project_path(rel_path, proj, must_exist=False)
-            si.note_source(rel_path, recorded)
-            return deferred_read_parquet(str(si.recon_cas_path(proj, recon_path, recorded)))
-    path = project_path(rel_path, proj)
-    if si.mode() != "off":
-        digest = si.digest_for(proj, path)
-        si.note_source(rel_path, digest)
-        if si.mode() == "cas":
-            path = si.ensure_cas_path(proj, path, digest)
-    return deferred_read_parquet(str(path))
-
-
-# Pinned polars parquet-write settings for the ordered-CSV intermediate. Held
-# constant so the bytes — and therefore the snapshot digest — are reproducible
-# run-to-run within an environment. A polars/library upgrade may change the
-# bytes; rebuild-is-fine here per the project's single-user rule.
-_CSV_PARQUET_WRITE = {
-    "compression": "zstd",
-    "compression_level": 3,
-    "row_group_size": 122880,
-    "statistics": True,
-}
 
 # ibis primitive -> polars dtype, for reading a CSV with an explicit schema.
 # Covers the types the MCP documents for tallyman_read_csv; an unmapped type
@@ -132,6 +122,10 @@ def _polars_dtype(dtype):
     schema's intent). ``decimal`` reads as ``float64`` for now — exact-decimal
     parsing is deferred to a future UI-driven buckaroo autoclean step (#150).
     An unmapped type still raises loudly, so a schema mistake fails fast.
+
+    A timestamp with a zone is the type the column ends up with, and is not what
+    the reader is given: ``_materialize_ordered`` reads that column as text and
+    ``_parse_zoned`` parses it (#231).
     """
     import polars as pl
 
@@ -210,7 +204,7 @@ def _normalize_schema(spec, header: list[str], *, reserved: tuple[str, ...] = ()
     """Resolve a schema spec against the CSV *header* into a polars parse plan.
 
     *header* is the CSV's full header. *reserved* names tallyman-managed columns
-    (currently ``original_row_order``) that the caller must not spec: they are
+    (currently ``__row_order``) that the caller must not spec: they are
     excluded from the columns the spec has to cover, but kept in the diagnostics
     so an error message matches the file the user is looking at rather than a
     silently reserved-stripped subset. Threading ``reserved`` in — rather than
@@ -374,7 +368,7 @@ def _polars_to_ibis(dt) -> str:
 def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] = ()) -> str:
     """Whole-file-infer *src* and render it as the paste-ready tuple-of-tuples DSL.
 
-    *reserved* columns (tallyman-managed, e.g. ``original_row_order``) are dropped:
+    *reserved* columns (tallyman-managed, e.g. ``__row_order``) are dropped:
     they must not appear in the suggestion because the caller cannot spec them —
     a suggestion carrying one is un-pasteable (the totality check excludes the
     reserved column, so pasting it back over-counts the columns and raises).
@@ -386,46 +380,170 @@ def _suggest_schema_dsl(src: Path, scan_kwargs: dict, reserved: tuple[str, ...] 
     return repr(pairs)
 
 
-def _validate_existing_row_order(src: Path, scan_kwargs: dict) -> None:
-    """The CSV already has an ``original_row_order`` column, colliding with the row
-    index tallyman would add via ``with_row_index`` (a raw polars ``DuplicateError``
-    the infer ladder does not catch). Reuse the column only if it *is* the canonical
-    order — the contiguous ``0..N-1`` file sequence tallyman itself writes, each row
-    exactly one more than the last. Otherwise the name is a coincidence carrying
-    foreign data, so raise loudly rather than trust a non-canonical order.
+def _zoned_columns(overrides: dict) -> dict:
+    """The pinned columns whose timestamp type carries a zone, as ``{header_name: pl.Datetime}``."""
+    import polars as pl
+
+    return {name: dt for name, dt in overrides.items() if isinstance(dt, pl.Datetime) and dt.time_zone is not None}
+
+
+def _zoned_text_value(name: str):
+    """Zoned column *name*, which the scan read as text, with an empty cell as null.
+
+    ``missing_utf8_is_empty_string`` reads an empty cell of a string column as ``""``. It is meant for the file's
+    string columns, and an empty cell of a zoned column stays null, as it was when polars' reader parsed the column.
     """
     import polars as pl
 
-    reserved = (
-        f"tallyman_read_csv: {src.name} already has a column named 'original_row_order', which is "
-        "reserved for tallyman's canonical row index. {why} Rename the column in the source CSV."
+    return pl.when(pl.col(name) != "").then(pl.col(name))
+
+
+def _parse_zoned(lf, zoned: dict):
+    """Parse each zoned column of *lf*, which the scan read as text, into its declared type (ADR-005 D9(a), #231).
+
+    polars' CSV reader, given a ``Datetime`` with a zone, parses text with no UTC offset as UTC and converts it into
+    the zone, so ``09:30`` under America/New_York was stored as ``04:30-05:00``. ``str.to_datetime`` with
+    ``time_zone`` reads it the way D9(a) says: text with an offset is an instant and is converted into the zone, and
+    text without one is a wall-clock time in the zone, which gets the zone attached. The declared unit is kept, so
+    ``ns`` digits survive (#145).
+
+    It raises rather than shift a value:
+
+    - offset-less text that names a time the zone skips or repeats at a daylight-saving change, since no instant, or
+      two, fit it (``ambiguous="raise"``; a skipped time raises by default);
+    - a column that mixes text with and without an offset. The streaming engine infers one format per column, from
+      its first non-null value in file order, and parses every later batch with it (polars' ``strptime-infer``
+      node), so text of the other kind fails wherever it first appears;
+    - text that is not a timestamp, once the format is known.
+
+    The one gap is before the format is known: polars 1.40.1 turns a batch into nulls, without an error, when the
+    first non-null value it sees matches no format (fixed upstream in pola-rs/polars#28986). The file's first
+    non-null value is that value, so ``_unreadable_first_zoned_value`` checks it before the read.
+    """
+    return lf.with_columns(
+        _zoned_text_value(name).str.to_datetime(time_unit=dt.time_unit, time_zone=dt.time_zone, ambiguous="raise")
+        for name, dt in zoned.items()
     )
-    try:
-        series = (
-            pl.scan_csv(
-                str(src),
-                schema_overrides={"original_row_order": pl.Int64},
-                infer_schema_length=0,
-                **scan_kwargs,
-            )
-            .select("original_row_order")
-            .collect()
-            .to_series()
-        )
-    except pl.exceptions.ComputeError as exc:
-        raise ValueError(reserved.format(why=f"Its values are not integers ({exc}).")) from exc
-    n = series.len()
-    expected = pl.int_range(0, n, dtype=pl.Int64, eager=True)
-    if series.null_count() or not (series == expected).all():
-        raise ValueError(
-            reserved.format(
-                why=f"Its values are not the contiguous 0..{n - 1} sequence (each row must be one more than the last)."
-            )
-        )
 
 
-def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -> None:
-    """Read *src* into a row-order-stable parquet at *tmp_path* (#143).
+# Text ending in a UTC offset after a time of day: Z, +hh, +hhmm or +hh:mm. polars does the parsing; this only sorts
+# rows into the two kinds, to explain a failed read of a zoned column.
+_UTC_OFFSET = r"\d:\d{2}(?::\d{2}(?:[.,]\d+)?)?\s*(?:[Zz]|[+-]\d{2}(?::?\d{2})?)$"
+
+
+def _zoned_text(src: Path, scan_kwargs: dict, name: str):
+    """The non-null text of column *name* of *src*, with its row number counted from 1 after the header.
+
+    The row index is added after the select, so a column of the file's own named ``row`` does not collide with it.
+    """
+    import polars as pl
+
+    return (
+        pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs)
+        .select(_zoned_text_value(name).alias("text"))
+        .with_row_index("row", offset=1)
+        .filter(pl.col("text").is_not_null())
+    )
+
+
+def _cell(found) -> str:
+    """The value and row number of the one-row frame *found*, for an error message."""
+    return f"{found['text'][0]!r} (row {found['row'][0]})"
+
+
+def _zoned_label(name: str, dt, rename: dict) -> str:
+    """How an error names a zoned column: by its schema name, and its header when a positional schema renamed it."""
+    column = repr(name) if rename.get(name, name) == name else f"{rename[name]!r} (header {name!r})"
+    return f"tallyman_read_csv: column {column} is a timestamp with the zone {dt.time_zone!r}"
+
+
+def _not_a_timestamp(label: str, found) -> str:
+    return f"{label}, and {_cell(found)} is not a timestamp. Correct the value, or declare the column as a string."
+
+
+# The two ways offset-less text can name no single instant in a zone, as the error words them.
+_SKIPPED = "does not exist in {tz}: the clocks skip it at a daylight-saving change, so no instant matches it"
+_REPEATED = (
+    "occurs twice in {tz}: the clocks pass it twice at a daylight-saving change, once at each offset, so it names "
+    "two instants"
+)
+
+
+def _unreadable_first_zoned_value(src: Path, scan_kwargs: dict, zoned: dict, rename: dict) -> str | None:
+    """An error message when a zoned column's first non-null value is not a timestamp, else None.
+
+    ``_parse_zoned`` infers the column's format from that value, and polars 1.40.1 writes nulls instead of raising
+    when it matches no format. An eager parse of the one value raises in exactly that case. Reads the file only up to
+    the first non-null value of each zoned column.
+    """
+    import polars as pl
+
+    for name, dt in zoned.items():
+        first = _zoned_text(src, scan_kwargs, name).head(1).collect()
+        if first.is_empty():
+            continue
+        try:
+            first["text"].str.to_datetime(time_unit=dt.time_unit)
+        except pl.exceptions.PolarsError:
+            return _not_a_timestamp(_zoned_label(name, dt, rename), first)
+    return None
+
+
+def _explain_zoned_failure(src: Path, scan_kwargs: dict, zoned: dict, rename: dict) -> str | None:
+    """Why the zoned columns of *src* did not parse, as an error message, or None when they are not the reason.
+
+    Runs only after a read has failed. It reads each zoned column again as text and looks, in file order, for the
+    failures of ``_parse_zoned``: a row whose text has a UTC offset when the column's first value has none (or the
+    other way round), offset-less text that names a time the zone skips or repeats, and text that is not a timestamp.
+    """
+    import polars as pl
+
+    for name, dt in zoned.items():
+        tz, label = dt.time_zone, _zoned_label(name, dt, rename)
+        text = _zoned_text(src, scan_kwargs, name).with_columns(offset=pl.col("text").str.contains(_UTC_OFFSET))
+        try:
+            first = text.head(1).collect()
+            if first.is_empty():
+                continue
+            other = text.filter(pl.col("offset") != first["offset"][0]).head(1).collect()
+            if not other.is_empty():
+                with_offset, without = (first, other) if first["offset"][0] else (other, first)
+                return (
+                    f"{label} and mixes text with a UTC offset and text without one: {_cell(with_offset)} has an "
+                    f"offset and {_cell(without)} does not. Text with an offset is an instant, converted into the "
+                    "zone; text without one is a wall-clock time in the zone. A column is read one way, so write "
+                    "every value with its offset, or none of them."
+                )
+            if not first["offset"][0]:
+                wall = pl.col("text").str.to_datetime(time_unit=dt.time_unit, strict=False)
+                earliest = wall.dt.replace_time_zone(tz, ambiguous="earliest", non_existent="null")
+                unique = wall.dt.replace_time_zone(tz, ambiguous="null", non_existent="null")
+                found = (
+                    text.with_columns(
+                        skipped=wall.is_not_null() & earliest.is_null(),
+                        repeated=earliest.is_not_null() & unique.is_null(),
+                    )
+                    .filter(pl.col("skipped") | pl.col("repeated"))
+                    .head(1)
+                    .collect()
+                )
+                if not found.is_empty():
+                    why = (_SKIPPED if found["skipped"][0] else _REPEATED).format(tz=tz)
+                    return (
+                        f"{label}, where text with no UTC offset is a wall-clock time, and {_cell(found)} {why}. "
+                        "tallyman does not pick an instant for it. Correct the value, or write it with its UTC offset."
+                    )
+            parsed = pl.col("text").str.to_datetime(time_unit=dt.time_unit, time_zone=tz, strict=False)
+            found = text.filter(parsed.is_null()).head(1).collect()
+        except pl.exceptions.PolarsError:
+            continue  # the text defeats this explanation too, and the caller's general error stands
+        if not found.is_empty():
+            return _not_a_timestamp(label, found)
+    return None
+
+
+def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path, *, write) -> None:
+    """Read *src* (a CSV) into a row-order-stable parquet at *tmp_path* (#143).
 
     Inference mode (no schema, or a spec with inferred columns) escalates the
     infer window on a parse failure — 100 -> 10k -> whole-file — because a value
@@ -433,188 +551,104 @@ def _materialize_ordered(src: Path, schema, scan_kwargs: dict, tmp_path: Path) -
     always resolves (a mixed column falls back to string). Explicit mode (every
     column pinned) never escalates: a pinned type that cannot parse is the
     caller's mistake, so it raises with a paste-ready suggested schema.
+
+    The last column is ``__row_order`` (ADR-008 D2). A CSV that already has a
+    column of that name has it overwritten, which is the right outcome for a
+    file tallyman exported.
+
+    *write* takes the parsed LazyFrame of one rung of the ladder and puts it on
+    disk. There is one caller, the import, and it passes a writer that streams
+    the rows into pyarrow so a source snapshot has the layout every other
+    snapshot has (ADR-011 D1).
     """
     import polars as pl
 
-    # Header (names only) drives both the schema plan and the row-index collision
-    # check; infer_schema_length=0 reads just the header line, no type sampling.
+    # Header (names only) drives the schema plan; infer_schema_length=0 reads
+    # just the header line, no type sampling.
     header = list(pl.scan_csv(str(src), infer_schema_length=0, **scan_kwargs).collect_schema().names())
-    has_row_order = "original_row_order" in header
-    # original_row_order is tallyman's reserved index — _ordered re-appends it, and
-    # _validate_existing_row_order (below) vets a pre-existing one. It is not the caller's
-    # to spec, so it is threaded as `reserved` through every header reader (the schema
-    # plan, the diagnostics, and the suggested-schema hint) rather than stripped ad hoc.
-    reserved = ("original_row_order",) if has_row_order else ()
-    if has_row_order:
-        _validate_existing_row_order(src, scan_kwargs)  # reuse it, or raise — never with_row_index over it
+    has_row_order = ROW_ORDER in header
+    # __row_order is tallyman's reserved index — it is not the caller's to spec, so it is threaded as `reserved`
+    # through every header reader (the schema plan, the diagnostics, and the suggested-schema hint) rather than
+    # stripped ad hoc.
+    reserved = (ROW_ORDER,) if has_row_order else ()
 
     plan = None
     explicit_only = False
     if schema is not None:
         plan = _normalize_schema(schema, header, reserved=reserved)
-        # A spec may not PRODUCE the reserved name either: renaming a data column onto
-        # 'original_row_order' collides with the index _ordered re-appends (a raw polars
-        # DuplicateError at sink). Reject the reserved output name up front with the same
-        # guidance as the pre-existing-column clash.
-        if "original_row_order" in plan["out_names"]:
+        # A spec may not PRODUCE the reserved name either: renaming a data column onto __row_order collides with the
+        # index appended below (a raw polars DuplicateError at sink). Reject the reserved output name up front.
+        if ROW_ORDER in plan["out_names"]:
             raise ValueError(
-                "tallyman_read_csv: 'original_row_order' is reserved for tallyman's canonical "
-                "row index and cannot be a schema output column name. Rename that column to "
-                "something other than 'original_row_order' in the schema."
+                f"tallyman_read_csv: {ROW_ORDER!r} is reserved for tallyman's row index and cannot be a "
+                f"schema output column name. Rename that column to something other than {ROW_ORDER!r} in the schema."
             )
         explicit_only = plan["all_pinned"]
+    # A zoned column is read as text and parsed after the scan: the reader itself would convert offset-less text
+    # from UTC (#231).
+    zoned = _zoned_columns(plan["overrides"]) if plan else {}
+    if zoned:
+        unreadable = _unreadable_first_zoned_value(src, scan_kwargs, zoned, plan["rename"])
+        if unreadable is not None:
+            raise ValueError(unreadable)
 
     def _ordered(infer_len):
         if schema is None:
             lf = pl.scan_csv(str(src), infer_schema_length=infer_len, **scan_kwargs)
-            if not has_row_order:
-                lf = lf.with_row_index("original_row_order")
-            cols = [c for c in lf.collect_schema().names() if c != "original_row_order"]
         else:
             il = 0 if plan["all_pinned"] else infer_len
-            lf = pl.scan_csv(str(src), schema_overrides=plan["overrides"], infer_schema_length=il, **scan_kwargs)
-            if not has_row_order:
-                lf = lf.with_row_index("original_row_order")
-            if plan["rename"]:
-                lf = lf.rename(plan["rename"])
-            cols = [c for c in plan["out_names"] if c != "original_row_order"]
-        # original_row_order last and cast to int64 (a fresh with_row_index yields
-        # uint32; a reused in-CSV column is stripped from `cols` and re-appended here).
-        return lf.select([*cols, pl.col("original_row_order").cast(pl.Int64)])
+            overrides = {**plan["overrides"], **dict.fromkeys(zoned, pl.String)}
+            lf = pl.scan_csv(str(src), schema_overrides=overrides, infer_schema_length=il, **scan_kwargs)
+            lf = _parse_zoned(lf, zoned)
+        if has_row_order:
+            lf = lf.drop(ROW_ORDER)  # overwritten by the fresh index below
+        lf = lf.with_row_index(ROW_ORDER)
+        if schema is not None and plan["rename"]:
+            lf = lf.rename(plan["rename"])
+        if schema is None:
+            cols = [c for c in lf.collect_schema().names() if c != ROW_ORDER]
+        else:
+            cols = [c for c in plan["out_names"] if c != ROW_ORDER]
+        # __row_order last and cast to int64 (a fresh with_row_index yields uint32).
+        return lf.select([*cols, pl.col(ROW_ORDER).cast(pl.Int64)])
 
     ladder = [_DEFAULT_INFER] if explicit_only else [_DEFAULT_INFER, _ESCALATED_INFER, None]
     last_exc = None
     for infer_len in ladder:
         try:
-            _ordered(infer_len).sink_parquet(str(tmp_path), **_CSV_PARQUET_WRITE)
+            write(_ordered(infer_len), tmp_path)
             return
-        except pl.exceptions.ComputeError as exc:
+        # InvalidOperationError is how str.to_datetime reports text that does not match the column's format.
+        except (pl.exceptions.ComputeError, pl.exceptions.InvalidOperationError) as exc:
             last_exc = exc
+    zone_problem = _explain_zoned_failure(src, scan_kwargs, zoned, plan["rename"]) if zoned else None
+    if zone_problem is not None:
+        raise ValueError(zone_problem) from last_exc
     raise ValueError(
         f"tallyman_read_csv: the schema does not parse {src.name}: {last_exc}. "
         f"Suggested schema (whole-file inference): schema={_suggest_schema_dsl(src, scan_kwargs, reserved)}"
     )
 
 
-def _csv_ordered_dir() -> Path:
-    """Project-independent home for the ordered-CSV intermediates.
+def tallyman_read_csv(path: str, schema=None, project: str | None = None, **kwargs):
+    """The raw read of a CSV, refused for the same reason ``read_project_file`` is (ADR-011 D2).
 
-    Keyed on the absolute CSV path (+ schema + reader options), so the same file
-    resolves to the same intermediate regardless of which project is active —
-    unlike a per-project artifacts dir, which makes a reconstruction running
-    under a *different* active project miss the cache and re-read the CSV (#9).
-    Per-test isolation still holds: ``TALLYMAN_HOME`` points at a tmp dir.
-    """
-    from tallyman_core.paths import tallyman_home
+    D2 names ``read_project_file``; this one goes with it, because both open a file the catalog does not
+    own and leaving the CSV reader open would be a hole in the rule. Import the CSV instead —
+    ``catalog_import_source(path, alias, separator=..., schema=...)`` — and read the source alias. The
+    reader options move to the import call and are recorded on the entry (ADR-011 D12), so the file is
+    read one way forever; to read it a second way, import it again under a second alias.
 
-    out_dir = tallyman_home() / "csv_ordered"
-    out_dir.mkdir(parents=True, exist_ok=True)
-    return out_dir
-
-
-def _ordered_csv_key(path: str, schema, scan_kwargs: dict) -> str:
-    """Stable, CSV-stat-independent key for the ordered intermediate.
-
-    Derived from the absolute path, the schema, and the reader options only —
-    NOT the CSV's mtime/size — so a reconstruction can resolve the intermediate
-    without touching (or even stat-ing) the source CSV. Freshness is a separate,
-    best-effort mtime sidecar (see ``_ordered_csv_parquet``).
-    """
-    import hashlib
-
-    kwargs_sig = repr(sorted((k, repr(v)) for k, v in scan_kwargs.items()))
-    raw = f"{Path(path).resolve()}|{_spec_sig(schema)}|{kwargs_sig}"
-    return hashlib.md5(raw.encode()).hexdigest()  # noqa: S324 — cache key, not a security boundary
-
-
-def _ordered_csv_parquet(path: str, schema, scan_kwargs: dict) -> Path:
-    """Materialise *path* to a row-order-stable parquet and return its path.
-
-    The CSV is read exactly once — at first ingest (and again only if its mtime
-    changes). The intermediate is addressed by (absolute path, schema, reader
-    options), not by the CSV's stat, so a faithful reconstruction resolves it
-    without re-reading or even stat-ing the CSV; if the source has since been
-    moved or deleted the existing intermediate is still served rather than
-    raising (#6). A sidecar records the *source* CSV's mtime so a changed CSV
-    re-materialises (#8 — mtime invalidates; bytes/size are unnecessary). The
-    sidecar tracks the source's mtime, never a derived parquet's, so the
-    result-digest / snapshot bake can never bump it into a re-ingest loop.
-
-    polars ``scan_csv -> with_row_index -> sink_parquet`` preserves source file
-    order (unlike datafusion's parallel scan, whose row order is nondeterministic
-    above the repartition threshold), so ``original_row_order`` is the true
-    0..N-1 file sequence and the bytes are reproducible. See
-    ``plans/ADR-004-result-digest-canonical-ordering.md``.
-    """
-    import os
-    import uuid
-
-    src = Path(path)
-    out_dir = _csv_ordered_dir()
-    key = _ordered_csv_key(path, schema, scan_kwargs)
-    target = out_dir / f"{key}.parquet"
-    stamp = out_dir / f"{key}.mtime"
-
-    if target.exists():
-        try:
-            current = str(src.stat().st_mtime_ns)
-        except OSError:
-            return target  # source gone — the baked intermediate IS the source of truth (#6)
-        try:
-            recorded = stamp.read_text()
-        except OSError:
-            recorded = None
-        if recorded == current:
-            return target  # unchanged source — reuse, never re-read the CSV (#6)
-        # mtime changed → fall through and re-materialise (#8)
-
-    st = src.stat()  # the single point that touches the CSV; it must be present here
-    # Unique temp name (not a fixed {key}.parquet.tmp) so two builds writing the
-    # same key concurrently can't corrupt each other's partial file (#7); the
-    # rename is atomic and last-writer-wins on identical bytes.
-    tmp = out_dir / f"{key}.{uuid.uuid4().hex}.tmp"
-    try:
-        _materialize_ordered(src, schema, scan_kwargs, tmp)
-        os.replace(tmp, target)
-    finally:
-        tmp.unlink(missing_ok=True)
-    stamp.write_text(str(st.st_mtime_ns))
-    return target
-
-
-def tallyman_read_csv(path: str, schema=None, **kwargs):
-    """Read a CSV into a xorq expression with a stable ``original_row_order``.
-
-    Use this instead of ``xo.deferred_read_csv`` for all CSV ingests. It adds a
-    0-based ``original_row_order`` column holding the source file's true row
-    sequence, which serves as the canonical total order for snapshot baking —
-    making the entry's result digest byte-stable across builds.
-
-    The CSV is read exactly once, at ingest: an order-preserving polars read
-    (``scan_csv -> with_row_index``) materialises it to a parquet intermediate,
-    and the returned expression is a ``deferred_read_parquet`` of that file with
-    a top-level ``order_by("original_row_order")``. All downstream computation
-    (the recipe, the snapshot bake, the result digest) runs on the parquet, never
-    the CSV. polars is used rather than ``ibis.row_number()`` because a bare
-    datafusion ``ROW_NUMBER() OVER ()`` numbers rows in the nondeterministic
-    arrival order of a parallel CSV scan (any file over datafusion's ~10 MB
-    repartition threshold), so it would not pin file order at all. See
-    ``plans/ADR-004-result-digest-canonical-ordering.md``.
+    The CSV reader itself did not go anywhere: the schema DSL, the inference ladder and the row-order
+    guarantee of ADR-005 and ADR-008 D2 all run at import time now (``source_import._write_csv_snapshot``
+    over ``_materialize_ordered``).
 
     Args:
         path: Absolute path to the CSV file.
-        schema: Optional ibis schema for the columns (same as deferred_read_csv).
-            When omitted, polars infers types.
-        **kwargs: Forwarded to ``polars.scan_csv`` — reader options such as
-            ``separator``, ``skip_rows``, ``null_values``, ``quote_char``,
-            ``has_header``, ``encoding``. They participate in the intermediate's
-            cache key, so changing one re-ingests. ``infer_schema_length`` and
-            ``schema_overrides`` are managed internally (see ``_RESERVED_SCAN_KWARGS``)
-            and rejected — they would collide with the values every internal
-            ``scan_csv`` call already sets.
+        schema: Accepted and unused; the import takes it.
+        project: Project name override (defaults to the active project).
+        **kwargs: Accepted and unused; the import takes them.
     """
-    import xorq.api as xo
-
     reserved = [k for k in _RESERVED_SCAN_KWARGS if k in kwargs]
     if reserved:
         raise ValueError(
@@ -623,49 +657,7 @@ def tallyman_read_csv(path: str, schema=None, **kwargs):
             "(100 -> 10k -> whole-file); to pin column types pass schema= (an ibis schema, "
             "plain dict, or tuple-of-tuples), never schema_overrides."
         )
-    parquet_path = _ordered_csv_parquet(path, schema, kwargs)
-    return xo.deferred_read_parquet(str(parquet_path)).order_by("original_row_order")
-
-
-def _reconstructing_source_digest(proj: str, rel_path: str) -> str | None:
-    """The digest *rel_path* was built with, if a recipe for *proj* is being
-    reconstructed on this call stack (#115); otherwise None.
-
-    Reads the per-entry ``{rel_path: digest}`` map ``result_cache._recipe_expr``
-    threads through ``_RECON_SOURCES``. Returns None outside reconstruction (the build
-    path), when the reconstructing entry belongs to a different project, or when this
-    source was not recorded — read_project_file then falls through to its live-file path.
-    """
-    from tallyman_xorq.result_cache import _RECON_SOURCES
-
-    ctx = _RECON_SOURCES.get()
-    if ctx is None:
-        return None
-    recon_proj, sources = ctx
-    if recon_proj != proj:
-        return None
-    return sources.get(rel_path)
-
-
-def _note_parent_sources(proj: str, content_hash: str) -> None:
-    """Fold the parent's recorded source digests into the current build's collector.
-
-    A child's build inlines its parent's frozen graph — CAS clone paths included
-    — so the child's manifest must record those digests too: ``manifest.sources``
-    is the closure record ``gc_cas`` walks to keep clones alive, and the child
-    must keep its own leaves alive even if the parent entry is later evicted.
-    ``note_source`` is a no-op outside a build's collect window, so this costs
-    nothing on a plain read.
-    """
-    from tallyman_core import read_manifest
-    from tallyman_xorq import source_identity as si
-
-    try:
-        sources = read_manifest(entry_dir(proj, content_hash)).sources or {}
-    except (OSError, ValueError):
-        return
-    for rel_path, digest in sources.items():
-        si.note_source(rel_path, digest)
+    return _source_entry_read("tallyman_read_csv", path)
 
 
 def tracked_expr_from_alias(alias: str, project: str | None = None):
@@ -680,13 +672,14 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
     current head entry. Pass the alias name as it appears in ``catalog_list``.
     To read by hash without tracking, use ``pinned_expr_from_alias``.
 
-    Returns the parent entry's *frozen build graph* on the in-process default
-    backend (``entry_graph_expr``, ADR D4): parents are inlined by value —
-    content-pinned sources, and an expensive parent's baked ``CachedNode``
-    travels along — so the child's own build becomes self-contained and
-    self-healing. When this alias is revised, recalc mints a new version of the
-    child expression; the child entry built *now* stays bound to the parent
-    revision recorded at build time forever.
+    Returns the parent entry's result on the in-process default backend
+    (``cached_result_expr``, ADR-007 D3): for a worthy parent a bare read of
+    its snapshot, whose path contains the parent's content hash, so the child's
+    identity is a function of the parent's; for a cheap parent the parent's own
+    frozen graph. The snapshot is made to exist first (``ensure_materialized``),
+    since a child cannot be built over a file that is missing. When this alias is
+    revised, recalc mints a new version of the child expression; the child entry
+    built *now* stays bound to the parent revision recorded at build time forever.
 
     The parent edge is suppressed during reconstruction (when ``_RECONSTRUCTING``
     is True — the structural-nondeterminism diagnostic re-running a recipe) so a
@@ -698,7 +691,7 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
             content hash — pass hashes to pinned_expr_from_alias instead.
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, entry_graph_expr
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
     if entry_dir(proj, alias).exists():
@@ -714,8 +707,7 @@ def tracked_expr_from_alias(alias: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=alias, follow=True)
-    _note_parent_sources(proj, content_hash)
-    return entry_graph_expr(proj, content_hash)
+    return cached_result_expr(proj, content_hash)
 
 
 def pinned_expr_from_alias(ref: str, project: str | None = None):
@@ -726,31 +718,47 @@ def pinned_expr_from_alias(ref: str, project: str | None = None):
     not advance it when the parent alias moves. Use this when you want to stay on
     a specific version of a parent rather than following alias changes.
 
-    Accepts a content hash or an explicit version reference ``"<alias>-v<N>"``
-    (1-based into the alias history — the V1…Vn the UI shows). A bare alias is
-    rejected (#166): it reads like a pin but resolves to whatever the head
-    happens to be when the recipe is built, so the recipe text under-determines
-    the entry. A pinned reference must denote the same entry forever.
+    Accepts an explicit version reference ``"<alias>-v<N>"`` only (1-based into the
+    alias history — the V1…Vn the UI shows). Two other forms are rejected:
+
+    - a bare alias (#166), which reads like a pin but resolves to whatever the head
+      happens to be when the recipe is built, so the recipe text under-determines
+      the entry. A pinned reference must denote the same entry forever;
+    - a bare content hash (ADR-011 D5). Every parent edge names an alias, followed
+      or pinned at a version, so no opaque hash appears in a recipe or in
+      ``manifest.parents``. An entry with no alias — one built by ``catalog_run`` —
+      must be named (``catalog_alias``) before anything can build on it.
 
     The parent edge is suppressed during reconstruction (same as tracked_expr_from_alias)
     so re-running a child's recipe doesn't accidentally write to the manifest.
 
     Args:
-        ref: A content hash, or a version reference like "shoe_sales-v2".
+        ref: A version reference like "shoe_sales-v2".
         project: Project name override (defaults to active TALLYMAN_PROJECT).
     """
-    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref
-    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, entry_graph_expr
+    from tallyman_core.aliases import VERSION_REF_RE, history_for, resolve_version_ref, version_of_hash
+    from tallyman_xorq.result_cache import _RECONSTRUCTING, _resolve_noncyclic_hash, cached_result_expr
 
     proj = resolve_project(project)
     if entry_dir(proj, ref).exists():
-        content_hash = ref
+        named = version_of_hash(proj, ref)
+        steer = (
+            f"Pin it as {named[0] + '-v' + str(named[1])!r} instead."
+            if named
+            else f"Entry {ref} heads no alias history, so there is no version to name: give it a name with "
+            "catalog_alias first, then pin it as '<alias>-v<N>'."
+        )
+        raise ProjectDataNotFound(
+            f"pinned_expr_from_alias({ref!r}) is a bare content hash, which a recipe may not name (ADR-011 D5): "
+            f"a parent edge names an alias and a version of it, so the DAG is readable and a hash never leaks into "
+            f"a recipe. {steer}"
+        )
     elif get_alias(proj, ref) is not None:
         raise ProjectDataNotFound(
             f"pinned_expr_from_alias({ref!r}) is a bare alias, which would silently pin "
             f"whatever the head happens to be right now (#166). Pin an exact version — "
-            f"a content hash, or {ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) "
-            "to follow the alias."
+            f"{ref + '-v<N>'!r} — or use tracked_expr_from_alias({ref!r}) to follow the "
+            "alias. A bare content hash is not the way either (ADR-011 D5)."
         )
     else:
         content_hash = resolve_version_ref(proj, ref)
@@ -770,5 +778,4 @@ def pinned_expr_from_alias(ref: str, project: str | None = None):
         from tallyman_xorq import parent_capture as pc
 
         pc.note_parent(content_hash, ref=ref, follow=False)
-    _note_parent_sources(proj, content_hash)
-    return entry_graph_expr(proj, content_hash)
+    return cached_result_expr(proj, content_hash)

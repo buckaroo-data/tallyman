@@ -346,6 +346,18 @@ def generate_datasets(data_dir: Path, scale: float) -> list[dict]:
     return out
 
 
+def import_datasets(data_dir: Path) -> None:
+    """Point a source alias at each generated dataset (ADR-011 D2).
+
+    A recipe never opens a file, so the corpus enters the catalog by import. Re-running with the same
+    bytes is a no-op, which is what makes the whole script re-runnable against a warm workdir.
+    """
+    from tallyman_xorq.source_import import update_and_depend
+
+    for name in ("events", "events_lowcard", "wide_a", "wide_b", "agg_small"):
+        update_and_depend(data_dir / f"{name}.parquet", name, project=PROJECT)
+
+
 # ---------------------------------------------------------------------------
 # catalog entries
 # ---------------------------------------------------------------------------
@@ -354,49 +366,52 @@ def generate_datasets(data_dir: Path, scale: float) -> list[dict]:
 ENTRY_ORDER = ["events_scan", "lowcard_scan", "union_wide", "small_limit", "agg_by_plate", "agg_nunique"]
 
 
-def entry_code(key: str, hashes: dict[str, str], scale: float) -> str:
+def entry_code(key: str, scale: float) -> str:
     limit = max(int(SMALL_LIMIT * scale), 1_000)
     codes = {
-        "events_scan": "from tallyman_xorq.io import read_project_file\nexpr = read_project_file('events.parquet')\n",
+        "events_scan": (
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "expr = tracked_expr_from_alias('events')\n"
+        ),
         "lowcard_scan": (
-            "from tallyman_xorq.io import read_project_file\n"
-            "expr = read_project_file('events_lowcard.parquet')\n"
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "expr = tracked_expr_from_alias('events_lowcard')\n"
         ),
         "union_wide": (
-            "from tallyman_xorq.io import read_project_file\n"
-            "a = read_project_file('wide_a.parquet')\n"
-            "b = read_project_file('wide_b.parquet')\n"
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "a = tracked_expr_from_alias('wide_a')\n"
+            "b = tracked_expr_from_alias('wide_b')\n"
             "expr = a.union(b)\n"
         ),
         "small_limit": (
-            f"from tallyman_xorq.io import read_project_file\n"
-            f"expr = read_project_file('events.parquet').limit({limit})\n"
+            f"from tallyman_xorq.io import tracked_expr_from_alias\n"
+            f"expr = tracked_expr_from_alias('events').limit({limit})\n"
         ),
         # Grouped approximate distinct count. The exact `nunique()` here is the
         # datafusion memory bomb (#46: ~37KB transient/group); `approx_nunique`
         # is the bounded-state alternative an entry should use. Kept on its own
         # small dataset regardless; keep it OFF the 4M-row events table.
         "agg_nunique": (
-            "from tallyman_xorq.io import read_project_file\n"
-            "t = read_project_file('agg_small.parquet')\n"
+            "from tallyman_xorq.io import tracked_expr_from_alias\n"
+            "t = tracked_expr_from_alias('agg_small')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
             "    n_days=t.issue_ts.approx_nunique(),\n"
             "    n_states=t.state.approx_nunique(),\n"
             ")\n"
         ),
-    }
-    if key == "agg_by_plate":
-        events_hash = hashes["events_scan"]
-        return (
+        # Chains off events_scan by ALIAS. A recipe never names a hash (ADR-011 D5), so child_build
+        # points an alias at each entry as it lands and the next one reads it.
+        "agg_by_plate": (
             "from tallyman_xorq.io import tracked_expr_from_alias\n"
-            f"t = tracked_expr_from_alias('{events_hash}')\n"
+            "t = tracked_expr_from_alias('events_scan')\n"
             "expr = t.group_by('plate').aggregate(\n"
             "    n_tickets=t.count(),\n"
             "    first_seen=t.issue_ts.min(),\n"
             "    last_seen=t.issue_ts.max(),\n"
             ")\n"
-        )
+        ),
+    }
     return codes[key]
 
 
@@ -409,15 +424,16 @@ def child_build(key: str, workdir: Path, scale: float) -> None:
     import psutil
 
     sampler = RssSampler(psutil.Process(), interval=0.025)
-    hashes = _load_hashes(workdir)
-    code = entry_code(key, hashes, scale)
+    code = entry_code(key, scale)
 
+    from tallyman_core.aliases import set_alias
     from tallyman_xorq.build import build_and_persist
 
     t0 = time.monotonic()
     res = build_and_persist(PROJECT, code)
     wall = time.monotonic() - t0
     sampler.stop()
+    set_alias(PROJECT, key, res.content_hash)  # the next entry in ENTRY_ORDER chains off this alias
     print(
         json.dumps(
             {
@@ -757,6 +773,7 @@ def main() -> int:
     # -- datasets ------------------------------------------------------------
     log.info("phase: datasets")
     results["datasets"] = generate_datasets(data_dir(PROJECT), args.scale)
+    import_datasets(data_dir(PROJECT))
 
     # -- entry builds (fresh process each) -----------------------------------
     log.info("phase: entry builds")

@@ -5,8 +5,7 @@
       "args": ["run", "tallyman", "mcp"],
       "cwd": "/Users/paddy/tallyman",
       "env": {
-        "TALLYMAN_PROJECT": "spike",
-        "TALLYMAN_COMPANION_URL": "http://127.0.0.1:7860"
+        "TALLYMAN_PROJECT": "spike"
       }
     }
   }

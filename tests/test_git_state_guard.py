@@ -139,10 +139,10 @@ def segfault_git_repo(tmp_path: Path, monkeypatch) -> Path:
     return repo
 
 
-def _agg_code(parquet_path: Path) -> str:
+def _agg_code(src: str) -> str:
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
@@ -164,10 +164,10 @@ def test_installed_guard_dispatches_git_fork_free(guard_env, spawn_spy, temp_git
     _assert_provenance_fork_free(spawn_spy, "guarded get_git_state")
 
 
-def test_build_dispatches_git_provenance_fork_free(project, orders_parquet, spawn_spy):
+def test_build_dispatches_git_provenance_fork_free(project, orders_src, spawn_spy):
     """End-to-end: a real catalog write, through real xorq build_expr ->
     compiler.py:507 -> lu.get_git_state, must capture provenance fork-free."""
-    res = build_and_persist(project, _agg_code(orders_parquet), prompt="fork-safety")
+    res = build_and_persist(project, _agg_code(orders_src), prompt="fork-safety")
     assert res.content_hash
 
     _assert_provenance_fork_free(spawn_spy, "build_and_persist")
@@ -211,3 +211,80 @@ def test_guard_degrades_on_signal_death(guard_env, segfault_git_repo):
     g.install_git_state_guard()
     state = lu.get_git_state(hash_diffs=False)
     assert state == {"commit": "unknown", "diff": "", "diff_cached": ""}
+
+
+# ---------------------------------------------------------------------------
+# The companion's own builds. Opening a worthy entry's grid (the view build), a diff's compare grid and the re-hash
+# after an unfaithful heal each call xorq's build_expr in the companion process. Catalog writes normally run in the MCP
+# process, so no build may have installed the guard in the companion before these run.
+# ---------------------------------------------------------------------------
+def _unguarded_get_git_state(hash_diffs=False):
+    """xorq's ``get_git_state`` as it ships (``logging_utils.py:44``): a bare ``git`` through ``subprocess``, which
+    forks, and a signal death raises."""
+    commit, diff, diff_cached = (
+        subprocess.check_output(cmd).decode().strip()
+        for cmd in (["git", "rev-parse", "HEAD"], ["git", "diff"], ["git", "diff", "--cached"])
+    )
+    return {"commit": commit, "diff": diff, "diff_cached": diff_cached}
+
+
+def _crash_forked_git(monkeypatch, tmp_path: Path) -> None:
+    """Put the process in the state #267 describes: a ``git`` forked from it dies with SIGSEGV, and xorq's unguarded
+    ``get_git_state`` is in place, as in a companion that has not built anything yet.
+
+    Call it after the test's own builds, since ``build_and_persist`` installs the guard.
+    """
+    from xorq.common.utils import logging_utils as lu
+
+    repo = tmp_path / "checkout"
+    (repo / ".git").mkdir(parents=True)  # the companion runs from a checkout, so xorq's _git_is_present() is true
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    fake_git = bindir / "git"
+    fake_git.write_text("#!/bin/sh\nkill -SEGV $$\n")
+    fake_git.chmod(0o755)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(lu, "get_git_state", _unguarded_get_git_state)
+
+
+def test_a_companion_opens_a_worthy_entrys_grid_when_a_forked_git_would_crash(
+    project, orders_src, tmp_path, monkeypatch
+):
+    from tallyman_companion import create_app
+    from tallyman_companion.buckaroo_lifecycle import ensure_view_build
+
+    h = build_and_persist(project, _agg_code(orders_src)).content_hash
+    _crash_forked_git(monkeypatch, tmp_path)
+    create_app(project)
+
+    assert (ensure_view_build(project, h) / "expr.yaml").is_file()
+
+
+def test_a_companion_builds_a_diffs_compare_grid_when_a_forked_git_would_crash(
+    project, orders_src, tmp_path, monkeypatch
+):
+    from tallyman_companion import create_app
+    from tallyman_companion.app import _build_compare_expr
+
+    a = build_and_persist(project, _agg_code(orders_src)).content_hash
+    b = build_and_persist(project, _agg_code(orders_src).replace("t.price.sum()", "t.price.max()")).content_hash
+    _crash_forked_git(monkeypatch, tmp_path)
+    create_app(project)
+    _build_compare_expr.cache_clear()  # keyed by hashes that another test's project can share
+
+    build_path, _ = _build_compare_expr(project, a, b, ("region",))
+    assert (build_path / "expr.yaml").is_file()
+
+
+def test_a_companion_re_hashes_a_recipe_when_a_forked_git_would_crash(project, orders_src, tmp_path, monkeypatch):
+    """The re-hash decides whether an unfaithful heal is blamed on the recipe (#88). It returns None on any error, so a
+    crashed git shows up as no hash, and the heal is blamed on execution."""
+    from tallyman_companion import create_app
+    from tallyman_xorq.result_cache import _reconstructed_hash
+
+    h = build_and_persist(project, _agg_code(orders_src)).content_hash
+    _crash_forked_git(monkeypatch, tmp_path)
+    create_app(project)
+
+    assert _reconstructed_hash(project, h) is not None

@@ -1,9 +1,30 @@
 # ADR: Intelligent CSV import — a deterministic reader with a great error/suggestion contract
 
-- **Status:** Proposed (2026-06-26). Lands on top of #137 (the polars
-  order-stable reader swap), which is merged to `main` (`52afca7`). Resolves the
-  CSV-ingest-contract cluster filed during the #137 review: **#141, #143, #144,
-  #145**; **#142 is deferred** to the holistic edge-case pass (see below).
+- **Status:** Implemented. It addresses #141, #143, #144 and #145, which are
+  still open on GitHub; #142 is deferred to the holistic edge-case pass (see
+  below).
+- **Amended by:**
+  - `plans/ADR-008-row-order-of-reads.md`: INV-1's row-index column is named
+    `__row_order` (not `original_row_order`), and INV-2's trailing `order_by` is
+    gone.
+  - `plans/ADR-011-sources-are-aliases.md`: **this reader runs at import time,
+    not in a recipe.** A CSV enters through `catalog_import_source(path, alias,
+    schema=..., reader_options={"separator": ...})`, and the schema DSL and its
+    normaliser, the inference ladder (100 → 10k → whole file), the suggestion
+    engine and the error contract all run inside the import
+    (`source_import._write_csv_snapshot`); `tallyman_read_csv` is refused in a
+    recipe, which reads the resulting source alias. The reader options are
+    fixed at import and recorded on the source entry (ADR-011 D12), so one file
+    is read one way; to read it a second way, import it again under a second
+    alias. The retry loop this ADR is built around (read, see the suggestion,
+    adjust the schema, read again) is a loop over imports, which is why ADR-011
+    keeps the raw bytes in the clone store. INV-3 holds: the parsed parquet is
+    the source entry's snapshot, `compute_cache/result_cache/<hash>.parquet`,
+    whose hash covers the CSV's digest and the reader options, and it is
+    re-created from the clone, never from the outside CSV. D5's drift check does
+    not exist, because staleness has one axis (ADR-011 D6): editing the outside
+    CSV changes nothing until it is imported again, which mints the next version
+    of its source alias.
 - **Affected code:** `src/tallyman_xorq/io.py` (`tallyman_read_csv`,
   `_polars_overrides`, `_IBIS_TO_POLARS`, a new schema-spec normaliser and a
   suggestion engine), `src/tallyman_mcp/server.py` (the `catalog_run` CSV
@@ -223,6 +244,20 @@ defensible and a guard would mean sniffing the data): (a) a tz-aware override on
 converting (wrong only if naive-local data is mislabelled with a tz); (b) `ns`
 precision is silently truncated to `µs` by `scan_csv` (the `ns` dtype label is kept
 but sub-µs digits are dropped). Bad values still raise loudly, never null.
+
+**Implementation note (#231, 2026-09-24, polars 1.40.1).** Both (a) and (b) were
+wrong about the reader as installed. (a): the reader parses offset-less text as
+UTC and converts it, so `09:30` under `timestamp('America/New_York')` was stored as
+`04:30-05:00`. A zoned column is now read as text and parsed with
+`str.to_datetime(time_unit, time_zone=tz)` (`io._parse_zoned`), which does what (a)
+says: text with an offset is converted into the zone, text without one gets the
+zone attached. A wall-clock time the zone skips or repeats at a DST change raises,
+and so does a column that mixes text with and without an offset (polars infers one
+format per column from its first non-null value). That first value is checked
+before the read, because polars 1.40.1's streaming parse writes nulls instead of
+raising when it is not a timestamp. The error names the column, the row and the
+value. (b): `ns` digits survive the reader and the snapshot, for a naive, a UTC and
+a zoned column alike.
 
 ## Alternatives considered
 

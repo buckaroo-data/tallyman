@@ -14,18 +14,18 @@ from tallyman_core import set_alias
 from tallyman_xorq import build_and_persist
 
 
-def _build_one(project: str, orders_parquet: Path) -> str:
+def _build_one(project: str, src: str) -> str:
     code = f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
     res = build_and_persist(project, code, prompt="by region")
     return res.content_hash
 
 
-def test_pack_creates_tgz(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path):
-    h = _build_one(project, orders_parquet)
+def test_pack_creates_tgz(project: str, orders_src: str, isolated_home: Path, tmp_path: Path):
+    h = _build_one(project, orders_src)
     set_alias(project, "by_region", h)
 
     out_path = tmp_path / "spike.tgz"
@@ -41,13 +41,16 @@ def test_pack_creates_tgz(project: str, orders_parquet: Path, isolated_home: Pat
     assert f"{project}/artifacts/catalog/aliases.jsonl" in names
     assert f"{project}/data/orders.parquet" in names
     assert any(f"{project}/artifacts/catalog/entries/{h}/" in n for n in names)
+    # The clone of the imported bytes ships too. A source version's snapshot is cache re-created from
+    # the clone (ADR-011 D1), so a bundle without it could not make the rows it serves again.
+    assert any(n.startswith(f"{project}/data/.cas/") and n.endswith(".parquet") for n in names)
 
 
-def test_pack_skips_buckaroo_sessions(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path):
+def test_pack_skips_buckaroo_sessions(project: str, orders_src: str, isolated_home: Path, tmp_path: Path):
     # Write a stale sessions file that mustn't ship.
     from tallyman_core import catalog_dir
 
-    _build_one(project, orders_parquet)
+    _build_one(project, orders_src)
     sessions_file = catalog_dir(project) / "buckaroo_sessions.json"
     sessions_file.write_text("{}")
     assert sessions_file.exists()
@@ -69,11 +72,11 @@ def test_pack_unknown_project(isolated_home: Path, tmp_path: Path):
     assert "not found" in result.output
 
 
-def test_pack_round_trip_serves(project: str, orders_parquet: Path, isolated_home: Path, tmp_path: Path, monkeypatch):
+def test_pack_round_trip_serves(project: str, orders_src: str, isolated_home: Path, tmp_path: Path, monkeypatch):
     """The full handoff loop: pack → extract to a random location →
     point TALLYMAN_PROJECT_PATH at the extract → serve read-only and verify
     every alias resolves."""
-    h = _build_one(project, orders_parquet)
+    h = _build_one(project, orders_src)
     set_alias(project, "by_region", h)
 
     out_path = tmp_path / "bundle.tgz"

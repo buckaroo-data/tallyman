@@ -2,9 +2,13 @@
   "project": "spike",
   "steps": [
     {
-      "tool": "catalog_load_parquet",
-      "args": {"rel_path": "orders.parquet", "name": "orders", "prompt": "raw orders dataset"},
-      "narration": "beat 1: load the orders parquet and name it"
+      "tool": "catalog_import_source",
+      "args": {
+        "outside_path": "${TALLYMAN_PROJECT_ROOT}/data/orders.parquet",
+        "alias": "orders",
+        "prompt": "raw orders dataset"
+      },
+      "narration": "beat 1: import the orders parquet under a source alias"
     },
     {
       "tool": "catalog_create",
@@ -21,7 +25,7 @@
         "code": "from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias('shoe_sales')\nexpr = t.order_by('total')\n",
         "prompt": "verify shoe_sales totals are reasonable"
       },
-      "narration": "beat 4: scratch verification — sort the result"
+      "narration": "beat 4: scratch verification \u2014 sort the result"
     },
     {
       "tool": "catalog_revise",
@@ -39,8 +43,14 @@
         "vega_spec": {
           "mark": "bar",
           "encoding": {
-            "x": {"field": "region", "type": "nominal"},
-            "y": {"field": "total", "type": "quantitative"}
+            "x": {
+              "field": "region",
+              "type": "nominal"
+            },
+            "y": {
+              "field": "total",
+              "type": "quantitative"
+            }
           }
         }
       },
@@ -52,7 +62,7 @@
         "cell_id": "PLACEHOLDER",
         "markdown": "## Shoe sales by region\n\nBroader bucket: boots, sneakers, sandals."
       },
-      "narration": "beat 10: rewrite the markdown for the audience (skipped — needs cell_id resolution)",
+      "narration": "beat 10: rewrite the markdown for the audience (skipped \u2014 needs cell_id resolution)",
       "skip": true
     }
   ]

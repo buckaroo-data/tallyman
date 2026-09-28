@@ -65,9 +65,11 @@ import pytest
 
 from tallyman_core import catalog_state as cs
 from tallyman_core import paths
+from tallyman_core.aliases import set_alias
 from tallyman_core.paths import data_dir, ensure_project, entry_dir, set_active_project
 from tallyman_xorq.build import build_and_persist
 from tallyman_xorq.result_cache import cached_result_expr
+from tallyman_xorq.source_import import update_and_depend
 from tests.cache_lab_data import (
     N_STATIONS,
     capacity_frame,
@@ -82,7 +84,6 @@ pytestmark = pytest.mark.cache_lab
 
 TRIPS_ROWS = int(os.environ.get("CACHE_LAB_TRIPS", "150000"))
 CHAIN_DEPTH = int(os.environ.get("CACHE_LAB_CHAIN", "32"))
-IDENTITY_MODE = os.environ.get("TALLYMAN_SOURCE_IDENTITY", "off")
 REPORT_DIR = Path(__file__).resolve().parent / "cache_lab_reports"
 
 
@@ -115,12 +116,11 @@ class LabReport:
                 "platform": platform.platform(),
                 "xorq": version("xorq"),
                 "xorq_dasher": version("xorq-dasher"),
-                "source_identity_mode": IDENTITY_MODE,
             },
             "scenarios": self.scenarios,
         }
         REPORT_DIR.mkdir(exist_ok=True)
-        out = REPORT_DIR / f"{rev}-{IDENTITY_MODE}-{self.started.replace(':', '')}.json"
+        out = REPORT_DIR / f"{rev}-{self.started.replace(':', '')}.json"
         out.write_text(json.dumps(doc, indent=2, default=str))
         print(f"\n=== cache lab report: {out} ===")
         for name, rec in self.scenarios.items():
@@ -171,9 +171,11 @@ def _warm_xorq_once(staged_data: Path) -> None:
     dd = data_dir("lab-warmup")
     dd.mkdir(parents=True, exist_ok=True)
     shutil.copy2(staged_data / "stations.parquet", dd / "stations.parquet")
+    update_and_depend(dd / "stations.parquet", "stations_src", project="lab-warmup")
     build_and_persist(
         "lab-warmup",
-        _prelude("lab-warmup") + 'expr = read_project_file("stations.parquet", project=_P).select("station_id")\n',
+        _prelude("lab-warmup")
+        + 'expr = tracked_expr_from_alias("stations_src", project=_P).select("station_id", "__row_order")\n',
     )
     _WARMED = True
 
@@ -189,6 +191,9 @@ def lab(staged_data: Path, isolated_home: Path, request, lab_report):
     dd.mkdir(parents=True, exist_ok=True)
     for f in staged_data.iterdir():
         shutil.copy2(f, dd / f.name)
+        # A recipe never opens a file (ADR-011 D2): each staged parquet enters the project as a
+        # source alias, "<stem>_src", and the scenario codes read that.
+        update_and_depend(dd / f.name, f"{f.stem}_src", project=name)
     rec = lab_report.scenario(request.node.name.removeprefix("test_"))
 
     class Lab:
@@ -292,7 +297,7 @@ def md5_file(path: Path) -> str:
 
 def _prelude(project: str) -> str:
     return (
-        "from tallyman_xorq.io import read_project_file, tracked_expr_from_alias, pinned_expr_from_alias\n"
+        "from tallyman_xorq.io import tracked_expr_from_alias, pinned_expr_from_alias\n"
         f"import xorq.vendor.ibis as ibis\n_P = {project!r}\n"
     )
 
@@ -307,8 +312,8 @@ def treadmill_code(project: str, edit: int) -> str:
     """
     parts = [
         _prelude(project),
-        'trips = read_project_file("trips.parquet", project=_P)\n'
-        'stations = read_project_file("stations.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        'stations = tracked_expr_from_alias("stations_src", project=_P)\n'
         "t = trips.filter(trips.start_station_id != trips.end_station_id)\n"
         "j = t.join(stations, t.start_station_id == stations.station_id)\n"
         "j = j.mutate(trip_minutes=(j.ended_at.cast('int64') - j.started_at.cast('int64')) / 60_000_000)\n",
@@ -351,8 +356,8 @@ def flow_imbalance_code(project: str) -> str:
     lineage, tiny (~600 row) result. The high-value cache archetype.
     """
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
-        'stations = read_project_file("stations.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        'stations = tracked_expr_from_alias("stations_src", project=_P)\n'
         "t = trips.mutate(day=trips.started_at.truncate('D'))\n"
         "dep = t.group_by(['start_station_id', 'day']).aggregate(departures=t.ride_id.count())\n"
         "arr = t.group_by(['end_station_id', 'day']).aggregate(arrivals=t.ride_id.count())\n"
@@ -368,8 +373,8 @@ def flow_imbalance_code(project: str) -> str:
 def weather_mix_code(project: str) -> str:
     """Trips joined to hourly weather on the truncated hour, bucketed."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
-        'wx = read_project_file("weather.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        'wx = tracked_expr_from_alias("weather_src", project=_P)\n'
         "t = trips.mutate(obs=trips.started_at.truncate('h'))\n"
         "j = t.join(wx, t.obs == wx.obs_hour)\n"
         "j = j.mutate(minutes=(j.ended_at.cast('int64') - j.started_at.cast('int64')) / 60_000_000)\n"
@@ -388,7 +393,7 @@ def od_matrix_code(project: str, order: str = "name") -> str:
         "none": "expr = od\n",
     }[order]
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "t = trips.filter(trips.start_station_id != trips.end_station_id)\n"
         "t = t.mutate(minutes=(t.ended_at.cast('int64') - t.started_at.cast('int64')) / 60_000_000)\n"
         "od = t.group_by(['start_station_name', 'end_station_name']).aggregate(\n"
@@ -399,7 +404,7 @@ def od_matrix_code(project: str, order: str = "name") -> str:
 def member_count_code(project: str) -> str:
     """Smallest honest aggregate; used where the scenario isn't about the expr."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "expr = trips.group_by('member_casual').aggregate(n=trips.ride_id.count())\n"
     )
 
@@ -407,8 +412,8 @@ def member_count_code(project: str) -> str:
 def utilization_code(project: str) -> str:
     """Trips-per-dock against the fixed-width capacity table (swap scenario)."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
-        'cap = read_project_file("capacity.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        'cap = tracked_expr_from_alias("capacity_src", project=_P)\n'
         "g = trips.group_by('start_station_id').aggregate(n_starts=trips.ride_id.count())\n"
         "j = g.join(cap, g.start_station_id == cap.station_id)\n"
         "expr = j.select('start_station_id', 'n_starts', 'capacity',\n"
@@ -419,17 +424,17 @@ def utilization_code(project: str) -> str:
 def cleaned_trips_code(project: str) -> str:
     """Parent of a tracked_expr_from_alias chain: filter + projection only (no join/agg/sort)."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "t = trips.filter((trips.start_station_id != trips.end_station_id)\n"
         "                 & (trips.ended_at > trips.started_at))\n"
         "expr = t.select('ride_id', 'rideable_type', 'started_at', 'ended_at',\n"
-        "                'start_station_id', 'end_station_id', 'member_casual')\n"
+        "                'start_station_id', 'end_station_id', 'member_casual', '__row_order')\n"
     )
 
 
-def child_of_catalog_code(project: str, parent_hash: str) -> str:
+def child_of_catalog_code(project: str, parent_ref: str) -> str:
     return _prelude(project) + (
-        f"base = pinned_expr_from_alias({parent_hash!r}, project=_P)\n"
+        f"base = pinned_expr_from_alias({parent_ref!r}, project=_P)\n"
         "base = base.mutate(minutes=(base.ended_at.cast('int64') - base.started_at.cast('int64')) / 60_000_000)\n"
         "expr = base.group_by(['start_station_id', 'rideable_type']).aggregate(\n"
         "    n=base.ride_id.count(), avg_minutes=base.minutes.mean())\n"
@@ -443,7 +448,7 @@ def wide_compile_code(project: str, depth: int) -> str:
     in a loop without thinking about plan size.
     """
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "f = trips.mutate(minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000,\n"
         "                 hour=trips.started_at.hour())\n"
         "for h in range(24):\n"
@@ -454,7 +459,7 @@ def wide_compile_code(project: str, depth: int) -> str:
         "band = ibis.cases(*[ (f.start_station_id % 20 == k, float(k)) for k in range(19) ], else_=19.0)\n"
         "f = f.mutate(zone_band=band)\n"
         f"expr = f.select('ride_id', 'minutes', 'hour', 'zone_band', f'score_{depth}',\n"
-        "                *[f'is_h{h:02d}' for h in range(24)])\n"
+        "                *[f'is_h{h:02d}' for h in range(24)], '__row_order')\n"
     )
 
 
@@ -467,7 +472,7 @@ def dock_contention_code(project: str) -> str:
     and the result is one row per station.
     """
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "week = trips.filter(trips.started_at < ibis.timestamp('2025-09-08 00:00:00'))\n"
         "a = week.select(sid='start_station_id', ride='ride_id', ts='started_at')\n"
         "b = week.view().select(sid2='start_station_id', ride2='ride_id', ts2='started_at')\n"
@@ -481,8 +486,8 @@ def event_annotate_code(project: str) -> str:
     """'Annotate each trip with its start station's maintenance events' —
     reads as an enrichment, is actually a row multiplier (~8 events/station)."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
-        'ev = read_project_file("events.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        'ev = tracked_expr_from_alias("events_src", project=_P)\n'
         "j = trips.join(ev, trips.start_station_id == ev.station_id)\n"
         "expr = j.select('ride_id', 'start_station_id', 'started_at', 'member_casual',\n"
         "                'event_type', 'event_date', 'crew')\n"
@@ -492,7 +497,7 @@ def event_annotate_code(project: str) -> str:
 def groups_galore_code(project: str) -> str:
     """An Aggregate that barely reduces: group keys ≈ row identity."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "t = trips.mutate(day=trips.started_at.truncate('D'), hour=trips.started_at.hour(),\n"
         "                 minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000)\n"
         "expr = t.group_by(['start_station_id', 'end_station_id', 'day', 'hour']).aggregate(\n"
@@ -503,18 +508,19 @@ def groups_galore_code(project: str) -> str:
 def label_balloon_code(project: str) -> str:
     """Row-wise string assembly: output bytes balloon past the input's."""
     return _prelude(project) + (
-        'trips = read_project_file("trips.parquet", project=_P)\n'
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
         "t = trips.mutate(minutes=(trips.ended_at.cast('int64') - trips.started_at.cast('int64')) / 60_000_000)\n"
         "t = t.mutate(route_label=t.start_station_name.concat(' -> ').concat(t.end_station_name))\n"
         "t = t.mutate(trip_summary=t.member_casual.concat(' ').concat(t.rideable_type)\n"
         "             .concat(' ride ').concat(t.ride_id).concat(' via ').concat(t.route_label))\n"
-        "expr = t.select('ride_id', 'route_label', 'trip_summary', 'minutes')\n"
+        "expr = t.select('ride_id', 'route_label', 'trip_summary', 'minutes', '__row_order')\n"
     )
 
 
 def distinct_tiny_code(project: str) -> str:
     return _prelude(project) + (
-        "trips = read_project_file(\"trips.parquet\", project=_P)\nexpr = trips.select('rideable_type').distinct()\n"
+        'trips = tracked_expr_from_alias("trips_src", project=_P)\n'
+        "expr = trips.select('rideable_type').distinct()\n"
     )
 
 
@@ -569,8 +575,11 @@ def test_agg_views(lab):
 
 
 def test_touch_identity(lab):
-    """Byte-identical rewrite of the source (new inode + mtime). Strategy
-    differentiator: stat-keyed identity forks, content-keyed identity holds."""
+    """A byte-identical rewrite of the outside file (new inode + mtime) must change nothing.
+
+    Identity is the bytes and the reader options, so re-importing the same content is a no-op: the
+    alias stays where it is, no version is minted, and the entry over it keeps its hash. A stat-keyed
+    identity would fork here and manufacture a duplicate entry."""
     code = od_matrix_code(lab.project)
     b1 = build(lab.project, code)
 
@@ -578,18 +587,22 @@ def test_touch_identity(lab):
     tmp = src.with_suffix(".rewrite")
     shutil.copyfile(src, tmp)
     os.replace(tmp, src)  # same bytes, fresh inode and mtime
+    again = update_and_depend(src, "trips_src", project=lab.project)
 
     b2 = build(lab.project, code)
     lab.record.update(
         {
             "hash_before": b1["hash"],
             "hash_after": b2["hash"],
+            "reimport_minted_a_version": again["created"],
             "identity_stable_on_identical_rewrite": b1["hash"] == b2["hash"],
             "duplicate_entries_created": int(b1["hash"] != b2["hash"]),
             "build_wall_s": [b1["wall_s"], b2["wall_s"]],
             "final_disk": disk(lab.project),
         }
     )
+    assert again["created"] is False and again["version"] == 1
+    assert b1["hash"] == b2["hash"], "an identical rewrite forked the entry"
     # Invariant either way: both entries hold the same logical result.
     a = cached_result_expr(lab.project, b1["hash"]).execute()
     b = cached_result_expr(lab.project, b2["hash"]).execute()
@@ -602,8 +615,10 @@ def test_touch_identity(lab):
 
 
 def test_append_invalidates(lab, staged_data):
-    """A real content change MUST fork identity and refresh results — hard
-    invariant for any strategy."""
+    """A real content change MUST mint the next source version and refresh results — a hard invariant.
+
+    The edit reaches the catalog through the import, not through the build: the file on disk is
+    provenance, and re-importing it is what advances ``trips_src`` to v2."""
     code = member_count_code(lab.project)
     b1 = build(lab.project, code)
     n_before = cached_result_expr(lab.project, b1["hash"]).execute()["n"].sum()
@@ -613,6 +628,8 @@ def test_append_invalidates(lab, staged_data):
         max(TRIPS_ROWS // 20, 500), pd.read_parquet(lab.data / "stations.parquet"), np.random.default_rng(99)
     )
     pd.concat([pd.read_parquet(src), extra], ignore_index=True).to_parquet(src)
+    v2 = update_and_depend(src, "trips_src", project=lab.project)
+    assert v2["created"] is True and v2["version"] == 2, v2
 
     b2 = build(lab.project, code)
     n_after = cached_result_expr(lab.project, b2["hash"]).execute()["n"].sum()
@@ -629,9 +646,11 @@ def test_append_invalidates(lab, staged_data):
 
 
 def test_stat_swap(lab):
-    """The nastiest invalidation case: replace content while preserving
-    (mtime, size, inode). A stat identity keeps the old hash and silently
-    serves stale bytes; a content identity forks. Recorded, not asserted."""
+    """The nastiest invalidation case: replace content while preserving (mtime, size, inode).
+
+    A stat-keyed identity keeps the old hash and silently serves stale bytes. There is no stat memo
+    left to defeat (ADR-011 D6 deleted it with ``source_digests.json``): an import digests the bytes
+    every time, so the swap is seen and mints v2. Asserted now, where it used to be recorded."""
     code = utilization_code(lab.project)
     b1 = build(lab.project, code)
     stored_before = cached_result_expr(lab.project, b1["hash"]).execute()
@@ -656,30 +675,40 @@ def test_stat_swap(lab):
         st_before.st_ino,
     ), "test rig failed to preserve the stat triple"
 
+    v2 = update_and_depend(cap_path, "capacity_src", project=lab.project)
     b2 = build(lab.project, code)
     detected = b2["hash"] != b1["hash"]
-    lab.record.update({"hash_before": b1["hash"], "hash_after": b2["hash"], "content_swap_detected": detected})
-    if not detected:
-        # Same identity ⇒ the dedup path returned the OLD entry. Show whether
-        # its stored bytes now disagree with an honest recompute.
-        fresh = cached_result_expr(lab.project, b1["hash"]).execute()
-        merged = stored_before.merge(fresh, on="start_station_id", suffixes=("_stale", "_fresh"))
-        lab.record["stale_rows_served"] = int((merged.capacity_stale != merged.capacity_fresh).sum())
-    else:
-        fresh = cached_result_expr(lab.project, b2["hash"]).execute()
-        assert (
-            fresh.sort_values("start_station_id").capacity.to_numpy()
-            == swapped.sort_values("station_id").capacity.to_numpy()
-        ).all()
+    lab.record.update(
+        {
+            "hash_before": b1["hash"],
+            "hash_after": b2["hash"],
+            "content_swap_detected": detected,
+            "reimport_version": v2["version"],
+        }
+    )
+    assert v2["created"] is True and v2["version"] == 2, "a stat-preserving content swap went unseen"
+    assert detected, "the entry over the swapped source kept its hash"
+    fresh = cached_result_expr(lab.project, b2["hash"]).execute()
+    assert (
+        fresh.sort_values("start_station_id").capacity.to_numpy()
+        == swapped.sort_values("station_id").capacity.to_numpy()
+    ).all()
+    # The v1 entry still serves the bytes it was built from; that is what the clone is for.
+    kept = cached_result_expr(lab.project, b1["hash"]).execute()
+    pd.testing.assert_frame_equal(
+        kept.sort_values("start_station_id").reset_index(drop=True),
+        stored_before.sort_values("start_station_id").reset_index(drop=True),
+        check_dtype=False,
+    )
 
 
 def test_selfheal_after_edit(lab):
-    """An entry's materializations are evicted AFTER the user edits the
-    source file in place. Self-heal recomputes from the persisted build:
-    does the old entry get back the data it was built from, or silently
-    absorb the new data under the old identity? A content-addressed
-    snapshot (cas) stays faithful; a plain data-path read recomputes over
-    the new bytes. Recorded, not asserted — it differentiates strategies."""
+    """An entry's materializations are evicted AFTER the user edits the outside file in place.
+
+    The heal must get back the data the entry was built from. It does, and not by being careful: the
+    edited file is provenance and is never opened again (ADR-011 D2), so the heal reads the source
+    entry's snapshot, or writes it again from the clone of the bytes that were imported. Asserted
+    now, where it used to be recorded as a strategy difference."""
     code = od_matrix_code(lab.project)
     b1 = build(lab.project, code)
     before = cached_result_expr(lab.project, b1["hash"]).execute()
@@ -704,7 +733,9 @@ def test_selfheal_after_edit(lab):
             "selfheal_faithful_after_source_edit": int(healed.n_trips.sum()) == int(before.n_trips.sum()),
         }
     )
-    assert len(healed) > 0  # self-heal must at least produce a readable result
+    assert int(healed.n_trips.sum()) == int(before.n_trips.sum()), (
+        "the heal absorbed the edited file; an imported version's rows do not move"
+    )
 
 
 def test_reset_roundtrip(lab):
@@ -763,7 +794,9 @@ def test_parent_regen(lab):
     import tempfile
 
     parent = build(lab.project, cleaned_trips_code(lab.project))
-    child_code = child_of_catalog_code(lab.project, parent["hash"])
+    # A recipe pins by version reference, never by bare hash (ADR-011 D5), so the parent needs a name first.
+    set_alias(lab.project, "lab_parent", parent["hash"])
+    child_code = child_of_catalog_code(lab.project, "lab_parent-v1")
     c1 = build(lab.project, child_code)
 
     # The parent (cleaned_trips: filter+projection) is cheap, so it bakes no

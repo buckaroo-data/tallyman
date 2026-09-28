@@ -1,6 +1,12 @@
 # DataFusion scan ordering — findings and decision
 
 - **Status:** Resolved (2026-06-25) — **stick with polars for the ingest reader.**
+- **Status note (2026-09-24):** the polars decision stands for CSV: polars parses
+  a CSV once, when it is imported (`plans/ADR-011-sources-are-aliases.md`), and
+  a parquet file is copied in file order by pyarrow, which keeps its types. The
+  row-index column is `__row_order`, not `original_row_order`, and
+  `result_digest` is a content digest of the snapshot read back, not a hash of
+  its bytes (`plans/ADR-009-digest-stability.md`).
 - **Origin:** Investigation behind `plans/ADR-004-result-digest-canonical-ordering.md`,
   prompted by datafusion's nondeterministic parallel scan order producing false
   "drift" on the order-sensitive result digest.
@@ -61,7 +67,7 @@ Source of truth: `datafusion/common/src/config.rs` and the
 | `datafusion.execution.target_partitions` | `0` → CPU cores | The master knob. `1` → single partition → no round-robin, no file split, no arbitrary coalesce → deterministic file-order output. Also single-threaded. |
 | `datafusion.optimizer.repartition_file_scans` | `true` | When true (+ `target_partitions>1` + file ≥ min size), a single file is byte-range-split across partitions and merged → reorders. `false` keeps one file in one partition, read in order. (alamb's recommended flag.) |
 | `datafusion.optimizer.enable_round_robin_repartition` | `true` | Inserts `RepartitionExec(RoundRobinBatch)` → "arbitrary interleaving (and thus unordered)." Not exposed as a xorq builder method, but reachable via the generic `.set(...)`. |
-| `datafusion.optimizer.repartition_file_min_size` | `1048576` (1 MiB) | Threshold below which a file is never split. Small test files look "deterministic" only because they are under this. |
+| `datafusion.optimizer.repartition_file_min_size` | `10485760` (10 MiB in xorq-datafusion 0.2.7) | Threshold below which a file is never split. Small test files look "deterministic" only because they are under this. |
 | `datafusion.optimizer.prefer_existing_sort` | `false` | Preserves only a *declared* ordering (`preserve_order=true` on `RepartitionExec` + `SortPreservingMergeExec`). No-op for an undeclared scan. |
 
 Not relevant to a plain scan: `repartition_aggregations`, `repartition_windows`,

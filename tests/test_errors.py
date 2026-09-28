@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core import clear_errors, get_error, list_errors, record_error
+from tallyman_core.paths import errors_path
 from tallyman_mcp.server import catalog_run
 
 
@@ -29,6 +31,25 @@ def test_get_error_by_id(project: str):
     got = get_error(project, a["id"])
     assert got["message"] == "m"
     assert get_error(project, "missing") is None
+
+
+def test_a_corrupt_line_is_skipped_and_the_records_around_it_are_still_read(project: str):
+    """A line that is not a JSON object (a torn append, a hand edit) used to make every reader of the log raise: the
+    banner, the error page, and the Cache page's listing and delete (#196). It is skipped instead."""
+    a = record_error(project, code="a", message="m1")
+    with errors_path(project).open("a") as fh:
+        fh.write('{"id": "torn", "code": \n')
+        fh.write("[1, 2]\n")
+    b = record_error(project, code="b", message="m2")
+
+    try:
+        rows = list_errors(project)
+        found = get_error(project, b["id"])
+    except ValueError as exc:
+        pytest.fail(f"one corrupt line made the log unreadable: {exc!r}")
+
+    assert [r["id"] for r in rows] == [b["id"], a["id"]]
+    assert found is not None and found["message"] == "m2"
 
 
 def test_catalog_run_failure_records_error(project: str, monkeypatch):
@@ -120,7 +141,7 @@ def test_error_detail_shows_tool_pill(fresh_companion_app, project: str):
     assert r.json()["error"]["tool"] == "catalog_run"
 
 
-def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_parquet, monkeypatch):
+def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     """Entries and error APIs return independent data for the React sidebar."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     from tallyman_mcp.server import catalog_create
@@ -128,8 +149,8 @@ def test_error_detail_sidebar_has_full_catalog_list(fresh_companion_app, project
     catalog_create(
         "shoe_sales",
         f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r}, project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """,
     )

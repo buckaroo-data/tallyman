@@ -506,8 +506,8 @@ function EntryCacheView({ project, hash }: { project: string; hash: string }) {
         </span>
         <span className="meta">
           {data.source_tracked
-            ? `${data.source_formatted} raw source${data.sources.length > 1 ? ` (${data.sources.length} files)` : ""}`
-            : "raw source size not tracked (source-identity off)"}
+            ? `${data.source_formatted} imported bytes, kept so the snapshot can be written again`
+            : "no imported bytes — this expression is a computation over other aliases"}
           {data.modified_at && <> · last modified {data.modified_at.slice(0, 19).replace("T", " ")}</>}
         </span>
         <span className="meta cache-note">

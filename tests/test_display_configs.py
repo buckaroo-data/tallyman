@@ -29,8 +29,8 @@ SAMPLE_CONFIG = {
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(n=t.count())
 """
 
@@ -74,7 +74,7 @@ def test_remove_display_config(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_entry_detail_includes_display_config(fresh_companion_app, project: str, orders_parquet):
+def test_entry_detail_includes_display_config(fresh_companion_app, project: str, orders_src):
     res = build_and_persist(project, _agg_code(project))
     set_display_config(project, res.content_hash, SAMPLE_CONFIG)
     c = TestClient(fresh_companion_app)
@@ -85,7 +85,7 @@ def test_entry_detail_includes_display_config(fresh_companion_app, project: str,
     assert body["display_config"]["diff_provenance"]["source_alias"] == "sales"
 
 
-def test_entry_detail_display_config_null_when_absent(fresh_companion_app, project: str, orders_parquet):
+def test_entry_detail_display_config_null_when_absent(fresh_companion_app, project: str, orders_src):
     res = build_and_persist(project, _agg_code(project))
     c = TestClient(fresh_companion_app)
     r = c.get(f"/{project}/api/entry/{res.content_hash}")

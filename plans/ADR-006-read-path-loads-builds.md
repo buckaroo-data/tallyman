@@ -1,9 +1,15 @@
 # ADR: Reads load the frozen build — the #163 read-path decisions
 
-- **Status:** Accepted (2026-07-30) — decided in the grilling session over
-  `docs/system-contract.md`. Supersedes the read-path behavior introduced by
-  #74/#75 (recipe re-import on read). All follow-up questions resolved
-  (D9–D12, and the D5 amendment); implemented on PR #167.
+- **Status:** Accepted (2026-07-30) — decided in the grilling session over `docs/system-contract.md`.
+  Supersedes the read-path behavior introduced by #74/#75 (recipe re-import on read). All follow-up questions
+  resolved (D9–D12, and the D5 amendment); implemented on PR #167. Two of its decisions are superseded by
+  `plans/ADR-007-tallyman-owned-materialization.md`: D4 (chaining inlines the parent's cache node) and D8 (the
+  manifest records the snapshot key and reads assert it), since no build holds a cache node any more. D5 (the
+  canonical sort) is amended by `plans/ADR-008-row-order-of-reads.md` (every sort gets the natural order, a
+  non-final sort is kept) and by `plans/ADR-009-digest-stability.md` (`result_digest` is a content digest, no
+  longer a file hash). D2 keeps its facade, but the snapshot's path is now a function of the content hash
+  (ADR-007 D2) and no loader takes a `cache_dir`. D10's session eviction became a forced Buckaroo reload,
+  since tallyman keeps no record of sessions (ADR-007 D6). D3, D6, D7, D9 and D12 keep their intent.
 - **Context ticket:** buckaroo-data/tallyman#163 (read path reconstructs from
   `expr.py`; a content hash does not name a fixed result). Normative design:
   `docs/system-contract.md`. Bug-class survey:
@@ -95,8 +101,10 @@ warnings advisory, #171 + provocation tests capturing the residual — with
 sort-by-all-columns and a multiset digest noted as the escape hatches "if the
 advisory fires in practice."
 
-It fires on every heal. The #171 probe (250k rows, above DataFusion's 1 MiB
-`repartition_file_min_size`) produced three distinct digests over three heals,
+It fires on every heal. The #171 probe (250k rows, a 2.07 MB file, which is
+below DataFusion's `repartition_file_min_size` of 10,485,760 bytes, 10 MiB in
+xorq-datafusion 0.2.7, so it is the aggregate's repartitioning by key that
+reorders rows there) produced three distinct digests over three heals,
 none matching the build. At that rate the advisory posture is untenable: D10
 would wipe stat caches on every heal and D12 would pin and badge every large
 parquet-sourced entry, drowning the signal both exist to carry.

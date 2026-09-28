@@ -9,13 +9,14 @@ bare ``deferred_read_parquet`` — every entry truncated the graph at a parquet
 boundary, so build/reconstruct cost was depth-independent by construction. #74
 (and #104, which made ``cached_result_expr`` the *sole* read path) dropped that:
 
-* **Expensive parent** (``cache_worthy`` — Aggregate / Join / Sort / window / UDF):
-  ``cached_result_expr`` returns a bare ``deferred_read_parquet`` of the baked
-  ``ParquetSnapshotCache`` snapshot. Still truncates — for the *returned*
-  expression.
-* **Cheap parent** (projection / rename / row-wise scalar math): re-imports the
-  parent's ``expr.py`` recipe and composes its full expression into the child.
-  No truncation. The recipe re-import runs on every cold read (since #73).
+* **Expensive parent** (``cache_worthy`` — Aggregate / Join / Sort / window / UDF /
+  union / …): ``cached_result_expr`` returns a bare ``deferred_read_parquet`` of the
+  parent's materialized snapshot (ADR-007 D3). Truncates the graph, for the child's
+  build and for every read after it.
+* **Cheap parent** (a row-preserving plan over one file): ``cached_result_expr`` returns
+  the parent's own loaded build, and the child's build composes that full expression
+  into itself. No truncation, so the graph grows with the depth of the cheap chain.
+  Loading each frozen build runs on every cold read, and no recipe is re-imported (#163).
 
 So the per-entry parquet boundary that used to hide deep-graph build cost is gone
 for cheap chains. This module measures what that costs, against the three
@@ -26,19 +27,20 @@ hypotheses #82 names:
   cheap chains need their own boundary).
 * **H2** — an expensive entry truncates the chain: a child reading it pays a bare
   snapshot read, independent of the depth *below* it.
-* **H3** — the per-cold-read recipe-reconstruction cost (new since #73) is small
-  relative to execute, or it is a material cold-read regression.
+* **H3** — the per-cold-read plan-load cost is small relative to execute, or it is a
+  material cold-read regression.
 
 What "build/tokenize ... no ``.execute()``" means here. ``cached_result_expr``
-*returns the reconstructed expression without executing it* — for a cheap chain
-that is the full graph-construction cost (recipe re-import + compose) the issue
-asks for. We time that, then separately time ``to_sql`` (graph → plan compile)
-and ``.execute()`` (the H3 denominator). Cold = ``cache_clear()`` + an evicted
-compute cache (recipe re-imported); warm = the ``_resolve_result_plan`` LRU is hot
+*returns the expression without executing it* — for a cheap chain that is the full
+graph-construction cost (build load + compose) the issue asks for, after
+``ensure_materialized`` has made every file it reads exist. We time that, then
+separately time ``to_sql`` (graph → plan compile) and ``.execute()`` (the H3
+denominator). Cold = ``cache_clear()`` + an evicted compute cache (builds
+re-loaded, files made again); warm = the ``_resolve_result_plan`` LRU is hot
 (``result_cache.py``). The reconstruct *count* — the explanatory variable per
 #59's "counts over wall-clock" convention — is read straight off the
-``tallyman.perf`` cold-read log lines (#87/#60 instrumentation): one per entry
-reconstructed in the chain.
+``tallyman.perf`` cold-read log lines (#87/#60 instrumentation): one per build
+loaded in the chain.
 
 Why a *synthetic* chain, not the parking corpus. The parking corpus is deep in
 *revisions*, not in ``tracked_expr_from_alias`` chaining (its deepest chain is ~4), so it
@@ -107,10 +109,12 @@ pr = _load_perf_report()
 def _count_cold_reads():
     """Count ``cached_result_expr`` cold-read events emitted on ``tallyman.perf``.
 
-    Each cold reconstruct of an entry logs one ``... cold read ...`` line
-    (``result_cache.py``). During a single cold read of a chain leaf, every entry
-    reconstructed in the chain emits one — so the count is the number of links the
-    read actually walked, i.e. #59's explanatory variable for the wall time.
+    Each cold load of an entry's build logs one ``... cold read ...`` line
+    (``result_cache.py``), and each heal of a snapshot one ``ensure_materialized
+    healed`` line (``materialize.py``). During a single cold read of a chain leaf,
+    every entry whose build is loaded emits one — so the count is the number of
+    links the read actually walked, i.e. #59's explanatory variable for the wall
+    time.
 
     Yields a dict whose ``count`` key is filled in once the block exits.
     """
@@ -132,7 +136,7 @@ def _count_cold_reads():
         logger.removeHandler(handler)
         logger.setLevel(old_level)
         box["count"] = sum(1 for m in msgs if "cold read" in m)
-        box["heals"] = sum(1 for m in msgs if "self-heal" in m)
+        box["heals"] = sum(1 for m in msgs if "healed" in m or "self-heal" in m)
 
 
 # ---------------------------------------------------------------------------
@@ -144,30 +148,30 @@ def _root_code() -> str:  # cheap: parquet read + projection (no expensive op)
     return f"""
 from tallyman_xorq.io import read_project_file
 t = read_project_file("seed.parquet", project={PROJECT!r})
-expr = t.select("region", "price", "qty")
+expr = t.select("region", "price", "qty", "__row_order")
 """
 
 
-def _cheap_child_code(parent: str, i: int) -> str:  # cheap: row-wise mutate off a pinned parent hash
+def _cheap_child_code(parent: str, i: int) -> str:  # cheap: row-wise mutate off the parent alias (never revised)
     return f"""
-from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(d{i}=t.price + {i})
 """
 
 
-def _expensive_code(parent: str) -> str:  # Aggregate → cache_worthy → bakes a snapshot (the truncating boundary)
+def _expensive_code(parent: str) -> str:  # Aggregate → cache_worthy → materialized (the truncating boundary)
     return f"""
-from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
 def _cheap_over_expensive_code(parent: str) -> str:  # cheap leaf above the expensive boundary
     return f"""
-from tallyman_xorq.io import pinned_expr_from_alias
-t = pinned_expr_from_alias({parent!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({parent!r})
 expr = t.mutate(total2=t.total * 2)
 """
 

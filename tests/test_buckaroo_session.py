@@ -4,8 +4,8 @@ import httpx
 from fastapi.testclient import TestClient
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_core import get_alias
 from tallyman_mcp.server import catalog_create
-from tallyman_xorq.build import list_entries
 
 # #133: the catalog detail page loads the Buckaroo grid lazily via
 # GET /api/session/{hash}, which returns a typed status so the SPA can show a
@@ -17,8 +17,8 @@ from tallyman_xorq.build import list_entries
 
 def _agg_code(project: str) -> str:
     return f"""
-from tallyman_xorq.io import read_project_file
-t = read_project_file("orders.parquet", project={project!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias("orders_src", project={project!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
@@ -36,10 +36,10 @@ class _RaisingClient:
         raise self._exc
 
 
-def test_session_endpoint_unavailable_without_buckaroo(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_session_endpoint_unavailable_without_buckaroo(fresh_companion_app, project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
-    h = list_entries(project)[0]["content_hash"]
+    h = get_alias(project, "shoe_sales")
     c = TestClient(fresh_companion_app)  # built with no Buckaroo subprocess
     r = c.get(f"/{project}/api/session/{h}")
     assert r.status_code == 200
@@ -49,12 +49,12 @@ def test_session_endpoint_unavailable_without_buckaroo(fresh_companion_app, proj
     assert "Buckaroo" in body["detail"]
 
 
-def test_entry_detail_does_not_carry_a_session(fresh_companion_app, project, orders_parquet, monkeypatch):
+def test_entry_detail_does_not_carry_a_session(fresh_companion_app, project, orders_src, monkeypatch):
     # The detail request stays metadata-only — the grid loads lazily — so it
     # never blocks on the snapshot bake + /load_expr POST (the #133 hang).
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
-    h = list_entries(project)[0]["content_hash"]
+    h = get_alias(project, "shoe_sales")
     c = TestClient(fresh_companion_app)
     body = c.get(f"/{project}/api/entry/{h}").json()
     assert body["buckaroo_session"] is None
@@ -79,10 +79,10 @@ def test_load_session_no_build_for_unknown_entry(project, monkeypatch):
     assert res["session_id"] is None
 
 
-def test_load_session_classifies_timeout_then_error(project, orders_parquet, monkeypatch):
+def test_load_session_classifies_timeout_then_error(project, orders_src, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))
-    h = list_entries(project)[0]["content_hash"]
+    h = get_alias(project, "shoe_sales")
 
     bk = BuckarooManager()
     bk.proc = _AliveProc()

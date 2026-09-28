@@ -27,6 +27,7 @@ import inspect
 import re
 from pathlib import Path
 
+from tallyman_core.execution import execution_lock
 from tallyman_core.fsutil import atomic_write_text
 from tallyman_core.paths import post_processing_dir as _post_processing_dir
 
@@ -244,8 +245,11 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
 
     # Read the entry's result the same way the viewer's api_data does: a cheap
     # entry recomputes, an expensive one reads its baked snapshot, and an evicted
-    # snapshot self-heals — all inside cached_result_expr. No result.parquet.
-    df = cached_result_expr(project, content_hash).execute()
+    # snapshot self-heals — all inside cached_result_expr. No result.parquet. The heal comes before the execution lock
+    # (it takes the project lock), and the execute holds it: one execution at a time on the shared backend (#118).
+    expr = cached_result_expr(project, content_hash)
+    with execution_lock():
+        df = expr.execute()
     ibis_table = memtable(df, name="_post_processing_run")
 
     # Exec the source and extract process().
@@ -271,7 +275,8 @@ def run_post_processing(project: str, entry_name_or_hash: str, source: str) -> d
         import pandas as pd  # noqa: PLC0415
 
         if hasattr(result, "execute"):
-            df = result.execute()
+            with execution_lock():
+                df = result.execute()
         elif isinstance(result, pd.DataFrame):
             df = result
         else:

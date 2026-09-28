@@ -4,6 +4,12 @@ Status: **post-grill, ready to ticket and implement.** Fifteen decisions locked
 through interactive grilling; recorded below with the reasoning that landed
 each one. Implementation order at the bottom.
 
+Status note (2026-09-22): implemented. Two things below have since changed. The
+home root is `~/.tallyman-notebooks/` (movable with `TALLYMAN_HOME`), not
+`~/.tallyman/`. And decision 11's session file is gone: a Buckaroo session id
+is `entry-<project>-<content_hash>`, derived and never stored
+(`plans/ADR-007-tallyman-owned-materialization.md` D6).
+
 ## Goal
 
 A user-visible project switcher in the companion chrome:

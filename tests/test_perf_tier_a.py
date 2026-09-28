@@ -34,7 +34,9 @@ Note on ``/load_expr`` vs ``/load``. #64 phrases the drive as ``/load`` with
 ``mode: 'buckaroo'`` (the buckaroo-js-core example template, which loads a CSV
 *path*). The companion never takes that path — a catalog entry is a xorq build,
 not a materialised file, and the companion serves it via ``/load_expr`` against
-``xorq_build/`` (``buckaroo_lifecycle.ensure_session``). ``/load_expr`` is also
+a build dir tallyman hands it: a worthy entry's view build of its snapshot, a
+cheap entry's own expanded build (``buckaroo_lifecycle.load_session``,
+ADR-007 D6). ``/load_expr`` is also
 the only path that exercises the load+stat work Tier B proxies, so it is the one
 that calibrates Tier B. We therefore drive ``/load_expr`` (via ``ensure_session``,
 zero payload duplication) and render the resulting session at ``/s/<session>``.
@@ -94,10 +96,12 @@ DATA_GRID_SELECTOR = ".df-viewer .ag-cell"
 # the same subprocess; the buckaroo specs use 15s for trivial CSVs.
 GRID_TIMEOUT_MS = 60_000
 # Ground-truth backend wait. ``ensure_session`` caps its ``/load_expr`` POST at
-# 10s (#34) and returns None past that, which is exactly the failure that
-# motivated this measurement — a cold parking-dataset stat compute blows past
-# 10s. To measure the real backend cost we POST the same payload with a long,
-# overridable timeout rather than reusing the capped path.
+# 10s plus a second per million rows (#34) and returns None past that, which is
+# exactly the failure that motivated this measurement — a cold parking-dataset
+# stat compute blows past it. To measure the real backend cost we POST the same
+# payload with a long, overridable timeout rather than reusing the capped path.
+# (The cap covers Buckaroo's pipeline only: ``ensure_session`` first makes every
+# file the entry reads exist, in tallyman's own process, and that is not capped.)
 LOAD_EXPR_TIMEOUT_S = float(os.environ.get("TALLYMAN_PERF_LOAD_TIMEOUT", "180"))
 
 
@@ -192,17 +196,16 @@ def _read_first_backend_spans(text: str) -> dict[str, float]:
     return {}
 
 
-def _evict_session(mgr, content_hash: str) -> None:
-    """Drop the in-memory cached session so the next ensure_session re-POSTs.
+def _force_reload(mgr, project: str, content_hash: str) -> bool:
+    """Make Buckaroo re-run its pipeline for the entry's session, so the next load is a fresh one.
 
-    ``ensure_session`` caches the session id for the Buckaroo lifetime, so a
-    second call returns it instantly (the same-lifetime re-view). To measure the
-    server-restart warm path — a fresh ``/load_expr`` against the now-populated
-    on-disk stat cache — evict first, mirroring what a restart does to the
-    in-memory map (``start()`` resets ``_sessions``).
+    Tallyman keeps no session map (ADR-007 D6): ``ensure_session`` posts the derived session id every time, and
+    Buckaroo answers a repeat from the session it already holds (the same-lifetime re-view). To measure the
+    server-restart warm path — a fresh ``/load_expr`` against the now-populated on-disk stat cache — post the load
+    with ``force_reload`` first, which is what a restart does to Buckaroo's in-memory session. Returns whether
+    Buckaroo accepted it.
     """
-    with mgr._session_lock:
-        mgr._sessions.pop(content_hash, None)
+    return mgr.force_reload_session(project, content_hash)
 
 
 # ---------------------------------------------------------------------------
@@ -247,30 +250,16 @@ def _load_expr(mgr, project: str, content_hash: str) -> str:
     ``ensure_session`` (10s cap) for the headline numbers; this is only used when
     that cap trips (``ensure_session`` returned None) to obtain a renderable —
     now-warm — session so the grid still paints and the calibration completes.
-    Mirrors ``buckaroo_lifecycle.ensure_session``'s payload (expanded build dir,
-    ``project_root`` = artifacts dir, on-disk ``cache_storage_path``) but issues
-    the POST directly with ``LOAD_EXPR_TIMEOUT_S`` instead of the 10s cap. Keep
-    the payload in sync with ensure_session.
+    The body is the one ``buckaroo_lifecycle`` builds (the view build of a worthy entry's snapshot, or a cheap
+    entry's expanded build, with ``project_root``, the on-disk ``cache_storage_path`` and the derived session id),
+    so it cannot drift from ensure_session; only the POST's timeout differs
+    (``LOAD_EXPR_TIMEOUT_S`` instead of the 10s cap).
     """
     import httpx  # noqa: PLC0415
 
-    from tallyman_core.paths import artifacts_dir, entry_dir, project_dir  # noqa: PLC0415
-    from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
-
-    build_dir = entry_dir(project, content_hash) / "xorq_build"
-    expanded = ensure_expanded_build(
-        build_dir, project_dir(project), entry_dir(project, content_hash) / ".xorq_build_expanded"
-    )
-    stat_cache = entry_dir(project, content_hash) / ".buckaroo_stat_cache"
-    stat_cache.mkdir(parents=True, exist_ok=True)
     resp = httpx.post(
         f"{mgr.base_url}/load_expr",
-        json={
-            "build_dir": str(expanded),
-            "no_browser": True,
-            "project_root": str(artifacts_dir(project)),
-            "cache_storage_path": str(stat_cache),
-        },
+        json=mgr._load_body(project, content_hash, None),
         timeout=LOAD_EXPR_TIMEOUT_S,
     )
     resp.raise_for_status()
@@ -289,9 +278,9 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
     from the buckaroo#926 ``firstpull.load_expr`` span even when the cap trips.
 
     Cold then two warms. Cold is a genuine empty-overlay-cache ``ensure_session``.
-    ``warm_cached`` re-calls without eviction (the same-lifetime re-view — an
-    in-memory map hit, ~0ms, the path a second detail view takes). ``warm_reload``
-    evicts then re-calls: a fresh ``/load_expr`` against the now-populated on-disk
+    ``warm_cached`` re-calls it (the same-lifetime re-view — Buckaroo already holds the session and answers
+    the repeat post without redoing the work, the path a second detail view takes). ``warm_reload``
+    forces a fresh ``/load_expr`` against the now-populated on-disk
     stat cache, the path a Buckaroo restart takes — so warm_reload ≈ cold means
     the on-disk cache is unused.
 
@@ -320,16 +309,18 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
         session_cold = _load_expr(mgr, project, content_hash)
     render_cold = _time_grid_render(browser, mgr.base_url, session_cold)
 
-    # Warm A — same-lifetime re-view: ensure_session returns the cached id.
+    # Warm A — same-lifetime re-view: ensure_session posts the derived id again and Buckaroo answers from the
+    # session it holds.
     t0 = time.monotonic()
     mgr.ensure_session(content_hash, project)
     warm_cached_s = round(time.monotonic() - t0, 3)
 
-    # Warm B — server-restart path: evict, then re-POST against the on-disk cache.
-    _evict_session(mgr, content_hash)
+    # Warm B — server-restart path: force Buckaroo to re-run its pipeline for the same session, against the
+    # on-disk stat cache.
     t0 = time.monotonic()
-    session_warm = mgr.ensure_session(content_hash, project)
+    reloaded = _force_reload(mgr, project, content_hash)
     backend_warm_s = round(time.monotonic() - t0, 2)
+    session_warm = mgr.session_id_for(project, content_hash) if reloaded else None
     if session_warm is None:  # warm capped too (unexpected) — fall back to render-only
         session_warm = _load_expr(mgr, project, content_hash)
     render_warm = _time_grid_render(browser, mgr.base_url, session_warm)
@@ -359,7 +350,7 @@ def measure_tier_a(mgr, browser, project: str, content_hash: str) -> dict:
         "total_cold_s": total_cold_s,
         # The deliverable: fraction of the cold user-wait the proxy can see.
         "backend_ratio": round(backend_cold_s / total_cold_s, 3) if total_cold_s else None,
-        # Same-lifetime re-view (in-memory session cache hit).
+        # Same-lifetime re-view (Buckaroo's own warm-session answer).
         "warm_cached_s": warm_cached_s,
         # Server-restart re-load against the on-disk stat cache.
         "backend_warm_s": backend_warm_s,
@@ -401,8 +392,8 @@ def _render_report(project: str, rows: list[dict], aliases: dict[str, str]) -> s
         "pandas preview, #34); `true backend` is the uncapped server-side cost "
         "from the #926 span. `render` is the WS + first-page + ag-grid paint the "
         "Tier-B proxy cannot see. `warm cached` is a same-lifetime re-view "
-        "(in-memory session hit); `backend warm` is a server-restart re-load "
-        "against the on-disk stat cache.",
+        "(Buckaroo answers from the session it holds); `backend warm` is a forced re-load "
+        "against the on-disk stat cache, the path a server restart takes.",
         "",
         "## Calibration (Tier A ground truth vs Tier B proxy)",
         "",

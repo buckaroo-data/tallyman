@@ -2,6 +2,7 @@
   "name": "@tallyman/embed",
   "version": "0.0.1",
   "private": true,
+  "license": "AGPL-3.0-only",
   "description": "Vite library that mounts BuckarooServerView into [data-ws-url] divs on companion pages.",
   "type": "module",
   "scripts": {

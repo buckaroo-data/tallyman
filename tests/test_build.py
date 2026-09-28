@@ -9,24 +9,24 @@ from tallyman_core import entry_dir
 from tallyman_xorq import BuildError, build_and_persist, list_entries
 
 
-def _agg_code(parquet_path: Path) -> str:
+def _agg_code(src: str) -> str:
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.group_by("region").aggregate(total=t.price.sum(), n=t.count())
 """
 
 
-def _cheap_code(parquet_path: Path) -> str:  # parquet read + projection → cheap, bakes nothing
+def _cheap_code(src: str) -> str:  # source read + projection → cheap, bakes nothing
     return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet_path)!r})
-expr = t.select("region", "price")
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
+expr = t.select("region", "price", "__row_order")
 """
 
 
-def test_build_writes_entry(project: str, orders_parquet: Path):
-    code = _agg_code(orders_parquet)
+def test_build_writes_entry(project: str, orders_src: str):
+    code = _agg_code(orders_src)
     res = build_and_persist(project, code, prompt="region totals")
     assert res.row_count == 4  # one row per region
     assert res.execute_seconds >= 0.0
@@ -69,7 +69,7 @@ def test_migrate_drop_result_parquet_sweeps_legacy(project: str):
     assert migrate_drop_result_parquet(project) == 0
 
 
-def test_build_records_admission_instrumentation(project: str, orders_parquet: Path, caplog):
+def test_build_records_admission_instrumentation(project: str, orders_src: str, caplog):
     # #87: the build records the structural cache_worthy verdict alongside the
     # measured value-per-byte inputs (compile_seconds, execute_seconds, snapshot
     # bytes), so the structural-vs-measured cache decision (#30) is decidable
@@ -79,7 +79,7 @@ def test_build_records_admission_instrumentation(project: str, orders_parquet: P
     import logging
 
     with caplog.at_level(logging.INFO, logger="tallyman.perf"):
-        res = build_and_persist(project, _agg_code(orders_parquet))
+        res = build_and_persist(project, _agg_code(orders_src))
 
     m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
     assert m["compile_seconds"] is not None and m["compile_seconds"] >= 0.0
@@ -96,11 +96,11 @@ def test_build_records_admission_instrumentation(project: str, orders_parquet: P
     assert any("admission" in r.getMessage() and res.content_hash in r.getMessage() for r in perf)
 
 
-def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_parquet: Path):
+def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_src: str):
     # A cheap (projection) entry is structurally not worthy and bakes no
     # snapshot, so cache_bytes is absent — it materialises nothing to size. The
     # compile/structural verdict is still recorded for the shadow comparison.
-    res = build_and_persist(project, _cheap_code(orders_parquet))
+    res = build_and_persist(project, _cheap_code(orders_src))
     m = json.loads((entry_dir(project, res.content_hash) / "manifest.json").read_text())
     assert m["cache_worthy"] is False
     assert "cheap" in m["cache_worthy_why"]
@@ -110,7 +110,7 @@ def test_build_cheap_entry_records_no_snapshot_bytes(project: str, orders_parque
     assert res.cache_bytes is None
 
 
-def test_cheap_build_validates_row_projection(project: str):
+def test_cheap_build_validates_row_projection(project: str, tmp_path: Path):
     # A cheap entry (pure projection — no Aggregate/Join/Sort/window/UDF) must
     # still evaluate its row-level projection at build time. count() is satisfied
     # from source metadata and prunes the projection, so a failing row-level op
@@ -122,57 +122,60 @@ def test_cheap_build_validates_row_projection(project: str):
     import pyarrow as pa
     import pyarrow.parquet as pq
 
-    from tallyman_core.paths import data_dir
+    from tallyman_xorq.source_import import update_and_depend
 
-    p = data_dir(project) / "bad_dates.parquet"
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p = tmp_path / "bad_dates.parquet"
     # month 20 is out of range — datafusion's date32 cast rejects it at row-eval
     # time, but count() prunes the cast so it never runs at build unless forced.
+    # The strings import fine; only the recipe's cast is bad.
     pq.write_table(pa.table({"d": ["2020-01-01", "2020-20-07", "2021-12-31"]}), p)
+    update_and_depend(p, "bad_dates", project=project)
 
-    def _cast_code(parquet: Path) -> str:
+    def _cast_code(src: str) -> str:
         return f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(parquet)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.mutate(dd=t.d.cast("date"))
 """
 
     with pytest.raises(BuildError):
-        build_and_persist(project, _cast_code(p))
+        build_and_persist(project, _cast_code("bad_dates"))
 
     # The streaming validation is also the cheap path's row-count source, so a
     # valid cheap projection must still build and report the right count.
-    good = data_dir(project) / "good_dates.parquet"
+    good = tmp_path / "good_dates.parquet"
     pq.write_table(pa.table({"d": ["2020-01-01", "2021-12-31"]}), good)
-    res = build_and_persist(project, _cast_code(good))
+    update_and_depend(good, "good_dates", project=project)
+    res = build_and_persist(project, _cast_code("good_dates"))
     assert res.cache_worthy is False  # pure projection — the cheap path under test
     assert res.row_count == 2
 
 
-def test_build_idempotent_same_code(project: str, orders_parquet: Path):
-    code = _agg_code(orders_parquet)
+def test_build_idempotent_same_code(project: str, orders_src: str):
+    code = _agg_code(orders_src)
     a = build_and_persist(project, code, prompt="first")
     b = build_and_persist(project, code, prompt="second")
     assert a.content_hash == b.content_hash
     assert a.entry_path == b.entry_path
-    assert len(list_entries(project)) == 1
+    # Two entries: the source version the fixture imported, and this build over it.
+    assert len(list_entries(project)) == 2
 
 
-def test_build_distinct_code_distinct_hash(project: str, orders_parquet: Path):
-    code_a = _agg_code(orders_parquet)
+def test_build_distinct_code_distinct_hash(project: str, orders_src: str):
+    code_a = _agg_code(orders_src)
     code_b = f"""
-import xorq.api as xo
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
 filtered = t.filter(t.category == "boots")
 expr = filtered.group_by("region").aggregate(n=filtered.count())
 """
     a = build_and_persist(project, code_a)
     b = build_and_persist(project, code_b)
     assert a.content_hash != b.content_hash
-    assert len(list_entries(project)) == 2
+    assert len(list_entries(project)) == 3  # the imported source plus the two builds
 
 
-def test_build_missing_expr_variable(project: str, orders_parquet: Path):
+def test_build_missing_expr_variable(project: str):
     code = "import xorq.api as xo\nx = 1\n"
     with pytest.raises(BuildError, match="not found"):
         build_and_persist(project, code)
@@ -188,25 +191,25 @@ def test_list_entries_empty(project: str):
     assert list_entries(project) == []
 
 
-def test_build_hints_bare_ibis_import(project: str, orders_parquet: Path):
+def test_build_hints_bare_ibis_import(project: str, orders_src: str):
     # `import ibis` triggers an AttributeError at user-code exec time because
     # the real ibis package doesn't expose all the methods xorq does. The
     # BuildError should include a hint pointing at xorq.vendor.ibis.
     code = f"""
-import xorq.api as xo
 import ibis
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
 expr = t.mutate(flag=ibis.case().when(t.price > 50, "hi").else_("lo").end())
 """
     with pytest.raises(BuildError, match="import xorq.vendor.ibis as ibis"):
         build_and_persist(project, code)
 
 
-def test_build_no_hint_on_unrelated_error(project: str, orders_parquet: Path):
+def test_build_no_hint_on_unrelated_error(project: str, orders_src: str):
     code = f"""
-import xorq.api as xo
 import xorq.vendor.ibis as ibis
-t = xo.deferred_read_parquet({str(orders_parquet)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
 expr = t.nonexistent_column.sum()
 """
     with pytest.raises(BuildError) as excinfo:
@@ -232,7 +235,7 @@ def test_hint_bare_xorq_attribute_points_to_api():
 
 def test_hint_ibis_read_parquet_points_to_loaders():
     h = _ibis_import_hint("module 'ibis' has no attribute 'read_parquet'")
-    assert "read_project_file" in h
+    assert "catalog_import_source" in h and "tracked_expr_from_alias" in h
 
 
 def test_hint_ibis_math_func_is_column_method():
@@ -242,7 +245,7 @@ def test_hint_ibis_math_func_is_column_method():
 
 def test_hint_io_import_typo_lists_real_exports():
     h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'tallyman_xorq.io'")
-    assert "read_project_file" in h and "tracked_expr_from_alias" in h
+    assert "tracked_expr_from_alias" in h and "pinned_expr_from_alias" in h
 
 
 def test_hint_missing_table_column():
@@ -278,25 +281,25 @@ expr = t.group_by("region").aggregate(n=t.count())
 # ---------------------------------------------------------------------------
 
 
-def _nondeterministic_code(parquet_path: Path) -> str:
+def _nondeterministic_code(src: str) -> str:
     return f"""
-import xorq.api as xo
 import xorq.vendor.ibis as ibis
-t = xo.deferred_read_parquet({str(parquet_path)!r})
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({src!r})
 expr = t.mutate(built_at=ibis.now())
 """
 
 
-def test_build_lints_nondeterministic_now(project: str, orders_parquet: Path):
-    res = build_and_persist(project, _nondeterministic_code(orders_parquet))
+def test_build_lints_nondeterministic_now(project: str, orders_src: str):
+    res = build_and_persist(project, _nondeterministic_code(orders_src))
     joined = " ".join(res.lint_warnings)
     assert res.lint_warnings, "expected a nondeterminism lint warning"
     assert "now()" in joined
     assert "#88" in joined
 
 
-def test_build_no_lint_for_deterministic_recipe(project: str, orders_parquet: Path):
-    res = build_and_persist(project, _agg_code(orders_parquet))
+def test_build_no_lint_for_deterministic_recipe(project: str, orders_src: str):
+    res = build_and_persist(project, _agg_code(orders_src))
     assert res.lint_warnings == []
 
 

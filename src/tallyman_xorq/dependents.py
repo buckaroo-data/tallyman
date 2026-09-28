@@ -7,9 +7,8 @@ lineage views that were its only consumer. The reactive consumer needs the DAG
 walk back — not the column lineage — to find the dependents of a changed entry.
 This is that thin reader over the recorded manifests — the single seam every
 consumer (recalc, staleness) goes through instead of touching manifest fields
-directly: a child's parents, its source-leaf digests, the reverse index (a
-parent's children), and the topologically-ordered descendant cone a recalc
-rebuilds in dependency order.
+directly: a child's parents, the reverse index (a parent's children), and the
+topologically-ordered descendant cone a recalc rebuilds in dependency order.
 """
 
 from __future__ import annotations
@@ -42,17 +41,6 @@ def references_own_alias(project: str, content_hash: str, alias: str) -> bool:
     is allowed.
     """
     return any(p.ref == alias for p in parents_of(project, content_hash))
-
-
-def sources_of(project: str, content_hash: str) -> dict[str, str] | None:
-    """The recorded source-leaf digests of one entry (``{rel_path: digest}``).
-
-    ``None`` when the entry was built under source-identity ``off`` (no digests
-    recorded) — kept distinct from ``{}`` (identity on, but the recipe read no
-    raw files), because staleness treats ``None`` as an unevaluable axis rather
-    than silently "fresh".
-    """
-    return read_manifest(entry_dir(project, content_hash)).sources
 
 
 def build_dag(project: str) -> dict[str, list[ParentRef]]:

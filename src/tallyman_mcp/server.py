@@ -645,27 +645,47 @@ def catalog_import_source(
         return out  # nothing moved, so nothing to record, notify or cascade
 
     # An import is a catalog operation (ADR-011 D7): it emits the events a revise emits, and the dispatch-boundary
-    # decorator commits it — the head advance and any cascade — as ONE revision.
-    try:
-        record_event(
-            project, "alias_set", session=SESSION_ID, tool="catalog_import_source",
-            alias=alias, version=out["version"], hash=out["hash"], prompt=prompt or None,
+    # decorator commits it — the head advance and any cascade — as ONE revision. The head has advanced, so the import
+    # happened and the reply is not an error. Each step after it runs whether or not the one before it failed: a
+    # failed notebook append or config carry-forward must not skip the recalc, or everything over the source stays on
+    # the old version's rows. What failed is recorded, as one failure after the import (#227).
+    record_event(
+        project, "alias_set", session=SESSION_ID, tool="catalog_import_source",
+        alias=alias, version=out["version"], hash=out["hash"], prompt=prompt or None,
+    )
+    failed: list[tuple[str, str]] = []
+
+    def step(what: str, run) -> None:
+        try:
+            run()
+        except Exception as exc:
+            failed.append((f"{what} failed: {type(exc).__name__}: {exc}", traceback.format_exc()))
+
+    def carry_forward() -> None:
+        carried = carry_forward_entry_config(project, history_for(project, alias)[-2], out["hash"])
+        if carried:
+            out["carried_over"] = carried
+
+    def recalc() -> None:
+        report = _auto_recalc_after_head_advance(project, alias, tool="catalog_import_source")
+        if report is not None:
+            out["recalc"] = report
+
+    if out["version"] == 1:
+        step("appending it to the notebook", lambda: notebook.append(project, alias, markdown=prompt or ""))
+        _notify("notebook_changed")
+    else:
+        step("carrying the previous version's display config forward", carry_forward)
+    _notify("new_entry", content_hash=out["hash"], alias=alias, version=out["version"])
+    step("recalculating what reads it", recalc)
+    if failed:
+        out["after_import_error"] = _record_after_import_failure(
+            project,
+            prompt,
+            out["hash"],
+            f"{alias}-v{out['version']} was imported, then " + "; ".join(what for what, _tb in failed) + ".",
+            "\n".join(tb for _what, tb in failed),
         )
-        if out["version"] == 1:
-            notebook.append(project, alias, markdown=prompt or "")
-            _notify("notebook_changed")
-        else:
-            carried = carry_forward_entry_config(project, history_for(project, alias)[-2], out["hash"])
-            if carried:
-                out["carried_over"] = carried
-        _notify("new_entry", content_hash=out["hash"], alias=alias, version=out["version"])
-        recalc_report = _auto_recalc_after_head_advance(project, alias, tool="catalog_import_source")
-        if recalc_report is not None:
-            out["recalc"] = recalc_report
-    except Exception as exc:
-        # The head has advanced, so the import happened: the reply is not an error, and the decorator commits the
-        # advance. What failed after it is recorded and named, with its error_id (#227).
-        out["after_import_error"] = _record_import_failure(project, prompt, f"{type(exc).__name__}: {exc}")
     return out
 
 
@@ -682,6 +702,37 @@ def _record_import_failure(project: str, prompt: str, message: str) -> dict:
         session=SESSION_ID,
         tool="catalog_import_source",
         prompt=prompt or None,
+        message=message,
+        traceback=tb,
+        error_id=rec["id"],
+    )
+    _notify("build_failed", error_id=rec["id"], tool="catalog_import_source")
+    return {"error": message, "error_id": rec["id"]}
+
+
+def _record_after_import_failure(project: str, prompt: str, content_hash: str, message: str, tb: str) -> dict:
+    """Record steps that failed after an import that happened; the ``{error, error_id}`` for the reply.
+
+    Not a ``build_error``: the Log would show a failed build for a version that was imported and committed. The
+    record carries the new entry's hash, so a dependent the failure left stale is tied back to it (``error_for_hash``).
+    ``build_failed`` is still sent, as it is the notification that makes the companion reload its error banner.
+    """
+    rec = record_error(
+        project,
+        code="",
+        message=message,
+        prompt=prompt or None,
+        tool="catalog_import_source",
+        hash=content_hash,
+        traceback=tb,
+    )
+    record_event(
+        project,
+        "after_import_error",
+        session=SESSION_ID,
+        tool="catalog_import_source",
+        prompt=prompt or None,
+        hash=content_hash,
         message=message,
         traceback=tb,
         error_id=rec["id"],

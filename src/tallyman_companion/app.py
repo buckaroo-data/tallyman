@@ -43,7 +43,7 @@ from tallyman_core.notebook import CellNotFound
 from tallyman_core.paths import entries_dir, project_dir, validate_project_name
 from tallyman_core.server_lock import is_this_data_dir, resolved_home
 from tallyman_core.telemetry import read_spans, record_span
-from tallyman_core.version import git_revision, version_info
+from tallyman_core.version import REPO_ROOT, describe_source, git_revision, is_this_revision, version_info
 from tallyman_xorq import (
     full_diff,
     list_entries,
@@ -72,6 +72,9 @@ class NotifyPayload(BaseModel):
     # The sender's data dir (TALLYMAN_HOME). A notify from a client of another data dir is refused (#183); absent → not
     # checked.
     home: str | None = None
+    # The sender's git revision. A notify from a client running other source is refused, and so is one without it: a
+    # client that sends none was started from source older than the check.
+    revision: str | None = None
 
 
 def _refuse_another_data_dir(what: str, home: str | None) -> None:
@@ -88,6 +91,25 @@ def _refuse_another_data_dir(what: str, home: str | None) -> None:
         f"{what} from data dir {home} refused: this companion serves data dir {resolved_home()}. A client reaches the "
         "companion of its own data dir through the server.lock of that data dir.",
     )
+
+
+def _refuse_other_source(what: str, revision: str | None) -> None:
+    """409 when a client runs other source than this companion (``tallyman_core.version``).
+
+    An MCP server or CLI on another revision has already written to the catalogs by the time it notifies, and one
+    started from source older than the check has no check of its own, so this refusal and its log line are how it is
+    noticed. It must not reload or publish anything here either.
+    """
+    if is_this_revision(revision):
+        return
+    message = (
+        f"{what} refused: the client runs {revision or 'no revision (source older than the revision check)'} but this "
+        f"companion runs {describe_source(git_revision(), str(REPO_ROOT))}. Restart whichever is stale: an MCP server "
+        "with /mcp, then tallyman, then Reconnect; the companion with restart-tallyman. A `tallyman` CLI command runs "
+        "the source of the checkout it is run from, so run it from the companion's."
+    )
+    log.error(message)
+    raise HTTPException(409, message)
 
 
 def _broadcaster() -> tuple[asyncio.Queue, list]:
@@ -1856,6 +1878,7 @@ def create_app(
     @app.post("/internal/notify")
     async def notify(payload: NotifyPayload):
         _refuse_another_data_dir("notify", payload.home)
+        _refuse_other_source("notify", payload.revision)
         # The payload may name its project (CLI `reset-to --project` can target
         # a non-active project); only fall back to the active one when it doesn't.
         project_name = payload.project or _require_project()
@@ -1895,7 +1918,7 @@ def create_app(
             extra = payload.extra or {}
             event = _recalc_sse_event(extra.get("remap", {}), extra.get("step"))
         else:
-            event = payload.model_dump(exclude={"home"})
+            event = payload.model_dump(exclude={"home", "revision"})
         await publish(event)
         return {"ok": True, "subscribers": len(subscribers), "project": project_name}
 

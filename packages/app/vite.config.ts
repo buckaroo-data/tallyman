@@ -1,14 +1,23 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 
 // Bake the git revision into the bundle so the running SPA knows which source it
 // was built from and can flag drift against the companion's /api/version (the
 // stale-dist failure mode behind #132). Best-effort: "unknown" if git isn't
-// available at build time.
+// available at build time. The same string tallyman_core.version.checkout_revision
+// computes: a dirty tree also names its edits with a short hash of `git diff HEAD`.
 function gitRevision(): string {
   try {
-    return execSync("git describe --always --dirty --abbrev=7", { encoding: "utf8" }).trim() || "unknown";
+    const rev = execSync("git describe --always --dirty --abbrev=7", { encoding: "utf8" }).trim();
+    if (!rev) return "unknown";
+    if (!rev.endsWith("-dirty")) return rev;
+    const diff = execSync("git diff --no-ext-diff --no-color --binary HEAD", {
+      encoding: "utf8",
+      maxBuffer: 1 << 30,
+    }).trim();
+    return `${rev}.${createHash("sha1").update(diff).digest("hex").slice(0, 6)}`;
   } catch {
     return "unknown";
   }

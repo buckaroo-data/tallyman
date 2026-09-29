@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 
 import httpx
 from fastmcp import FastMCP
+from fastmcp.exceptions import ToolError
 
 from tallyman_core import (
     AliasExists,
@@ -59,7 +60,8 @@ from tallyman_core.aliases import version_of_hash
 from tallyman_core.errors import RECORD_HOOKS
 from tallyman_core.events import record_event
 from tallyman_core.paths import errors_path
-from tallyman_core.server_lock import companion_url, resolved_home
+from tallyman_core.server_lock import companion_url, read_owner, resolved_home
+from tallyman_core.version import REPO_ROOT, describe_source, git_revision, is_this_revision
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
@@ -347,16 +349,51 @@ def _with_checkpoint(fn):
     return wrapped
 
 
+def _refuse_other_source(tool: str) -> None:
+    """Raise ``ToolError`` when the companion of this data dir runs other source than this MCP server.
+
+    Both are long-lived and started independently, so after a pull, a checkout or an edit one of them runs the old
+    code against the catalogs the other writes with the new code. Checked on every call, not once at startup: the
+    companion is restarted under an MCP server that lives as long as its Claude Code session. With no server on the
+    data dir (or one between claiming it and writing its record) there is nothing to compare.
+    """
+    try:
+        owner = read_owner()
+    except OSError:
+        return
+    if not owner or is_this_revision(owner.get("revision")):
+        return
+    raise ToolError(
+        f"tallyman refused {tool}: this MCP server and the companion on its data dir run different source.\n"
+        f"  MCP server (pid {os.getpid()}): {describe_source(git_revision(), str(REPO_ROOT))}\n"
+        f"  companion (pid {owner.get('pid')}, port {owner.get('port')}): "
+        f"{describe_source(owner.get('revision'), owner.get('source'))}\n"
+        "Restart whichever is stale and try again: the MCP server with /mcp, then tallyman, then Reconnect; the "
+        "companion with restart-tallyman (or stop `tallyman run` and start it again)."
+    )
+
+
+def _with_source_check(fn):
+    """Refuse the call before *fn* runs when the companion runs other source (``_refuse_other_source``)."""
+
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        _refuse_other_source(fn.__name__)
+        return fn(*args, **kwargs)
+
+    return wrapped
+
+
 _original_tool = mcp.tool
 
 
 def _checkpointing_tool(*dargs, **dkwargs):
-    """``mcp.tool`` wrapped so registration applies the checkpoint hook."""
+    """``mcp.tool`` wrapped so registration applies the source check and the checkpoint hook."""
     register = _original_tool(*dargs, **dkwargs)
 
     def _register(fn):
         _CHECKPOINTED_TOOLS.add(fn.__name__)
-        return register(_with_checkpoint(fn))
+        return register(_with_source_check(_with_checkpoint(fn)))
 
     return _register
 
@@ -368,7 +405,8 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
     """Best-effort POST to the companion's /internal/notify. Never raise.
 
     ``home`` names this data dir, so a companion serving another one refuses the notify (409) instead of publishing
-    this project's events to its own browsers (#183).
+    this project's events to its own browsers (#183). ``revision`` names this process's source, so a companion running
+    other source refuses it too.
     """
     base = companion_url()
     if base is None:
@@ -378,7 +416,13 @@ def _notify(kind: str, content_hash: str | None = None, **extra) -> None:
         with httpx.Client(timeout=2.0) as client:
             resp = client.post(
                 url,
-                json={"kind": kind, "hash": content_hash, "extra": extra or None, "home": str(resolved_home())},
+                json={
+                    "kind": kind,
+                    "hash": content_hash,
+                    "extra": extra or None,
+                    "home": str(resolved_home()),
+                    "revision": git_revision(),
+                },
             )
             if resp.status_code >= 400:
                 print(f"[tallyman_mcp] notify {kind} refused by {url}: {resp.status_code} {resp.text}", file=sys.stderr)
@@ -2139,9 +2183,7 @@ def main() -> None:
         level=os.environ.get("TALLYMAN_LOG_LEVEL", "INFO"),
         format="[%(name)s] %(message)s",
     )
-    from tallyman_core.version import git_revision  # noqa: PLC0415
-
-    log.info("tallyman_mcp revision %s", git_revision())
+    log.info("tallyman_mcp revision %s from %s", git_revision(), REPO_ROOT)
     mcp.run()
 
 

@@ -245,6 +245,7 @@ class BuckarooManager:
                 r = self._client.get(f"{self.base_url}/health", timeout=1.0)
                 if r.status_code == 200:
                     health = r.json()
+                    self._refuse_other_buckaroo(health.get("version"))
                     started_at = health.get("started")
                     log.info("buckaroo ready on %s (started=%s)", self.base_url, started_at)
                     # If this Buckaroo started fresh (different start time from
@@ -259,6 +260,26 @@ class BuckarooManager:
 
         self.stop()
         raise BuckarooUnavailable("buckaroo did not respond to /health in time")
+
+    def _refuse_other_buckaroo(self, version: str | None) -> None:
+        """Stop the server and raise ``BuckarooUnavailable`` when it runs another buckaroo than this companion.
+
+        The companion runs buckaroo in-process too (diffs, klass validation), and the server is spawned from the same
+        venv, so they agree at startup. The server is spawned again whenever it dies, though, and a venv synced to
+        another buckaroo in between (a pull that bumped the pin) gives the new server a version the companion, and the
+        SPA bundle built with it, were not built against.
+        """
+        import buckaroo  # noqa: PLC0415
+
+        if version == buckaroo.__version__:
+            return
+        self.stop()
+        message = (
+            f"the Buckaroo server runs buckaroo {version} but this companion runs buckaroo {buckaroo.__version__}: the "
+            "venv changed under the running companion. Restart the companion (restart-tallyman)."
+        )
+        log.error(message)
+        raise BuckarooUnavailable(message)
 
     def _drain_stdout(self) -> None:
         if self.proc is None or self.proc.stdout is None:

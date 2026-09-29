@@ -1,7 +1,7 @@
 """Hints for engine errors whose message does not say how to fix the recipe.
 
 Each entry pairs a regex, searched in a failed build's or query's error message, with a short hint.
-``build._ibis_import_hint`` appends the hint of every entry that matches to the error text, so it reaches every place a
+``build._error_hint`` appends the hint of every entry that matches to the error text, so it reaches every place a
 build error is shown (a tool reply, the companion, a recalc report, ``catalog_query``). An entry is for an error that
 recurs, is distinctive, and has a known fix, where the message names an engine internal rather than the recipe line to
 change. A gotcha that only matters when its error shows up belongs here, not in ``catalog_run``'s docstring, which every

@@ -153,8 +153,8 @@ _IBIS_MATH = frozenset(
 )
 
 
-def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
-    """Actionable hints for the namespace / column mistakes seen in the wild.
+def _error_hint(exc_msg: str, code: str = "") -> str:
+    """Actionable hints for a failed build or query, appended to its error text: namespace, column and engine errors.
 
     Reactive backstop to the proactive guidance in the MCP tool docstrings:
     fired only after user code (or build_expr) raises, and shown to the model
@@ -414,7 +414,7 @@ def _import_script(code: str) -> tuple[object, Path]:
     try:
         spec.loader.exec_module(module)
     except Exception as exc:
-        hint = _ibis_import_hint(str(exc), code)
+        hint = _error_hint(str(exc), code)
         raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
     return module, tmp
 
@@ -505,7 +505,7 @@ def _execution_error(what: str, exc: Exception, code: str) -> BuildError:
     translated = translate_collision(exc)
     if translated is not None:
         return BuildError(str(translated))
-    hint = _ibis_import_hint(str(exc), code)
+    hint = _error_hint(str(exc), code)
     return BuildError(f"{what} failed: {exc}{hint}\n{traceback.format_exc()}")
 
 
@@ -556,7 +556,7 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             try:
                 build_path = Path(build_expr(expr_obj, builds_dir=builds_dir))
             except Exception as exc:
-                hint = _ibis_import_hint(str(exc), code)
+                hint = _error_hint(str(exc), code)
                 raise BuildError(f"build_expr failed: {exc}{hint}\n{traceback.format_exc()}") from exc
 
             content_hash = build_path.name

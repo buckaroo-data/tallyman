@@ -225,37 +225,37 @@ expr = t.nonexistent_column.sum()
 # hint only caught bare `import ibis`, the Expr class mismatch, and `xorq._`.
 # ---------------------------------------------------------------------------
 
-from tallyman_xorq.build import _ibis_import_hint  # noqa: E402
+from tallyman_xorq.build import _error_hint  # noqa: E402
 
 
 def test_hint_bare_xorq_attribute_points_to_api():
-    h = _ibis_import_hint("module 'xorq' has no attribute 'memtable'")
+    h = _error_hint("module 'xorq' has no attribute 'memtable'")
     assert "xorq.api" in h
 
 
 def test_hint_ibis_read_parquet_points_to_loaders():
-    h = _ibis_import_hint("module 'ibis' has no attribute 'read_parquet'")
+    h = _error_hint("module 'ibis' has no attribute 'read_parquet'")
     assert "catalog_import_source" in h and "tracked_expr_from_alias" in h
 
 
 def test_hint_ibis_math_func_is_column_method():
-    h = _ibis_import_hint("module 'ibis' has no attribute 'sin'")
+    h = _error_hint("module 'ibis' has no attribute 'sin'")
     assert ".sin()" in h
 
 
 def test_hint_io_import_typo_lists_real_exports():
-    h = _ibis_import_hint("cannot import name 'load_parquet_expr' from 'tallyman_xorq.io'")
+    h = _error_hint("cannot import name 'load_parquet_expr' from 'tallyman_xorq.io'")
     assert "tracked_expr_from_alias" in h and "pinned_expr_from_alias" in h
 
 
 def test_hint_missing_table_column():
-    h = _ibis_import_hint("'Table' object has no attribute 'trip_duration'")
+    h = _error_hint("'Table' object has no attribute 'trip_duration'")
     assert "not a column" in h.lower()
     assert "trip_duration" in h
 
 
 def test_hint_duckdb_reach_points_to_datafusion():
-    h = _ibis_import_hint("No module named 'duckdb'")
+    h = _error_hint("No module named 'duckdb'")
     assert "datafusion" in h.lower()
 
 
@@ -272,7 +272,7 @@ def test_hint_window_sanity_check_on_the_window_node():
         'SanityCheckPlan\ncaused by\nError during planning: Plan: ["BoundedWindowAggExec: wdw=[row_number() '
         'ORDER BY [CAST(strpos(t6.a, Utf8(\\"/\\")) > Int64(0) AS Int8) ASC NULLS LAST]", "  SortExec: ...'
     )
-    assert "mutate" in _ibis_import_hint(message)
+    assert "mutate" in _error_hint(message)
 
 
 def test_no_window_hint_when_the_failing_node_is_not_the_window():
@@ -284,7 +284,7 @@ def test_no_window_hint_when_the_failing_node_is_not_the_window():
         '"  SortExec: expr=[k@3 ASC NULLS LAST]", "    BoundedWindowAggExec: wdw=[row_number() PARTITION BY [t0.k] '
         'ORDER BY [t0.a ASC NULLS LAST]]"] does not satisfy order requirements'
     )
-    assert "window over that column" not in _ibis_import_hint(message)
+    assert "window over that column" not in _error_hint(message)
 
 
 def test_hint_count_of_another_relation_uses_the_deferred_table():
@@ -292,7 +292,7 @@ def test_hint_count_of_another_relation_uses_the_deferred_table():
         "Cannot add <xorq.vendor.ibis.expr.operations.reductions.CountStar object at 0x116fa96d0> to projection, "
         "they belong to another relation"
     )
-    h = _ibis_import_hint(message)
+    h = _error_hint(message)
     assert "ibis._.count()" in h
 
 
@@ -301,7 +301,7 @@ def test_hint_string_cast_failure_casts_only_matching_rows():
         "Arrow error: C Data interface error: Invalid: Arrow error: Cast error: Cannot cast string '' to value of "
         "Int64 type"
     )
-    h = _ibis_import_hint(message)
+    h = _error_hint(message)
     assert "try_cast" in h and "re_search" in h
 
 
@@ -310,7 +310,7 @@ def test_hint_window_inside_a_window_is_mutated_first():
         "This feature is not implemented: Physical plan does not support logical expression "
         "WindowFunction(WindowFunction { fun: WindowUDF(WindowUDF { inner: WindowShift { kind: Lag } }) })"
     )
-    assert "mutate" in _ibis_import_hint(message)
+    assert "mutate" in _error_hint(message)
 
 
 @pytest.mark.parametrize(
@@ -323,7 +323,7 @@ def test_hint_window_inside_a_window_is_mutated_first():
     ids=["no-field-named", "unique-names"],
 )
 def test_hint_select_after_a_join_renames_the_kept_column(message: str):
-    assert ".rename(" in _ibis_import_hint(message)
+    assert ".rename(" in _error_hint(message)
 
 
 @pytest.mark.parametrize(
@@ -335,11 +335,11 @@ def test_hint_select_after_a_join_renames_the_kept_column(message: str):
     ids=["close-match", "wrong-type"],
 )
 def test_hint_missing_column_method_names_a_close_one_or_a_cast(message: str, says: str):
-    assert says in _ibis_import_hint(message)
+    assert says in _error_hint(message)
 
 
 def test_hint_window_takes_group_by_not_partition_by():
-    h = _ibis_import_hint("window() got an unexpected keyword argument 'partition_by'")
+    h = _error_hint("window() got an unexpected keyword argument 'partition_by'")
     assert "group_by=" in h
 
 
@@ -348,7 +348,7 @@ def test_expr_that_is_a_dataframe_is_not_blamed_on_the_ibis_import():
         "'expr' must be <class 'xorq.vendor.ibis.expr.types.core.Expr'> (got    a\n0  1 that is a "
         "<class 'pandas.core.frame.DataFrame'>)."
     )
-    h = _ibis_import_hint(message, "import pandas as pd\nexpr = pd.read_parquet('x.parquet')\n")
+    h = _error_hint(message, "import pandas as pd\nexpr = pd.read_parquet('x.parquet')\n")
     assert _BARE_IBIS not in h
     assert "DataFrame" in h and "tracked_expr_from_alias" in h
 
@@ -358,12 +358,12 @@ def test_expr_built_with_bare_ibis_gets_the_import_hint():
         "'expr' must be <class 'xorq.vendor.ibis.expr.types.core.Expr'> (got InMemoryTable\n  data: ... that is a "
         "<class 'ibis.expr.types.relations.Table'>)."
     )
-    assert _BARE_IBIS in _ibis_import_hint(message)
+    assert _BARE_IBIS in _error_hint(message)
 
 
 def test_hint_duckdb_in_the_code_points_to_datafusion():
     code = "import duckdb\nimport xorq.api as xo\ncon = xo.connect()\ncon.register(duckdb.sql('select 1'), 'x')\n"
-    h = _ibis_import_hint("'Backend' object has no attribute 'register'", code)
+    h = _error_hint("'Backend' object has no attribute 'register'", code)
     assert "datafusion" in h.lower()
 
 

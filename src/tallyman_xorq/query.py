@@ -123,7 +123,7 @@ def _imported(code: str):
     The code never touches disk: it runs from memory, with its source registered in ``linecache`` so tracebacks and
     ``inspect.getsource`` still show its lines. The module and the ``linecache`` entry are removed on exit.
     """
-    from tallyman_xorq.build import BuildError, _ibis_import_hint
+    from tallyman_xorq.build import BuildError, _error_hint
 
     name = f"tallyman_query_{uuid.uuid4().hex}"
     filename = f"<{name}>"
@@ -136,7 +136,7 @@ def _imported(code: str):
             # dont_inherit: this module's ``from __future__ import annotations`` is not the recipe's.
             exec(compile(code, filename, "exec", dont_inherit=True), module.__dict__)
         except Exception as exc:
-            hint = _ibis_import_hint(str(exc), code)
+            hint = _error_hint(str(exc), code)
             raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
         yield module
     finally:

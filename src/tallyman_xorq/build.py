@@ -170,13 +170,27 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
       - `module 'ibis' has no attribute 'X'` — math is a column method, reads
         go through tracked_expr_from_alias, `ibis.case` is now `ibis.cases`;
       - `cannot import name 'X' from 'tallyman_xorq.io'` — invented loader;
-      - any duckdb reach — there is no duckdb backend, only datafusion;
-      - `'Table' object has no attribute 'X'` — guessed a column name.
+      - any duckdb reach, in the message or the code — there is no duckdb backend, only datafusion;
+      - `'Table' object has no attribute 'X'` — guessed a column name;
+      - `'StringColumn' object has no attribute 'X'` (any column type) — the closest real method, or a cast;
+      - `expr` bound to something that is not an expression (a pandas DataFrame);
+      - the engine errors in ``hints.HINTS``, matched by regex.
     """
+    from tallyman_xorq.hints import hints_for
+
     hints: list[str] = []
 
     has_bad_import = _user_imports_bare_ibis(code)
+    # attrs' message ends "(got <repr> that is a <class '...'>)": ibis's Table is the wrong ibis instance, anything
+    # else (a DataFrame) is not an expression at all.
     has_expr_mismatch = "xorq.vendor.ibis.expr.types.core.Expr" in exc_msg and "must be" in exc_msg
+    got = re.search(r"that is a <class '([\w.]+)'>\)", exc_msg) if has_expr_mismatch else None
+    if got and not got.group(1).startswith("ibis."):
+        has_expr_mismatch = False
+        hints.append(
+            f"`expr` is a {got.group(1).rsplit('.', 1)[-1]}, not an expression. A recipe builds an ibis expression "
+            "over `tracked_expr_from_alias('<alias>')` and does not load data itself; bind `expr` to that expression."
+        )
     if has_bad_import or has_expr_mismatch:
         hints.append(
             "this usually means the expression was built using `import ibis` "
@@ -236,7 +250,7 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             "`catalog_import_source('<abs path>', '<alias>')` first."
         )
 
-    if "duckdb" in exc_msg.lower():
+    if "duckdb" in exc_msg.lower() or re.search(r"^\s*(?:import|from)\s+duckdb\b", code, re.MULTILINE):
         hints.append(
             "there is no duckdb backend here — the only backend is xorq's built-in datafusion. "
             "Build with the ibis expression API over tracked_expr_from_alias sources; "
@@ -252,6 +266,24 @@ def _ibis_import_hint(exc_msg: str, code: str = "") -> str:
             "per entry, or use the source step's returned `schema`) and reference exact names; "
             f"when unsure use `t['{name}']`, whose error lists the real columns."
         )
+
+    m = re.search(r"'(\w+(?:Column|Scalar|Value))' object has no attribute '(\w+)'", exc_msg)
+    if m:
+        import difflib
+
+        import xorq.vendor.ibis.expr.types as ir
+
+        kind, name = m.groups()
+        methods = [a for a in dir(getattr(ir, kind, object)) if not a.startswith("_")]
+        close = difflib.get_close_matches(name, methods, n=1, cutoff=0.8)  # substr for substring, not sub for substr
+        hints.append(
+            f"`{name}` is not a method of {kind}"
+            + (f"; did you mean `.{close[0]}`?" if close else ".")
+            + ' If the column is the wrong type for it, cast first: `t.a.cast("string").substr(0, 4)`, '
+            '`t.a.cast("float64").sum()`.'
+        )
+
+    hints.extend(hints_for(exc_msg))
 
     if not hints:
         return ""

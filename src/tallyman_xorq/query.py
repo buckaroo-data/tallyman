@@ -8,15 +8,9 @@ entry directory, manifest, parent edge, alias, notebook cell or error record. Bo
 
 from __future__ import annotations
 
-import contextlib
 import datetime as dt
-import linecache
 import math
 import re
-import sys
-import traceback
-import types
-import uuid
 from decimal import Decimal
 
 from tallyman_core.aliases import VERSION_REF_RE, get_alias, history_for, resolve_version_ref
@@ -116,46 +110,18 @@ def peek(project: str, ref: str, limit: int = 20, columns: list[str] | None = No
     }
 
 
-@contextlib.contextmanager
-def _imported(code: str):
-    """Run *code* in a fresh module, as a build imports a recipe (``build._import_script``), with the same error text.
-
-    The code never touches disk: it runs from memory, with its source registered in ``linecache`` so tracebacks and
-    ``inspect.getsource`` still show its lines. The module and the ``linecache`` entry are removed on exit.
-    """
-    from tallyman_xorq.build import BuildError, _error_hint
-
-    name = f"tallyman_query_{uuid.uuid4().hex}"
-    filename = f"<{name}>"
-    module = types.ModuleType(name)
-    module.__file__ = filename
-    linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
-    sys.modules[name] = module
-    try:
-        try:
-            # dont_inherit: this module's ``from __future__ import annotations`` is not the recipe's.
-            exec(compile(code, filename, "exec", dont_inherit=True), module.__dict__)
-        except Exception as exc:
-            hint = _error_hint(str(exc), code)
-            raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
-        yield module
-    finally:
-        sys.modules.pop(name, None)
-        linecache.cache.pop(filename, None)
-
-
 def query(project: str, code: str, limit: int = 50) -> dict:
     """Run *code* (a recipe binding ``expr``) and return its first *limit* rows and full row count. Writes nothing.
 
     Raises ``BuildError`` with the text a build gives for the same mistake.
     """
     from tallyman_xorq import parent_capture as pc
-    from tallyman_xorq.build import BuildError, _checked_rewrite, _execution_error, _recipe_expr
+    from tallyman_xorq.build import BuildError, _checked_rewrite, _execution_error, _imported_recipe, _recipe_expr
 
     # A private collector: the reads the recipe notes as parents are dropped, and none reach an enclosing build's.
     token = pc.begin_collect()
     try:
-        with _imported(code) as module:
+        with _imported_recipe(code) as module:
             expr = _recipe_expr(module)
             if hasattr(expr, "as_table"):
                 expr = expr.as_table()  # a column or scalar comes back as a one-column table

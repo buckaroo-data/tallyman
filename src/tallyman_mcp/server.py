@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import json
 import logging
@@ -103,10 +104,21 @@ _NEW_ERRORS_CAP = 10
 _NEW_ERROR_MESSAGE_CHARS = 300
 _error_cursors: dict[str, tuple[int, int]] = {}
 _error_cursor_lock = threading.Lock()
-_recorded_here: set[str] = set()  # ids of the records this process wrote
+# The tool running in this call's thread, and for each record this process wrote during a tool call, that tool.
+# A record whose ``tool`` is the tool that was running when it was written is that call's own (its build error, its
+# recalc failures): it is in that call's reply, so no reply reports it again, including a concurrent call's.
+_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_tool", default=None)
+_recorded_by: dict[str, str] = {}
 _ERROR_KIND = re.compile(r"[A-Za-z_][\w.-]{0,63}")  # `code` is a kind (unfaithful_heal) or a build's full recipe
 
-RECORD_HOOKS.append(lambda _project, entry: _recorded_here.add(entry["id"]))
+
+def _note_recorded(_project: str, entry: dict) -> None:
+    tool = _current_tool.get()
+    if tool is not None:
+        _recorded_by[entry["id"]] = tool
+
+
+RECORD_HOOKS.append(_note_recorded)
 
 
 def _unread_error_records(project: str) -> list[dict]:
@@ -188,18 +200,20 @@ def _compact_error(project: str, row: dict) -> dict:
     return {k: v for k, v in item.items() if v is not None}
 
 
-def _attach_new_errors(result: dict, project: str, tool: str) -> None:
+def _attach_new_errors(result: dict, project: str) -> None:
     """Add ``new_errors`` (newest first, capped) and ``new_errors_omitted`` to *result* when there are any.
 
-    A record this call already answers with is left out: one this process wrote for this same tool (its build error,
-    its recalc failures), or one whose id is in the reply.
+    A record some call already answers with is left out: one a tool call in this process wrote as its own (its build
+    error, its recalc failures; see ``_recorded_by``), or one whose id is in this reply.
     """
     rows = _unread_error_records(project)
     if not rows:
         return
     returned = _ids_in(result, set())
     rows = [
-        r for r in rows if r.get("id") not in returned and not (r.get("id") in _recorded_here and r.get("tool") == tool)
+        r
+        for r in rows
+        if r.get("id") not in returned and not (r.get("tool") and _recorded_by.get(r.get("id")) == r.get("tool"))
     ]
     if not rows:
         return
@@ -233,7 +247,11 @@ def _tag_project(fn):
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         global _last_project, _mcp_active_project
-        result = fn(*args, **kwargs)
+        token = _current_tool.set(fn.__name__)
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _current_tool.reset(token)
         current = _resolve_active_project()
         # Seed in-process state on the very first call so future calls are
         # sticky even if the disk file changes after this point.
@@ -249,7 +267,7 @@ def _tag_project(fn):
             )
         _last_project = current
         try:
-            _attach_new_errors(result, current, fn.__name__)
+            _attach_new_errors(result, current)
         except Exception as exc:
             log.warning("reading new errors after %s failed: %s", fn.__name__, exc)
         return result

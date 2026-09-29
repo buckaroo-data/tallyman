@@ -275,6 +275,18 @@ def test_hint_window_sanity_check_on_the_window_node():
     assert "mutate" in _ibis_import_hint(message)
 
 
+def test_no_window_hint_when_the_failing_node_is_not_the_window():
+    """DataFusion prints the failing node's whole subtree. An ordered aggregate that fails above a plain window is not
+    the window's fault; the window hint would point at the wrong line."""
+    message = (
+        'SanityCheckPlan\ncaused by\nError during planning: Plan: ["AggregateExec: mode=Single, gby=[k@3 as k], '
+        "aggr=[array_agg(t1.a) ORDER BY [strpos(t1.b, Utf8(\\\"x\\\")) > Int64(0) ASC NULLS LAST]]\", "
+        '"  SortExec: expr=[k@3 ASC NULLS LAST]", "    BoundedWindowAggExec: wdw=[row_number() PARTITION BY [t0.k] '
+        'ORDER BY [t0.a ASC NULLS LAST]]"] does not satisfy order requirements'
+    )
+    assert "window over that column" not in _ibis_import_hint(message)
+
+
 def test_hint_count_of_another_relation_uses_the_deferred_table():
     message = (
         "Cannot add <xorq.vendor.ibis.expr.operations.reductions.CountStar object at 0x116fa96d0> to projection, "

@@ -53,7 +53,6 @@ from tallyman_core import (
 )
 from tallyman_core.events import record_event
 from tallyman_core.server_lock import companion_url, resolved_home
-from tallyman_mcp.hints import hint_for
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
@@ -767,10 +766,7 @@ def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalo
             error_id=rec["id"],
         )
         _notify("build_failed", error_id=rec["id"], tool=tool)
-        failed = {"error": str(exc), "error_id": rec["id"]}
-        if hint := hint_for(str(exc)):
-            failed["hint"] = hint
-        return failed
+        return {"error": str(exc), "error_id": rec["id"]}
     reply = {
         "_build": result,
         "hash": result.content_hash,

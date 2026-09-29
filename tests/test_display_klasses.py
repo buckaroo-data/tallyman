@@ -1,0 +1,84 @@
+"""Tests for the project-authored display klass surface.
+
+``catalog_add_display_klass`` runs the class through buckaroo before the
+file lands on disk: buckaroo's loader execs it, buckaroo computes summary
+stats for a sample, and every column is styled with the class. A class
+that would fail when buckaroo renders a table is rejected with the
+exception and the column it failed on, and nothing is written.
+"""
+
+from __future__ import annotations
+
+from tallyman_core.paths import display_dir
+
+USES_GETATTR = """
+class MainUsesGetattr(DefaultMainStyling):
+    df_display_name = "main"
+
+    @classmethod
+    def style_column(cls, col, column_metadata):
+        cc = super().style_column(col, column_metadata)
+        if getattr(cc, "displayer_args", None) is None:
+            cc["displayer_args"] = {"displayer": "obj"}
+        return cc
+"""
+
+RAISES_ON_REGION = """
+class MainRegionBug(DefaultMainStyling):
+    df_display_name = "main"
+
+    @classmethod
+    def style_column(cls, col, column_metadata):
+        cc = super().style_column(col, column_metadata)
+        if column_metadata.get("orig_col_name") == "region":
+            cc["width"] = 1 / 0
+        return cc
+"""
+
+MISSING_STAT = """
+class MainMissingStat(DefaultMainStyling):
+    df_display_name = "main"
+
+    @classmethod
+    def style_column(cls, col, column_metadata):
+        cc = super().style_column(col, column_metadata)
+        if column_metadata["no_such_stat"] > 0:
+            cc["displayer_args"] = {"displayer": "string"}
+        return cc
+"""
+
+
+def test_mcp_add_rejects_getattr_and_writes_nothing(project: str):
+    """``getattr`` is not in buckaroo's sandbox builtins, so ``style_column``
+    raises NameError on every column at render time."""
+    from tallyman_mcp.server import catalog_add_display_klass
+
+    resp = catalog_add_display_klass("uses_getattr", USES_GETATTR)
+    assert "error" in resp, resp
+    assert "NameError" in resp["error"]
+    assert "getattr" in resp["error"]
+    assert "style_column" in resp["error"]
+    assert not (display_dir(project) / "uses_getattr.py").exists()
+
+
+def test_mcp_add_rejects_klass_that_raises_on_one_entry_column(project: str, orders_src: str):
+    """The class fails only on a column the catalog's entries actually have,
+    so the check has to style a sample of a real entry, not just synthetic
+    columns. The error names the column."""
+    from tallyman_mcp.server import catalog_add_display_klass
+
+    resp = catalog_add_display_klass("region_bug", RAISES_ON_REGION)
+    assert "error" in resp, resp
+    assert "ZeroDivisionError" in resp["error"]
+    assert "'region'" in resp["error"]
+    assert not (display_dir(project) / "region_bug.py").exists()
+
+
+def test_mcp_add_rejects_klass_reading_a_missing_stat(project: str):
+    from tallyman_mcp.server import catalog_add_display_klass
+
+    resp = catalog_add_display_klass("missing_stat", MISSING_STAT)
+    assert "error" in resp, resp
+    assert "KeyError" in resp["error"]
+    assert "no_such_stat" in resp["error"]
+    assert not (display_dir(project) / "missing_stat.py").exists()

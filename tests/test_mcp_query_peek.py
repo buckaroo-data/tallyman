@@ -299,6 +299,65 @@ def test_query_errors_follow_catalog_run_rules(project: str, code: str, says: st
     assert list_errors(project) == []
 
 
+def _without_row_order(rows: list[dict]) -> list[dict]:
+    return [{k: v for k, v in r.items() if k != "__row_order"} for r in rows]
+
+
+def test_query_rows_are_the_first_rows_of_the_entry_catalog_run_builds(project: str, orders_src: str):
+    """A hash aggregate's output order depends on how DataFusion partitions it, so its first rows differ call to call.
+    The build sorts a worthy entry canonically; query does too, so its rows are the ones the built entry serves."""
+    code = _agg(orders_src, by="order_id")
+
+    runs = [_tool("catalog_query")(code, limit=10) for _ in range(5)]
+    built = server.catalog_run(code)
+    peeked = _tool("catalog_peek")(built["hash"], limit=10)
+
+    assert "error" not in peeked, peeked
+    for out in runs:
+        assert "error" not in out, out
+        assert _without_row_order(out["rows"]) == _without_row_order(peeked["rows"])
+
+
+def test_query_compiles_a_recipe_as_catalog_run_imports_it(project: str, orders_src: str):
+    """query.py's ``from __future__ import annotations`` must not reach the recipe: its annotations stay objects."""
+    code = f"""
+def keep(x: int) -> int:
+    return x
+
+
+assert keep.__annotations__ == {{"x": int, "return": int}}, keep.__annotations__
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
+expr = t.filter(t.price > 0)
+"""
+    out = _tool("catalog_query")(code, limit=1)
+
+    assert "error" not in out, out
+    assert "error" not in server.catalog_run(code)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        'import xorq.api as xo\nexpr = xo.memtable({{"i": [1, 2]}})\n',
+        'from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias("{src}")\n'
+        'expr = t.select("order_id", "price")\n',
+        'from tallyman_xorq.io import tracked_expr_from_alias\nt = tracked_expr_from_alias("{src}")\n'
+        "expr = t.mutate(__row_order=t.order_id)\n",
+    ],
+    ids=["in-memory-table", "cheap-select-drops-row-order", "assigns-row-order"],
+)
+def test_query_refuses_what_catalog_run_refuses_with_its_message(project: str, orders_src: str, body: str):
+    code = body.format(src=orders_src)
+
+    out = _tool("catalog_query")(code)
+    built = server.catalog_run(code)
+
+    assert "error" in built, built
+    assert "error" in out, out
+    assert out["error"].split("\nTraceback")[0] == built["error"].split("\nTraceback")[0]
+
+
 def test_query_refuses_a_raw_file_read_as_catalog_run_does(project: str, orders_parquet: Path):
     code = f"import xorq.api as xo\nexpr = xo.deferred_read_parquet({str(orders_parquet)!r})\n"
 

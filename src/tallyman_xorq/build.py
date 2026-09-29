@@ -421,6 +421,62 @@ def _reading(expr, project: str) -> str:
     return describe_read(project, paths[0]) if len(paths) == 1 else "a file"
 
 
+def _recipe_expr(module, expr_name: str = "expr"):
+    """What the imported recipe *module* binds to *expr_name*; a ``BuildError`` naming what it does bind if nothing."""
+    expr = getattr(module, expr_name, None)
+    if expr is None:
+        names = ", ".join(n for n in dir(module) if not n.startswith("_"))
+        raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
+    return expr
+
+
+def _checked_rewrite(expr, project: str):
+    """*expr* through a build's fatal read checks and ``rewrite_for_build``, with its worthiness verdict.
+
+    A build and ``catalog_query`` both call this, so they refuse the same recipes with the same text.
+    """
+    from tallyman_xorq.row_order import RowOrderError, translate_collision
+    from tallyman_xorq.source_cache import CacheNodeError, InMemoryReadError, rewrite_for_build
+    from tallyman_xorq.worthiness import classify_expr
+
+    # Fatal: raw reads are banned. A file enters the catalog by an import and a recipe reads the source alias
+    # (ADR-011 D2); read_project_file and tallyman_read_csv refuse in io.py, and these two catch the xorq readers
+    # that would otherwise go straight to a file with no digest, no clone and no __row_order.
+    _csv_direct_read_check(expr)
+    _raw_parquet_read_check(expr, project)
+
+    # Whether the entry is materialized is decided ONCE, here, on the expression the author wrote (ADR-008 D4), and
+    # recorded in the manifest. The rewrite below then adds the canonical sort to a worthy entry and checks that a
+    # cheap one keeps __row_order; no cache node is created (ADR-007 D1).
+    verdict = classify_expr(expr)
+    try:
+        rewritten = rewrite_for_build(
+            expr,
+            project,
+            verdict=verdict,
+            reading=_reading(expr, project) if not verdict.worthy else None,
+        )
+    except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
+        raise BuildError(str(exc)) from exc
+    except Exception as exc:
+        translated = translate_collision(exc)
+        if translated is not None:
+            raise BuildError(str(translated)) from exc
+        raise
+    return rewritten, verdict
+
+
+def _execution_error(what: str, exc: Exception, code: str) -> BuildError:
+    """The ``BuildError`` for *exc*, raised while executing a rewritten recipe; call it inside the ``except``."""
+    from tallyman_xorq.row_order import translate_collision
+
+    translated = translate_collision(exc)
+    if translated is not None:
+        return BuildError(str(translated))
+    hint = _ibis_import_hint(str(exc), code)
+    return BuildError(f"{what} failed: {exc}{hint}\n{traceback.format_exc()}")
+
+
 def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | None) -> BuildResult:
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
@@ -433,8 +489,6 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
         publish_snapshot,
     )
     from tallyman_xorq.result_cache import stream_row_count
-    from tallyman_xorq.row_order import RowOrderError
-    from tallyman_xorq.worthiness import classify_expr
 
     # git-provenance capture in xorq's compiler can crash (git SIGSEGV when forked
     # from the long-lived server) and abort the whole build. Make it best-effort.
@@ -450,45 +504,15 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
         module, tmp_script = _import_script(code)
     finally:
         parents = pc.end_collect(parent_token)
-    expr_obj = getattr(module, expr_name, None)
-    if expr_obj is None:
-        names = ", ".join(n for n in dir(module) if not n.startswith("_"))
-        raise BuildError(f"variable {expr_name!r} not found in code. Available names: {names}")
+    expr_obj = _recipe_expr(module, expr_name)
 
     # Advisory nondeterminism lint (#88) on the author's expression, surfaced on the result, never fatal.
     lint_warnings = _nondeterminism_warnings(expr_obj)
 
-    # Fatal: raw reads are banned. A file enters the catalog by an import and a recipe reads the source alias
-    # (ADR-011 D2); read_project_file and tallyman_read_csv refuse in io.py, and these two catch the xorq readers
-    # that would otherwise go straight to a file with no digest, no clone and no __row_order.
-    _csv_direct_read_check(expr_obj)
-    _raw_parquet_read_check(expr_obj, project)
-
-    # Whether the entry is materialized is decided ONCE, here, on the expression the author wrote (ADR-008 D4), and
-    # recorded in the manifest. The rewrite below then adds the canonical sort to a worthy entry and checks that a
-    # cheap one keeps __row_order; no cache node is created (ADR-007 D1).
-    from tallyman_xorq.source_cache import CacheNodeError, InMemoryReadError, rewrite_for_build
-
-    verdict = classify_expr(expr_obj)
     # The author's DAG before the canonical sort: compile_seconds (#87) times its expr->backend-plan step, the
     # un-truncated "large expression DAG" recompile that #30's profiling found dominates per-view cost.
     author_expr = expr_obj
-    try:
-        expr_obj = rewrite_for_build(
-            expr_obj,
-            project,
-            verdict=verdict,
-            reading=_reading(expr_obj, project) if not verdict.worthy else None,
-        )
-    except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
-        raise BuildError(str(exc)) from exc
-    except Exception as exc:
-        from tallyman_xorq.row_order import translate_collision
-
-        translated = translate_collision(exc)
-        if translated is not None:
-            raise BuildError(str(translated)) from exc
-        raise
+    expr_obj, verdict = _checked_rewrite(expr_obj, project)
 
     created_target = False
     staged: Materialized | None = None  # a worthy entry's snapshot, complete at a temp name until it is published
@@ -573,13 +597,7 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
                     row_count = stream_row_count(loaded)
                     result_digest_v = None
             except Exception as exc:
-                hint = _ibis_import_hint(str(exc), code)
-                from tallyman_xorq.row_order import translate_collision
-
-                translated = translate_collision(exc)
-                if translated is not None:
-                    raise BuildError(str(translated)) from exc
-                raise BuildError(f"build execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
+                raise _execution_error("build execution", exc, code) from exc
             execute_seconds = round(time.monotonic() - t0, 3)
 
         # Schema + row count: a worthy entry's schema is read from the file it wrote (parquet changes some types, and

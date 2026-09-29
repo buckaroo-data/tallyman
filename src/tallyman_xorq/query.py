@@ -150,43 +150,18 @@ def query(project: str, code: str, limit: int = 50) -> dict:
     Raises ``BuildError`` with the text a build gives for the same mistake.
     """
     from tallyman_xorq import parent_capture as pc
-    from tallyman_xorq.build import (
-        BuildError,
-        _csv_direct_read_check,
-        _ibis_import_hint,
-        _raw_parquet_read_check,
-        _reading,
-    )
-    from tallyman_xorq.row_order import RowOrderError, translate_collision
-    from tallyman_xorq.source_cache import CacheNodeError, InMemoryReadError, rewrite_for_build
-    from tallyman_xorq.worthiness import classify_expr
+    from tallyman_xorq.build import BuildError, _checked_rewrite, _execution_error, _recipe_expr
 
     # A private collector: the reads the recipe notes as parents are dropped, and none reach an enclosing build's.
     token = pc.begin_collect()
     try:
         with _imported(code) as module:
-            expr = getattr(module, "expr", None)
-            if expr is None:
-                names = ", ".join(n for n in dir(module) if not n.startswith("_"))
-                raise BuildError(f"variable 'expr' not found in code. Available names: {names}")
+            expr = _recipe_expr(module)
             if hasattr(expr, "as_table"):
                 expr = expr.as_table()  # a column or scalar comes back as a one-column table
             if not hasattr(expr, "to_pyarrow_batches"):
                 raise BuildError(f"expr must be a xorq/ibis expression, not {type(expr).__name__}")
-            _csv_direct_read_check(expr)
-            _raw_parquet_read_check(expr, project)
-            verdict = classify_expr(expr)
-            try:
-                expr = rewrite_for_build(
-                    expr, project, verdict=verdict, reading=None if verdict.worthy else _reading(expr, project)
-                )
-            except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
-                raise BuildError(str(exc)) from exc
-            except Exception as exc:
-                translated = translate_collision(exc)
-                if translated is not None:
-                    raise BuildError(str(translated)) from exc
-                raise
+            expr, verdict = _checked_rewrite(expr, project)
             if not verdict.worthy:
                 expr = expr.order_by(ROW_ORDER)  # a worthy one is sorted canonically; a cheap one keeps __row_order
             cap = _cap(limit)
@@ -201,11 +176,7 @@ def query(project: str, code: str, limit: int = 50) -> dict:
                             kept.append(batch.slice(0, cap - row_count))
                         row_count += batch.num_rows
             except Exception as exc:
-                translated = translate_collision(exc)
-                if translated is not None:
-                    raise BuildError(str(translated)) from exc
-                hint = _ibis_import_hint(str(exc), code)
-                raise BuildError(f"query execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
+                raise _execution_error("query execution", exc, code) from exc
     finally:
         pc.end_collect(token)
 

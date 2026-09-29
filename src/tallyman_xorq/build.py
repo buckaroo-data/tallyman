@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import importlib.util
+import contextlib
 import json
+import linecache
 import logging
 import re
 import shutil
@@ -9,6 +10,7 @@ import sys
 import tempfile
 import time
 import traceback
+import types
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -399,24 +401,37 @@ def _nondeterminism_warnings(expr) -> list[str]:
     ]
 
 
-def _import_script(code: str) -> tuple[object, Path]:
-    """Write code to a temp file, import it, return (module, temp_path).
+@contextlib.contextmanager
+def _imported_recipe(code: str):
+    """Run the recipe *code* in a fresh module and yield the module; nothing is written, and nothing outlives the block.
 
-    The temp file is kept alive for the caller to copy into the entry dir.
+    Every reader of a recipe imports it here: a build, ``catalog_query``, a source import and the recompute of an
+    entry. While the block runs, the module is in ``sys.modules`` (a dataclass resolves its annotations through it)
+    and registered with cloudpickle to pickle by value, so a UDF the recipe defines goes into the entry's frozen build
+    as code. By reference, it would name a module that exists only in this process, and no other process (the
+    companion's Buckaroo, this server after a restart) could load the build. The source is in ``linecache`` so
+    tracebacks and ``inspect.getsource`` show its lines. On exit the module, its registration and its source go.
     """
-    tmp = Path(tempfile.gettempdir()) / f"tallyman_expr_{uuid.uuid4().hex}.py"
-    tmp.write_text(code)
-    spec = importlib.util.spec_from_file_location(f"tallyman_expr_{tmp.stem}", tmp)
-    if spec is None or spec.loader is None:
-        raise BuildError(f"Could not load module spec from {tmp}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
+    import cloudpickle
+
+    name = f"tallyman_recipe_{uuid.uuid4().hex}"
+    filename = f"<{name}>"
+    module = types.ModuleType(name)
+    linecache.cache[filename] = (len(code), None, code.splitlines(keepends=True), filename)
+    sys.modules[name] = module
+    cloudpickle.register_pickle_by_value(module)
     try:
-        spec.loader.exec_module(module)
-    except Exception as exc:
-        hint = _error_hint(str(exc), code)
-        raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
-    return module, tmp
+        try:
+            # dont_inherit: this module's ``from __future__ import annotations`` is not the recipe's.
+            exec(compile(code, filename, "exec", dont_inherit=True), module.__dict__)
+        except Exception as exc:
+            hint = _error_hint(str(exc), code)
+            raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
+        yield module
+    finally:
+        cloudpickle.unregister_pickle_by_value(module)
+        sys.modules.pop(name, None)
+        linecache.cache.pop(filename, None)
 
 
 def build_and_persist(
@@ -437,8 +452,9 @@ def build_and_persist(
     from tallyman_core.catalog_state import project_lock
 
     ensure_project(project)
-    with project_lock(project):
-        return _build_and_persist(project, code, expr_name, prompt)
+    # The recipe's module lives as long as the build: build_expr pickles the UDFs it defines (``_imported_recipe``).
+    with project_lock(project), contextlib.ExitStack() as recipe_scope:
+        return _build_and_persist(project, code, expr_name, prompt, recipe_scope)
 
 
 def _reading(expr, project: str) -> str:
@@ -509,7 +525,9 @@ def _execution_error(what: str, exc: Exception, code: str) -> BuildError:
     return BuildError(f"{what} failed: {exc}{hint}\n{traceback.format_exc()}")
 
 
-def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | None) -> BuildResult:
+def _build_and_persist(
+    project: str, code: str, expr_name: str, prompt: str | None, recipe_scope: contextlib.ExitStack
+) -> BuildResult:
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
     from tallyman_xorq._git_state_guard import install_git_state_guard
@@ -533,7 +551,7 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
 
     parent_token = pc.begin_collect()
     try:
-        module, tmp_script = _import_script(code)
+        module = recipe_scope.enter_context(_imported_recipe(code))
     finally:
         parents = pc.end_collect(parent_token)
     expr_obj = _recipe_expr(module, expr_name)
@@ -719,12 +737,6 @@ def _build_and_persist(project: str, code: str, expr_name: str, prompt: str | No
             "cannot be re-created faithfully. Seed a sample, or replace now()/random()/an impure UDF with a value "
             "fixed at author time, for a reproducible entry.",
         ]
-
-    # Best-effort: drop the temp script.
-    try:
-        tmp_script.unlink()
-    except OSError:
-        pass
 
     # The complete entry dir (recipe + manifest + schema) is now persisted on
     # disk. catalog_registered reports that local fact — "entry dir persisted" —

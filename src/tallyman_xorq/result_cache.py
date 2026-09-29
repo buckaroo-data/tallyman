@@ -28,7 +28,6 @@ from __future__ import annotations
 import contextvars
 import functools
 import logging
-import sys
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -120,14 +119,14 @@ _RECIPE_VAR = "expr"
 def _recipe_expr(project: str, content_hash: str):
     """Re-import the entry's persisted recipe (``expr.py``) as a live expression.
 
-    Symmetric with the original build's ``_import_script`` — same source code — so the
+    Symmetric with the original build's ``_imported_recipe`` — same source code — so the
     reconstructed expression is structurally identical to what was built. The recipe's
     deferred readers bind to the in-process *default* backend, so the returned
     expression roots there and composes with other ``tracked_expr_from_alias`` results
     as a single backend (#75).
     """
     from tallyman_core.paths import entry_dir, project_dir
-    from tallyman_xorq.build import BuildError, _import_script
+    from tallyman_xorq.build import BuildError, _imported_recipe
     from tallyman_xorq.portable import PLACEHOLDER
     from tallyman_xorq.source_import import in_source_recipe, is_source_entry, release_source_recipe
 
@@ -141,36 +140,24 @@ def _recipe_expr(project: str, content_hash: str):
     code = (entry_dir(project, content_hash) / "expr.py").read_text().replace(PLACEHOLDER, str(project_dir(project)))
     # Mark this entry in-flight for the duration of the recipe exec, so any
     # tracked_expr_from_alias the recipe issues can step back out of a self-reference (#74).
-    # The contextvar must wrap _import_script — that is where the recipe's
-    # tracked_expr_from_alias calls run — and reset in this finally, NOT the
-    # sys.modules-cleanup finally below.
+    # The contextvar must wrap _imported_recipe — that is where the recipe's
+    # tracked_expr_from_alias calls run.
     token = _RECONSTRUCTING.set(active | {(project, content_hash)})
     # A source entry's recipe is the one the importer generated, and its read_project_file is the one raw read
     # tallyman allows (ADR-011 D2): mark it so the read resolves to this entry's own snapshot.
     source_token = in_source_recipe(project, content_hash) if is_source_entry(project, content_hash) else None
     try:
-        module, tmp = _import_script(code)
+        # Leaving the block drops the module's sys.modules entry: reconstruction runs on every cold read since #73.
+        # The returned expr still holds the module object (and any UDF __globals__) while in use.
+        with _imported_recipe(code) as module:
+            expr = getattr(module, _RECIPE_VAR, None)
     finally:
         if source_token is not None:
             release_source_recipe(source_token)
         _RECONSTRUCTING.reset(token)
-    try:
-        expr = getattr(module, _RECIPE_VAR, None)
-        if expr is None:
-            raise BuildError(f"recipe for {content_hash} in {project!r} binds no {_RECIPE_VAR!r}")
-        return expr
-    finally:
-        # _import_script registers the recipe module in sys.modules (needed
-        # during exec, e.g. for dataclass annotation resolution). Reconstruction
-        # runs on every cold read since #73, so drop that registration to avoid
-        # an unbounded sys.modules leak of recipe modules and the expression
-        # graphs they pin. The returned expr still holds the module object (and
-        # any UDF __globals__) while in use; only the name->module mapping goes.
-        sys.modules.pop(getattr(module, "__name__", "") or "", None)
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+    if expr is None:
+        raise BuildError(f"recipe for {content_hash} in {project!r} binds no {_RECIPE_VAR!r}")
+    return expr
 
 
 def load_entry_expr(project: str, content_hash: str):

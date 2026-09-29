@@ -35,6 +35,7 @@ editing the original file has no effect on any build.
 from __future__ import annotations
 
 import ast
+import contextlib
 import contextvars
 import hashlib
 import json
@@ -702,7 +703,7 @@ def _mint(
     from tallyman_core.manifest import SourceProvenance
     from tallyman_xorq import source_identity as si
     from tallyman_xorq._git_state_guard import install_git_state_guard
-    from tallyman_xorq.build import BuildError, _import_script
+    from tallyman_xorq.build import BuildError, _imported_recipe
     from tallyman_xorq.materialize import SNAPSHOT_FORMAT_VERSION, engine_versions, snapshot_path
     from tallyman_xorq.portable import PLACEHOLDER, make_portable_inplace
     from tallyman_xorq.source_cache import rewrite_for_build
@@ -751,12 +752,12 @@ def _mint(
         # 3. The entry: a generated recipe, its frozen build, a schema and a manifest.
         install_git_state_guard()
         code = _recipe(outside_path, alias, version, digest, reader)
-        token = in_source_recipe(project, content_hash)
-        try:
-            module, tmp_script = _import_script(code)
-        finally:
-            release_source_recipe(token)
-        try:
+        with contextlib.ExitStack() as recipe_scope:
+            token = in_source_recipe(project, content_hash)
+            try:
+                module = recipe_scope.enter_context(_imported_recipe(code))
+            finally:
+                release_source_recipe(token)
             expr = getattr(module, "expr", None)
             if expr is None:
                 raise BuildError(f"the generated recipe of {alias}-v{version} bound no 'expr'")
@@ -808,11 +809,6 @@ def _mint(
                     ),
                 ),
             )
-        finally:
-            import sys
-
-            sys.modules.pop(getattr(module, "__name__", "") or "", None)
-            tmp_script.unlink(missing_ok=True)
     except BaseException:
         if created:
             shutil.rmtree(target, ignore_errors=True)

@@ -288,13 +288,12 @@ precise message and a retry.
 4. **Stat-cache dir**: `stat_cache = <entry>/.buckaroo_stat_cache`,
    `mkdir(exist_ok=True)` — preserves an existing cache, never wipes it.
 5. **POST `/load_expr`** with `session=entry-<project>-<content_hash>`,
-   `build_dir` (from step 3), `project_root=<artifacts_dir>`,
+   `build_dir` (from step 3), `project_root=<catalog_dir>`,
    `cache_storage_path=<stat_cache>`, and `row_order_column="__row_order"`.
    Buckaroo looks for the project's klasses (its summary stats,
    post-processing functions and display classes) in `stats/`,
-   `post_processing/` and `display/` under `project_root`; tallyman keeps
-   display classes in `artifacts/display/` but writes the other two under
-   `artifacts/catalog/`, so Buckaroo does not find them (#170). A promoted diff
+   `post_processing/` and `display/` under `project_root`, which is
+   `buckaroo_project_root`, the directory tallyman writes all three to. A promoted diff
    entry adds `column_config_overrides`, and the companion adds `telemetry_url`
    when it knows its own address. Buckaroo loads the xorq expression, creates
    the session, and returns its `session` id.

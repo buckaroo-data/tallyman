@@ -25,7 +25,9 @@ from tallyman_core.paths import (
     ENTRY_SCHEMA_FILENAME,
     ENTRY_STAT_CACHE_DIRNAME,
     active_project_file_path,
+    buckaroo_project_root,
     delete_project,
+    display_dir,
     entry_build_dir,
     entry_expanded_build_dir,
     entry_manifest_path,
@@ -194,6 +196,10 @@ def test_path_helpers_under_artifacts(isolated_home: Path):
     assert entry_dir("alpha", "abc123") == entries_dir("alpha") / "abc123"
     assert post_processing_dir("alpha") == p / "artifacts" / "catalog" / "post_processing"
     assert stats_dir("alpha") == p / "artifacts" / "catalog" / "stats"
+    # Buckaroo reads stats/, post_processing/ and display/ under one root.
+    root = buckaroo_project_root("alpha")
+    assert (stats_dir("alpha"), post_processing_dir("alpha"), display_dir("alpha")) == (
+        root / "stats", root / "post_processing", root / "display")
     assert exports_dir("alpha") == p / "artifacts" / "exports"
     assert errors_path("alpha") == p / "artifacts" / "errors.jsonl"
     # data/ stays at project root.

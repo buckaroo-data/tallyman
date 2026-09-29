@@ -131,3 +131,29 @@ def test_validate_without_a_project_styles_the_synthetic_sample():
     validate_display_klass_source("money", PER_COLUMN)
     with pytest.raises(DisplayKlassError, match="getattr"):
         validate_display_klass_source("uses_getattr", USES_GETATTR)
+
+
+READS_PROJECT_STAT = """
+class MainShowsPresent(DefaultMainStyling):
+    df_display_name = "main"
+
+    @classmethod
+    def style_column(cls, col, column_metadata):
+        cc = super().style_column(col, column_metadata)
+        if column_metadata["n_present"] > 0:
+            cc["displayer_args"] = {"displayer": "string"}
+        return cc
+"""
+
+
+def test_mcp_add_accepts_klass_reading_a_project_stat(project: str, orders_src: str):
+    """The check computes the project's stats the way buckaroo's session does, so a class may read one from
+    column_metadata. The stat is added through the same tool an agent uses, so it lands where buckaroo looks."""
+    from tallyman_mcp.server import catalog_add_display_klass, catalog_add_summary_stat
+
+    added = catalog_add_summary_stat("n_present", "def compute(col):\n    return col.count()\n")
+    assert "error" not in added, added
+
+    resp = catalog_add_display_klass("shows_present", READS_PROJECT_STAT)
+    assert "error" not in resp, resp
+    assert (display_dir(project) / "shows_present.py").exists()

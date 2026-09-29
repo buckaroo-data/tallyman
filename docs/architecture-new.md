@@ -135,14 +135,13 @@ repository, unless they start with `artifacts/` or `data/`.
 | `entries.jsonl` | the complete entry directories the last checkpoint saw | record, tracked |
 | `entries/<hash>.zip` | the **recipe zip**: a deterministic archive of the entry's `expr.py`, `schema.json`, `manifest.json` and `xorq_build/`, written by the first checkpoint after the entry is made; nothing reads it back | record, tracked |
 | `config.json` | project settings, one key: `auto_recalc` | record, tracked |
-| `notebook.jsonl`, `chart_specs/`, `display_configs/`, `prompts/`, `post_processing/`, `stats/` | notebook cells, per-entry charts and grid settings, the prompts each entry was built from, the project's statistic and post-processing functions | record, tracked |
+| `notebook.jsonl`, `chart_specs/`, `display_configs/`, `prompts/`, `post_processing/`, `stats/`, `display/` | notebook cells, per-entry charts and grid settings, the prompts each entry was built from, the project's statistic and post-processing functions and display classes | record, tracked |
 | `entries/<hash>/` | the entry directory (section 4) | record, untracked: every read uses it, and nothing re-creates it |
 | `entries/<hash>/.xorq_build_expanded/`, `.xorq_view_build/`, `.buckaroo_stat_cache/`, `primary_key.json` | per-entry derived files | cache |
 | `compute_cache/result_cache/<hash>.parquet` | snapshots, the result files of worthy entries (section 4) | cache, unless pinned because it cannot be made again faithfully (section 8) |
 | `bullpen/entries/<hash>/`, `bullpen/cas/` | the **bullpen**: entry directories and clones a reset retired, kept so a reset forward can bring them back (section 10) | record, parked |
 | `diff_stat_cache/<a12>-<b12>/` | Buckaroo statistics per diffed pair | cache |
 | `data/.cas/<digest><suffix>` | clones: the bytes of every imported file | record |
-| `artifacts/display/` | display classes, outside the repository | record, untracked |
 | `artifacts/errors.jsonl`, `events.jsonl`, `telemetry.jsonl` | failures, the activity log, grid-load timings | log |
 
 The catalog's `.gitignore` keeps the untracked paths out of `git add -A`, and
@@ -846,7 +845,6 @@ Recalc and row order:
 
 The viewer:
 
-- #170: Buckaroo is pointed at `artifacts/`, so it never finds the project's statistics and post-processing functions under `artifacts/catalog/`.
 - #172: diff sessions are keyed by the two hashes with no project, so two projects holding the same source versions can share one.
 - #188: the live diff grid hands Buckaroo an unmaterialized join, which Buckaroo runs for every query.
 - #201: a klass reload posts `/reload_expr` once per catalog entry, one after another, from the event loop.

@@ -1,6 +1,6 @@
 """Project-authored display klasses (ColAnalysis subclasses with df_display_name).
 
-Each file under artifacts/display/ is exec'd by buckaroo's server at
+Each file under artifacts/catalog/display/ is exec'd by buckaroo's server at
 session load and reload time.  Any class found that subclasses ColAnalysis
 and carries a ``df_display_name`` string overrides the built-in styling for
 that display view.
@@ -24,7 +24,7 @@ import traceback
 from pathlib import Path
 
 from tallyman_core.execution import execution_lock
-from tallyman_core.paths import artifacts_dir, display_dir
+from tallyman_core.paths import buckaroo_project_root, display_dir
 
 # How much of each entry the render check styles: the first rows of the most recently built entries that have a
 # snapshot on disk. Enough for buckaroo to compute every stat a column's metadata carries; the check never computes
@@ -69,7 +69,7 @@ def validate_display_klass_source(name: str, source: str, project: str | None = 
             "and has a string df_display_name attribute")
 
     # The project's stats go in as buckaroo's session gets them, so a class may read them from column_metadata.
-    stat_klasses = xorq_loading.load_project_stat_klasses(artifacts_dir(project)) if project else []
+    stat_klasses = xorq_loading.load_project_stat_klasses(buckaroo_project_root(project)) if project else []
     for label, table in _samples(project):
         try:
             _check_styling(xorq_loading, klasses, stat_klasses, table)

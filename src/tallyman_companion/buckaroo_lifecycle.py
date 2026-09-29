@@ -54,7 +54,7 @@ from tallyman_core import (
     entry_view_build_dir,
 )
 from tallyman_core.net import port_in_use
-from tallyman_core.paths import artifacts_dir, project_dir
+from tallyman_core.paths import buckaroo_project_root, project_dir
 from tallyman_xorq.row_order import ROW_ORDER
 
 log = logging.getLogger("tallyman.buckaroo")
@@ -490,10 +490,9 @@ class BuckarooManager:
             "session": self.session_id_for(project, content_hash),
             "build_dir": str(build_dir),
             "no_browser": True,
-            # Buckaroo scans <project_root>/stats/*.py and <project_root>/post_processing/*.py for project-authored
-            # klasses. tallyman stores both under artifacts/, so pass artifacts_dir, not project_dir. Older buckaroo
-            # builds ignore this field, so it's safe to always send.
-            "project_root": str(artifacts_dir(project)),
+            # Buckaroo loads the project's stats, post-processing functions and display klasses from stats/,
+            # post_processing/ and display/ under this root (#170).
+            "project_root": str(buckaroo_project_root(project)),
             # Buckaroo 0.14.9+: persist computed summary stats to disk so they survive a Buckaroo restart without full
             # recomputation on next /load_expr.
             "cache_storage_path": str(stat_cache),

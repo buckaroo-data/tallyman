@@ -409,12 +409,9 @@ Project-authored per-column statistics. Source runs in a restricted-globals
 sandbox; errors come back inline rather than later in the Buckaroo log. There is
 no separate update tool — re-adding the same `name` overwrites.
 
-Buckaroo looks for project stats in `<project_root>/stats/`, and tallyman sends
-`project_root` as `<project>/artifacts/`, while it writes stats to
-`<project>/artifacts/catalog/stats/`. So a stat added here is validated,
-committed and reloaded, but Buckaroo does not find it and the grid does not show
-it (#170). Post-processing functions have the same problem; display klasses,
-which live in `artifacts/display/`, do not.
+Buckaroo looks for project stats, post-processing functions and display klasses
+in `stats/`, `post_processing/` and `display/` under the `project_root` tallyman
+sends, `<project>/artifacts/catalog/`, which is where these tools write them.
 
 ### `catalog_add_summary_stat(name, source) -> dict`
 Validate a `compute(col)` function against a 3-row, one-column ibis memtable,
@@ -448,10 +445,11 @@ styling base classes already in scope; validated in a restricted sandbox before
 the file lands.
 
 ### `catalog_add_display_klass(name, source) -> dict`
-Validate and persist a display klass to `<project>/artifacts/display/<name>.py`,
-then hot-reload it into open sessions (`display_changed`). That directory is
-outside the catalog repository, so the checkpoint this tool takes commits
-nothing for it, and a reset does not undo it. The primary use is extending
+Validate and persist a display klass to `<project>/artifacts/catalog/display/<name>.py`,
+then hot-reload it into open sessions (`display_changed`). The file is tracked
+in the catalog repository, so the checkpoint this tool takes commits it and a
+reset undoes it. The pre-write check computes the project's summary stats the
+way a session does, so a class may read one from `column_metadata`. The primary use is extending
 `DefaultMainStyling` (`df_display_name='main'`) or `DefaultSummaryStatsStyling`
 (`'summary'`) with a `pinned_rows` entry so a stat shows as a frozen row.
 - **Params:** `name` (required) — valid identifier; `source` (required) — must
@@ -479,7 +477,7 @@ sandbox as summary stats (third-party imports like numpy/sklearn raise
 ### `catalog_add_post_processing(name, source) -> dict`
 Validate a `process(expr)` function and write it to
 `<project>/artifacts/catalog/post_processing/<name>.py` (tracked in the catalog
-repository). Buckaroo does not find it there yet (#170, above).
+repository), where Buckaroo finds it.
 - **Params:** `name` (required) — valid identifier, becomes the dropdown label;
   `source` (required) — defines `process(expr)` returning an ibis expression or a
   pandas DataFrame.
@@ -599,10 +597,6 @@ checkpoint or tagging wrappers.
   history and the step count. Adding them to `_NO_CHECKPOINT` (next to
   `catalog_list_summary_stats` / `catalog_list_post_processings`) would bring
   them in line with the other read-only tools.
-- **Display klasses are outside the catalog repository.** `catalog_add_display_klass`
-  and `catalog_remove_display_klass` checkpoint, but `artifacts/display/` is not
-  in the repository, so the revision records nothing about them and a reset does
-  not undo them.
 - **A build holds the project lock for its whole length.** Parallel tool calls
   that build queue behind each other, and behind any build or heal the companion
   is running (#186).

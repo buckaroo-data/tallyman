@@ -499,9 +499,8 @@ it is never stale. There is no session file.
   on-disk stat cache relies on. The body also
   carries `row_order_column`, the name `__row_order`, which Buckaroo 0.15.6
   ignores, and `project_root`, where Buckaroo looks for the project's `stats/`,
-  `post_processing/` and `display/` klasses. Tallyman sends `artifacts/`,
-  which holds `display/`, but it writes stats and post-processing functions
-  under `artifacts/catalog/`, so Buckaroo does not find them (#170).
+  `post_processing/` and `display/` klasses. Tallyman sends
+  `buckaroo_project_root`, the catalog dir, where it writes all three.
 - **After an unfaithful heal**: `_verify_self_heal` wipes the entry's stat
   cache, and the companion's hook POSTs `/load_expr` for the entry's id with
   `force_reload: true`, so an open grid does not keep stats computed from the

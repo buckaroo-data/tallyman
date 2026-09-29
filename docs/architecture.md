@@ -326,9 +326,10 @@ Key formats, and what is tracked:
   `errors.jsonl`, which holds no pin (pins are decided from the manifest), and the
   readers of `errors.jsonl` skip a line that is not a JSON object, so one torn
   append does not break the banner or the error page.
-- **Display klasses** (`artifacts/display/`) are also outside the catalog
-  repository, so no checkpoint commits them and no reset rewinds them.
-  Summary stats and post-processing functions are inside it.
+- **Display klasses** (`display/`) are inside the catalog repository with
+  the summary stats and post-processing functions, since Buckaroo reads all
+  three from one directory (`buckaroo_project_root`, the catalog dir). A
+  checkpoint commits them and a reset rewinds them.
 - **No per-entry `result.parquet`.** That layer was removed in #104; the
   companion still sweeps any old one away once per project at startup.
 
@@ -752,10 +753,9 @@ left behind, survives a failed re-add.
    (`<entry>/.xorq_view_build/`, written once); a cheap entry its own build,
    expanded into `<entry>/.xorq_build_expanded/`. The body also names the entry's
    statistics cache directory, `__row_order` as the `row_order_column`, and the
-   `project_root` Buckaroo searches for klasses. That root is `artifacts/`, so
-   Buckaroo finds the display klasses there but not the stats and
-   post-processing functions, which tallyman writes under `artifacts/catalog/`
-   (#170).
+   `project_root` Buckaroo searches for klasses: `buckaroo_project_root`, the
+   catalog dir, which holds the project's `stats/`, `post_processing/` and
+   `display/`.
 4. Buckaroo creates the session, or answers from the one it holds, and the grid
    connects over a WebSocket. Paging, sorting, search and summary statistics are
    Buckaroo's queries over the build it was handed, which for a worthy entry is a
@@ -846,8 +846,7 @@ Found while checking these docs (#233): a recipe's
 the `active_project` file, not the MCP session's own project, so the two can
 disagree after another session switches projects and a recipe then looks its
 aliases up in the other project (related to #39).
-Older open issues in the same areas: #170 (Buckaroo is not pointed at the
-project's stats and post-processing functions) and #157 (Buckaroo's on-disk
+An older open issue in the same area: #157 (Buckaroo's on-disk
 statistics cache has not been seen to give a first-load hit).
 
 Filed on 2026-09-24 against the same code, and described one by one in
@@ -995,8 +994,7 @@ code wins.
   old `catalog.yaml` and `aliases.json` formats.
 - [llm-summary-stats.md](../plans/llm-summary-stats.md): LLM-authored summary
   stats. **Partly stale:** Buckaroo's `_Generated_*` classes are now a `@stat()`
-  decorator, a few signatures and the notify `kind` differ, and the stats are
-  not found by Buckaroo (#170).
+  decorator, and a few signatures and the notify `kind` differ.
 
 ### Research notes and experiment logs (`plans/`, `demo/`, `docs/research/`)
 

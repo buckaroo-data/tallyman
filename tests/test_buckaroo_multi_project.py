@@ -17,7 +17,7 @@ from pathlib import Path
 from tallyman_cli.fixtures import write_shoe_orders
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
 from tallyman_core import data_dir, ensure_project, set_active_project
-from tallyman_core.paths import artifacts_dir
+from tallyman_core.paths import stats_dir
 from tallyman_xorq import build_and_persist
 from tallyman_xorq.source_import import update_and_depend
 
@@ -101,8 +101,9 @@ def test_ensure_session_takes_project_explicitly(isolated_home: Path, monkeypatc
     assert sid_a == mgr.session_id_for("alpha", hashes["alpha"])
     assert sid_b == mgr.session_id_for("beta", hashes["beta"])
     assert sid_a != sid_b
-    # Each load names its own project's artifacts dir (where Buckaroo finds that project's klasses).
-    assert [body["project_root"] for body in posted] == [str(artifacts_dir("alpha")), str(artifacts_dir("beta"))]
+    # Each load names its own project's klass root: Buckaroo reads <root>/stats/, so the root is the parent of the
+    # dir tallyman writes that project's stats to.
+    assert [body["project_root"] for body in posted] == [str(stats_dir("alpha").parent), str(stats_dir("beta").parent)]
 
 
 def test_no_session_file_is_written_anywhere(isolated_home: Path, monkeypatch):

@@ -401,6 +401,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
     from tallyman_core import aliases as al
     from tallyman_core import charts, notebook
     from tallyman_core import display_configs as dc
+    from tallyman_core import display_klasses as dk
     from tallyman_core import post_processing as pp
     from tallyman_core import summary_stats as ss
 
@@ -412,6 +413,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
     dc.set_display_config(project, h, {"pinned_rows": [1]})
     pp.write_post_processing(project, "pp1", "def process(expr):\n    return expr\n")
     ss.write_stat(project, "st1", "def compute(col):\n    return col.count()\n")
+    dk.write_display_klass(project, "dk1", 'class Dk1(DefaultMainStyling):\n    df_display_name = "main"\n')
     notebook.append(project, "by_region", markdown="hello")
     cs.checkpoint_catalog(project, "create")
 
@@ -429,6 +431,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
         f"display_configs/{h}.json",
         "post_processing/pp1.py",
         "stats/st1.py",
+        "display/dk1.py",
         f"prompts/{h}.jsonl",
     }, tracked
     assert "catalog.yaml" not in tracked and not any("/xorq_build/" in t for t in tracked)
@@ -447,6 +450,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
         "prompts/_disabled/leak.jsonl",
         "stats/nested/leak.py",
         "display_configs/nested/leak.json",
+        "display/nested/leak.py",
     ],
 )
 def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_src, rel):
@@ -479,7 +483,7 @@ def test_legit_disabled_subdir_member_still_passes(project, orders_src):
     build_and_persist(project, _agg_code(orders_src))
     cs.checkpoint_catalog(project, "create")
     cd = paths.catalog_dir(project)
-    for rel in ("post_processing/_disabled/old.py", "stats/_disabled/old.py"):
+    for rel in ("post_processing/_disabled/old.py", "stats/_disabled/old.py", "display/_disabled/old.py"):
         p = cd / rel
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text("def process(t):\n    return t\n")

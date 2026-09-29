@@ -4,16 +4,15 @@ Three layers:
 
 - ``tallyman_core.summary_stats``: write/list/remove + the dry-run
   validator that gates ``write_stat``.
-- ``BuckarooManager.ensure_session``: must include ``project_root`` in
-  the ``/load_expr`` POST body so buckaroo's project-stats scanner
-  picks them up (paired with buckaroo PR #784).
+- ``BuckarooManager.ensure_session``: the ``project_root`` in the
+  ``/load_expr`` POST body must be where buckaroo's loaders find the
+  stats, post-processing functions and display klasses tallyman wrote.
 - MCP tools: the three ``catalog_*_summary_stat`` wrappers around the
   core module, exposing the same surface to an agent.
 """
 
 from __future__ import annotations
 
-from pathlib import Path
 from typing import Any
 
 import pytest
@@ -101,12 +100,26 @@ def test_write_does_not_create_disabled_dir_on_active_listing(project: str):
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_session_includes_project_root_in_load_expr_body(project: str, orders_src: str, monkeypatch):
-    """The /load_expr POST must carry the project's absolute path so
-    buckaroo's load_project_stat_klasses (PR #784) can scan its stats/
-    directory."""
+MAIN_STYLING = """
+class ProjectMain(DefaultMainStyling):
+    df_display_name = "main"
+"""
+
+
+def test_ensure_session_project_root_finds_the_project_klasses(project: str, orders_src: str, monkeypatch):
+    """Buckaroo loads a session's project stats, post-processing functions and
+    display klasses from ``stats/``, ``post_processing/`` and ``display/`` under
+    the ``project_root`` in the /load_expr POST. Everything tallyman's writers
+    put on disk must be found by buckaroo's own loaders given that root (#170)."""
+    from buckaroo.server import xorq_loading
+
     from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+    from tallyman_core import write_display_klass, write_post_processing
     from tallyman_xorq import build_and_persist
+
+    write_stat(project, "n_present", N_ROWS)
+    write_post_processing(project, "noop", "def process(expr):\n    return expr\n")
+    write_display_klass(project, "project_main", MAIN_STYLING)
 
     code = f"""
 from tallyman_xorq.io import tracked_expr_from_alias
@@ -135,13 +148,11 @@ expr = t.group_by("region").aggregate(n=t.count())
     monkeypatch.setattr(mgr._client, "post", fake_post)
     mgr.ensure_session(res.content_hash, project)
 
-    posted_project_root = captured["json"].get("project_root")
-    assert posted_project_root is not None
-    # project_root must point to artifacts_dir so buckaroo finds
-    # stats/ and post_processing/ under it.
-    from tallyman_core.paths import artifacts_dir
-
-    assert Path(posted_project_root) == artifacts_dir(project)
+    root = captured["json"].get("project_root")
+    assert root is not None
+    assert [f.__name__ for f in xorq_loading.load_project_stat_klasses(root)] == ["n_present"]
+    assert [k.post_processing_method for k in xorq_loading.load_project_post_processing_klasses(root)] == ["noop"]
+    assert [k.__name__ for k in xorq_loading.load_project_display_klasses(root)] == ["ProjectMain"]
 
 
 # ---------------------------------------------------------------------------

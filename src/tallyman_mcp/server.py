@@ -1523,9 +1523,10 @@ def catalog_add_display_klass(name: str, source: str) -> dict:
     ``histogram`` (the ``histogram`` stat only). ``column_metadata`` also holds the column's summary stats
     (``min``, ``max``, ``_type``, ...).
 
-    This tool only execs the class. ``style_column`` first runs when a table renders, with a small builtins
-    whitelist: no ``any``, ``all``, ``sorted``, ``getattr`` or ``hasattr``. A column whose ``style_column`` raises
-    keeps the parent class's styling, logged as "styling failed" in ``~/.buckaroo/logs/server.log``.
+    Before writing the file, this tool loads the class with buckaroo's own loader and styles sample columns with it:
+    one column of each dtype, plus the first rows of the project's latest entries. The builtins are a small whitelist
+    (no ``any``, ``all``, ``sorted``, ``getattr`` or ``hasattr``). If ``style_column`` raises on any column, nothing is
+    written and the error names the exception, the line and the column.
 
     The ``df_display_name`` must match an existing display slot:
       - ``"main"``     — the primary table view (override DefaultMainStyling)

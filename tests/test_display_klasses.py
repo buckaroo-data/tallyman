@@ -9,6 +9,8 @@ exception and the column it failed on, and nothing is written.
 
 from __future__ import annotations
 
+import pytest
+
 from tallyman_core.paths import display_dir
 
 USES_GETATTR = """
@@ -82,3 +84,50 @@ def test_mcp_add_rejects_klass_reading_a_missing_stat(project: str):
     assert "KeyError" in resp["error"]
     assert "no_such_stat" in resp["error"]
     assert not (display_dir(project) / "missing_stat.py").exists()
+
+
+# The two examples catalog_add_display_klass documents.
+PINNED_ROW = """
+class MainWithMostFreq(DefaultMainStyling):
+    df_display_name = "main"
+    requires_summary = ["histogram", "is_numeric", "dtype", "_type", "most_freq"]
+    pinned_rows = [
+        {'primary_key_val': 'dtype',      'displayer_args': {'displayer': 'obj'}},
+        {'primary_key_val': 'histogram',  'displayer_args': {'displayer': 'histogram'}},
+        {'primary_key_val': 'most_freq',  'displayer_args': {'displayer': 'inherit'}},
+    ]
+"""
+
+PER_COLUMN = """
+class Money(DefaultMainStyling):
+    df_display_name = "main"
+
+    @classmethod
+    def style_column(cls, col, column_metadata):
+        cc = super().style_column(col, column_metadata)
+        name = column_metadata.get("orig_col_name", col)
+        if name == "year":
+            cc["displayer_args"] = {"displayer": "string"}
+        elif name == "price":
+            cc["displayer_args"] = {"displayer": "float", "min_fraction_digits": 1,
+                                    "max_fraction_digits": 1, "prefix": "$", "suffix": "M"}
+        return cc
+"""
+
+
+def test_mcp_add_accepts_the_documented_examples(project: str, orders_src: str):
+    from tallyman_mcp.server import catalog_add_display_klass
+
+    for name, source in (("main_with_most_freq", PINNED_ROW), ("money", PER_COLUMN)):
+        resp = catalog_add_display_klass(name, source)
+        assert "error" not in resp, resp
+        assert (display_dir(project) / f"{name}.py").exists()
+
+
+def test_validate_without_a_project_styles_the_synthetic_sample():
+    """With no project there are no entries to sample; the synthetic columns still catch a sandbox NameError."""
+    from tallyman_core.display_klasses import DisplayKlassError, validate_display_klass_source
+
+    validate_display_klass_source("money", PER_COLUMN)
+    with pytest.raises(DisplayKlassError, match="getattr"):
+        validate_display_klass_source("uses_getattr", USES_GETATTR)

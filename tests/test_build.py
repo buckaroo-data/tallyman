@@ -259,6 +259,102 @@ def test_hint_duckdb_reach_points_to_datafusion():
     assert "datafusion" in h.lower()
 
 
+# ---------------------------------------------------------------------------
+# Engine-error hints. Each message below is a recorded failure (errors.jsonl and build_error events across the
+# local projects), with column names made neutral; the hint is what the model eventually did to fix it.
+# ---------------------------------------------------------------------------
+
+_BARE_IBIS = "`import xorq.vendor.ibis as ibis`"
+
+
+def test_hint_window_sanity_check_on_the_window_node():
+    message = (
+        'SanityCheckPlan\ncaused by\nError during planning: Plan: ["BoundedWindowAggExec: wdw=[row_number() '
+        'ORDER BY [CAST(strpos(t6.a, Utf8(\\"/\\")) > Int64(0) AS Int8) ASC NULLS LAST]", "  SortExec: ...'
+    )
+    assert "mutate" in _ibis_import_hint(message)
+
+
+def test_hint_count_of_another_relation_uses_the_deferred_table():
+    message = (
+        "Cannot add <xorq.vendor.ibis.expr.operations.reductions.CountStar object at 0x116fa96d0> to projection, "
+        "they belong to another relation"
+    )
+    h = _ibis_import_hint(message)
+    assert "ibis._.count()" in h
+
+
+def test_hint_string_cast_failure_casts_only_matching_rows():
+    message = (
+        "Arrow error: C Data interface error: Invalid: Arrow error: Cast error: Cannot cast string '' to value of "
+        "Int64 type"
+    )
+    h = _ibis_import_hint(message)
+    assert "try_cast" in h and "re_search" in h
+
+
+def test_hint_window_inside_a_window_is_mutated_first():
+    message = (
+        "This feature is not implemented: Physical plan does not support logical expression "
+        "WindowFunction(WindowFunction { fun: WindowUDF(WindowUDF { inner: WindowShift { kind: Lag } }) })"
+    )
+    assert "mutate" in _ibis_import_hint(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "No field named t8.a. Did you mean 't8.t4.a'?",
+        'Projections require unique expression names but the expression "CAST(t8.a AS Float64)" at position 8 and '
+        '"t8.a" at position 16 have the same name. Consider aliasing ("AS") one of them.',
+    ],
+    ids=["no-field-named", "unique-names"],
+)
+def test_hint_select_after_a_join_renames_the_kept_column(message: str):
+    assert ".rename(" in _ibis_import_hint(message)
+
+
+@pytest.mark.parametrize(
+    ("message", "says"),
+    [
+        ("'StringColumn' object has no attribute 'substring'", ".substr"),
+        ("'DateColumn' object has no attribute 'substr'", 'cast("string")'),
+    ],
+    ids=["close-match", "wrong-type"],
+)
+def test_hint_missing_column_method_names_a_close_one_or_a_cast(message: str, says: str):
+    assert says in _ibis_import_hint(message)
+
+
+def test_hint_window_takes_group_by_not_partition_by():
+    h = _ibis_import_hint("window() got an unexpected keyword argument 'partition_by'")
+    assert "group_by=" in h
+
+
+def test_expr_that_is_a_dataframe_is_not_blamed_on_the_ibis_import():
+    message = (
+        "'expr' must be <class 'xorq.vendor.ibis.expr.types.core.Expr'> (got    a\n0  1 that is a "
+        "<class 'pandas.core.frame.DataFrame'>)."
+    )
+    h = _ibis_import_hint(message, "import pandas as pd\nexpr = pd.read_parquet('x.parquet')\n")
+    assert _BARE_IBIS not in h
+    assert "DataFrame" in h and "tracked_expr_from_alias" in h
+
+
+def test_expr_built_with_bare_ibis_gets_the_import_hint():
+    message = (
+        "'expr' must be <class 'xorq.vendor.ibis.expr.types.core.Expr'> (got InMemoryTable\n  data: ... that is a "
+        "<class 'ibis.expr.types.relations.Table'>)."
+    )
+    assert _BARE_IBIS in _ibis_import_hint(message)
+
+
+def test_hint_duckdb_in_the_code_points_to_datafusion():
+    code = "import duckdb\nimport xorq.api as xo\ncon = xo.connect()\ncon.register(duckdb.sql('select 1'), 'x')\n"
+    h = _ibis_import_hint("'Backend' object has no attribute 'register'", code)
+    assert "datafusion" in h.lower()
+
+
 def test_build_hints_bare_xorq_namespace(project: str, orders_parquet: Path):
     # End-to-end: a bare `import xorq` + `xorq.deferred_read_parquet(...)` must
     # steer the model to `xorq.api` through the real build path, not just the

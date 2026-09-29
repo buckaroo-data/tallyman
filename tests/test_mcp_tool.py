@@ -94,8 +94,8 @@ _WINDOW_ON_COMPUTED_KEY = {
 def test_a_window_keyed_on_a_computed_expression_fails_with_a_hint_to_mutate_it_first(
     project: str, orders_src: str, monkeypatch, window: str
 ):
-    """The error names a physical plan node, not the recipe line. The hint says to mutate the key into a column and
-    window over that column, which builds."""
+    """The error names a physical plan node, not the recipe line. The hint, in the error text as every build error's
+    is (so the companion, recalc and catalog_query show it too), says to mutate the key into a column first."""
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     code = f"""
 import xorq.vendor.ibis as ibis
@@ -105,13 +105,30 @@ expr = t.mutate(rn=ibis.row_number().over({window}))
 """
     out = catalog_run(code, prompt="window on a computed key")
     assert "SanityCheckPlan" in out["error"]
-    assert "hint" in out
-    assert "mutate" in out["hint"]
+    assert "Hint:" in out["error"]
+    assert "mutate" in out["error"].split("\nTraceback")[0].split("Hint:")[1]
+    assert "hint" not in out
+
+
+def test_an_ordered_aggregate_above_a_plain_window_gets_no_window_hint(project: str, orders_src: str, monkeypatch):
+    """The plan check fails on the aggregate's ORDER BY a computed key; the window below it is keyed on a column. The
+    printed plan names the window node too, but the window is not what to change."""
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    code = f"""
+import xorq.vendor.ibis as ibis
+from tallyman_xorq.io import tracked_expr_from_alias
+t = tracked_expr_from_alias({orders_src!r})
+t = t.mutate(rn=ibis.row_number().over(ibis.window(group_by="region", order_by=t.order_id)))
+expr = t.group_by("region").aggregate(f=ibis._.order_id.collect(order_by=[ibis._.category.contains("a"), ibis._.rn]))
+"""
+    out = catalog_run(code, prompt="ordered collect above a window")
+    assert "SanityCheckPlan" in out["error"]
+    assert "window over that column" not in out["error"] + out.get("hint", "")
 
 
 def test_an_error_with_no_known_fix_and_a_build_that_succeeds_carry_no_hint(project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    assert "hint" not in catalog_run("expr = nope", prompt="broken")
+    assert "Hint:" not in catalog_run("expr = nope", prompt="broken")["error"]
     code = f"""
 import xorq.vendor.ibis as ibis
 from tallyman_xorq.io import tracked_expr_from_alias
@@ -126,11 +143,11 @@ expr = t.mutate(rn=ibis.row_number().over(ibis.window(group_by="region", order_b
 
 def test_the_window_hint_matches_the_error_as_the_arrow_reader_wraps_it():
     """A transcript saw the same failure raised through the Arrow C stream, prefixed and naming the bounded node."""
-    from tallyman_mcp.hints import hint_for
+    from tallyman_xorq.build import _ibis_import_hint
 
     message = 'Arrow error: C Data interface error: Invalid: SanityCheckPlan\nPlan: ["BoundedWindowAggExec: ...'
-    assert "mutate" in hint_for(message)
-    assert hint_for('SanityCheckPlan\ncaused by\nPlan: ["SortExec: ...') is None
+    assert "mutate" in _ibis_import_hint(message)
+    assert _ibis_import_hint('SanityCheckPlan\ncaused by\nPlan: ["SortExec: ...') == ""
 
 
 def test_catalog_import_source_repeated_on_unchanged_bytes_is_a_noop(project: str, orders_parquet, monkeypatch):

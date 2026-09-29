@@ -143,11 +143,11 @@ expr = t.mutate(rn=ibis.row_number().over(ibis.window(group_by="region", order_b
 
 def test_the_window_hint_matches_the_error_as_the_arrow_reader_wraps_it():
     """A transcript saw the same failure raised through the Arrow C stream, prefixed and naming the bounded node."""
-    from tallyman_xorq.build import _ibis_import_hint
+    from tallyman_xorq.build import _error_hint
 
     message = 'Arrow error: C Data interface error: Invalid: SanityCheckPlan\nPlan: ["BoundedWindowAggExec: ...'
-    assert "mutate" in _ibis_import_hint(message)
-    assert _ibis_import_hint('SanityCheckPlan\ncaused by\nPlan: ["SortExec: ...') == ""
+    assert "mutate" in _error_hint(message)
+    assert _error_hint('SanityCheckPlan\ncaused by\nPlan: ["SortExec: ...') == ""
 
 
 def test_catalog_import_source_repeated_on_unchanged_bytes_is_a_noop(project: str, orders_parquet, monkeypatch):

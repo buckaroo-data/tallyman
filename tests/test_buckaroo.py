@@ -666,6 +666,25 @@ def test_integration_spawn_and_load(project: str, orders_src: str, isolated_home
 
 
 @pytest.mark.integration
+def test_integration_start_refuses_a_buckaroo_other_than_the_companions(monkeypatch):
+    """The companion runs buckaroo in-process (diffs, klass validation) and spawns the Buckaroo server from its venv,
+    again whenever the server dies. A venv synced to another buckaroo after the companion started gives the respawned
+    server another version than the companion's own: refused, and the server stopped, rather than served."""
+    import buckaroo
+
+    from tallyman_companion.buckaroo_lifecycle import BuckarooUnavailable
+
+    monkeypatch.setattr(buckaroo, "__version__", "0.0.0")  # the companion's buckaroo; the subprocess reports its own
+    mgr = BuckarooManager(port=0, startup_timeout=15.0)
+    try:
+        with pytest.raises(BuckarooUnavailable, match=r"0\.0\.0"):
+            mgr.start()
+        assert not mgr.is_running
+    finally:
+        mgr.stop()
+
+
+@pytest.mark.integration
 def test_integration_load_expr_returns_nonzero_rows(project: str, orders_src: str):
     """Smoking-gun integration test for the placeholder-expansion fix.
 

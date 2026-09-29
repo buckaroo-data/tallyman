@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tallyman_core.version import git_revision
+
 # A process that claims the data dir named by its TALLYMAN_HOME, says so on stdout and holds the claim until its stdin
 # closes or it is killed. With "spawn" it first starts a child that outlives it, the way a Buckaroo subprocess could.
 _HOLDER = """
@@ -534,7 +536,13 @@ def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(project, isola
     assert posted == [
         (
             "http://127.0.0.1:17874/internal/notify",
-            {"kind": "new_entry", "hash": "abc", "extra": None, "home": str(isolated_home.resolve())},
+            {
+                "kind": "new_entry",
+                "hash": "abc",
+                "extra": None,
+                "home": str(isolated_home.resolve()),
+                "revision": git_revision(),  # so a companion on other source refuses it
+            },
         )
     ]
     assert srv._entry_url(project, "abc") == f"http://127.0.0.1:17874/{project}/catalog/abc"
@@ -557,6 +565,7 @@ def test_cli_reset_notifies_the_companion_of_its_own_data_dir(isolated_home, mon
     assert result.exit_code == 0, result.output
     assert sent["url"] == "http://127.0.0.1:17875/internal/notify"
     assert sent["json"]["home"] == str(isolated_home.resolve())
+    assert sent["json"]["revision"] == git_revision()
 
 
 # ---------------------------------------------------------------------------

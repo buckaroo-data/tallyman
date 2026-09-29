@@ -149,6 +149,8 @@ _NO_CHECKPOINT = frozenset(
         "catalog_list_post_processings",
         "catalog_run_post_processing",  # preview, persists nothing
         "catalog_export_marimo",  # export artifact, not state
+        "catalog_peek",  # reads an entry's rows, persists nothing
+        "catalog_query",  # runs a recipe and returns rows, persists nothing
         "project_list",
         "project_switch",
         "project_new",  # lifecycle; genesis happens inside the tool itself
@@ -544,6 +546,8 @@ def catalog_run(code: str, prompt: str = "") -> dict:
           return an error or a clearly-labelled column instead.
         - pass a project= argument to tracked_expr_from_alias; the active project
           is implicit.
+
+    To look at rows without saving an entry, use `catalog_query` (same code rules).
 
     Args:
         code: A self-contained Python script that binds `expr`.
@@ -1747,6 +1751,51 @@ def catalog_list() -> list[dict]:
             e["version"] = None
         e["columns"] = _compact_columns(project, e["content_hash"])
     return entries
+
+
+@mcp.tool()
+@_tag_project
+def catalog_peek(ref: str, limit: int = 20, columns: list[str] | None = None) -> dict:
+    """Return rows of an existing catalog entry. Persists nothing.
+
+    Use this, not pandas or the raw files, to look at an entry's data or to check a result after building it.
+    `ref` is an alias, a version `"<alias>-v<N>"`, or a content hash. `columns` picks columns; `limit` is capped at
+    1000. Rows come in `__row_order` order.
+
+    Returns:
+        dict with keys: hash, schema, row_count (the whole entry), rows, truncated.
+    """
+    from tallyman_xorq.query import peek  # noqa: PLC0415
+
+    project = _resolve_active_project()
+    try:
+        return peek(project, ref, limit=limit, columns=columns)
+    except (LookupError, ValueError, BuildError) as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@mcp.tool()
+@_tag_project
+def catalog_query(code: str, limit: int = 50) -> dict:
+    """Run a recipe and return its rows without saving anything: no entry, alias, notebook cell or error record.
+
+    Use this, not pandas or the raw files, to explore data (counts, duplicates, one key's rows) and to check a result
+    before or after building it. `code` follows `catalog_run`'s rules and binds `expr`. `limit` is capped at 1000.
+
+    Returns:
+        dict with keys: schema, row_count (the whole result), rows (the first `limit`), truncated.
+    """
+    from tallyman_xorq.query import query  # noqa: PLC0415
+
+    project = _resolve_active_project()
+    try:
+        return query(project, code, limit=limit)
+    except BuildError as exc:
+        return {"error": str(exc)}
+    except Exception as exc:
+        return {"error": f"{type(exc).__name__}: {exc}"}
 
 
 # ---------------------------------------------------------------------------

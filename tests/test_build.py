@@ -187,6 +187,73 @@ def test_build_user_code_raises(project: str):
         build_and_persist(project, code)
 
 
+def _udf_code(src: str) -> str:
+    return f"""
+import xorq.vendor.ibis.expr.datatypes as dt
+from xorq.expr.udf import make_pandas_udf
+from xorq.vendor.ibis import schema as ibis_schema
+from tallyman_xorq.io import tracked_expr_from_alias
+
+t = tracked_expr_from_alias({src!r})
+
+
+def plusone(df):
+    return df["qty"] + 1
+
+
+_udf = make_pandas_udf(plusone, ibis_schema({{"qty": dt.int64}}), dt.int64, name="plusone")
+expr = t.mutate(qty_plus=_udf.on_expr(t))
+"""
+
+
+def test_an_entry_whose_recipe_defines_a_udf_loads_in_another_process(project: str, orders_src: str):
+    """The UDF is pickled into the entry's frozen build. Pickled by reference to the recipe's module, which exists only
+    in the process that built it, the build cannot be loaded anywhere else: the companion's Buckaroo subprocess, or
+    this server after a restart."""
+    import os
+    import subprocess
+    import sys
+    import textwrap
+
+    content_hash = build_and_persist(project, _udf_code(orders_src)).content_hash
+    script = textwrap.dedent(f"""
+        from tallyman_xorq.result_cache import load_entry_expr
+        df = load_entry_expr({project!r}, {content_hash!r}).execute()
+        print(len(df), int((df["qty_plus"] == df["qty"] + 1).all()))
+    """)
+    out = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, env=os.environ.copy())
+
+    assert out.returncode == 0, out.stderr[-2000:]
+    assert out.stdout.split()[-2:] == ["200", "1"]
+
+
+def _recipe_modules() -> set[str]:
+    import sys
+
+    return {name for name in sys.modules if name.startswith(("tallyman_expr_", "tallyman_recipe_", "tallyman_query_"))}
+
+
+def test_a_build_leaves_no_recipe_module_or_temp_file(project: str, orders_parquet: Path, monkeypatch, tmp_path: Path):
+    """Each build, source import and failed build used to leave its recipe's module in sys.modules, and a script or
+    its bytecode in the temp dir."""
+    import tempfile
+
+    from tallyman_xorq.source_import import update_and_depend
+
+    scratch = tmp_path / "scratch_tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    before = _recipe_modules()
+
+    update_and_depend(orders_parquet, "src", project=project)
+    build_and_persist(project, _agg_code("src"))
+    with pytest.raises(BuildError):
+        build_and_persist(project, "expr = nope\n")
+
+    assert _recipe_modules() == before
+    assert sorted(p.name for p in scratch.rglob("*")) == []
+
+
 def test_list_entries_empty(project: str):
     assert list_entries(project) == []
 

@@ -9,6 +9,10 @@ from tallyman_core.paths import ensure_project, errors_path
 
 _UNBOUNDED = 1_000_000_000  # list_errors caps at `limit`; this means "all rows"
 
+# Called with (project, entry) after each record this process appends. The MCP server uses it to tell a record its own
+# tool call wrote from one another process wrote (``new_errors``). A hook that raises is ignored.
+RECORD_HOOKS: list = []
+
 
 def _errors_path(project: str) -> Path:
     return errors_path(project)
@@ -47,6 +51,11 @@ def record_error(
     p = _errors_path(project)
     with p.open("a") as fh:
         fh.write(json.dumps(entry) + "\n")
+    for hook in list(RECORD_HOOKS):
+        try:
+            hook(project, entry)
+        except Exception:
+            pass
     return entry
 
 

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import contextvars
 import functools
 import json
 import logging
 import os
+import re
 import sys
+import threading
 import traceback
 import uuid
 from dataclasses import asdict
+from datetime import datetime, timezone
 
 import httpx
 from fastmcp import FastMCP
@@ -51,7 +55,10 @@ from tallyman_core import (
     write_post_processing,
     write_stat,
 )
+from tallyman_core.aliases import version_of_hash
+from tallyman_core.errors import RECORD_HOOKS
 from tallyman_core.events import record_event
+from tallyman_core.paths import errors_path
 from tallyman_core.server_lock import companion_url, resolved_home
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
@@ -88,6 +95,134 @@ def _resolve_active_project() -> str:
     return _mcp_active_project or resolve_project()
 
 
+# ``new_errors``: records in the active project's errors.jsonl that no tool reply carried, such as the companion's
+# unfaithful_heal or a browser chart failure. Each is reported once, on the next tool response. Records from before
+# this process started are old history and are not reported. The log is append-only, so a cursor per log file (its
+# inode and the byte offset read up to) makes an unchanged log cost one stat.
+_STARTED_AT = datetime.now(timezone.utc)
+_NEW_ERRORS_CAP = 10
+_NEW_ERROR_MESSAGE_CHARS = 300
+_error_cursors: dict[str, tuple[int, int]] = {}
+_error_cursor_lock = threading.Lock()
+# The tool running in this call's thread, and for each record this process wrote during a tool call, that tool.
+# A record whose ``tool`` is the tool that was running when it was written is that call's own (its build error, its
+# recalc failures): it is in that call's reply, so no reply reports it again, including a concurrent call's.
+_current_tool: contextvars.ContextVar[str | None] = contextvars.ContextVar("_current_tool", default=None)
+_recorded_by: dict[str, str] = {}
+_ERROR_KIND = re.compile(r"[A-Za-z_][\w.-]{0,63}")  # `code` is a kind (unfaithful_heal) or a build's full recipe
+
+
+def _note_recorded(_project: str, entry: dict) -> None:
+    tool = _current_tool.get()
+    if tool is not None:
+        _recorded_by[entry["id"]] = tool
+
+
+RECORD_HOOKS.append(_note_recorded)
+
+
+def _unread_error_records(project: str) -> list[dict]:
+    """Records appended to *project*'s errors.jsonl since the last call, oldest first; advances the cursor.
+
+    A line still being appended (no newline yet) is left for the next call. A line that is not a JSON object is skipped.
+    """
+    path = errors_path(project)
+    key = str(path)
+    with _error_cursor_lock:
+        try:
+            st = path.stat()
+        except FileNotFoundError:
+            _error_cursors.pop(key, None)
+            return []
+        ino, offset = _error_cursors.get(key, (st.st_ino, 0))
+        if ino != st.st_ino or st.st_size < offset:
+            offset = 0  # cleared and written again: a new log
+        if st.st_size == offset:
+            _error_cursors[key] = (st.st_ino, offset)
+            return []
+        with path.open("rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read(st.st_size - offset)
+        complete = chunk.rfind(b"\n") + 1
+        _error_cursors[key] = (st.st_ino, offset + complete)
+    rows = []
+    for line in chunk[:complete].splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(row, dict) and not _before_start(row.get("created_at")):
+            rows.append(row)
+    return rows
+
+
+def _before_start(created_at) -> bool:
+    try:
+        return datetime.fromisoformat(created_at) < _STARTED_AT
+    except (TypeError, ValueError):
+        return False
+
+
+def _ids_in(value, out: set[str]) -> set[str]:
+    """Every ``id`` / ``error_id`` value anywhere in a tool reply: the records it already returns."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in ("id", "error_id") and isinstance(v, str):
+                out.add(v)
+            else:
+                _ids_in(v, out)
+    elif isinstance(value, list):
+        for v in value:
+            _ids_in(v, out)
+    return out
+
+
+def _compact_error(project: str, row: dict) -> dict:
+    message = row.get("message") or ""
+    if len(message) > _NEW_ERROR_MESSAGE_CHARS:
+        message = message[:_NEW_ERROR_MESSAGE_CHARS] + "…"
+    code = row.get("code")
+    item = {
+        "id": row.get("id"),
+        "created_at": row.get("created_at"),
+        "code": code if isinstance(code, str) and _ERROR_KIND.fullmatch(code) else None,
+        "hash": row.get("hash"),
+        "tool": row.get("tool"),
+        "message": message,
+    }
+    if item["hash"]:
+        try:
+            found = version_of_hash(project, item["hash"])
+        except Exception:  # the cursor has moved past this record: report it without the alias
+            found = None
+        if found:
+            item["alias"], item["version"] = found
+    return {k: v for k, v in item.items() if v is not None}
+
+
+def _attach_new_errors(result: dict, project: str) -> None:
+    """Add ``new_errors`` (newest first, capped) and ``new_errors_omitted`` to *result* when there are any.
+
+    A record some call already answers with is left out: one a tool call in this process wrote as its own (its build
+    error, its recalc failures; see ``_recorded_by``), or one whose id is in this reply.
+    """
+    rows = _unread_error_records(project)
+    if not rows:
+        return
+    returned = _ids_in(result, set())
+    rows = [
+        r
+        for r in rows
+        if r.get("id") not in returned and not (r.get("tool") and _recorded_by.get(r.get("id")) == r.get("tool"))
+    ]
+    if not rows:
+        return
+    rows.reverse()
+    result["new_errors"] = [_compact_error(project, r) for r in rows[:_NEW_ERRORS_CAP]]
+    if len(rows) > _NEW_ERRORS_CAP:
+        result["new_errors_omitted"] = len(rows) - _NEW_ERRORS_CAP
+
+
 def _tag_project(fn):
     """Wrap a tool function so every response carries the active project.
 
@@ -105,12 +240,18 @@ def _tag_project(fn):
       ``warning`` field is added with the wording from the design plan.
     - On the very first tool call, no warning is emitted; ``_last_project``
       is simply seeded.
+    - ``new_errors``: errors recorded since the last response that no reply
+      carried (e.g. the companion's unfaithful_heal); see ``_attach_new_errors``.
     """
 
     @functools.wraps(fn)
     def wrapped(*args, **kwargs):
         global _last_project, _mcp_active_project
-        result = fn(*args, **kwargs)
+        token = _current_tool.set(fn.__name__)
+        try:
+            result = fn(*args, **kwargs)
+        finally:
+            _current_tool.reset(token)
         current = _resolve_active_project()
         # Seed in-process state on the very first call so future calls are
         # sticky even if the disk file changes after this point.
@@ -125,6 +266,10 @@ def _tag_project(fn):
                 f"since the last call; proceeding with {current!r}"
             )
         _last_project = current
+        try:
+            _attach_new_errors(result, current)
+        except Exception as exc:
+            log.warning("reading new errors after %s failed: %s", fn.__name__, exc)
         return result
 
     return wrapped
@@ -555,6 +700,8 @@ def catalog_run(code: str, prompt: str = "") -> dict:
 
     Returns:
         dict with keys: hash, row_count, execute_seconds, schema, entry_path.
+        Any tool's reply may carry `new_errors`: failures recorded since your last call that no reply
+        returned (e.g. an unfaithful_heal on an entry you read). Each is reported once; tell the user.
     """
     project = _resolve_active_project()
     out = _run_and_record(project, code, prompt, tool="catalog_run")

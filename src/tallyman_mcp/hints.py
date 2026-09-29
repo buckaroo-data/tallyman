@@ -17,8 +17,8 @@ HINTS: tuple[tuple[re.Pattern[str], str], ...] = (
         re.compile(r"SanityCheckPlan.*WindowAggExec", re.DOTALL),
         "A window keyed on a computed expression (order_by or group_by) can fail DataFusion's plan check.\n"
         "Mutate the key into a column first, then window over that column:\n"
-        '  before: w = ibis.window(order_by=t.team.contains("/"))\n'
-        '  after:  t = t.mutate(k=t.team.contains("/")); w = ibis.window(order_by=t.k)',
+        '  before: w = ibis.window(order_by=t.name.contains("x"))\n'
+        '  after:  t = t.mutate(k=t.name.contains("x")); w = ibis.window(order_by=t.k)',
     ),
 )
 

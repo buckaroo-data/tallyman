@@ -1503,12 +1503,12 @@ def catalog_add_display_klass(name: str, source: str) -> dict:
             def style_column(cls, col, column_metadata):
                 cc = super().style_column(col, column_metadata)
                 name = column_metadata.get("orig_col_name", col)  # col is a short id: "a", "b", ...
-                if name == "season":  # 2024, not 2,024
+                if name == "year":  # 2024, not 2,024
                     cc["displayer_args"] = {"displayer": "string"}
-                elif name == "revenue_m":  # 55.0 -> $55.0M
+                elif name == "revenue_millions":  # 55.0 -> $55.0M
                     cc["displayer_args"] = {"displayer": "float", "min_fraction_digits": 1,
                                             "max_fraction_digits": 1, "prefix": "$", "suffix": "M"}
-                elif name == "payroll":  # 34400000 -> $34.4M
+                elif name == "revenue":  # 34400000 -> $34.4M
                     cc["displayer_args"] = {"displayer": "compact_number", "prefix": "$"}
                 return cc
 

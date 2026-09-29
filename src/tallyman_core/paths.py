@@ -13,7 +13,8 @@ Layout (per-project):
         │   │   ├── notebook.jsonl         # tracked notebook cells
         │   │   ├── chart_specs/<hash>.vl.json
         │   │   ├── display_configs/<hash>.json
-        │   │   ├── post_processing/<name>.py , stats/<name>.py
+        │   │   ├── post_processing/<name>.py , stats/<name>.py , display/<name>.py
+        │   │   │                          # read by buckaroo (buckaroo_project_root)
         │   │   ├── prompts/<hash>.jsonl
         │   │   └── entries.jsonl                         # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
@@ -247,14 +248,29 @@ def diff_stat_cache_dir(project: str, a_hash: str, b_hash: str) -> Path:
     return diff_stat_cache_root(project) / f"{a_hash[:12]}-{b_hash[:12]}"
 
 
+def buckaroo_project_root(project: str) -> Path:
+    """The ``project_root`` buckaroo is handed for *project*.
+
+    Buckaroo loads a session's project stats, post-processing functions and
+    display klasses from ``stats/``, ``post_processing/`` and ``display/`` under
+    this one directory, so the three dir helpers below are built from it, and
+    anything that loads them the way buckaroo does must use it too.
+    """
+    return catalog_dir(project)
+
+
 def post_processing_dir(project: str) -> Path:
     # Under the catalog repo (was artifacts/) so the native store tracks the
     # scripts directly instead of round-tripping them through catalog.yaml.
-    return catalog_dir(project) / "post_processing"
+    return buckaroo_project_root(project) / "post_processing"
 
 
 def stats_dir(project: str) -> Path:
-    return catalog_dir(project) / "stats"
+    return buckaroo_project_root(project) / "stats"
+
+
+def display_dir(project: str) -> Path:
+    return buckaroo_project_root(project) / "display"
 
 
 def prompts_dir(project: str) -> Path:
@@ -266,10 +282,6 @@ def prompts_path(project: str, content_hash: str) -> Path:
     ``entries/<hash>/prompts.jsonl``, lost on a clone now that build dirs are
     gitignored)."""
     return prompts_dir(project) / f"{content_hash}.jsonl"
-
-
-def display_dir(project: str) -> Path:
-    return artifacts_dir(project) / "display"
 
 
 def exports_dir(project: str) -> Path:

@@ -107,6 +107,7 @@ _CATALOG_LINK_NAMES = (
     "prompts",
     "post_processing",
     "stats",
+    "display",
     "display_configs",
     "chart_specs",
     # legacy xorq-catalog layout — _link skips whichever are absent, so a native
@@ -389,8 +390,6 @@ def _build_overlay(overlay_home: Path, project: str, real_dir: Path) -> Path:
     (cat / "entries").mkdir(parents=True)
 
     _link(real_dir / "data", proj / "data")
-    for name in ("stats", "post_processing", "display"):
-        _link(real_dir / "artifacts" / name, proj / "artifacts" / name)
     for name in _CATALOG_LINK_NAMES:
         _link(real_dir / "artifacts" / "catalog" / name, cat / name)
 

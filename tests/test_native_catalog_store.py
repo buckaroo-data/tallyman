@@ -450,6 +450,7 @@ def test_tracked_tree_is_the_decomposed_surface(project, orders_src):
         "prompts/_disabled/leak.jsonl",
         "stats/nested/leak.py",
         "display_configs/nested/leak.json",
+        "display/nested/leak.py",
     ],
 )
 def test_nested_stray_under_allowlisted_prefix_is_rejected(project, orders_src, rel):

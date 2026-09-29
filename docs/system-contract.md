@@ -904,9 +904,8 @@ change of the rule.
   a promoted diff re-runs Buckaroo's statistics on every open (#202); the
   forced reload after an unfaithful heal runs under the project lock and opens a
   session nobody asked for (#203); a klass reload posts once per entry from the
-  companion's event loop (#201); Buckaroo is pointed at `artifacts/` and does
-  not find the project's stats and post-processing functions (#170); the live
-  diff grid is an unmaterialized join (#188).
+  companion's event loop (#201); the live diff grid is an unmaterialized join
+  (#188).
 - **One writer at a time.** The project lock blocks with no timeout (#186), and
   two companion routes build on the event loop and freeze the UI while they wait
   (#190). The lock covers builds, materializations, checkpoints and resets

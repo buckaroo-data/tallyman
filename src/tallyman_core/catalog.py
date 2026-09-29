@@ -60,6 +60,8 @@ TRACKED_SURFACE = (
     "post_processing/_disabled/*.py",
     "stats/*.py",
     "stats/_disabled/*.py",
+    "display/*.py",
+    "display/_disabled/*.py",
     "pyproject.toml",
     "uv.lock",
 )

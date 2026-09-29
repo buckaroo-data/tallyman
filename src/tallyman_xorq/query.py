@@ -1,7 +1,8 @@
 """Rows for a reader, with nothing written: the MCP ``catalog_peek`` and ``catalog_query`` tools.
 
 ``peek`` reads an existing entry through ``cached_result_expr``, the read every consumer uses. ``query`` runs a recipe
-the way a build imports one, with the same fatal read checks and the same error text, then executes it and stops: no
+the way a build imports one, with the same fatal checks, the same rewrite (``rewrite_for_build``: a worthy result is
+sorted canonically, a cheap one is ordered by ``__row_order``) and the same error text, then executes it and stops: no
 entry directory, manifest, parent edge, alias, notebook cell or error record. Both hand back JSON-safe rows.
 """
 
@@ -132,7 +133,8 @@ def _imported(code: str):
     sys.modules[name] = module
     try:
         try:
-            exec(compile(code, filename, "exec"), module.__dict__)
+            # dont_inherit: this module's ``from __future__ import annotations`` is not the recipe's.
+            exec(compile(code, filename, "exec", dont_inherit=True), module.__dict__)
         except Exception as exc:
             hint = _ibis_import_hint(str(exc), code)
             raise BuildError(f"executing user code raised: {exc}{hint}\n{traceback.format_exc()}") from exc
@@ -148,7 +150,16 @@ def query(project: str, code: str, limit: int = 50) -> dict:
     Raises ``BuildError`` with the text a build gives for the same mistake.
     """
     from tallyman_xorq import parent_capture as pc
-    from tallyman_xorq.build import BuildError, _csv_direct_read_check, _ibis_import_hint, _raw_parquet_read_check
+    from tallyman_xorq.build import (
+        BuildError,
+        _csv_direct_read_check,
+        _ibis_import_hint,
+        _raw_parquet_read_check,
+        _reading,
+    )
+    from tallyman_xorq.row_order import RowOrderError, translate_collision
+    from tallyman_xorq.source_cache import CacheNodeError, InMemoryReadError, rewrite_for_build
+    from tallyman_xorq.worthiness import classify_expr
 
     # A private collector: the reads the recipe notes as parents are dropped, and none reach an enclosing build's.
     token = pc.begin_collect()
@@ -164,6 +175,20 @@ def query(project: str, code: str, limit: int = 50) -> dict:
                 raise BuildError(f"expr must be a xorq/ibis expression, not {type(expr).__name__}")
             _csv_direct_read_check(expr)
             _raw_parquet_read_check(expr, project)
+            verdict = classify_expr(expr)
+            try:
+                expr = rewrite_for_build(
+                    expr, project, verdict=verdict, reading=None if verdict.worthy else _reading(expr, project)
+                )
+            except (InMemoryReadError, CacheNodeError, RowOrderError) as exc:
+                raise BuildError(str(exc)) from exc
+            except Exception as exc:
+                translated = translate_collision(exc)
+                if translated is not None:
+                    raise BuildError(str(translated)) from exc
+                raise
+            if not verdict.worthy:
+                expr = expr.order_by(ROW_ORDER)  # a worthy one is sorted canonically; a cheap one keeps __row_order
             cap = _cap(limit)
             kept: list = []
             row_count = 0
@@ -176,6 +201,9 @@ def query(project: str, code: str, limit: int = 50) -> dict:
                             kept.append(batch.slice(0, cap - row_count))
                         row_count += batch.num_rows
             except Exception as exc:
+                translated = translate_collision(exc)
+                if translated is not None:
+                    raise BuildError(str(translated)) from exc
                 hint = _ibis_import_hint(str(exc), code)
                 raise BuildError(f"query execution failed: {exc}{hint}\n{traceback.format_exc()}") from exc
     finally:

@@ -136,7 +136,7 @@ def test_query_returns_first_rows_and_full_row_count(project: str, orders_src: s
     code = f"""
 from tallyman_xorq.io import tracked_expr_from_alias
 t = tracked_expr_from_alias({orders_src!r})
-expr = t.filter(t.price > 100).select("order_id", "price")
+expr = t.filter(t.price > 100).select("order_id", "price", "__row_order")
 """
     expected = int((pd.read_parquet(orders_parquet)["price"] > 100).sum())
 
@@ -146,14 +146,21 @@ expr = t.filter(t.price > 100).select("order_id", "price")
     assert out["row_count"] == expected
     assert len(out["rows"]) == 7
     assert out["truncated"] is True
-    assert [f["name"] for f in out["schema"]["fields"]] == ["order_id", "price"]
+    assert [f["name"] for f in out["schema"]["fields"]] == ["order_id", "price", "__row_order"]
     assert all(r["price"] > 100 for r in out["rows"])
+    positions = [r["__row_order"] for r in out["rows"]]
+    assert positions == sorted(positions)  # a cheap result comes back in __row_order order
 
 
 def test_query_limit_is_capped(project: str):
+    from tallyman_cli.fixtures import write_shoe_orders
+    from tallyman_core import data_dir
+    from tallyman_xorq.source_import import update_and_depend
+
+    update_and_depend(write_shoe_orders(data_dir(project) / "big.parquet", n_rows=1500, seed=1), "big", project=project)
     code = """
-import xorq.api as xo
-expr = xo.memtable({"i": list(range(1500))})
+from tallyman_xorq.io import tracked_expr_from_alias
+expr = tracked_expr_from_alias("big")
 """
     out = _tool("catalog_query")(code, limit=5000)
 

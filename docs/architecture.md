@@ -910,6 +910,10 @@ code wins.
 - [mcp-server.md](mcp-server.md): every MCP tool and the prompt, with
   parameters, return shapes and side effects. **Current.**
 - [installing.md](installing.md): install and run tallyman. **Current.**
+- [improving-from-sessions.md](improving-from-sessions.md): how we review
+  Claude sessions that drove tallyman, check hints against every recorded
+  error, and replay sessions in the eval suite, and what each kind of finding
+  turns into. **Current** as of 2026-09-29.
 
 ### Design records (`plans/ADR-*.md`)
 

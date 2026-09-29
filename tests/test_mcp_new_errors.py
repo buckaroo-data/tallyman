@@ -140,6 +140,38 @@ expr = t.mutate(doubled=t.price * 2)
     assert _ids(out) == [elsewhere["id"]]
 
 
+def test_a_build_error_is_not_reported_by_a_concurrent_call_of_another_tool(project: str, monkeypatch):
+    """FastMCP runs tool calls on a thread pool. While catalog_run is between recording its build error and replying,
+    a project_list that returns reads that record from the log; it is catalog_run's to report, not project_list's."""
+    import threading
+
+    from tallyman_mcp import server as srv
+
+    srv.project_list()
+    recorded, release = threading.Event(), threading.Event()
+    real_record_event = srv.record_event
+
+    def record_event_then_wait(project, kind, **kw):
+        real_record_event(project, kind, **kw)
+        if kind == "build_error":
+            recorded.set()
+            assert release.wait(30)
+
+    monkeypatch.setattr(srv, "record_event", record_event_then_wait)
+    replies = {}
+    run = threading.Thread(target=lambda: replies.update(srv.catalog_run("expr = nope", prompt="broken")))
+    run.start()
+    try:
+        assert recorded.wait(30)
+        concurrent = srv.project_list()
+    finally:
+        release.set()
+        run.join(30)
+    assert replies["error_id"]
+    assert "new_errors" not in concurrent, concurrent  # catalog_run's own record, in its `error`
+    assert "new_errors" not in replies
+
+
 def test_a_heal_recorded_in_process_during_a_call_is_reported(project: str, monkeypatch):
     """The MCP process heals too, when a tool reads an entry. That record is not in the tool's reply, so it is new."""
     from tallyman_mcp import server as srv

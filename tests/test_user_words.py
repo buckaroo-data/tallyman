@@ -48,6 +48,12 @@ def test_the_message_is_kept_word_for_word(tmp_path, monkeypatch):
     assert transcript.user_words() == QB_EPA
 
 
+def test_a_prompt_given_to_claude_p_is_kept(tmp_path, monkeypatch):
+    # `claude -p` and the Agent SDK record the prompt with promptSource "sdk" and no origin.
+    _session(tmp_path, monkeypatch, {"type": "user", "promptSource": "sdk", "message": {"content": QB_EPA}})
+    assert transcript.user_words() == QB_EPA
+
+
 def test_a_paste_is_unwrapped(tmp_path, monkeypatch):
     pasted = 'the UI shows\n\n<pasted_content id="ffb5">\n  Load nfl_contracts.parquet\n</pasted_content id="ffb5">'
     _session(tmp_path, monkeypatch, _typed(pasted))
@@ -68,6 +74,13 @@ def test_only_what_the_user_typed(tmp_path, monkeypatch):
             "origin": {"kind": "task-notification"},
             "promptSource": "system",
             "message": {"content": "<task-notification>done</task-notification>"},
+        },
+        {
+            "type": "user",
+            "isMeta": True,
+            "origin": {"kind": "peer"},
+            "promptSource": "system",
+            "message": {"content": "Another Claude session sent a message"},
         },
     )
     assert transcript.user_words() == QB_EPA

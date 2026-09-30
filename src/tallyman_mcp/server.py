@@ -60,6 +60,7 @@ from tallyman_core.errors import RECORD_HOOKS
 from tallyman_core.events import record_event
 from tallyman_core.paths import errors_path
 from tallyman_core.server_lock import companion_url, resolved_home
+from tallyman_mcp import transcript
 from tallyman_xorq import BuildError, build_and_persist, full_diff, list_entries, staleness
 from tallyman_xorq.dependents import references_own_alias
 from tallyman_xorq.recalc import classify_orphans, recalc
@@ -900,8 +901,10 @@ def _entry_url(project: str, content_hash: str) -> str | None:
 
 def _run_and_record(project: str, code: str, prompt: str, *, tool: str = "catalog_run") -> dict:
     """Shared body for tools that compile-and-persist; returns the tool reply dict."""
+    # ``prompt`` is the model's summary. Under Claude Code the entry also records what the user typed.
+    user_prompt = transcript.user_words()
     try:
-        result = build_and_persist(project=project, code=code, prompt=prompt or None)
+        result = build_and_persist(project=project, code=code, prompt=prompt or None, user_prompt=user_prompt)
     except BuildError as exc:
         tb = traceback.format_exc()
         rec = record_error(project, code=code, message=str(exc), prompt=prompt or None, tool=tool, traceback=tb)

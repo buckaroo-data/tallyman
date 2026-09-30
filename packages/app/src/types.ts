@@ -38,6 +38,8 @@ export interface EntryDetail {
     execute_seconds: number;
     created_at: string;
     prompt: string | null;
+    // What the user typed, verbatim, read from the Claude Code transcript; `prompt` is the model's summary of it.
+    user_prompt?: string | null;
     // Recorded tracked_expr_from_alias parent edges (raw manifest shape — no
     // resolved alias). Used to linkify the code's catalog refs (#135).
     parents?: { hash: string; ref: string; follow: boolean }[] | null;
@@ -47,7 +49,7 @@ export interface EntryDetail {
   alias: string | null;
   version: number | null;
   forensic_history: Array<{ hash: string; version: number; is_current: boolean }>;
-  prompt_history: Array<{ at: string; prompt: string }>;
+  prompt_history: Array<{ at: string; prompt: string | null; user_prompt?: string }>;
   chart_spec: Record<string, unknown> | null;
   display_config: {
     column_config_overrides: Record<string, unknown>;

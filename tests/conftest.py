@@ -18,6 +18,12 @@ from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402
 from tallyman_core import data_dir, ensure_project, set_active_project  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _no_claude_session(monkeypatch):
+    """Keep the MCP tools from reading the transcript of the Claude Code session that runs pytest (``transcript``)."""
+    monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
+
+
 @pytest.fixture
 def isolated_home(tmp_path: Path, monkeypatch) -> Path:
     """Point TALLYMAN_HOME at a tmp dir for the duration of the test.

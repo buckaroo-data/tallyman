@@ -200,6 +200,8 @@ main {
 
 .prompt-row { display: flex; align-items: center; gap: 12px; margin: 2px 0 6px; }
 .prompt-row .prompt-text { flex: 1 1 auto; min-width: 0; }
+.prompt-row .user-prompt { white-space: pre-wrap; }
+.prompt-row .prompt-summary { margin: 4px 0 0; }
 
 .metadata-section { margin-bottom: 12px; }
 .metadata-section h3:first-child { margin-top: 0; }

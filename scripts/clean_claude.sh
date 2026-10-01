@@ -237,12 +237,20 @@ check_mcp() {
 # Session settings for --perms. Deny rules hold in every mode, bypass included, but only for claude's Read tool: they
 # keep it out of your real ~/.claude, other tallyman projects and the checkout's own CLAUDE.md and docs. Bash is not
 # covered, so a determined `cat` still gets there.
+# A bare tool name in deny removes that tool from claude's tool list, description included. A run has one project, so
+# project_switch and project_new are only noise, and project_switch's description names a stale data dir
+# (~/.tallyman) that sends the model looking for it on disk.
+# claudeMdExcludes: claude looks for CLAUDE.md in every dir above its cwd and in each one's .claude/, so a run dir under
+# $HOME picks up ~/.claude/CLAUDE.md, your global rules, as if it were a project file. CLAUDE_CONFIG_DIR doesn't stop
+# that walk; excluding every CLAUDE.md does.
 claude_settings() {
   local allow='[]'
   [[ "$PERMS" != "ask" ]] && allow='["mcp__tallyman"]'
   jq -cn --argjson allow "$allow" --arg checkout "$CHECKOUT" '{permissions: {
     allow: $allow,
-    deny: ["Read(~/.claude/**)", "Read(~/.tallyman-notebooks/**)", ("Read(/" + $checkout + "/**)")]}}'
+    deny: ["Read(~/.claude/**)", "Read(~/.tallyman-notebooks/**)", ("Read(/" + $checkout + "/**)"),
+      "mcp__tallyman__project_switch", "mcp__tallyman__project_new"]},
+    claudeMdExcludes: ["**/CLAUDE.md", "**/CLAUDE.local.md", "**/.claude/rules/**"]}'
 }
 
 permission_mode() {
@@ -256,13 +264,16 @@ permission_mode() {
 # Run claude from work/ with its own config dir and only the tallyman MCP server. CLAUDE_CONFIG_DIR drops ~/.claude
 # (global CLAUDE.md, memories, skills, plugins, history); --strict-mcp-config drops every MCP server but ours;
 # ENABLE_CLAUDEAI_MCP_SERVERS=false drops the claude.ai account connectors.
+# ENABLE_TOOL_SEARCH=false sends the tallyman tools up front instead of behind ToolSearch. Haiku doesn't take a tool
+# that arrives as a ToolSearch result as callable: it runs `mcp__tallyman__catalog_import_source --outside_path ...`
+# through Bash, or invents an `mcp-tallyman` CLI and wraps it in python, and each try is a Bash permission prompt.
 run_claude() {
   echo "starting claude in $WORK_DIR ..."
   cd "$WORK_DIR" || exit 1
   local args=(--strict-mcp-config --mcp-config "$(mcp_config)")
   args+=(--settings "$(claude_settings)" --permission-mode "$(permission_mode)")
   args+=(${CLAUDE_ARGS[@]+"${CLAUDE_ARGS[@]}"})
-  CLAUDE_CONFIG_DIR="$CLAUDE_DIR" ENABLE_CLAUDEAI_MCP_SERVERS=false claude "${args[@]}"
+  CLAUDE_CONFIG_DIR="$CLAUDE_DIR" ENABLE_CLAUDEAI_MCP_SERVERS=false ENABLE_TOOL_SEARCH=false claude "${args[@]}"
   echo "claude exited. Run dir kept: $RUN_DIR"
 }
 

@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       buckaroo-js-core:
-        specifier: 0.15.8
-        version: 0.15.8(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
+        specifier: 0.15.9
+        version: 0.15.9(react-dom@18.3.1(react@18.3.1))(react@18.3.1)
       react:
         specifier: ^18.3.1
         version: 18.3.1
@@ -517,8 +517,8 @@ packages:
     engines: {node: ^6 || ^7 || ^8 || ^9 || ^10 || ^11 || ^12 || >=13.7}
     hasBin: true
 
-  buckaroo-js-core@0.15.8:
-    resolution: {integrity: sha512-YJQ0Isfkgvj3Ak/OjHLqi1NTKSJwN6SwvuY1OQkxfhKMCmOTcUEPwL5lF/ZeyuINvgmwlBT5XKu0ud8IVWC6Hg==}
+  buckaroo-js-core@0.15.9:
+    resolution: {integrity: sha512-oRgE73zhKoYpM+U+1Uh+LZQo8shkJZnltrclZrRWPAx2KPykE83voxgoY0owludd/P6T97+Y06tiirpxOriYnw==}
     engines: {node: '>=18'}
     peerDependencies:
       react: ^18.2.0 || ^19.0.0
@@ -1201,7 +1201,7 @@ snapshots:
       node-releases: 2.0.46
       update-browserslist-db: 1.2.3(browserslist@4.28.2)
 
-  buckaroo-js-core@0.15.8(react-dom@18.3.1(react@18.3.1))(react@18.3.1):
+  buckaroo-js-core@0.15.9(react-dom@18.3.1(react@18.3.1))(react@18.3.1):
     dependencies:
       ag-grid-community: 33.3.2
       ag-grid-react: 33.3.2(react-dom@18.3.1(react@18.3.1))(react@18.3.1)

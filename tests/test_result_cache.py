@@ -639,8 +639,8 @@ def test_resolve_noncyclic_hash_multi_hop_stays_in_requested_lineage(project):
 
 
 def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_src, monkeypatch):
-    # Recipe reconstruction (_recipe_expr -> _import_script) survives as a diagnostic (the structural-nondeterminism
-    # check, which re-imports the recipe twice); it was a per-READ operation under #73. _import_script registers the
+    # Recipe reconstruction (_recipe_expr -> _imported_recipe) survives as a diagnostic (the structural-nondeterminism
+    # check, which re-imports the recipe twice); it was a per-READ operation under #73. _imported_recipe registers the
     # recipe module in sys.modules under a unique uuid name; left there, every reconstruction leaks a module object
     # that pins its whole expression graph. Reconstructing the same entry repeatedly must not accumulate sys.modules
     # entries.
@@ -651,10 +651,10 @@ def test_recipe_reconstruction_does_not_leak_sys_modules(project, orders_src, mo
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("proj", _project_code(project))
     h = _hash_of(project)
-    before = [m for m in sys.modules if m.startswith("tallyman_expr_")]
+    before = [m for m in sys.modules if m.startswith("tallyman_recipe_")]
     for _ in range(5):
         _recipe_expr(project, h)  # not lru-cached: re-imports every call
-    after = [m for m in sys.modules if m.startswith("tallyman_expr_")]
+    after = [m for m in sys.modules if m.startswith("tallyman_recipe_")]
     assert len(after) == len(before), f"leaked {len(after) - len(before)} recipe modules"
 
 

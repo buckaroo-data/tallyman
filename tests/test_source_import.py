@@ -11,6 +11,7 @@ axis (D6) and the source-identity modes (D8) are stage 2.
 
 from __future__ import annotations
 
+import contextlib
 import errno
 from pathlib import Path
 
@@ -1738,10 +1739,12 @@ def test_an_import_that_fails_in_its_generated_recipe_leaves_the_arena_as_it_was
     src = _write_parquet(_outside(tmp_path) / "orders.parquet", 10)
     before = _arena(project)
 
+    @contextlib.contextmanager
     def fails(code):
         raise build.BuildError("executing user code raised: KeyError")
+        yield
 
-    monkeypatch.setattr(build, "_import_script", fails)
+    monkeypatch.setattr(build, "_imported_recipe", fails)
     with pytest.raises(build.BuildError):
         source_import.update_and_depend(str(src), "orders")
 

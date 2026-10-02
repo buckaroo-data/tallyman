@@ -21,6 +21,8 @@
 
    ```
    Use tallyman via the MCP server, against the nfl-demo project. Load nfl_contracts.parquet as contracts and player_stats_season.parquet as player_stats. Make a result called qb_epa: one row per QB per regular season (attempts + carries >= 200), with passing EPA, rushing EPA, and the team, year signed, and APY from the contract that's currently active for that player (assume the contract flagged is_active is the right one). Every QB should end up with exactly one contract row, even players with more than one contract on file. Add a column epa_per_apy_million = (passing EPA + rushing EPA) / APY — APY is already expressed in millions of dollars, so no further scaling is needed.
+order qb_epa to player_name, season, team, epa_per_apy_million, epa, apy, then the rest
+
    ```
 
 4. Format the numbers:
@@ -42,24 +44,28 @@
 **On screen:** Claude Code and the browser side by side.
 
 > "LLMs are great at writing code. They're okay at understanding data. But
-> they're crap at the kind of verifiable, shareable data science notebooks
-> have done for well over a decade — you ask a question, get an answer, and
-> the moment you ask the next one, the last answer's gone. Nothing's named,
-> nothing's versioned, and nobody else can open what you just did and trust
-> it.
->
-> I built tallyman to fix that, specifically for agents. It's not a
-> notebook, and it's not a chat window — it's a data catalog with an LLM
-> analyst wired into it. You talk to it in plain English, and instead of
-> an answer that scrolls by and disappears, you get a named table right
-> there in the UI. You build the next question on top of a table you
-> already have, not a fresh blob of text. Update the original table, and
-> everything downstream that depends on it updates automatically. And the
-> UI itself is built for looking at the actual data, not a description of
-> it — every version sticks around, so you can diff any two and see
-> exactly what moved. Because it's backed by git, you can hand the whole
-> project to someone else and they get the same answers you got.
->
+> they fall short at the kind of literate, verifiable, and shareable data science workflows
+> that have led jupyter notebooks to be the go to solution for explainable data science work for over a decade.
+> With coding agent workflows — you ask a question, get an answer, and
+> the moment you ask the next one, the last answer has scrolled up and its essentially forgotten without archaelogical work. 
+> Chat isn't an interface built for data work nothing's named, nothing's versioned
+> and most importantly it is extremely cumbersome to look at the data and code that produced it. If you can't see the data how can you trust the work?
+
+> I built tallyman to fix that, it combines the relevant parts of
+> notebooks with a system meant to be driven by agents. Tallyman
+> displays notebook work as a catalog of named expression that are
+> created by an agent via MCP with a UI meant to understand data.
+
+> You talk to your agent in plain English, and instead of text table
+> emitted at the speed of a 1200 baud modem, you get an interactive
+> table with sorting, histograms, summary stats, and search capable of
+> showing millions of rows.
+
+> When you revise a named table, you can see the new version in the UI
+> and run a visual diff against any other version to see what has
+> actually changed.
+
+
 > Let me show you what that looks like, on a real dataset."
 
 ### Beat 1 — two datasets, one table (0:45–1:05)
@@ -74,7 +80,7 @@
 >
 > To answer it, I'm joining two datasets that don't normally talk to each
 > other: nflverse's play-by-play data — every pass and run, graded and
-> summed up per season — and OTC's contract data, what every quarterback
+> summed up per season — and Over The Cap's contract data, what every quarterback
 > has actually signed for. I asked for one table: each QB's season, and
 > the deal he was playing under at the time.
 >
@@ -84,6 +90,7 @@
 > contract-speak for 'average per year' — a $200 million, four-year deal
 > has an APY of $50 million. Divide one by the other and you get a
 > bang-for-buck number: points produced per million dollars paid."
+> I setup tallyman to this point before the video, but it was quick.
 
 ### Beat 2 — sort it, and something's wrong (1:05–1:40)
 
@@ -102,12 +109,14 @@
 > 2026' can't explain what he was paid in 2020, 2021, 2022 — those seasons
 > already happened. Something in the join picked the wrong contract."
 
+> I have scripted this demo, but this type of exploration, sorting, searching is the first thing I did when playing with the data.  You always have to look at the data.
+
 ### Beat 3 — ask why, watch it get fixed (1:40–2:35)
 
 **Type:**
 
 ```
-Tua Tagovailoa's row can't be right — wrong team, and a contract signed in the future. Find out why the join picked the wrong contract for him and fix it so it always finds each player's real, current deal.
+Tua Tagovailoa's row can't be right — wrong team, and a contract signed in the future. Find out why the join picked the wrong contract for him and fix it so it always finds each player's real, current deal.  He didn't play for Atalanta until 2026, and he signed two contracts with Miami
 ```
 
 **On screen:** the agent's diagnosis, the fix, and a new version of `qb_epa`.
@@ -152,19 +161,15 @@ Tua Tagovailoa's row can't be right — wrong team, and a contract signed in the
 
 **On screen:** `tallyman pack nfl-demo`, then the Marimo export from the Notebook view, opening the exported file.
 
-> "One more thing. Tallyman's an ambitious idea, but it's not asking you
-> to trust something built out of nothing. Of course it's all sitting in
-> git — that part's almost not worth mentioning, it's just how you'd build
-> this. What's actually useful is that you're not locked in: export any
-> tallyman project straight into a Marimo notebook — a real, open-source
-> Python notebook — for presenting it or picking it apart by hand in a
-> tool you already know.
->
-> So: everything you just watched happen is real, committed history. I
-> can hand this whole project to someone else, and they don't get my chat
-> log — they get the data, every version of that table, the exact query
-> behind each one, the fix, the diff. They can pick up exactly where I
-> left off, open it as a notebook if that's more comfortable, or ask their
-> own question and branch off from here. That's tallyman."
+> "This is the core value prop of tallyman, a notebook like environment custom built for agents.  I will be making a series of videos showing 
+
+> * tallyman features like diffs to see what changed
+> * LLM driven chart authoring
+> * Caching built into the core so you never have to run the same expensive computation twice
+> * Dag based recomputation.
+> * Computations and code backed by git
+> * Export to notebooks so you can drop into your familiar jupyter ecosystem
+
+> Checkout tallyman at https://github.com/buckaroo-data/tallyman and get in touch with any questions
 
 **End card.**

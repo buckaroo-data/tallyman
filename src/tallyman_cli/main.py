@@ -84,12 +84,14 @@ def _notify_companion_reset(project: str) -> None:
     import httpx
 
     from tallyman_core.server_lock import companion_url, resolved_home
+    from tallyman_core.version import git_revision
 
     url = companion_url()
     if url is None:
         return  # no server on this data dir, so no browsers or Buckaroo sessions to reload
-    # `home` names this data dir, so a companion serving another one refuses the notify (#183).
-    payload = {"kind": "project_reset", "project": project, "home": str(resolved_home())}
+    # `home` names this data dir, so a companion serving another one refuses the notify (#183); `revision` names this
+    # process's source, so a companion running other source refuses it too.
+    payload = {"kind": "project_reset", "project": project, "home": str(resolved_home()), "revision": git_revision()}
     try:
         resp = httpx.post(f"{url}/internal/notify", json=payload, timeout=2.0)
         if resp.status_code == 409:

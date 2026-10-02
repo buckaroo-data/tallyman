@@ -24,6 +24,8 @@ from pathlib import Path
 
 import pytest
 
+from tallyman_core.version import git_revision
+
 # A process that claims the data dir named by its TALLYMAN_HOME, says so on stdout and holds the claim until its stdin
 # closes or it is killed. With "spawn" it first starts a child that outlives it, the way a Buckaroo subprocess could.
 _HOLDER = """
@@ -534,7 +536,13 @@ def test_mcp_notifies_and_links_the_companion_of_its_own_data_dir(project, isola
     assert posted == [
         (
             "http://127.0.0.1:17874/internal/notify",
-            {"kind": "new_entry", "hash": "abc", "extra": None, "home": str(isolated_home.resolve())},
+            {
+                "kind": "new_entry",
+                "hash": "abc",
+                "extra": None,
+                "home": str(isolated_home.resolve()),
+                "revision": git_revision(),  # so a companion on other source refuses it
+            },
         )
     ]
     assert srv._entry_url(project, "abc") == f"http://127.0.0.1:17874/{project}/catalog/abc"
@@ -557,6 +565,7 @@ def test_cli_reset_notifies_the_companion_of_its_own_data_dir(isolated_home, mon
     assert result.exit_code == 0, result.output
     assert sent["url"] == "http://127.0.0.1:17875/internal/notify"
     assert sent["json"]["home"] == str(isolated_home.resolve())
+    assert sent["json"]["revision"] == git_revision()
 
 
 # ---------------------------------------------------------------------------
@@ -572,14 +581,23 @@ def test_notify_from_another_data_dir_is_refused(project, isolated_home, tmp_pat
     other = tmp_path / "another-data-dir"
     c = TestClient(create_app(project))
 
-    refused = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc", "home": str(other)})
+    refused = c.post(
+        "/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "hash": "abc", "home": str(other)}
+    )
     assert refused.status_code == 409, refused.text
     detail = refused.json()["detail"]
     assert str(other.resolve()) in detail
     assert str(isolated_home.resolve()) in detail
 
-    assert c.post("/internal/notify", json={"kind": "new_entry", "home": str(isolated_home)}).status_code == 200
-    assert c.post("/internal/notify", json={"kind": "new_entry"}).status_code == 200  # no home: still accepted
+    assert (
+        c.post(
+            "/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "home": str(isolated_home)}
+        ).status_code
+        == 200
+    )
+    assert (
+        c.post("/internal/notify", json={"revision": git_revision(), "kind": "new_entry"}).status_code == 200
+    )  # no home: still accepted
 
 
 def _next_event(lines) -> str:
@@ -617,10 +635,12 @@ def test_a_refused_notify_publishes_no_sse_event(project, isolated_home, tmp_pat
             lines = stream.iter_lines()
             assert _next_event(lines) == "hello"  # subscribed before anything is posted
             refused = client.post(
-                f"{base}/internal/notify", json={"kind": "from_another_data_dir", "home": str(tmp_path / "other")}
+                f"{base}/internal/notify",
+                json={"revision": git_revision(), "kind": "from_another_data_dir", "home": str(tmp_path / "other")},
             )
             accepted = client.post(
-                f"{base}/internal/notify", json={"kind": "from_this_data_dir", "home": str(isolated_home)}
+                f"{base}/internal/notify",
+                json={"revision": git_revision(), "kind": "from_this_data_dir", "home": str(isolated_home)},
             )
             first = _next_event(lines)
 
@@ -752,7 +772,9 @@ def test_notify_from_this_data_dir_spelled_in_another_case_is_accepted(project, 
         pytest.skip("case-sensitive filesystem: another spelling is another directory")
     c = TestClient(create_app(project))
 
-    accepted = c.post("/internal/notify", json={"kind": "new_entry", "home": str(respelled)})
+    accepted = c.post(
+        "/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "home": str(respelled)}
+    )
     assert accepted.status_code == 200, accepted.text
     switched = c.post("/api/projects/switch", json={"name": project, "home": str(respelled)})
     assert switched.status_code == 200, switched.text

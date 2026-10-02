@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core import entry_dir
+from tallyman_core.version import git_revision
 from tallyman_xorq import build_and_persist
 
 
@@ -269,7 +270,7 @@ def test_read_endpoints_reject_malformed_content_hash(fresh_companion_app, proje
 
 def test_internal_notify_returns_subscriber_count(fresh_companion_app):
     c = TestClient(fresh_companion_app)
-    r = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "hash": "abc"})
     assert r.status_code == 200
     body = r.json()
     assert body["ok"] is True

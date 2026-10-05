@@ -217,8 +217,9 @@ def test_unit_reload_project_sessions_skips_sessions_buckaroo_does_not_hold(
     project: str, orders_src: str, monkeypatch
 ):
     """A 404 (never opened, or idle-evicted) or a 400 (no longer an xorq session) from /reload_expr means "not open"
-    (ADR-007 D6): skipped and not counted, and the entry's stat cache is left alone. Only a grid that reloaded has its
-    stat cache cleared, so its next request recomputes the stats with the new klass."""
+    (ADR-007 D6): skipped and not counted. No entry's stat cache is cleared, the reloaded grid's included: Buckaroo
+    keys each cached stat by a hash of its code, so a new or edited klass misses on its own cells and the rest still
+    hit (buckaroo ADR-001, closes #177)."""
     from tallyman_core import get_alias
 
     live = build_and_persist(project, _code(project)).content_hash
@@ -248,9 +249,33 @@ def test_unit_reload_project_sessions_skips_sessions_buckaroo_does_not_hold(
     monkeypatch.setattr(mgr._client, "post", lambda url, **kw: _Response(status_for[url.rsplit("/", 1)[1]]))
 
     assert mgr.reload_project_sessions(project) == 1  # only the live grid reloaded
-    assert not (entry_stat_cache_dir(project, live) / "parquet").exists()  # its stale stats are gone
+    assert (entry_stat_cache_dir(project, live) / "parquet" / "stats.parquet").exists()
     assert (entry_stat_cache_dir(project, unopened) / "parquet" / "stats.parquet").exists()
     assert (entry_stat_cache_dir(project, not_xorq) / "parquet" / "stats.parquet").exists()
+
+
+def test_unit_load_body_sends_the_snapshot_digest_as_data_id(project: str, orders_src: str):
+    """Buckaroo keys its summary-stat cache by ``data_id``, the identity of the rows the grid reads (buckaroo ADR-001
+    D2). A worthy entry sends its snapshot's ``result_digest``; after an unfaithful heal, the digest that heal wrote,
+    since the snapshot now holds different rows under the same content hash. A cheap entry has no snapshot and sends
+    its content hash."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import entry_manifest
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    for h in (worthy, cheap):
+        ensure_materialized(project, h)
+    mgr = _running_manager()
+
+    digest = entry_manifest(project, worthy).result_digest
+    assert digest
+    assert mgr._load_body(project, worthy, None)["data_id"] == digest
+    path = entry_dir(project, worthy)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
+    assert mgr._load_body(project, worthy, None)["data_id"] == "arrow-sha256:healed"
+    assert mgr._load_body(project, cheap, None)["data_id"] == cheap
 
 
 def test_unit_status_shape(project: str):

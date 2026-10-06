@@ -22,6 +22,7 @@ from fastapi.testclient import TestClient
 from tallyman_companion import create_app
 from tallyman_core import ensure_project, resolve_project, set_active_project
 from tallyman_core.paths import active_project_file_path, project_dir
+from tallyman_core.version import git_revision
 
 # ---------------------------------------------------------------------------
 # GET /api/projects
@@ -286,7 +287,7 @@ def test_internal_notify_tags_with_active_project(isolated_home: Path):
     set_active_project("alpha")
     app = create_app()
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "test_event"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "test_event"})
     assert r.status_code == 200
     body = r.json()
     # Response echoes the project it tagged with so callers can verify.

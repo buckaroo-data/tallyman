@@ -121,3 +121,24 @@ expr = filtered.group_by("region").aggregate(n=filtered.count())
     assert diff["before"]["version"] == 1
     assert diff["after"]["version"] == 2
     assert diff["keyed_summary"] is not None
+
+
+@pytest.mark.integration
+@needs_uv
+def test_stdio_tool_call_against_a_companion_on_another_revision_is_a_tool_error(
+    isolated_home: Path, project: str, running_server: dict
+):
+    """What Claude Code sees: the refusal arrives as a tool error carrying the message, not a masked failure."""
+    import json
+
+    from fastmcp.exceptions import ToolError
+
+    lock = isolated_home / "server.lock"
+    lock.write_text(json.dumps({**json.loads(lock.read_text()), "revision": "0000000"}))
+
+    async def go():
+        async with _client(project, isolated_home) as client:
+            await client.call_tool("project_list", {})
+
+    with pytest.raises(ToolError, match="0000000"):
+        asyncio.run(go())

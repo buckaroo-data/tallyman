@@ -7,6 +7,7 @@ from fastapi.testclient import TestClient
 
 from tallyman_companion import create_app
 from tallyman_core import entry_dir, project_dir, set_alias
+from tallyman_core.version import git_revision
 from tallyman_xorq import build_and_persist
 
 
@@ -22,7 +23,7 @@ def test_read_only_mode_rejects_notify(fresh_companion_app, project: str):
     # The plain fixture is edit-mode; build a new app explicitly in read-only.
     app = create_app(project, read_only=True)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "hash": "abc"})
     assert r.status_code == 403
 
 
@@ -73,7 +74,7 @@ def test_notify_post_processing_changed_reloads_sessions(project: str):
     stub = _TrackingBuckaroo()
     app = create_app(project, buckaroo=stub)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "post_processing_changed"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "post_processing_changed"})
     assert r.status_code == 200
     assert stub.reload_calls == [project]
 
@@ -82,7 +83,7 @@ def test_notify_summary_stat_changed_reloads_sessions(project: str):
     stub = _TrackingBuckaroo()
     app = create_app(project, buckaroo=stub)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "summary_stat_changed"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "summary_stat_changed"})
     assert r.status_code == 200
     assert stub.reload_calls == [project]
 
@@ -91,7 +92,7 @@ def test_notify_other_kind_does_not_reload_sessions(project: str):
     stub = _TrackingBuckaroo()
     app = create_app(project, buckaroo=stub)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "new_entry", "hash": "abc"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "new_entry", "hash": "abc"})
     assert r.status_code == 200
     assert stub.reload_calls == []
 
@@ -109,7 +110,10 @@ def test_notify_recalc_reloads_sessions_and_invalidates_caches(project: str, mon
     stub = _TrackingBuckaroo()
     app = create_app(project, buckaroo=stub)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "recalc", "extra": {"remap": {"old": "new"}, "step": 3}})
+    r = c.post(
+        "/internal/notify",
+        json={"revision": git_revision(), "kind": "recalc", "extra": {"remap": {"old": "new"}, "step": 3}},
+    )
     assert r.status_code == 200
     assert stub.reload_calls == [project]  # buckaroo reloaded, like project_reset
     assert invalidated == [True]  # LRUs cleared, like project_reset
@@ -140,7 +144,10 @@ def test_notify_recalc_publishes_normalized_event(project: str, monkeypatch):
     )
     app = create_app(project)
     c = TestClient(app)
-    r = c.post("/internal/notify", json={"kind": "recalc", "extra": {"remap": {"o": "n"}, "step": 5}})
+    r = c.post(
+        "/internal/notify",
+        json={"revision": git_revision(), "kind": "recalc", "extra": {"remap": {"o": "n"}, "step": 5}},
+    )
     assert r.status_code == 200
     assert captured == [({"o": "n"}, 5)]  # remap + step pulled from extra, routed through the normalizer
 

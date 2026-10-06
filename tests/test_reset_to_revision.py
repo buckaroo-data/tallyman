@@ -23,6 +23,7 @@ from tallyman_core import catalog_state as cs
 from tallyman_core import charts, git_util, notebook, paths
 from tallyman_core import post_processing as pp
 from tallyman_core import summary_stats as ss
+from tallyman_core.version import git_revision
 from tallyman_xorq import build_and_persist
 
 PP_SRC = "def process(expr):\n    return expr\n"
@@ -463,7 +464,12 @@ def test_cli_reset_notify_names_the_reset_project(isolated_home, running_server,
     assert runner.invoke(cli, ["init", "beta", "--no-fixture"]).exit_code == 0
     res = runner.invoke(cli, ["reset-to", "0", "--project", "beta"])
     assert res.exit_code == 0, res.output
-    assert sent["json"] == {"kind": "project_reset", "project": "beta", "home": str(isolated_home.resolve())}
+    assert sent["json"] == {
+        "kind": "project_reset",
+        "project": "beta",
+        "home": str(isolated_home.resolve()),
+        "revision": git_revision(),
+    }
 
 
 def test_notify_honors_explicit_project(fresh_companion_app, project):
@@ -472,11 +478,11 @@ def test_notify_honors_explicit_project(fresh_companion_app, project):
     from fastapi.testclient import TestClient
 
     c = TestClient(fresh_companion_app)
-    r = c.post("/internal/notify", json={"kind": "project_reset", "project": "beta"})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "project_reset", "project": "beta"})
     assert r.status_code == 200, r.text
     assert r.json()["project"] == "beta"
 
-    r2 = c.post("/internal/notify", json={"kind": "project_reset"})  # no project: active
+    r2 = c.post("/internal/notify", json={"revision": git_revision(), "kind": "project_reset"})  # no project: active
     assert r2.status_code == 200
     assert r2.json()["project"] == project
 

@@ -9,9 +9,11 @@ The claim is an exclusive ``flock`` on ``<data dir>/server.lock``, taken on a de
 serves. The kernel drops the lock when the process exits, however it exits (SIGKILL included), so there is no stale
 lock to clean up. ``flock`` rather than ``fcntl.lockf``: a POSIX record lock is dropped when the process closes *any*
 descriptor of the file, which ``read_owner`` does in the server's own process. The file also holds an owner record
-(JSON: pid, host, port, bind host, start time, data dir, argv). It names the holder in a refusal, and it tells a
-client of this data dir which port its companion serves on (``companion_url``). The record is believed only while the
-lock is held; a dead server's record stays in the file and ``read_owner`` returns None for it.
+(JSON: pid, host, port, bind host, start time, data dir, argv, and the git revision and checkout it runs from). It
+names the holder in a refusal, it tells a client of this data dir which port its companion serves on
+(``companion_url``), and it tells an MCP server whether the companion runs the same source (``tallyman_core.version``).
+The record is believed only while the lock is held; a dead server's record stays in the file and ``read_owner``
+returns None for it.
 
 The port is decided once, by ``tallyman run --port``, and this record is how it reaches the clients of the data dir
 (the MCP server, ``reset-to``), which are separate processes started independently of the server. There is no
@@ -36,6 +38,7 @@ from pathlib import Path
 
 from tallyman_core.net import client_host
 from tallyman_core.paths import tallyman_home
+from tallyman_core.version import REPO_ROOT, git_revision
 
 LOCK_FILENAME = "server.lock"
 
@@ -95,6 +98,8 @@ def claim_data_dir(*, port: int, bind_host: str, home: Path | str | None = None)
         "started_at": datetime.datetime.now(datetime.UTC).isoformat(timespec="seconds"),
         "data_dir": str(data_dir),
         "argv": sys.argv,
+        "revision": git_revision(),
+        "source": str(REPO_ROOT),
     }
     os.ftruncate(fd, 0)
     os.pwrite(fd, json.dumps(record).encode(), 0)

@@ -4,6 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_core.paths import catalog_dir, entry_dir
+from tallyman_core.version import git_revision
 from tallyman_mcp.server import catalog_create, catalog_revise
 from tallyman_xorq.build import list_entries
 from tallyman_xorq.result_cache import cache_worthy
@@ -1014,7 +1015,7 @@ def test_notify_project_reset_evicts_the_compare_build(fresh_companion_app, proj
 
     # The notify signal clears it, so the next /api/diff_data builds afresh.
     c = TestClient(fresh_companion_app)
-    r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "project_reset", "project": project})
     assert r.status_code == 200, r.text
     assert _build_compare_expr.cache_info().currsize == 0
 
@@ -1038,7 +1039,7 @@ def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, proje
     assert cached_result_expr.cache_info().currsize >= 1
 
     c = TestClient(fresh_companion_app)
-    r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
+    r = c.post("/internal/notify", json={"revision": git_revision(), "kind": "project_reset", "project": project})
     assert r.status_code == 200, r.text
     assert cached_result_expr.cache_info().currsize == 0
 

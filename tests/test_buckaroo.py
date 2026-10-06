@@ -278,6 +278,39 @@ def test_unit_load_body_sends_the_snapshot_digest_as_data_id(project: str, order
     assert mgr._load_body(project, cheap, None)["data_id"] == cheap
 
 
+def test_unit_data_id_ignores_an_empty_heal_digest(project: str, orders_src: str):
+    """An empty ``unfaithful_heal_digest`` is no pin: the id falls back to the digest recorded at create."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import entry_manifest
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    path = entry_dir(project, worthy)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": ""}))
+
+    digest = entry_manifest(project, worthy).result_digest
+    assert digest
+    assert _running_manager()._load_body(project, worthy, None)["data_id"] == digest
+
+
+def test_unit_force_reload_skips_an_entry_with_no_manifest(project: str, orders_src: str):
+    """A forced reload builds its body from the entry's manifest. With none to read, it returns False, as it does for
+    any grid it could not refresh, and posts nothing to Buckaroo."""
+    from tallyman_core.manifest import ENTRY_MANIFEST_FILENAME
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    (entry_dir(project, worthy) / ENTRY_MANIFEST_FILENAME).unlink()
+    mgr = _running_manager()
+    posted: list = []
+    mgr._client = type("Client", (), {"post": staticmethod(lambda *a, **kw: posted.append((a, kw)))})()
+
+    assert mgr.force_reload_session(project, worthy) is False
+    assert posted == []
+
+
 def test_unit_status_shape(project: str):
     mgr = BuckarooManager()
     s = mgr.status()

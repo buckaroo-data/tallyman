@@ -429,8 +429,9 @@ def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
         regenerable, so the Cache page's delete leaves its file alone. It is a fact of the entry, kept in the manifest
         so it moves with the entry through a reset and outlasts the error banner's dismiss (#196);
       * a durable ``errors.jsonl`` record (``code="unfaithful_heal"``) — the UI badge's source;
-      * the entry's ``.buckaroo_stat_cache`` is wiped (ADR-006 D10): Buckaroo's summary stats key on expression
-        structure and stable paths (buckaroo#955), so stale stats would render beside the fresh rows;
+      * the entry's ``.buckaroo_stat_cache`` is wiped (ADR-006 D10). The pin changes the ``data_id`` the companion
+        sends, which keys Buckaroo's cached stats (buckaroo ADR-001), so the old cells are never read again; the wipe
+        removes the scope nothing will read, and covers the case where the pin could not be written;
       * registered hooks fire (companion: a forced reload of the open grid, and the SSE event).
     """
     recorded = _recorded_result_digest(project, content_hash)

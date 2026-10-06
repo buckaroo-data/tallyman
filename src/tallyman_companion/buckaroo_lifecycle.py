@@ -472,9 +472,10 @@ class BuckarooManager:
         stored definition over files that exist, which tallyman already executed in full when it was created.
         """
         from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
-        from tallyman_xorq.result_cache import cache_worthy, entry_manifest  # noqa: PLC0415
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-        if cache_worthy(project, content_hash):
+        manifest = entry_manifest(project, content_hash)
+        if manifest.cache_worthy:
             build_dir = ensure_view_build(project, content_hash)
         else:
             # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable per-entry dir (not a random tmp dir) so
@@ -502,7 +503,7 @@ class BuckarooManager:
             # content hash names the recipe, and an unfaithful heal writes different rows under it, so a snapshot
             # sends its digest: the one the last unfaithful heal wrote, else the one recorded at create. A cheap
             # entry has no snapshot and sends its content hash. Older buckaroo ignores the field.
-            "data_id": _data_id(entry_manifest(project, content_hash)),
+            "data_id": _data_id(manifest),
             # ADR-008 D8: the column with no ties that pages sort by (buckaroo-data/buckaroo#974). A page is
             # ORDER BY __row_order, or the user's keys and then __row_order, so the same request returns the same rows.
             # Buckaroo builds that predate the hint ignore it.

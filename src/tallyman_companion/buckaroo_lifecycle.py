@@ -64,6 +64,11 @@ _view_locks_guard = threading.Lock()
 _view_locks: dict[str, threading.Lock] = {}
 
 
+def _data_id(manifest) -> str:
+    """What Buckaroo keys an entry's stat cache by: the digest of the rows its grid reads."""
+    return manifest.unfaithful_heal_digest or manifest.result_digest or manifest.content_hash
+
+
 def ensure_view_build(project: str, content_hash: str) -> Path:
     """The stable per-entry directory holding the *view build* of a worthy entry's snapshot (ADR-007 D6).
 
@@ -341,9 +346,8 @@ class BuckarooManager:
         as "not open" (ADR-007 D6). That is one request per entry per klass change. The session stays alive and its
         klasses are updated in place — no page-load round-trip to /load_expr is needed.
 
-        After a successful reload the on-disk stat cache for that entry is cleared so the next widget request
-        recomputes all stats (including any newly added ones) from scratch. Without this, a stat added after the
-        session was first loaded would be absent from the cache and silently omitted from the display.
+        The entry's stat cache is kept. Buckaroo keys each cached stat by a hash of its code (buckaroo ADR-001), so a
+        new or edited klass misses on its own cells and recomputes only those (#177).
 
         Returns the number of sessions reloaded. Falls back to 0 (with a warning) if buckaroo isn't running or a
         reload call fails.
@@ -361,7 +365,6 @@ class BuckarooManager:
                 if resp.status_code in (404, 400):
                     continue  # Buckaroo does not hold this session (never opened, or idle-evicted)
                 resp.raise_for_status()
-                self._clear_stat_cache(project, content_hash)
                 reloaded += 1
                 log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
             except httpx.HTTPError as exc:
@@ -392,20 +395,6 @@ class BuckarooManager:
             return False
         log.info("forced a reload of the grid for %s (unfaithful heal)", content_hash)
         return True
-
-    def _clear_stat_cache(self, project: str, content_hash: str) -> None:
-        """Delete cached stat parquet files for one entry.
-
-        The parquet files in ``.buckaroo_stat_cache/parquet/`` are written
-        by xorq's ParquetSnapshotCache.  After a klass reload the cache is
-        stale (it was built before the new stat existed) so we delete it
-        here.  The cache directory itself is left intact; buckaroo repopulates
-        it on the next widget request.
-        """
-        cache_dir = entry_stat_cache_dir(project, content_hash) / "parquet"
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            log.info("cleared stat cache for %s/%s", project, content_hash)
 
     # ------------------------------------------------------------------
     # session creation
@@ -470,7 +459,7 @@ class BuckarooManager:
         stored definition over files that exist, which tallyman already executed in full when it was created.
         """
         from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
-        from tallyman_xorq.result_cache import cache_worthy  # noqa: PLC0415
+        from tallyman_xorq.result_cache import cache_worthy, entry_manifest  # noqa: PLC0415
 
         if cache_worthy(project, content_hash):
             build_dir = ensure_view_build(project, content_hash)
@@ -496,6 +485,11 @@ class BuckarooManager:
             # Buckaroo 0.14.9+: persist computed summary stats to disk so they survive a Buckaroo restart without full
             # recomputation on next /load_expr.
             "cache_storage_path": str(stat_cache),
+            # The identity of the rows the grid reads, which keys Buckaroo's stat cache (buckaroo ADR-001 D2). The
+            # content hash names the recipe, and an unfaithful heal writes different rows under it, so a snapshot
+            # sends its digest: the one the last unfaithful heal wrote, else the one recorded at create. A cheap
+            # entry has no snapshot and sends its content hash. Older buckaroo ignores the field.
+            "data_id": _data_id(entry_manifest(project, content_hash)),
             # ADR-008 D8: the column with no ties that pages sort by (buckaroo-data/buckaroo#974). A page is
             # ORDER BY __row_order, or the user's keys and then __row_order, so the same request returns the same rows.
             # Buckaroo builds that predate the hint ignore it.

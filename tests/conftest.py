@@ -12,6 +12,13 @@ from pathlib import Path
 _TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="tallyman_xorq_cache_"))
 os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
 
+# Import pyproj here, on the main thread, before any test runs a query on another thread (#305). ``import pyproj``
+# opens PROJ's proj.db and registers a pthread_atfork handler that closes it in a forked child. On macOS that close
+# faults once the thread that first imported pyproj has exited, and from then on every fork of this process dies with
+# SIGSEGV: git in fixtures, GitPython's ``git version`` at import. xorq's first pandas execute imports pyproj through
+# geopandas on whatever thread runs it, an AnyIO worker under the companion's TestClient, say. The main thread lives
+# as long as the process.
+import pyproj  # noqa: E402, F401
 import pytest  # noqa: E402
 
 from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402

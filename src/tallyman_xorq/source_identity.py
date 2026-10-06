@@ -26,12 +26,11 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import subprocess
 import sys
 import uuid
 from pathlib import Path
 
-from tallyman_core import data_dir
+from tallyman_core import data_dir, spawn
 
 
 class CloneDigestMismatch(ValueError):
@@ -64,15 +63,23 @@ def _clone(src: Path, dst: Path) -> None:
     a CoW clone on btrfs/XFS that degrades to a real copy on ext4 (a full copy
     per content version — the cost the ``.cas`` GC bounds). Both fall back to
     ``shutil.copy2`` when the platform ``cp`` is unavailable or fails.
+
+    ``cp`` is started with ``posix_spawn`` (``tallyman_core.spawn``), not fork:
+    a forked child of the companion dies before ``exec`` once pyproj was
+    imported on a pool thread (#305), and every clone would become a full copy.
     """
     if sys.platform == "darwin":
-        proc = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
-        if proc.returncode == 0:
-            return
+        argv = ["cp", "-c", str(src), str(dst)]
     elif sys.platform.startswith("linux"):
-        proc = subprocess.run(["cp", "--reflink=auto", str(src), str(dst)], capture_output=True)
-        if proc.returncode == 0:
-            return
+        argv = ["cp", "--reflink=auto", str(src), str(dst)]
+    else:
+        argv = None
+    if argv is not None:
+        try:
+            if spawn.run(argv)[0] == 0:
+                return
+        except OSError:
+            pass
     shutil.copy2(src, dst)
 
 

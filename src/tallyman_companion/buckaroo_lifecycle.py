@@ -205,6 +205,10 @@ class BuckarooManager:
             "--stdio-control",
         ]
         log_fp = open(self.log_file, "a") if self.log_file else subprocess.DEVNULL
+        # posix_spawn, not fork (#305): a forked child of the companion dies before exec once pyproj was imported on a
+        # pool thread that has exited, so a restart after a Buckaroo crash would fail with rc=-11. subprocess takes the
+        # posix_spawn path only for an absolute executable and close_fds=False (macOS has no POSIX_SPAWN_CLOSEFROM).
+        # Python opens descriptors non-inheritable (PEP 446), so close_fds=False hands Buckaroo none that Python opened.
         self.proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -212,6 +216,7 @@ class BuckarooManager:
             stderr=log_fp,
             text=True,
             bufsize=1,
+            close_fds=False,
         )
         atexit.register(self.stop)
 

@@ -35,6 +35,7 @@ idle hour.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import json
 import logging
 import shutil
@@ -67,6 +68,18 @@ _view_locks: dict[str, threading.Lock] = {}
 def _data_id(manifest) -> str:
     """What Buckaroo keys an entry's stat cache by: the digest of the rows its grid reads."""
     return manifest.unfaithful_heal_digest or manifest.result_digest or manifest.content_hash
+
+
+def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> str:
+    """What Buckaroo keys a compare view's stat cache by: the digests of both sides' rows, and the join keys.
+
+    Without one Buckaroo hashes the compare expression, which names each side's snapshot by path, so a heal that
+    rewrites a snapshot in place keeps serving the old cells (buckaroo ADR-001 D2).
+    """
+    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+    parts = [_data_id(entry_manifest(project, h)) for h in (a_hash, b_hash)]
+    return hashlib.sha256("\0".join([*parts, *keys]).encode()).hexdigest()
 
 
 def ensure_view_build(project: str, content_hash: str) -> Path:

@@ -114,8 +114,18 @@ QB_CONTRACTS_CHART_SPEC = {
                     {"field": "player", "type": "nominal", "title": "Player"},
                     {"field": "year_signed", "type": "quantitative", "title": "Signing year", "format": "d"},
                     {"field": "team", "type": "nominal", "title": "Team"},
-                    {"field": "epa_per_value_million", "type": "quantitative", "title": "EPA/$1M (true value)", "format": ".1f"},
-                    {"field": "total_epa_during_contract", "type": "quantitative", "title": "Total EPA", "format": ".1f"},
+                    {
+                        "field": "epa_per_value_million",
+                        "type": "quantitative",
+                        "title": "EPA/$1M (true value)",
+                        "format": ".1f",
+                    },
+                    {
+                        "field": "total_epa_during_contract",
+                        "type": "quantitative",
+                        "title": "Total EPA",
+                        "format": ".1f",
+                    },
                     {"field": "value", "type": "quantitative", "title": "Contract value ($)", "format": "$,.0f"},
                     {"field": "contract_years", "type": "quantitative", "title": "Contract years"},
                 ],
@@ -196,7 +206,8 @@ STEPS: tuple[Step, ...] = (
         "    .filter(ibis._.rn == 0)\n"
         ")\n"
         "\n"
-        "total_epa = ibis.coalesce(most_recent_contract.passing_epa, 0) + ibis.coalesce(most_recent_contract.rushing_epa, 0)\n"
+        "total_epa = ibis.coalesce(most_recent_contract.passing_epa, 0)"
+        " + ibis.coalesce(most_recent_contract.rushing_epa, 0)\n"
         "expr = most_recent_contract.select(\n"
         "    player_display_name=most_recent_contract.player_display_name,\n"
         "    season=most_recent_contract.season,\n"

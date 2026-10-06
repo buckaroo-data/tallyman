@@ -38,6 +38,8 @@ import atexit
 import contextlib
 import json
 import logging
+import os
+import secrets
 import shutil
 import subprocess
 import sys
@@ -45,6 +47,7 @@ import tempfile
 import threading
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -136,12 +139,20 @@ class BuckarooManager:
         # still works, buckaroo just emits no spans for it.
         self.companion_base_url = companion_base_url.rstrip("/") if companion_base_url else None
         self.proc: subprocess.Popen | None = None
-        self._client = httpx.Client(timeout=5.0)
+        # Buckaroo authenticates every request with this token (buckaroo#1091).
+        # We own the subprocess, so we mint the token, hand it to the child via
+        # BUCKAROO_TOKEN, and present it on every request and WebSocket URL.
+        self.token = secrets.token_hex(24)
+        self._client = httpx.Client(timeout=5.0, headers={"Authorization": f"token {self.token}"})
         # Diff-compare session_ids (``diff-<a>-<b>``) Buckaroo has loaded this
         # lifetime. Reset on a Buckaroo restart: these sessions live only in the
         # subprocess's RAM. (The live diff still posts an unmaterialized join, ADR-007 D10, #188.)
         self._loaded_diff_sessions: set[str] = set()
-        self._buckaroo_started_at: float | None = None
+        # The pid of the Buckaroo subprocess we last saw healthy. A change means
+        # a fresh process (restart), so the in-RAM diff sessions are gone.
+        # Replaces the old /health "started" timestamp, which buckaroo#1091
+        # dropped from the now-minimal /health.
+        self._buckaroo_pid: int | None = None
         # Tmp dirs we created by expanding ${TALLYMAN_PROJECT_ROOT} placeholders
         # before POSTing /load_expr. Buckaroo holds the loaded xorq expression
         # open against these paths for the session lifetime, so we keep them
@@ -183,6 +194,28 @@ class BuckarooManager:
             raise BuckarooUnavailable("Buckaroo has not finished starting up")
         return f"ws://127.0.0.1:{self.bound_port}"
 
+    def ws_url(self, session_id: str) -> str:
+        """The full WebSocket URL for *session_id*, carrying the auth token.
+
+        The browser connects cross-origin (the companion's page at its own
+        port to Buckaroo's), so there is no auth cookie — the token rides in
+        the query string. The frontend uses this verbatim.
+        """
+        return f"{self.ws_base_url}/ws/{session_id}?token={self.token}"
+
+    def _allow_origins(self) -> list[str]:
+        """Browser origins Buckaroo must accept a WebSocket from: the
+        companion's own origin, in both loopback spellings a browser might
+        use. Empty when the companion address is unknown (tests)."""
+        if not self.companion_base_url:
+            return []
+        parts = urlsplit(self.companion_base_url)
+        port = parts.port
+        if port is None:
+            return [self.companion_base_url]
+        scheme = parts.scheme or "http"
+        return [f"{scheme}://localhost:{port}", f"{scheme}://127.0.0.1:{port}"]
+
     def start(self) -> None:
         """Spawn the Buckaroo subprocess and wait for the handshake."""
         if self.is_running:
@@ -206,11 +239,19 @@ class BuckarooManager:
             "--no-browser",
             "--stdio-control",
         ]
+        # Register the companion's origin so the browser's cross-origin
+        # WebSocket (companion page -> Buckaroo) is accepted (buckaroo#1091).
+        for origin in self._allow_origins():
+            cmd += ["--allow-origin", origin]
+        # Hand the child the token we authenticate with. Full env so it keeps
+        # PATH / VIRTUAL_ENV; -I isolated mode does not scrub os.environ, so
+        # the child still reads BUCKAROO_TOKEN.
+        child_env = {**os.environ, "BUCKAROO_TOKEN": self.token}
         # posix_spawn, not fork (#305): a forked child of the companion dies before exec once pyproj was imported on a
         # pool thread that has exited, so a restart after a Buckaroo crash would fail with rc=-11. Buckaroo gets its
         # own descriptor on the log file; the companion closes the one it opened.
         with open(self.log_file, "a") if self.log_file else contextlib.nullcontext(subprocess.DEVNULL) as log_fp:
-            self.proc = spawn.start(cmd, stderr=log_fp)
+            self.proc = spawn.start(cmd, stderr=log_fp, env=child_env)
         atexit.register(self.stop)
 
         # Read stdout until we see the handshake. The subprocess prints
@@ -242,13 +283,12 @@ class BuckarooManager:
             try:
                 r = self._client.get(f"{self.base_url}/health", timeout=1.0)
                 if r.status_code == 200:
-                    health = r.json()
-                    started_at = health.get("started")
-                    log.info("buckaroo ready on %s (started=%s)", self.base_url, started_at)
-                    # If this Buckaroo started fresh (different start time from
-                    # what we last saw), its in-RAM sessions are gone — drop our
+                    log.info("buckaroo ready on %s (pid=%s)", self.base_url,
+                        self.proc.pid if self.proc else None)
+                    # If this is a fresh subprocess (different pid from what we
+                    # last saw healthy), its in-RAM sessions are gone — drop our
                     # bookkeeping so /load_expr runs again on first hit.
-                    self._reset_session_bookkeeping_if_restarted(started_at)
+                    self._reset_session_bookkeeping_if_restarted()
                     threading.Thread(target=self._drain_stdout, daemon=True).start()
                     return
             except httpx.HTTPError:
@@ -313,18 +353,19 @@ class BuckarooManager:
         """
         self._loaded_diff_sessions.add(session_id)
 
-    def _reset_session_bookkeeping_if_restarted(self, started_at) -> None:
+    def _reset_session_bookkeeping_if_restarted(self) -> None:
         """Drop in-RAM diff-session bookkeeping when a fresh Buckaroo is detected.
 
-        The diff-compare sessions live only in the subprocess's memory, so a restart (a new ``started_at`` from
-        ``/health``) invalidates every one we've handed out. Clearing forces a re-POST on next access; that reload is
-        cheap because the on-disk stat cache survives the restart. Entry sessions need no such record (ADR-007 D6):
-        their ids are derived and every open re-posts.
+        The diff-compare sessions live only in the subprocess's memory, so a restart (a new subprocess, hence a new
+        pid) invalidates every one we've handed out. Clearing forces a re-POST on next access; that reload is cheap
+        because the on-disk stat cache survives the restart. Entry sessions need no such record (ADR-007 D6): their ids
+        are derived and every open re-posts.
         """
-        if started_at == self._buckaroo_started_at:
+        pid = self.proc.pid if self.proc else None
+        if pid == self._buckaroo_pid:
             return
         self._loaded_diff_sessions.clear()
-        self._buckaroo_started_at = started_at
+        self._buckaroo_pid = pid
 
     # ------------------------------------------------------------------
     # klass reload and forced reload (no session record needed)

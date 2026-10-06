@@ -1133,7 +1133,7 @@ def create_app(
             # was minted.
             session_id=result.get("session_id"),
         )
-        ws_url = f"{buckaroo.ws_base_url}/ws/{result['session_id']}" if result["session_id"] else None
+        ws_url = buckaroo.ws_url(result["session_id"]) if result["session_id"] else None
         return {"status": result["status"], "ws_url": ws_url, "detail": result["detail"]}
 
     @app.get("/{project}/api/notebook")
@@ -1291,6 +1291,11 @@ def create_app(
             "diff": diff,
             "compare_session": compare_session,
             "buckaroo_ws_base": buckaroo_ws_base_url,
+            # Full token-bearing WS URL the browser uses verbatim (the token
+            # can't ride a cross-origin cookie). buckaroo#1091.
+            "compare_ws_url": buckaroo.ws_url(compare_session)
+            if (buckaroo is not None and compare_session)
+            else None,
         }
 
     @app.post("/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}")

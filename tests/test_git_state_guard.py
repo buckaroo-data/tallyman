@@ -94,20 +94,6 @@ def guard_env(monkeypatch):
 
 
 @pytest.fixture
-def spawn_spy(monkeypatch):
-    """Record every `os.posix_spawn` argv; pass-through to the real one."""
-    seen: list[list[str]] = []
-    real = os.posix_spawn
-
-    def spy(path, argv, env, **kwargs):
-        seen.append(list(argv))
-        return real(path, argv, env, **kwargs)
-
-    monkeypatch.setattr(os, "posix_spawn", spy)
-    return seen
-
-
-@pytest.fixture
 def temp_git_repo(tmp_path: Path, monkeypatch) -> Path:
     """A throwaway real git repo with one commit; cwd points here."""
     repo = tmp_path / "repo"

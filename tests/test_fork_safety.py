@@ -7,9 +7,10 @@ before ``exec`` once the parent first imported pyproj on a thread that has since
 imports pyproj, on whatever thread runs it: a companion route on an AnyIO worker, a pool thread in a test. From then
 on every fork of that process crashes. ``os.posix_spawn`` runs no atfork handlers and never does.
 
-Linux CI cannot reproduce the crash, so the static rule, the spawn spies and the conftest check are what CI enforces.
-The crash tests reproduce it in a child interpreter and skip off macOS. Each child imports pyproj on a thread before
-anything else, which made 8 of 8 fresh processes fork-unsafe; with tallyman's modules imported first it was 5 of 8.
+Linux CI cannot reproduce the crash, so the static rule, the spawn spies and the conftest and CLI checks are what CI
+enforces. The crash tests reproduce it in a child interpreter and skip off macOS. Each child imports pyproj on a thread
+before anything else, which made 8 of 8 fresh processes fork-unsafe; with tallyman's modules imported first it was 5
+of 8.
 """
 
 from __future__ import annotations
@@ -37,63 +38,73 @@ needs_macos = pytest.mark.skipif(sys.platform != "darwin", reason="the PROJ atfo
 # the static rule — what Linux CI enforces
 # ---------------------------------------------------------------------------
 
+SPAWN = SRC / "tallyman_core" / "spawn.py"  # the one module that starts children; the run-time tests below check it
+
 _SUBPROCESS_SPAWNS = {"run", "Popen", "call", "check_call", "check_output", "getoutput", "getstatusoutput"}
-# Any of these sends subprocess down fork_exec whatever else is passed (CPython 3.13 ``Popen._execute_child``).
-_FORCES_FORK = {"cwd", "preexec_fn", "pass_fds", "start_new_session", "process_group", "user", "group", "extra_groups"}
-_OS_FORKS = {"fork", "forkpty", "system", "popen"}
+_OS_SPAWNS = {"fork", "forkpty", "system", "popen", "posix_spawn", "posix_spawnp"}  # and every os.spawn*
+_SPAWNING_MODULES = ("multiprocessing", "pty", "concurrent.futures.process")
+# Functions and methods that start a child whatever they are reached through: asyncio's subprocesses (a
+# ``subprocess.Popen`` underneath) and process pools.
+_SPAWNING_ATTRS = {
+    "create_subprocess_exec",
+    "create_subprocess_shell",
+    "subprocess_exec",
+    "subprocess_shell",
+    "ProcessPoolExecutor",
+}
 
 
-def _fork_sites(tree: ast.AST) -> list[tuple[int, str]]:
-    subprocess_names = {"subprocess"}
-    direct: set[str] = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            subprocess_names |= {a.asname or a.name for a in node.names if a.name == "subprocess"}
-        elif isinstance(node, ast.ImportFrom) and node.module == "subprocess":
-            direct |= {a.asname or a.name for a in node.names if a.name in _SUBPROCESS_SPAWNS}
+def _is_spawn(module: str, name: str) -> bool:
+    if module == "os":
+        return name in _OS_SPAWNS or name.startswith("spawn")
+    return module == "subprocess" and name in _SUBPROCESS_SPAWNS
 
+
+def _spawning_module(module: str) -> bool:
+    return any(module == m or module.startswith(f"{m}.") for m in _SPAWNING_MODULES)
+
+
+def _child_starts(tree: ast.AST) -> list[tuple[int, str]]:
+    """Where *tree* starts a child process, or imports something that does: ``(line, what)``.
+
+    No argument makes a ``subprocess`` call safe here. Which path CPython takes depends on the executable, every
+    std stream and half a dozen keywords, most of them values the rule cannot see; ``tallyman_core.spawn`` is where
+    that is decided, once, and checked at run time.
+    """
+    aliases = {"os": {"os"}, "subprocess": {"subprocess"}}  # the names each module is bound to
     sites = []
     for node in ast.walk(tree):
-        if not isinstance(node, ast.Call):
-            continue
-        f = node.func
-        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "os":
-            if f.attr in _OS_FORKS or f.attr.startswith("spawn"):
-                sites.append((node.lineno, f"os.{f.attr} forks"))
-            continue
-        is_spawn = (
-            isinstance(f, ast.Attribute)
-            and isinstance(f.value, ast.Name)
-            and f.value.id in subprocess_names
-            and f.attr in _SUBPROCESS_SPAWNS
-        ) or (isinstance(f, ast.Name) and f.id in direct)
-        if not is_spawn:
-            continue
-        kw = {k.arg: k.value for k in node.keywords}
-        if not (isinstance(kw.get("close_fds"), ast.Constant) and kw["close_fds"].value is False):
-            sites.append((node.lineno, "subprocess without close_fds=False forks on macOS"))
-        if forcing := sorted(_FORCES_FORK & kw.keys()):
-            sites.append((node.lineno, f"subprocess with {', '.join(forcing)} forks"))
-        argv = node.args[0] if node.args else kw.get("args")
-        if isinstance(argv, (ast.List, ast.Tuple)) and argv.elts:
-            exe = argv.elts[0]
-            if isinstance(exe, ast.Constant) and isinstance(exe.value, str) and "/" not in exe.value:
-                sites.append((node.lineno, f"subprocess with the bare program name {exe.value!r} forks"))
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name in aliases:
+                    aliases[a.name].add(a.asname or a.name)
+                elif _spawning_module(a.name):
+                    sites.append((node.lineno, f"import {a.name}"))
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            spawns = sorted(a.name for a in node.names if _is_spawn(node.module, a.name) or a.name in _SPAWNING_ATTRS)
+            if _spawning_module(node.module) or spawns:
+                sites.append((node.lineno, f"from {node.module} import {', '.join(spawns) or '...'}"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in _SPAWNING_ATTRS:
+            sites.append((node.lineno, f".{node.attr}"))
+        elif isinstance(node, ast.Call) and isinstance(f := node.func, ast.Attribute) and isinstance(f.value, ast.Name):
+            if any(f.value.id in bound and _is_spawn(module, f.attr) for module, bound in aliases.items()):
+                sites.append((node.lineno, f"{f.value.id}.{f.attr}()"))
     return sites
 
 
-def test_src_starts_no_child_through_fork():
-    """No src/ module starts a child in a way CPython runs through ``fork_exec``.
+def test_src_starts_no_child_outside_spawn():
+    """No src/ module but ``tallyman_core/spawn.py`` starts a child process.
 
-    ``os.posix_spawn`` (``tallyman_core.spawn.run``) is the sanctioned primitive. ``subprocess`` takes the
-    ``posix_spawn`` path only with an absolute executable, ``close_fds=False`` (macOS has no
-    ``POSIX_SPAWN_CLOSEFROM``) and none of the arguments that force a fork; ``test_buckaroo_start_spawns_without_fork``
-    checks the one call that relies on that at run time.
+    ``spawn.run`` and ``spawn.start`` start children with ``posix_spawn``, and set up what ``posix_spawn`` leaves to
+    the caller; ``test_clone_spawns_cp_without_fork`` and ``test_buckaroo_start_spawns_without_fork`` check them at run
+    time with ``fork_exec`` made to fail.
     """
     offenders = []
     for p in sorted(SRC.rglob("*.py")):
-        offenders += [f"{p.relative_to(SRC)}:{line} {why}" for line, why in _fork_sites(ast.parse(p.read_text()))]
-    assert not offenders, "children started through fork:\n" + "\n".join(offenders)
+        if p != SPAWN:
+            offenders += [f"{p.relative_to(SRC)}:{n} {what}" for n, what in _child_starts(ast.parse(p.read_text()))]
+    assert not offenders, "children started outside tallyman_core.spawn:\n" + "\n".join(offenders)
 
 
 @pytest.mark.parametrize(
@@ -126,30 +137,38 @@ def test_the_static_rule_flags(source: str):
     asyncio's subprocesses are ``subprocess.Popen``. ``umask``, a child std stream on fd 0-2, and a bare program name
     in ``executable`` or in an argv the rule cannot see each send ``subprocess`` down ``fork_exec``.
     """
-    assert _fork_sites(ast.parse(source)), f"not flagged:\n{source}"
+    assert _child_starts(ast.parse(source)), f"not flagged:\n{source}"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("from tallyman_core import spawn\nspawn.run(['git', 'status'])", id="spawn-run"),
+        pytest.param("import subprocess\nproc: subprocess.Popen | None = None\nsubprocess.DEVNULL", id="names"),
+        pytest.param("import os\nos.execv('/bin/true', ['true'])", id="exec"),
+        pytest.param("from concurrent.futures import ThreadPoolExecutor\nThreadPoolExecutor()", id="thread-pool"),
+        pytest.param("import asyncio\nasyncio.subprocess.PIPE", id="asyncio-constant"),
+    ],
+)
+def test_the_static_rule_passes(source: str):
+    """Naming ``subprocess``'s types and constants, exec, and thread pools start no child."""
+    assert not _child_starts(ast.parse(source))
 
 
 # ---------------------------------------------------------------------------
-# the two sites, at run time
+# tallyman_core.spawn, at run time
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def spawned(monkeypatch) -> list[list[str]]:
-    """The argv of every child started through ``os.posix_spawn``. A child started through fork fails the test."""
-    seen: list[list[str]] = []
-    real = os.posix_spawn
-
-    def spy(path, argv, env, **kwargs):
-        seen.append([str(a) for a in argv])
-        return real(path, argv, env, **kwargs)
+def spawned(spawn_spy, monkeypatch) -> list[list[str]]:
+    """``spawn_spy``, with a child started through fork failing the test."""
 
     def forked(args, *rest):
         raise AssertionError(f"started {args!r} through fork_exec, not posix_spawn")
 
-    monkeypatch.setattr(os, "posix_spawn", spy)
     monkeypatch.setattr(subprocess, "_fork_exec", forked)
-    return seen
+    return spawn_spy
 
 
 @pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="_clone shells out to cp only on macOS and Linux")
@@ -180,7 +199,8 @@ def test_buckaroo_start_spawns_without_fork(spawned, monkeypatch):
     monkeypatch.setattr(os, "posix_spawn", stop_at_spawn)
     with pytest.raises(Spawned):
         BuckarooManager(port=0).start()
-    assert spawned[0][1:3] == ["-m", "buckaroo.server"]
+    argv = spawned[0]
+    assert argv[argv.index("-m") + 1] == "buckaroo.server"
 
 
 # ---------------------------------------------------------------------------

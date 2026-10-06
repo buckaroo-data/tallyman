@@ -8,8 +8,8 @@ statically forbids ``subprocess`` git in ``src/`` and routes everything here.
 
 ``run_git`` is ``spawn.run`` with ``git`` in front: ``os.posix_spawn``, a
 vfork-style spawn that does not clone the parent's address space or threads,
-so the hazard cannot fire by construction. This is the same spawn approach
-``_git_state_guard`` uses for xorq's provenance capture.
+so the hazard cannot fire by construction. ``_git_state_guard`` runs xorq's
+provenance capture through it too.
 """
 
 from __future__ import annotations

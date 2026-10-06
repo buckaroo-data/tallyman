@@ -35,6 +35,7 @@ idle hour.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import shutil
@@ -52,6 +53,7 @@ from tallyman_core import (
     entry_expanded_build_dir,
     entry_stat_cache_dir,
     entry_view_build_dir,
+    spawn,
 )
 from tallyman_core.net import port_in_use
 from tallyman_core.paths import buckaroo_project_root, project_dir
@@ -204,20 +206,11 @@ class BuckarooManager:
             "--no-browser",
             "--stdio-control",
         ]
-        log_fp = open(self.log_file, "a") if self.log_file else subprocess.DEVNULL
         # posix_spawn, not fork (#305): a forked child of the companion dies before exec once pyproj was imported on a
-        # pool thread that has exited, so a restart after a Buckaroo crash would fail with rc=-11. subprocess takes the
-        # posix_spawn path only for an absolute executable and close_fds=False (macOS has no POSIX_SPAWN_CLOSEFROM).
-        # Python opens descriptors non-inheritable (PEP 446), so close_fds=False hands Buckaroo none that Python opened.
-        self.proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=log_fp,
-            text=True,
-            bufsize=1,
-            close_fds=False,
-        )
+        # pool thread that has exited, so a restart after a Buckaroo crash would fail with rc=-11. Buckaroo gets its
+        # own descriptor on the log file; the companion closes the one it opened.
+        with open(self.log_file, "a") if self.log_file else contextlib.nullcontext(subprocess.DEVNULL) as log_fp:
+            self.proc = spawn.start(cmd, stderr=log_fp)
         atexit.register(self.stop)
 
         # Read stdout until we see the handshake. The subprocess prints

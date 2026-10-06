@@ -61,10 +61,16 @@ runs it, an AnyIO worker serving a companion route, say. In probes, 8 of 8 proce
 with the importing thread still alive, or pyproj imported on the main thread first, none did. That contradicts "a rare
 race" above for this case.
 
-- `tallyman_core.spawn.run` is the primitive; `git_util.run_git` is it with `git` in front, and the `.cas` clone's `cp`
-  uses it.
-- Buckaroo, a long-lived child, is started by `subprocess.Popen` with an absolute executable and `close_fds=False`,
-  which is what makes `subprocess` choose `posix_spawn` on macOS (no `POSIX_SPAWN_CLOSEFROM`).
-- `tests/test_fork_safety.py` statically forbids fork-based spawns in `src/` and reproduces the crash in a child
-  interpreter. `tests/conftest.py` imports pyproj on the main thread so the suite's own forks (git fixtures, GitPython's
-  import-time `git version`) are safe.
+- `tallyman_core.spawn` is the only module in `src/` that starts a child. `run` is the primitive for a child that runs
+  to completion: `git_util.run_git` is it with `git` in front, and the `.cas` clone's `cp` and xorq's provenance git
+  (`_git_state_guard`) use it. It does by hand what `subprocess` does for a child and `posix_spawn` does not: SIGPIPE
+  and SIGXFSZ back at their defaults, stdin on /dev/null, and a child whose wait is interrupted killed and reaped.
+- `start` starts Buckaroo, a long-lived child, through `subprocess.Popen` with an absolute executable and
+  `close_fds=False`, which is what makes `subprocess` choose `posix_spawn` on macOS (no `POSIX_SPAWN_CLOSEFROM`). The
+  child it spawns is a bare interpreter that closes every descriptor above 2 it inherited, since C libraries open
+  theirs inheritable, and then execs Buckaroo.
+- Every tallyman command imports pyproj on the main thread first (`spawn.pin_pyproj`), so the forks tallyman does not
+  make itself, a library's `subprocess` call or a multiprocessing worker, are safe too. `tests/conftest.py` does the
+  same for the suite's own forks (git fixtures, GitPython's import-time `git version`).
+- `tests/test_fork_safety.py` statically forbids starting a child anywhere in `src/` outside `tallyman_core.spawn`,
+  and reproduces the crash in a child interpreter.

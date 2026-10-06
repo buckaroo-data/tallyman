@@ -131,6 +131,7 @@ export interface DiffData {
   };
   compare_session: string | null;
   buckaroo_ws_base: string | null;
+  compare_ws_url: string | null;
 }
 
 export interface CacheEntry {

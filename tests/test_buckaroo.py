@@ -167,7 +167,7 @@ def test_unit_ensure_session_restart_throttled(project: str, orders_src: str, mo
 def _running_manager() -> BuckarooManager:
     mgr = BuckarooManager()
     mgr.bound_port = 65000
-    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None), "pid": 65000})()
     return mgr
 
 
@@ -575,23 +575,25 @@ def test_unit_diff_sessions_invalidated_on_buckaroo_restart(project: str):
     """A buckaroo restart must drop loaded diff-compare sessions.
 
     Buckaroo's /load_expr sessions live only in the subprocess's RAM, so a
-    restart (fresh ``started_at`` from /health) invalidates every session_id.
+    restart (a new subprocess, hence a new pid) invalidates every session_id.
     Entry sessions need no record on tallyman's side (their ids are derived and every open
     posts, ADR-007 D6), but the live diff still keeps one: the bookkeeping used to be a module global that nothing
     reset, so a post-restart diff view skipped the re-POST and handed the client a session the new process never
     loaded.
     """
     mgr = BuckarooManager()
-    mgr._buckaroo_started_at = 1000.0
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None), "pid": 1000})()
+    mgr._buckaroo_pid = 1000
     mgr.mark_diff_session_loaded("diff-aaaa-bbbb")
     assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
 
-    # Same started_at → not a restart → bookkeeping preserved.
-    mgr._reset_session_bookkeeping_if_restarted(1000.0)
+    # Same pid → not a restart → bookkeeping preserved.
+    mgr._reset_session_bookkeeping_if_restarted()
     assert mgr.diff_session_is_loaded("diff-aaaa-bbbb")
 
-    # Fresh started_at → restart → the diff sessions are dropped.
-    mgr._reset_session_bookkeeping_if_restarted(2000.0)
+    # New pid (fresh subprocess) → restart → the diff sessions are dropped.
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None), "pid": 2000})()
+    mgr._reset_session_bookkeeping_if_restarted()
     assert not mgr.diff_session_is_loaded("diff-aaaa-bbbb")
 
 
@@ -829,6 +831,7 @@ class _StubBuckaroo:
         self.session = session
         self.bound_port = port
         self.is_running = True
+        self.token = "stub-token"
 
     @property
     def base_url(self) -> str:
@@ -837,6 +840,9 @@ class _StubBuckaroo:
     @property
     def ws_base_url(self) -> str:
         return f"ws://127.0.0.1:{self.bound_port}"
+
+    def ws_url(self, session_id: str) -> str:
+        return f"ws://127.0.0.1:{self.bound_port}/ws/{session_id}?token={self.token}"
 
     def ensure_session(self, content_hash: str, project: str, column_config_overrides=None) -> str | None:
         return self.session
@@ -863,7 +869,7 @@ def test_entry_detail_decoupled_grid_session_via_session_endpoint(project: str, 
     # The session endpoint provides the widget on demand, with a typed status.
     sr = c.get(f"/{project}/api/session/{res.content_hash}").json()
     assert sr["status"] == "ok"
-    assert sr["ws_url"] == "ws://127.0.0.1:8700/ws/abc123"
+    assert sr["ws_url"] == "ws://127.0.0.1:8700/ws/abc123?token=stub-token"
 
 
 def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_src: str):
@@ -887,3 +893,77 @@ def test_entry_detail_falls_back_when_session_unavailable(project: str, orders_s
     body = r.json()
     assert body["buckaroo_session"] is None
     assert body["buckaroo_ws_base"] is None
+
+
+# ---------------------------------------------------------------------------
+# Token auth (buckaroo#1091): the companion owns the subprocess, so it mints
+# the token, hands it to the child, and presents it on every request + WS URL.
+# ---------------------------------------------------------------------------
+
+
+def test_unit_client_sends_auth_token_header():
+    """Every HTTP request carries the server token."""
+    mgr = BuckarooManager()
+    assert mgr._client.headers.get("Authorization") == f"token {mgr.token}"
+
+
+def test_unit_ws_url_carries_token():
+    """The WS URL handed to the browser carries the token in the query string
+    (a cross-origin WebSocket has no auth cookie to ride)."""
+    mgr = _running_manager()
+    assert mgr.ws_url("entry-p-h") == f"ws://127.0.0.1:65000/ws/entry-p-h?token={mgr.token}"
+
+
+def test_unit_allow_origins_from_companion_base_url():
+    """The companion's origin is allowlisted in both loopback spellings; none
+    when the companion address is unknown."""
+    mgr = BuckarooManager(companion_base_url="http://127.0.0.1:7860")
+    assert set(mgr._allow_origins()) == {"http://localhost:7860", "http://127.0.0.1:7860"}
+    assert BuckarooManager()._allow_origins() == []
+
+
+def test_unit_start_passes_token_env_and_allow_origin(monkeypatch):
+    """start() hands the token to the child via BUCKAROO_TOKEN and registers
+    the companion origin with --allow-origin."""
+    import io
+
+    from tallyman_companion import buckaroo_lifecycle as bl
+
+    captured: dict = {}
+
+    class FakeProc:
+        pid = 4321
+
+        def __init__(self):
+            self.stdout = io.StringIO("BUCKAROO_PORT=65001\n")
+
+        def poll(self):
+            return None
+
+    def fake_spawn_start(argv, *, stderr, env=None):
+        captured["argv"] = list(argv)
+        captured["env"] = env
+        return FakeProc()
+
+    class _HealthOK:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"status": "ok", "version": "x"}
+
+    monkeypatch.setattr(bl.spawn, "start", fake_spawn_start)
+    monkeypatch.setattr(bl, "port_in_use", lambda host, port: False)
+    mgr = BuckarooManager(companion_base_url="http://127.0.0.1:7860")
+    monkeypatch.setattr(mgr._client, "get", lambda *a, **k: _HealthOK())
+
+    mgr.start()
+
+    assert captured["env"]["BUCKAROO_TOKEN"] == mgr.token
+    assert "--allow-origin" in captured["argv"]
+    assert "http://127.0.0.1:7860" in captured["argv"]
+    assert "--no-browser" in captured["argv"]
+
+    # Drop the fake proc so the atexit-registered stop() early-returns
+    # instead of calling .wait() on it.
+    mgr.proc = None

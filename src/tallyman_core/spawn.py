@@ -116,13 +116,16 @@ def run(argv: list[str], *, timeout: float | None = None, capture: bool = True) 
         return rc, _read(out), _read(err)
 
 
-def start(argv: list[str], *, stderr) -> subprocess.Popen:
+def start(argv: list[str], *, stderr, env: dict | None = None) -> subprocess.Popen:
     """Start the long-lived *argv* fork-free, with text pipes on its stdin and stdout and *stderr* as its stderr.
 
     ``subprocess`` takes its ``posix_spawn`` path only for an absolute executable, ``close_fds=False`` and none of the
     arguments that force a fork; ``tests/test_fork_safety.py`` checks this call at run time. ``close_fds=False`` hands
     the child every inheritable descriptor, and a C library opens them that way (PEP 446 covers only Python's), so the
     child is a bare interpreter that closes them and then execs *argv*.
+
+    *env* is the child's environment (``None`` inherits ours). ``posix_spawn`` takes an explicit envp, so passing it
+    keeps the fork-free path.
     """
     return subprocess.Popen(
         [sys.executable, "-I", "-S", "-c", _CLEAN_EXEC, _program(argv[0]), *argv[1:]],
@@ -132,4 +135,5 @@ def start(argv: list[str], *, stderr) -> subprocess.Popen:
         text=True,
         bufsize=1,
         close_fds=False,
+        env=env,
     )

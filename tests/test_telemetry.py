@@ -220,6 +220,9 @@ def test_grid_load_event_records_session_id_for_join(project, orders_src, monkey
         is_running = True
         ws_base_url = "ws://127.0.0.1:8700"
 
+        def ws_url(self, session_id):
+            return f"ws://127.0.0.1:8700/ws/{session_id}?token=stub"
+
         def load_session(self, content_hash, project, column_config_overrides=None):
             return {"status": "ok", "session_id": "sess-join", "detail": "", "load_expr_ms": 5.0}
 

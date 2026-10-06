@@ -82,7 +82,11 @@ export function DiffPage() {
 
   const { diff, compare_session, buckaroo_ws_base } = data;
   const n = data.hashes.length;
-  const wsUrl = compare_session && buckaroo_ws_base ? `${buckaroo_ws_base}/ws/${compare_session}` : null;
+  // Prefer the full token-bearing URL the companion builds; fall back to the
+  // untokenized concat only if an older companion omitted it.
+  const wsUrl =
+    data.compare_ws_url ??
+    (compare_session && buckaroo_ws_base ? `${buckaroo_ws_base}/ws/${compare_session}` : null);
 
   return (
     <main>

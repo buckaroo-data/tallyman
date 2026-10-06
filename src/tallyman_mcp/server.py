@@ -50,6 +50,7 @@ from tallyman_core import (
     run_post_processing,
     set_alias,
     set_chart,
+    spawn,
     validate_alias_name,
     write_display_klass,
     write_post_processing,
@@ -2135,6 +2136,7 @@ def ds_modeling_workflow(dataset: str, target: str = "") -> str:
 
 
 def main() -> None:
+    spawn.pin_pyproj()  # on the main thread, before any tool runs on a worker (#305)
     logging.basicConfig(
         level=os.environ.get("TALLYMAN_LOG_LEVEL", "INFO"),
         format="[%(name)s] %(message)s",

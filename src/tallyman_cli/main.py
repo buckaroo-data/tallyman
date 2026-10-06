@@ -9,12 +9,15 @@ import click
 import uvicorn
 
 from tallyman_cli.fixtures import write_shoe_orders
-from tallyman_core import data_dir, ensure_project, project_dir, resolve_project
+from tallyman_core import data_dir, ensure_project, project_dir, resolve_project, spawn
 
 
 @click.group()
 def cli() -> None:
     """tallyman — deconstructed-notebook CLI."""
+    # Before any command starts a thread: keeps the forks of this process safe, not only the children tallyman starts
+    # itself (#305).
+    spawn.pin_pyproj()
 
 
 @cli.command("init")

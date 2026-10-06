@@ -12,11 +12,12 @@ hard blocker.
 
 Provenance must never be able to fail a write, so this installs a wrapper that:
 
-1. spawns git **fork-free** via ``os.posix_spawn`` — a vfork-style spawn that
-   does not clone the parent's address space or threads, so the macOS
-   fork-from-multithreaded hazard cannot fire by construction (bare-name
-   ``subprocess`` would fork: CPython only takes the posix_spawn path when the
-   executable has a directory component, which ``"git"`` lacks); and
+1. spawns git **fork-free** through ``git_util.run_git`` (``os.posix_spawn``,
+   ``tallyman_core.spawn``) — a vfork-style spawn that does not clone the
+   parent's address space or threads, so the macOS fork-from-multithreaded
+   hazard cannot fire by construction (bare-name ``subprocess`` would fork:
+   CPython only takes the posix_spawn path when the executable has a directory
+   component, which ``"git"`` lacks); and
 2. **degrades to placeholders on any failure** (signal death, missing git,
    timeout) instead of raising.
 
@@ -31,8 +32,8 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
-import tempfile
+
+from tallyman_core.git_util import run_git
 
 # Matches xorq's get_git_state command set (sub-commands; "git" prepended at spawn).
 _GIT_COMMANDS = (
@@ -43,32 +44,17 @@ _GIT_COMMANDS = (
 
 
 def _run_git(args: list[str], timeout: float = 10.0) -> str:
-    """Run ``git <args>`` without forking, via ``os.posix_spawn``.
+    """Run ``git <args>`` fork-free; return its stripped stdout.
 
-    Resolves git on PATH at call time (posix_spawn does not search PATH).
-    Returns stripped stdout; raises on a missing git, signal death, or non-zero
-    exit — all of which ``_capture`` turns into placeholders.
+    Raises on a missing git, a signal death (the *timeout* SIGKILL among them) or a
+    non-zero exit, all of which ``_capture`` turns into placeholders.
     """
-    git = shutil.which("git")
-    if git is None:
-        raise FileNotFoundError("git not found on PATH")
-    devnull = os.open(os.devnull, os.O_WRONLY)
-    try:
-        with tempfile.TemporaryFile() as out:
-            file_actions = [
-                (os.POSIX_SPAWN_DUP2, out.fileno(), 1),  # stdout -> temp file
-                (os.POSIX_SPAWN_DUP2, devnull, 2),  # stderr -> /dev/null
-            ]
-            pid = os.posix_spawn(git, [git, *args], os.environ, file_actions=file_actions)
-            _, status = os.waitpid(pid, 0)
-            if os.WIFSIGNALED(status):
-                raise RuntimeError(f"git {args} killed by signal {os.WTERMSIG(status)}")
-            if not (os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0):
-                raise RuntimeError(f"git {args} exited non-zero (status={status})")
-            out.seek(0)
-            return out.read().decode().strip()
-    finally:
-        os.close(devnull)
+    rc, out, _ = run_git(args, timeout=timeout)
+    if rc < 0:
+        raise RuntimeError(f"git {args} killed by signal {-rc}")
+    if rc != 0:
+        raise RuntimeError(f"git {args} exited {rc}")
+    return out
 
 
 def _format(triple: tuple[str, str, str], hash_diffs: bool) -> dict:

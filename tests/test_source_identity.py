@@ -12,9 +12,15 @@ but it is marked ``cache_lab`` and never runs in CI.
 
 from __future__ import annotations
 
-import pandas as pd
+import os
+import sys
+import time
+from types import SimpleNamespace
 
-from tallyman_core import data_dir
+import pandas as pd
+import pytest
+
+from tallyman_core import data_dir, spawn
 from tallyman_xorq import source_identity as si
 
 
@@ -78,3 +84,46 @@ def test_source_identity_has_one_mode():
         for m in pattern.finditer(p.read_text())
     ]
     assert not offenders, f"the source-identity modes and their digest memo are gone: {offenders}"
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="_clone shells out to cp only on macOS and Linux")
+def test_clone_gives_up_on_a_cp_that_never_finishes(tmp_path, monkeypatch):
+    """A wedged cp is killed and the clone raises, so the import holding the project lock lets go of it.
+
+    A hung network mount or an iCloud file cp has to download can keep cp from ever finishing. ``shutil.copy2`` is no
+    fallback here: it reads the same file in-process, with no timeout at all.
+    """
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "cp").write_text("#!/bin/sh\nexec sleep 5\n")
+    (bindir / "cp").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(si, "_CLONE_TIMEOUT_FLOOR", 0.2, raising=False)
+    src = tmp_path / "src.bin"
+    src.write_bytes(b"x" * 1024)
+
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        si._clone(src, tmp_path / "dst.bin")
+    assert time.monotonic() - started < 4
+
+
+@pytest.mark.skipif(sys.platform not in ("darwin", "linux"), reason="_clone shells out to cp only on macOS and Linux")
+def test_clone_keeps_none_of_cps_output(tmp_path, monkeypatch):
+    """``_clone`` reads only cp's exit status, so cp's output goes to /dev/null, not to two temp files per import."""
+
+    def no_temp_files(*args, **kwargs):
+        raise AssertionError("_clone captured cp's output, which it never reads")
+
+    def no_fallback(*args, **kwargs):
+        raise AssertionError("the clone fell back to shutil.copy2")
+
+    monkeypatch.setattr(spawn, "tempfile", SimpleNamespace(TemporaryFile=no_temp_files))
+    monkeypatch.setattr(si.shutil, "copy2", no_fallback)
+    src = tmp_path / "src.bin"
+    src.write_bytes(os.urandom(4096))
+    dst = tmp_path / "dst.bin"
+
+    si._clone(src, dst)
+
+    assert dst.read_bytes() == src.read_bytes()

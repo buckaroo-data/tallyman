@@ -6,37 +6,17 @@ long-lived multithreaded companion can ``SIGSEGV`` on macOS (the demo
 platform), and Linux CI will not reproduce it — so ``test_reset_to_revision``
 statically forbids ``subprocess`` git in ``src/`` and routes everything here.
 
-``os.posix_spawn`` is a vfork-style spawn that does not clone the parent's
-address space or threads, so the hazard cannot fire by construction. This is
-the same spawn approach ``_git_state_guard`` uses for xorq's provenance capture.
+``run_git`` is ``spawn.run`` with ``git`` in front: ``os.posix_spawn``, a
+vfork-style spawn that does not clone the parent's address space or threads,
+so the hazard cannot fire by construction. ``_git_state_guard`` runs xorq's
+provenance capture through it too.
 """
 
 from __future__ import annotations
 
-import os
-import shutil
-import signal
-import tempfile
-import time
 from pathlib import Path
 
-
-def _wait(pid: int, timeout: float) -> int:
-    """Reap *pid* within *timeout* seconds; SIGKILL it when the clock runs out.
-
-    Callers may hold the per-project flock, so a wedged git (index.lock
-    contention, fs hang) must surface as a signal death, never a stuck thread.
-    """
-    deadline = time.monotonic() + timeout
-    while True:
-        done, status = os.waitpid(pid, os.WNOHANG)
-        if done == pid:
-            return status
-        if time.monotonic() >= deadline:
-            os.kill(pid, signal.SIGKILL)
-            _, status = os.waitpid(pid, 0)
-            return status
-        time.sleep(0.01)
+from tallyman_core.spawn import run
 
 
 def run_git(args: list[str], *, cwd: Path | str | None = None, timeout: float = 10.0) -> tuple[int, str, str]:
@@ -48,26 +28,7 @@ def run_git(args: list[str], *, cwd: Path | str | None = None, timeout: float = 
     is resolved on PATH at call time because ``posix_spawn`` does not search
     PATH.
     """
-    git = shutil.which("git")
-    if git is None:
-        raise FileNotFoundError("git not found on PATH")
-    full = [git]
+    argv = ["git"]
     if cwd is not None:
-        full += ["-C", str(cwd)]
-    full += list(args)
-    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
-        file_actions = [
-            (os.POSIX_SPAWN_DUP2, out.fileno(), 1),
-            (os.POSIX_SPAWN_DUP2, err.fileno(), 2),
-        ]
-        pid = os.posix_spawn(git, full, os.environ, file_actions=file_actions)
-        status = _wait(pid, timeout)
-        out.seek(0)
-        err.seek(0)
-        stdout = out.read().decode(errors="replace").strip()
-        stderr = err.read().decode(errors="replace").strip()
-    if os.WIFSIGNALED(status):
-        return -os.WTERMSIG(status), stdout, stderr
-    if os.WIFEXITED(status):
-        return os.WEXITSTATUS(status), stdout, stderr
-    return -1, stdout, stderr
+        argv += ["-C", str(cwd)]
+    return run(argv + list(args), timeout=timeout)

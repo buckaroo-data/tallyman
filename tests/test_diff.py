@@ -342,6 +342,17 @@ def test_diff_route_sends_data_id_from_both_snapshot_digests(project: str, order
     assert _diff_load_bodies(create_app, project, "shoe_sales")[0]["data_id"] != first
 
 
+def test_diff_route_asks_for_deferred_stats(project: str, orders_src: str, monkeypatch):
+    """The compare grid uses the same client as an entry's, which merges ``stats_update`` (buckaroo ADR-002 D2)."""
+    from tallyman_companion import create_app
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+
+    assert _diff_load_bodies(create_app, project, "shoe_sales")[0]["stats_delivery"] == "deferred"
+
+
 def test_diff_route_explicit(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))

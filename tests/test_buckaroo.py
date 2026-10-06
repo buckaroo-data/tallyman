@@ -279,7 +279,41 @@ def test_unit_load_body_sends_the_snapshot_digest_as_data_id(project: str, order
     path = entry_dir(project, worthy)
     write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
     assert mgr._load_body(project, worthy, None)["data_id"] == "arrow-sha256:healed"
-    assert mgr._load_body(project, cheap, None)["data_id"] == cheap
+    parent = entry_manifest(project, cheap).parents[0].hash
+    assert mgr._load_body(project, cheap, None)["data_id"] == f"{entry_manifest(project, parent).result_digest}-{cheap}"
+
+
+def test_unit_data_id_of_a_cheap_entry_follows_its_parents_rows(project: str, orders_src: str):
+    """A cheap entry has no snapshot: its rows are its parent's rows through its recipe. Its id is the parent's id and
+    its own content hash, so an unfaithful heal of the parent, which rewrites the snapshot the child reads, changes the
+    child's id too. The child's own content hash does not move, and Buckaroo would keep serving stats for old rows."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.result_cache import entry_manifest
+
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    parent = entry_manifest(project, cheap).parents[0].hash
+    mgr = _running_manager()
+    before = mgr._load_body(project, cheap, None)["data_id"]
+
+    path = entry_dir(project, parent)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
+    after = mgr._load_body(project, cheap, None)["data_id"]
+    assert after == f"arrow-sha256:healed-{cheap}"
+    assert after != before
+
+
+def test_unit_load_body_asks_for_deferred_stats(project: str, orders_src: str):
+    """The grid's client merges ``stats_update`` (buckaroo-js-core 0.15.10), so Buckaroo sends rows first and pushes the
+    stats once they are sent (buckaroo ADR-002 D2). Both kinds of entry ask for it."""
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    for h in (worthy, cheap):
+        ensure_materialized(project, h)
+    mgr = _running_manager()
+    assert mgr._load_body(project, worthy, None)["stats_delivery"] == "deferred"
+    assert mgr._load_body(project, cheap, None)["stats_delivery"] == "deferred"
 
 
 def test_unit_data_id_ignores_an_empty_heal_digest(project: str, orders_src: str):

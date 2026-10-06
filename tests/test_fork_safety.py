@@ -96,6 +96,39 @@ def test_src_starts_no_child_through_fork():
     assert not offenders, "children started through fork:\n" + "\n".join(offenders)
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param("import asyncio\nasyncio.create_subprocess_exec('git', 'status')", id="asyncio-exec"),
+        pytest.param("async def f(loop, proto):\n    await loop.subprocess_exec(proto, 'git')", id="loop-exec"),
+        pytest.param("import multiprocessing\nmultiprocessing.get_context('spawn').Process().start()", id="mp-spawn"),
+        pytest.param("from concurrent.futures import ProcessPoolExecutor\nProcessPoolExecutor()", id="pool-import"),
+        pytest.param("import concurrent.futures\nconcurrent.futures.ProcessPoolExecutor()", id="pool-attr"),
+        pytest.param("import pty\npty.spawn(['sh'])", id="pty"),
+        pytest.param("import os as _os\n_os.system('true')", id="os-alias"),
+        pytest.param("from os import system\nsystem('true')", id="os-from-import"),
+        pytest.param("import os\nos.posix_spawn('/bin/true', ['true'], os.environ)", id="posix-spawn-elsewhere"),
+        pytest.param(
+            "import subprocess, sys\nsubprocess.run([sys.executable], close_fds=False, umask=0o22)", id="umask"
+        ),
+        pytest.param(
+            "import subprocess, sys\nsubprocess.run([sys.executable], close_fds=False, stderr=subprocess.STDOUT)",
+            id="stderr-to-stdout",
+        ),
+        pytest.param("import subprocess\ncmd = ['git']\nsubprocess.run(cmd, close_fds=False)", id="argv-variable"),
+        pytest.param("import subprocess\nsubprocess.run(['/x'], close_fds=False, executable='git')", id="executable"),
+    ],
+)
+def test_the_static_rule_flags(source: str):
+    """Each of these starts a child outside ``tallyman_core.spawn``, and all but one fork (CPython 3.13).
+
+    multiprocessing's ``spawn`` start method and ``ProcessPoolExecutor`` still reach ``_posixsubprocess.fork_exec``;
+    asyncio's subprocesses are ``subprocess.Popen``. ``umask``, a child std stream on fd 0-2, and a bare program name
+    in ``executable`` or in an argv the rule cannot see each send ``subprocess`` down ``fork_exec``.
+    """
+    assert _fork_sites(ast.parse(source)), f"not flagged:\n{source}"
+
+
 # ---------------------------------------------------------------------------
 # the two sites, at run time
 # ---------------------------------------------------------------------------
@@ -170,9 +203,14 @@ canary = subprocess.run(["true"], stdout=subprocess.DEVNULL, stderr=subprocess.D
 
 
 def _run_child(script: str, cwd: Path, *, timeout: float) -> dict:
-    # No cwd= (it forces fork_exec); the script changes directory itself.
+    # No cwd= (it forces fork_exec); the script changes directory itself. Its temp files go under *cwd* too.
     proc = subprocess.run(
-        [sys.executable, "-c", script, str(cwd)], capture_output=True, text=True, timeout=timeout, close_fds=False
+        [sys.executable, "-c", script, str(cwd)],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        close_fds=False,
+        env={**os.environ, "TMPDIR": str(cwd)},
     )
     assert proc.returncode == 0, f"child exited {proc.returncode}:\n{proc.stderr[-4000:]}"
     return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -256,4 +294,31 @@ def test_conftest_keeps_the_test_process_fork_safe(tmp_path: Path):
     script += 'print(json.dumps({"pinned": pinned, "canary": canary}))\n'
     out = _run_child(script, tmp_path, timeout=120.0)
     assert out["pinned"], "tests/conftest.py does not import pyproj on the main thread"
+    assert out["canary"] == 0, f"a fork after a pool-thread pyproj import returned {out['canary']}"
+
+
+def test_conftest_removes_its_xorq_cache_dir(tmp_path: Path):
+    """The temporary XORQ_CACHE_DIR conftest makes is gone once the process exits; test runs do not pile them up."""
+    script = f"import sys\nsys.path.insert(0, {str(REPO)!r})\nimport tests.conftest  # noqa: F401\nprint('{{}}')\n"
+    _run_child(script, tmp_path, timeout=120.0)
+    assert not list(tmp_path.glob("tallyman_xorq_cache_*")), "conftest left its xorq cache dir behind"
+
+
+def test_the_cli_keeps_its_process_fork_safe(tmp_path: Path):
+    """Every tallyman command (``tallyman run``, ``tallyman mcp``) imports pyproj on the main thread before its work.
+
+    The companion's first pandas execute on an AnyIO worker would otherwise make the process fork-unsafe, and from
+    then on any child tallyman does not start itself, a library's ``subprocess`` call or a multiprocessing worker,
+    dies with SIGSEGV. ``tallyman_core.spawn`` keeps tallyman's own children safe either way.
+    """
+    script = (
+        "import sys\n"
+        "from click.testing import CliRunner\n"
+        "from tallyman_cli.main import cli\n"
+        "CliRunner().invoke(cli, ['mcp', '--help'])  # the group runs first, on the main thread\n"
+        'pinned = "pyproj" in sys.modules\n'
+    )
+    script += _POISON + _CANARY + 'print(json.dumps({"pinned": pinned, "canary": canary}))\n'
+    out = _run_child(script, tmp_path, timeout=120.0)
+    assert out["pinned"], "the tallyman CLI does not import pyproj on the main thread"
     assert out["canary"] == 0, f"a fork after a pool-thread pyproj import returned {out['canary']}"

@@ -13,9 +13,13 @@ Three layers:
 
 from __future__ import annotations
 
+import gc
+import os
+import select
 import tempfile
 import threading
 import time
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -402,6 +406,84 @@ def test_unit_ensure_session_posts_a_build_over_files_that_exist_on_a_cold_cache
     replayed = load_expr(posted["build_dir"])
     assert int(replayed.count().execute()) > 0
     assert {str(p) for p in compute_cache_dir(project).rglob("*") if p.is_file()} == before
+
+
+# ---------------------------------------------------------------------------
+# unit: the descriptors start() leaves, with a stand-in Buckaroo
+# ---------------------------------------------------------------------------
+
+# What ``python -m buckaroo.server`` does that start() relies on: the port handshake, a /health that answers, and an
+# exit when stdin closes (``--stdio-control``). It starts in milliseconds, so the fast suite runs start() for real.
+_FAKE_BUCKAROO_SERVER = """\
+import http.server, json, sys, threading
+
+class Health(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        body = json.dumps({"started": 1.0}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+server = http.server.HTTPServer(("127.0.0.1", 0), Health)
+print(f"BUCKAROO_PORT={server.server_address[1]}", flush=True)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+sys.stdin.read()
+"""
+
+
+@pytest.fixture
+def fake_buckaroo(tmp_path: Path, monkeypatch) -> None:
+    """Make ``python -m buckaroo.server`` in a child run ``_FAKE_BUCKAROO_SERVER`` (this process keeps the real one)."""
+    pkg = tmp_path / "fake_buckaroo" / "buckaroo"
+    pkg.mkdir(parents=True)
+    (pkg / "__init__.py").write_text("")
+    (pkg / "server.py").write_text(_FAKE_BUCKAROO_SERVER)
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(pkg.parent), os.environ.get("PYTHONPATH")])))
+
+
+def test_unit_buckaroo_inherits_no_descriptor_of_the_companion(fake_buckaroo):
+    """Buckaroo holds none of the companion's descriptors, including one a C library opened inheritable.
+
+    PEP 446 covers only the descriptors Python opens. A parquet file pyarrow has open, or a socket accepted on another
+    thread a moment before the spawn, would otherwise stay open in Buckaroo for its whole life: a file ``gc_cas``
+    unlinks keeps its disk space, and a client socket uvicorn closes sends no FIN.
+    """
+    r, w = os.pipe()
+    os.set_inheritable(w, True)  # what a C library's open() leaves
+    mgr = BuckarooManager(port=0)
+    try:
+        mgr.start()
+        os.close(w)
+        w = -1
+        ready, _, _ = select.select([r], [], [], 2.0)
+        assert ready and os.read(r, 1) == b"", "Buckaroo holds the companion's descriptor open"
+    finally:
+        mgr.stop()
+        os.close(r)
+        if w != -1:
+            os.close(w)
+
+
+def test_unit_start_closes_its_own_handle_on_the_log_file(fake_buckaroo, tmp_path: Path):
+    """Buckaroo writes its stderr to the log file; start() closes the handle it opened for that, not the GC.
+
+    CPython happens to close an unreferenced file when start() returns, with a ResourceWarning. A handle kept alive by a
+    reference (a traceback, a debugger, another interpreter) stays open, one more after every crash and restart.
+    """
+    mgr = BuckarooManager(port=0, log_file=tmp_path / "buckaroo.log")
+    try:
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always", ResourceWarning)
+            mgr.start()
+            gc.collect()
+    finally:
+        mgr.stop()
+    unclosed = [str(w.message) for w in caught if "buckaroo.log" in str(w.message)]
+    assert not unclosed, unclosed
 
 
 # ---------------------------------------------------------------------------

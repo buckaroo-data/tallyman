@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
@@ -211,6 +212,22 @@ def test_guard_degrades_on_signal_death(guard_env, segfault_git_repo):
     g.install_git_state_guard()
     state = lu.get_git_state(hash_diffs=False)
     assert state == {"commit": "unknown", "diff": "", "diff_cached": ""}
+
+
+def test_guard_gives_up_on_a_git_that_never_exits(tmp_path: Path, monkeypatch):
+    """A hung ``git diff`` is killed at the timeout and fails like any other git failure, so a build never blocks."""
+    import tallyman_xorq._git_state_guard as g
+
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    (bindir / "git").write_text("#!/bin/sh\nexec sleep 5\n")
+    (bindir / "git").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+
+    started = time.monotonic()
+    with pytest.raises(RuntimeError):
+        g._run_git(["diff"], timeout=0.2)
+    assert time.monotonic() - started < 4
 
 
 # ---------------------------------------------------------------------------

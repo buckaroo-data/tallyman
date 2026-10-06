@@ -115,11 +115,15 @@ QB_CONTRACTS_CHART_SPEC = {
                     {"field": "year_signed", "type": "quantitative", "title": "Signing year", "format": "d"},
                     {"field": "team", "type": "nominal", "title": "Team"},
                     {
-                        "field": "epa_per_value_million", "type": "quantitative", "title": "EPA/$1M (true value)",
+                        "field": "epa_per_value_million",
+                        "type": "quantitative",
+                        "title": "EPA/$1M (true value)",
                         "format": ".1f",
                     },
                     {
-                        "field": "total_epa_during_contract", "type": "quantitative", "title": "Total EPA",
+                        "field": "total_epa_during_contract",
+                        "type": "quantitative",
+                        "title": "Total EPA",
                         "format": ".1f",
                     },
                     {"field": "value", "type": "quantitative", "title": "Contract value ($)", "format": "$,.0f"},

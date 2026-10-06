@@ -1,6 +1,6 @@
 # ADR: Calling git from the multithreaded tallyman server
 
-- **Status:** Accepted (2026-06-03)
+- **Status:** Accepted (2026-06-03). Amended 2026-10-06 (#305): decision 1 covers every child process, see the end.
 - **Context ticket:** buckaroo-data/nokernel-notebooks#25
 - **Affected code:** `src/tallyman_xorq/_git_state_guard.py`, the `run_git()` primitive in `tests/git_multithread_reliable.py`, `xorq.common.utils.logging_utils.get_git_state`
 
@@ -49,3 +49,28 @@ The fix stays in-repo (the guard swaps `lu.get_git_state`), not in xorq.
 - Provenance is fresh per build again (item 3).
 - `posix_spawn` protects against the fork hazard, not GIL starvation. It is not a defense against a future workload with many CPU-bound threads; that is a separate problem (process pool / subinterpreters / free-threaded build) and out of scope here.
 - Tests should use a faithful backdrop (idle / CoreFoundation-touching threads), not tight-allocation churn, so they exercise the real spawn path instead of an interpreter-starvation artifact. `tests/repro_git_state_segfault.py` already proves containment deterministically with a fake SIGSEGV-on-invoke git.
+
+## Amendment (2026-10-06, #305): every child, not just git
+
+The hazard has a deterministic case on macOS, so decision 1 now covers every child process tallyman starts. Once pyproj
+was first imported on a thread that has since exited, every `fork_exec` child of the process dies with SIGSEGV before
+`exec`. `import pyproj` opens PROJ's `proj.db` and registers a `pthread_atfork` child handler that closes it; Apple's
+libsqlite3 logs that close through `os_log`, which faults in the child (`_os_log_preferences_refresh` under
+`sqlite3_log`, in the crash report). xorq's first pandas `execute` imports pyproj through geopandas on whatever thread
+runs it, an AnyIO worker serving a companion route, say. In probes, 8 of 8 processes set up that way failed every fork;
+with the importing thread still alive, or pyproj imported on the main thread first, none did. That contradicts "a rare
+race" above for this case.
+
+- `tallyman_core.spawn` is the only module in `src/` that starts a child. `run` is the primitive for a child that runs
+  to completion: `git_util.run_git` is it with `git` in front, and the `.cas` clone's `cp` and xorq's provenance git
+  (`_git_state_guard`) use it. It does by hand what `subprocess` does for a child and `posix_spawn` does not: SIGPIPE
+  and SIGXFSZ back at their defaults, stdin on /dev/null, and a child whose wait is interrupted killed and reaped.
+- `start` starts Buckaroo, a long-lived child, through `subprocess.Popen` with an absolute executable and
+  `close_fds=False`, which is what makes `subprocess` choose `posix_spawn` on macOS (no `POSIX_SPAWN_CLOSEFROM`). The
+  child it spawns is a bare interpreter that closes every descriptor above 2 it inherited, since C libraries open
+  theirs inheritable, and then execs Buckaroo.
+- Every tallyman command imports pyproj on the main thread first (`spawn.pin_pyproj`), so the forks tallyman does not
+  make itself, a library's `subprocess` call or a multiprocessing worker, are safe too. `tests/conftest.py` does the
+  same for the suite's own forks (git fixtures, GitPython's import-time `git version`).
+- `tests/test_fork_safety.py` statically forbids starting a child anywhere in `src/` outside `tallyman_core.spawn`,
+  and reproduces the crash in a child interpreter.

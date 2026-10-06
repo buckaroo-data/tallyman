@@ -26,12 +26,17 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
-import subprocess
+import signal
 import sys
 import uuid
 from pathlib import Path
 
-from tallyman_core import data_dir
+from tallyman_core import data_dir, spawn
+
+# How long a clone's cp may run: cp -c and cp --reflink=auto fall back to a full copy, so 10 MB/s of the file on top
+# of a fixed minute before cp counts as wedged.
+_CLONE_TIMEOUT_FLOOR = 60.0
+_CLONE_BYTES_PER_SECOND = 10_000_000
 
 
 class CloneDigestMismatch(ValueError):
@@ -64,15 +69,32 @@ def _clone(src: Path, dst: Path) -> None:
     a CoW clone on btrfs/XFS that degrades to a real copy on ext4 (a full copy
     per content version — the cost the ``.cas`` GC bounds). Both fall back to
     ``shutil.copy2`` when the platform ``cp`` is unavailable or fails.
+
+    ``cp`` is started with ``posix_spawn`` (``tallyman_core.spawn``), not fork:
+    a forked child of the companion dies before ``exec`` once pyproj was
+    imported on a pool thread (#305), and every clone would become a full copy.
+
+    A ``cp`` still running at its timeout (a minute, plus 10 MB/s of the file)
+    is killed and the clone raises ``TimeoutError``: an import holds the project
+    lock while it clones, and ``shutil.copy2`` would read the same wedged file
+    in-process, with no timeout at all.
     """
     if sys.platform == "darwin":
-        proc = subprocess.run(["cp", "-c", str(src), str(dst)], capture_output=True)
-        if proc.returncode == 0:
-            return
+        argv = ["cp", "-c", str(src), str(dst)]
     elif sys.platform.startswith("linux"):
-        proc = subprocess.run(["cp", "--reflink=auto", str(src), str(dst)], capture_output=True)
-        if proc.returncode == 0:
+        argv = ["cp", "--reflink=auto", str(src), str(dst)]
+    else:
+        argv = None
+    if argv is not None:
+        timeout = _CLONE_TIMEOUT_FLOOR + src.stat().st_size / _CLONE_BYTES_PER_SECOND
+        try:
+            rc = spawn.run(argv, timeout=timeout, capture=False)[0]
+        except OSError:
+            rc = None
+        if rc == 0:
             return
+        if rc == -signal.SIGKILL:
+            raise TimeoutError(f"cp took more than {timeout:.0f}s to copy {src} and was stopped. Nothing was written.")
     shutil.copy2(src, dst)
 
 

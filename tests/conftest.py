@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import atexit
 import os
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -11,11 +13,18 @@ from pathlib import Path
 # helper imports xorq. Without this, tests pollute the user's ~/.cache/xorq/.
 _TEST_XORQ_CACHE = Path(tempfile.mkdtemp(prefix="tallyman_xorq_cache_"))
 os.environ.setdefault("XORQ_CACHE_DIR", str(_TEST_XORQ_CACHE))
+atexit.register(shutil.rmtree, _TEST_XORQ_CACHE, ignore_errors=True)
 
 import pytest  # noqa: E402
 
 from tallyman_cli.fixtures import write_shoe_orders  # noqa: E402
-from tallyman_core import data_dir, ensure_project, set_active_project  # noqa: E402
+from tallyman_core import data_dir, ensure_project, set_active_project, spawn  # noqa: E402
+
+# Import pyproj on the main thread, before any test runs a query on another thread (#305). xorq's first pandas execute
+# imports pyproj through geopandas on whatever thread runs it, an AnyIO worker under the companion's TestClient, say,
+# and once that thread has exited every fork of this process dies with SIGSEGV on macOS: git in fixtures, GitPython's
+# ``git version`` at import. ``spawn.pin_pyproj`` has the mechanism.
+spawn.pin_pyproj()
 
 
 @pytest.fixture
@@ -146,3 +155,17 @@ def built_spa():
 
     if not (_REACT_DIST / "index.html").exists():
         pytest.skip("React SPA not built — run `pnpm -C packages/app build`")
+
+
+@pytest.fixture
+def spawn_spy(monkeypatch) -> list[list[str]]:
+    """The argv of every child started through ``os.posix_spawn`` while the test runs; each still starts."""
+    seen: list[list[str]] = []
+    real = os.posix_spawn
+
+    def spy(path, argv, env, **kwargs):
+        seen.append([str(a) for a in argv])
+        return real(path, argv, env, **kwargs)
+
+    monkeypatch.setattr(os, "posix_spawn", spy)
+    return seen

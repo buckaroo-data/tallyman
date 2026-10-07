@@ -67,7 +67,7 @@ _view_locks_guard = threading.Lock()
 _view_locks: dict[str, threading.Lock] = {}
 
 
-def _data_id(project: str, manifest) -> str:
+def _data_id(project: str, manifest, memo: dict[str, str] | None = None) -> str:
     """What Buckaroo keys an entry's stat cache by: the identity of the rows its grid reads.
 
     A worthy entry's rows are its snapshot's, so the id is the digest of the file: the one the last unfaithful heal
@@ -75,6 +75,9 @@ def _data_id(project: str, manifest) -> str:
     through its recipe, so the id is its parents' ids and its own content hash (``<parent id>-<content hash>``), and a
     heal of a parent that rewrites the snapshot the child reads changes the child's id too. An entry with neither
     sends its content hash.
+
+    *memo* maps the hashes already resolved in this call to their ids, so an ancestor reached by several paths has its
+    manifest read once.
     """
     own = manifest.unfaithful_heal_digest or manifest.result_digest
     if own:
@@ -83,8 +86,11 @@ def _data_id(project: str, manifest) -> str:
         return manifest.content_hash
     from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-    parent_ids = [_data_id(project, entry_manifest(project, p.hash)) for p in manifest.parents]
-    return "-".join([*parent_ids, manifest.content_hash])
+    memo = {} if memo is None else memo
+    for p in manifest.parents:
+        if p.hash not in memo:
+            memo[p.hash] = _data_id(project, entry_manifest(project, p.hash), memo)
+    return "-".join([*(memo[p.hash] for p in manifest.parents), manifest.content_hash])
 
 
 def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> str:
@@ -95,7 +101,8 @@ def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) 
     """
     from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-    parts = [_data_id(project, entry_manifest(project, h)) for h in (a_hash, b_hash)]
+    memo: dict[str, str] = {}
+    parts = [_data_id(project, entry_manifest(project, h), memo) for h in (a_hash, b_hash)]
     return hashlib.sha256("\0".join([*parts, *keys]).encode()).hexdigest()
 
 
@@ -406,15 +413,17 @@ class BuckarooManager:
         """
         if not self.is_running or self.bound_port is None:
             return False
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
         try:
-            body = self._load_body(project, content_hash, None)
+            manifest = entry_manifest(project, content_hash)
+            body = self._load_body(project, content_hash, None, manifest)
         except Exception as exc:
             log.warning("could not build a forced reload for %s: %s", content_hash, exc)
             return False
         body["force_reload"] = True
         try:
-            timeout = self._load_timeout(project, content_hash)
-            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=timeout)
+            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=self._load_timeout(manifest))
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             log.warning("buckaroo forced reload failed for %s: %s", content_hash, exc)
@@ -471,23 +480,23 @@ class BuckarooManager:
         """
         return self.load_session(content_hash, project, column_config_overrides)["session_id"]
 
-    def _load_timeout(self, project: str, content_hash: str) -> float:
-        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+    @staticmethod
+    def _load_timeout(manifest) -> float:
+        return 10.0 + (manifest.row_count or 0) / 1_000_000
 
-        row_count = entry_manifest(project, content_hash).row_count or 0
-        return 10.0 + row_count / 1_000_000
-
-    def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None) -> dict:
+    def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None, manifest=None) -> dict:
         """The ``/load_expr`` body for an entry whose files all exist.
 
         A worthy entry is handed a view build of its snapshot, so Buckaroo never executes an aggregate, join or sort on
         tallyman's behalf and never writes a snapshot (ADR-007 D6). A cheap entry is handed its own expanded build, a
-        stored definition over files that exist, which tallyman already executed in full when it was created.
+        stored definition over files that exist, which tallyman already executed in full when it was created. A caller
+        that also needs the entry's manifest (for :meth:`_load_timeout`) passes the one it read.
         """
         from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
         from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-        manifest = entry_manifest(project, content_hash)
+        if manifest is None:
+            manifest = entry_manifest(project, content_hash)
         if manifest.cache_worthy:
             build_dir = ensure_view_build(project, content_hash)
         else:
@@ -580,9 +589,11 @@ class BuckarooManager:
             }
         try:
             from tallyman_xorq.materialize import ensure_materialized  # noqa: PLC0415
+            from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
             ensure_materialized(project, content_hash)
-            payload = self._load_body(project, content_hash, column_config_overrides)
+            manifest = entry_manifest(project, content_hash)
+            payload = self._load_body(project, content_hash, column_config_overrides, manifest)
         except Exception as exc:
             log.warning("could not prepare %s for Buckaroo: %s", content_hash, exc)
             return {
@@ -590,7 +601,7 @@ class BuckarooManager:
                 "session_id": None,
                 "detail": f"Tallyman could not prepare this entry: {type(exc).__name__}: {exc}",
             }
-        _load_timeout = self._load_timeout(project, content_hash)
+        _load_timeout = self._load_timeout(manifest)
         _t_post = time.perf_counter()
         try:
             resp = self._client.post(f"{self.base_url}/load_expr", json=payload, timeout=_load_timeout)

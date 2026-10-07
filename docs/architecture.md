@@ -788,10 +788,12 @@ left behind, survives a failed re-add.
 4. Buckaroo is handed a view build of that file, one read and no history of the
    join, as session `diff-<a12>-<b12>-<id12>`, with statistics cached per pair
    under `diff_stat_cache/`. Its statistics, pages, sorts and searches all run
-   over the file. Without Buckaroo, or without a key, or when the file or the
-   session fails, the page gets the code, schema, statistics, head and keyed
-   diffs from `full_diff`, which still include `__row_order` as a data column
-   (#200).
+   over the file, and the columns the grid hides (before-values, `_eq`,
+   `membership`, `__row_order`) are posted as `skip_stat_columns`, so no
+   statistic queries run for them. Without Buckaroo, or without a key, or when
+   the file or the session fails, the page gets the code, schema, statistics,
+   head and keyed diffs from `full_diff`, which still include `__row_order` as a
+   data column (#200).
 
 `catalog_promote_diff` and the diff page's promote button turn a diff into an
 entry of its own, whose recipe calls `build_diff_expr(a_hash, b_hash, keys)`.

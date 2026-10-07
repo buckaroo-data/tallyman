@@ -789,6 +789,34 @@ def test_self_heal_warns_on_unfaithful_recompute(project, orders_src, monkeypatc
     assert any("UNFAITHFUL" in m and h in m and "execution (#83)" in m for m in msgs), msgs
 
 
+def test_unfaithful_heal_raises_when_the_pin_cannot_be_written(project, orders_src, monkeypatch):
+    # The pin (manifest.unfaithful_heal_digest) is what moves the entry's data_id and its cheap children's. Without
+    # it they keep the scope of the old rows and serve its stats, and the Cache page can delete bytes that are not
+    # regenerable. A heal that could not write it fails the read with the write's error instead of carrying on.
+    import json
+
+    import tallyman_xorq.result_cache as result_cache
+    from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("agg", _agg_code(project))
+    h = _hash_of(project)
+
+    mpath = entry_dir(project, h) / "manifest.json"
+    doc = json.loads(mpath.read_text())
+    doc["result_digest"] = "arrow-sha256:" + "0" * 64
+    mpath.write_text(json.dumps(doc))
+    baked_snapshot_path(project, h).unlink()
+    cached_result_expr.cache_clear()
+
+    def fail(*_args):
+        raise OSError("manifest not writable")
+
+    monkeypatch.setattr(result_cache, "_record_unfaithful_heal", fail)
+    with pytest.raises(OSError, match="manifest not writable"):
+        cached_result_expr(project, h).execute()
+
+
 def test_structural_attribution_degrades_to_not_structural_when_the_manifest_is_unreadable(
     project, orders_src, monkeypatch
 ):

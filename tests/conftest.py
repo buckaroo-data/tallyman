@@ -115,9 +115,8 @@ def fresh_companion_app(project: str):
 def _clear_expr_lru_caches():
     """Clear the process-global expr/result caches around every test.
 
-    ``result_cache`` and ``cached_result_expr`` (tallyman_xorq.result_cache) and
-    ``_build_compare_expr`` (tallyman_companion.app) are ``functools.lru_cache``d
-    keyed on ``(project, content_hash)``. The ``project`` fixture reuses the name
+    ``result_cache`` and ``cached_result_expr`` (tallyman_xorq.result_cache) are
+    ``functools.lru_cache``d keyed on ``(project, content_hash)``. The ``project`` fixture reuses the name
     "test" across tests while ``isolated_home`` gives each test a fresh tmp dir,
     so a cached entry from one test would otherwise point at another test's
     torn-down home. Production is unaffected — entries are immutable and
@@ -128,12 +127,6 @@ def _clear_expr_lru_caches():
         from tallyman_xorq.result_cache import cached_result_expr
 
         cached_result_expr.cache_clear()
-        try:
-            from tallyman_companion.app import _build_compare_expr
-
-            _build_compare_expr.cache_clear()
-        except Exception:
-            pass
 
     _clear()
     yield

@@ -42,7 +42,7 @@ def _color(alias):
 def _layout(result, sd, keep_suffix, drop_suffix):
     """Filter and color a detailed delta view, preserving SELECT order.
 
-    _build_compare_expr already emits ``{col}_pct_delta`` / ``{col}_abs_delta``
+    build_compare_expr already emits ``{col}_pct_delta`` / ``{col}_abs_delta``
     immediately after ``{col}_v2``, so no reordering is needed. We run before
     column_config_overrides are merged, so columns still carry raw headers
     (value columns ``{col}_v2``, deltas ``{col}<suffix>``). Drops the opposite

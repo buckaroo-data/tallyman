@@ -29,6 +29,7 @@ from tallyman_xorq.row_order import without_row_order
 
 __all__ = [
     "code_diff",
+    "file_diff",
     "full_diff",
     "head_diff",
     "head_diff_polars",
@@ -88,6 +89,23 @@ def schema_diff(a_schema: dict, b_schema: dict) -> dict:
     }
 
 
+def file_diff(a_entry: Path, b_entry: Path, *, a_label: str = "before", b_label: str = "after") -> dict:
+    """The parts of a diff that are file reads, ``{"code", "schema"}``: no query runs.
+
+    The code diff comes from each entry's ``expr.py``, the schema diff from each entry's ``schema.json``. An entry
+    missing either reads as empty.
+    """
+    a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
+    b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
+    a_sj, b_sj = a_entry / ENTRY_SCHEMA_FILENAME, b_entry / ENTRY_SCHEMA_FILENAME
+    a_schema = json.loads(a_sj.read_text()) if a_sj.exists() else {}
+    b_schema = json.loads(b_sj.read_text()) if b_sj.exists() else {}
+    return {
+        "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),
+        "schema": schema_diff(a_schema, b_schema),
+    }
+
+
 def full_diff(
     a_entry: Path,
     b_entry: Path,
@@ -120,12 +138,6 @@ def full_diff(
     ``__row_order`` is dropped from both sides first, as ``build_compare_expr``
     does: a row's position in its file is not data (ADR-008 D6, #200).
     """
-    a_code = (a_entry / "expr.py").read_text() if (a_entry / "expr.py").exists() else ""
-    b_code = (b_entry / "expr.py").read_text() if (b_entry / "expr.py").exists() else ""
-    a_sj, b_sj = a_entry / ENTRY_SCHEMA_FILENAME, b_entry / ENTRY_SCHEMA_FILENAME
-    a_schema = json.loads(a_sj.read_text()) if a_sj.exists() else {}
-    b_schema = json.loads(b_sj.read_text()) if b_sj.exists() else {}
-
     if a_expr is None or b_expr is None:
         raise ValueError(
             "full_diff requires a_expr and b_expr (the entries' cache-resolving "
@@ -142,8 +154,7 @@ def full_diff(
         keyed = None if keys == [] else key_diff_xorq(a_expr, b_expr, keys=keys)
 
     return {
-        "code": code_diff(a_code, b_code, a_label=a_label, b_label=b_label),
-        "schema": schema_diff(a_schema, b_schema),
+        **file_diff(a_entry, b_entry, a_label=a_label, b_label=b_label),
         "head": head,
         "stats": stats,
         "keyed": keyed,

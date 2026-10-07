@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
 import json
 import logging
 import os
@@ -18,8 +17,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from tallyman_companion.buckaroo_lifecycle import BuckarooManager, diff_data_id
-from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
+from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_companion.diff_snapshot import open_diff_view, view_diff
 from tallyman_core import (
     ENTRY_BUILD_DIRNAME,
     ENTRY_MANIFEST_FILENAME,
@@ -433,44 +432,60 @@ def _compute_entry_cache(project: str, content_hash: str) -> dict:
     }
 
 
-@functools.lru_cache(maxsize=128)
-def _build_compare_expr(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> tuple[Path, dict]:
-    """Build and cache an xorq outer-join comparison expression for a diff pair.
+def _load_compare_view(
+    buckaroo: BuckarooManager, project: str, a_hash: str, b_hash: str, keys: list[str], a_expr, b_expr
+):
+    """Write the diff's join to a file and have Buckaroo load a session over it. ``(DiffView, session id)``, or None.
 
-    Keyed by (project, a_hash, b_hash, keys) — both entries are immutable
-    content-addressed artifacts so the result is stable for the process lifetime.
-    Bounded so the cache can't grow without limit over a long-lived process;
-    eviction just rebuilds the (deterministic) comparison on the next view.
-
-    Returns (build_path, column_config_overrides).
+    The first open of a pair runs the join once (``diff_snapshot``); Buckaroo is handed a build with one read in it, so
+    its summary stats, counts, pages and searches run over a file. The session id carries the identity of the rows, so
+    a session loaded before a heal or over other keys is never served for these ones. None when either step fails, and
+    the page then gets the static tables, which the caller computes.
     """
-    import tempfile
+    try:
+        view = open_diff_view(project, a_hash, b_hash, keys, a_expr, b_expr)
+        session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}-{view.identity[:12]}"
+        if not buckaroo.diff_session_is_loaded(session_id):
+            from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
 
-    from xorq.ibis_yaml.compiler import build_expr
-
-    a = cached_result_expr(project, a_hash)
-    b = cached_result_expr(project, b_hash)
-    expr, overrides = build_compare_expr(a, b, list(keys))
-    overrides = strip_live_diff_color(overrides)
-
-    builds_dir = Path(tempfile.gettempdir()) / "tallyman_diff_builds"
-    builds_dir.mkdir(parents=True, exist_ok=True)
-    build_path = Path(build_expr(expr, builds_dir=str(builds_dir)))
-
-    return build_path, overrides
+            stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
+            stat_cache.mkdir(parents=True, exist_ok=True)
+            resp = buckaroo._client.post(
+                f"{buckaroo.base_url}/load_expr",
+                json={
+                    "session": session_id,
+                    "build_dir": str(view.build_dir),
+                    "no_browser": True,
+                    "column_config_overrides": view.column_config_overrides,
+                    "cache_storage_path": str(stat_cache),
+                    "data_id": view.identity,
+                    "stats_delivery": "deferred",
+                    "extra_grid_config": {"searchDebounceMs": 3000},
+                    "project_root": str(Path(__file__).parent / "diff_extras"),
+                },
+                timeout=30.0,
+            )
+            if resp.status_code != 200:
+                log.warning("diff /load_expr answered %s for %s", resp.status_code, session_id)
+                return None
+            buckaroo.mark_diff_session_loaded(session_id)
+        return view, session_id
+    except Exception as exc:
+        log.warning("diff compare view failed for %s/%s: %s", a_hash[:12], b_hash[:12], exc, exc_info=True)
+        return None
 
 
 def _invalidate_reset_caches(project: str | None = None) -> None:
-    """Drop the companion's process-global result/compare caches after a reset.
+    """Drop the companion's process-global result cache after a reset.
 
     A reset changes which entries exist (``catalog_state.reset_to`` retires and
     restores entry dirs, and leaves ``compute_cache/`` alone, ADR-007 D14).
-    ``_build_compare_expr`` serializes snapshot paths into a build with no
-    per-call ``exists()`` recheck, so a warmed diff pair is dropped rather than
-    served over entries the reset retired (#80). ``cached_result_expr`` makes its
-    files exist on every read, so clearing its memo is hygiene, not load-bearing,
-    but we clear it for parity. Blunt global clear is correct and cheap: entries
-    are content-addressed, so the next call rebuilds an identical expression.
+    ``cached_result_expr`` makes its files exist on every read, so clearing its
+    memo is hygiene, not load-bearing, but we clear it for parity. Blunt global
+    clear is correct and cheap: entries are content-addressed, so the next call
+    rebuilds an identical expression. A diff's file (``compute_cache/diff_cache/``)
+    needs no clearing: it is named by the identity of both sides' rows, and a reset
+    that moves what an entry reads gives its diff another name.
 
     When *project* is given, the per-pair Buckaroo diff stat cache
     (``diff_stat_cache/``) is wiped too: its stats were computed over diff joins
@@ -482,7 +497,6 @@ def _invalidate_reset_caches(project: str | None = None) -> None:
     ``/internal/notify`` — so the two can't drift. (The in-server path having the
     clear while the notify path lacked it was exactly #80's "Communication gap".)
     """
-    _build_compare_expr.cache_clear()
     cached_result_expr.cache_clear()
     if project is not None:
         from tallyman_core.paths import diff_stat_cache_root  # noqa: PLC0415
@@ -1220,15 +1234,23 @@ def create_app(
             a_expr = cached_result_expr(project, a_hash)
             b_expr = cached_result_expr(project, b_hash)
             keys = diff_keys(project, a_hash, b_hash)
-            diff = full_diff(
-                a_dir,
-                b_dir,
-                a_label=f"V{va}",
-                b_label=f"V{vb}",
-                a_expr=a_expr,
-                b_expr=b_expr,
-                keys=keys,
-            )
+            compare = None
+            if keys and buckaroo is not None and buckaroo.is_running:
+                compare = _load_compare_view(buckaroo, project, a_hash, b_hash, keys, a_expr, b_expr)
+            if compare is not None:
+                view, compare_session = compare
+                diff = view_diff(view, a_dir, b_dir, a_label=f"V{va}", b_label=f"V{vb}", keys=keys)
+            else:
+                compare_session = None
+                diff = full_diff(
+                    a_dir,
+                    b_dir,
+                    a_label=f"V{va}",
+                    b_label=f"V{vb}",
+                    a_expr=a_expr,
+                    b_expr=b_expr,
+                    keys=keys,
+                )
         except PrimaryKeySearchTimeout as exc:
             # A key-less wide entry: the search is time-boxed rather than left
             # grinding on the shared DataFusion connection.
@@ -1242,45 +1264,7 @@ def create_app(
             log.exception("diff_data failed for %s/%s V%d→V%d", project, alias, va, vb)
             raise HTTPException(500, detail=f"{type(exc).__name__}: {exc}") from exc
 
-        compare_session = None
-        buckaroo_ws_base_url = None
-        if buckaroo is not None and buckaroo.is_running:
-            if not keys:
-                keys = diff["keyed"]["keys"] if diff.get("keyed") else None
-            if keys:
-                session_id = f"diff-{a_hash[:12]}-{b_hash[:12]}"
-                try:
-                    build_path, overrides = _build_compare_expr(project, a_hash, b_hash, tuple(keys))
-                    if buckaroo.diff_session_is_loaded(session_id):
-                        compare_session = session_id
-                        buckaroo_ws_base_url = buckaroo.ws_base_url
-                    else:
-                        from tallyman_core.paths import diff_stat_cache_dir  # noqa: PLC0415
-
-                        stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
-                        stat_cache.mkdir(parents=True, exist_ok=True)
-                        _diff_extras = Path(__file__).parent / "diff_extras"
-                        resp = buckaroo._client.post(
-                            f"{buckaroo.base_url}/load_expr",
-                            json={
-                                "session": session_id,
-                                "build_dir": str(build_path),
-                                "no_browser": True,
-                                "column_config_overrides": overrides,
-                                "cache_storage_path": str(stat_cache),
-                                "data_id": diff_data_id(project, a_hash, b_hash, tuple(keys)),
-                                "stats_delivery": "deferred",
-                                "extra_grid_config": {"searchDebounceMs": 3000},
-                                "project_root": str(_diff_extras),
-                            },
-                            timeout=30.0,
-                        )
-                        if resp.status_code == 200:
-                            buckaroo.mark_diff_session_loaded(session_id)
-                            compare_session = session_id
-                            buckaroo_ws_base_url = buckaroo.ws_base_url
-                except Exception as exc:
-                    log.warning("diff /load_expr compare failed: %s", exc)
+        buckaroo_ws_base_url = buckaroo.ws_base_url if compare_session and buckaroo is not None else None
 
         return {
             "project": project,

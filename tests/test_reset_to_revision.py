@@ -706,9 +706,7 @@ def test_deleted_snapshot_of_a_warmed_entry_self_heals_without_cache_clear(proje
     re-checks the file on each call (ADR-007 D5): the memo holds the read, never the fact that the file exists.
 
     A reset used to be the thing that removed the snapshot (``prune_compute_cache``). It no longer touches
-    ``compute_cache/`` (ADR-007 D14), so the file is removed here the way an explicit delete does. The non-self-healing
-    ``_build_compare_expr`` LRU, which bakes the snapshot path into a serialized build with no recheck, is the real
-    #80/#96 gap, closed by the reset-time cache invalidation of PR #124.
+    ``compute_cache/`` (ADR-007 D14), so the file is removed here the way an explicit delete does.
     """
     from tallyman_xorq.result_cache import baked_snapshot_path, cached_result_expr, verify_result_faithful
 

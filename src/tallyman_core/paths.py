@@ -16,6 +16,10 @@ Layout (per-project):
         │   │   ├── post_processing/<name>.py , stats/<name>.py , display/<name>.py
         │   │   │                          # read by buckaroo (buckaroo_project_root)
         │   │   ├── prompts/<hash>.jsonl
+        │   │   ├── compute_cache/                        # files tallyman can make again (untracked)
+        │   │   │   ├── result_cache/<hash>.parquet           # a worthy entry's snapshot
+        │   │   │   └── diff_cache/<a12>-<b12>-<id12>.parquet # one diff's join, and its .view_build/ beside it
+        │   │   ├── diff_stat_cache/<a12>-<b12>/          # Buckaroo's summary stats for a diff (untracked)
         │   │   └── entries.jsonl                         # untracked-artifact pointers
         │   ├── exports/...            # marimo .py, screenshots, CSVs
         │   └── errors.jsonl
@@ -63,6 +67,8 @@ def active_project_file_path() -> Path:
 ARTIFACTS_DIRNAME = "artifacts"
 CATALOG_DIRNAME = "catalog"
 ENTRIES_DIRNAME = "entries"
+# Under compute_cache/: the live diff's join, written once per compared pair (see ``diff_snapshot_path``).
+DIFF_CACHE_DIRNAME = "diff_cache"
 
 # Per-entry artifacts: build outputs. Safe to symlink read-only into a
 # write-isolated overlay (the perf harness): the one later write, an unfaithful
@@ -212,13 +218,43 @@ def compute_cache_dir(project: str) -> Path:
 
     ``result_cache/<content_hash>.parquet`` holds each worthy entry's snapshot (ADR-007 D2, D13),
     including a source version's, whose rows are an imported file rather than a computation and whose
-    snapshot is re-created from the clone of those bytes (ADR-011 D1).
+    snapshot is re-created from the clone of those bytes (ADR-011 D1). ``diff_cache/`` holds the join of
+    each diff the live diff view has opened, which Buckaroo reads as a file (``diff_snapshot_path``).
     Lives inside the catalog dir so it travels with the project, and is untracked by git
     (content-addressed parquet). Everything in it is cache, so anything may delete it:
     ``ensure_materialized`` makes a missing file again and checks it. A reset leaves it
     alone (ADR-007 D14).
     """
     return catalog_dir(project) / "compute_cache"
+
+
+def diff_cache_dir(project: str) -> Path:
+    """Where the live diff's joins are written. Cache, like the rest of ``compute_cache/``."""
+    return compute_cache_dir(project) / DIFF_CACHE_DIRNAME
+
+
+def _diff_stem(a_hash: str, b_hash: str, identity: str) -> str:
+    return f"{a_hash[:12]}-{b_hash[:12]}-{identity[:12]}"
+
+
+def diff_snapshot_path(project: str, a_hash: str, b_hash: str, identity: str) -> Path:
+    """The parquet file holding the join of one diff: the compare view's rows, ``__row_order`` last.
+
+    *identity* is ``diff_snapshot.diff_identity``: the digests of the rows each side reads and the join keys, so a
+    heal that rewrites a side's snapshot under the same content hash, or a different key, is a different file. The file
+    is written once and never changed (an atomic replace of a complete one), so Buckaroo can read it while another
+    process looks for it.
+    """
+    return diff_cache_dir(project) / f"{_diff_stem(a_hash, b_hash, identity)}.parquet"
+
+
+def diff_view_build_dir(project: str, a_hash: str, b_hash: str, identity: str) -> Path:
+    """The view build of ``diff_snapshot_path``: a stable directory beside the file, regenerated on demand.
+
+    Buckaroo's stat-cache keys include the build directory's path, so it is named by the same stem as the file and
+    written once.
+    """
+    return diff_cache_dir(project) / f"{_diff_stem(a_hash, b_hash, identity)}.view_build"
 
 
 def bullpen_dir(project: str) -> Path:

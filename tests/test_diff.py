@@ -638,33 +638,24 @@ def test_full_diff_requires_exprs(project: str, orders_src: str):
     assert not (b_dir / "result.parquet").exists()
 
 
-def test_build_compare_expr_reuses_session_build_dir(project: str, orders_src: str):
-    # The Buckaroo comparison embed builds an outer-join expr to a temp dir.
-    # Re-rendering the same diff must reuse one session-scoped build dir, not
-    # spawn a fresh mkdtemp per page view (which leaks /tmp across a demo).
-    from tallyman_companion.app import _build_compare_expr
-    from tallyman_xorq import build_and_persist
-
-    a = build_and_persist(project, _agg_code(project))
-    b = build_and_persist(project, _filter_code(project))
-    p1, _ = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
-    p2, _ = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
-    assert p1 == p2
-
-
-def test_build_compare_expr_magnitude_coloring(project: str, orders_src: str):
+def test_diff_view_overrides_magnitude_coloring(project: str, orders_src: str):
     # Numeric value-column coloring is applied per-view by the diff display
     # klasses (main/detailed_pct color by pct_delta, detailed_absolute by
     # abs_delta), NOT by the shared global override — which would clobber the
     # per-view color via merge_column_config. The global override only renames
     # the _v2 column, attaches the old-value tooltip, and hides the a-side.
     # Non-numeric columns keep the categorical membership palette.
-    from tallyman_companion.app import _build_compare_expr
+    from tallyman_companion.diff_snapshot import diff_view_overrides
     from tallyman_xorq import build_and_persist
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(project))
     b = build_and_persist(project, _filter_code(project))
-    _, overrides = _build_compare_expr(project, a.content_hash, b.content_hash, ("region",))
+    overrides = diff_view_overrides(
+        cached_result_expr(project, a.content_hash).schema(),
+        cached_result_expr(project, b.content_hash).schema(),
+        ["region"],
+    )
 
     # Numeric shared cols: new value displayed, old value via tooltip, a-side
     # hidden. No color_map_config here — coloring is per-view in the klasses.

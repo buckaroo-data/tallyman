@@ -188,6 +188,30 @@ def _temp_beside(path: Path) -> Path:
     return path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
 
 
+def write_expr_snapshot(expr, dest: Path) -> int:
+    """Run *expr* on a fresh single-partition connection, write its rows to *dest* in the snapshot format, and return
+    how many.
+
+    For a file that caches one query over entries and is no entry's snapshot: the join the live diff view hands
+    Buckaroo (``tallyman_companion.diff_snapshot``). It takes neither ``execution_lock`` nor the project lock. *expr* is
+    rebound onto a connection of its own, so nothing else executes on it (see ``_stream_to_parquet``), and the file is
+    named by what it was made from and read by no heal, reset or build. The file appears by an atomic replace of a
+    complete one, so a reader sees all of it or none. A writer that fails removes its temp file and leaves *dest* as it
+    was.
+    """
+    from tallyman_xorq.result_cache import rebind_onto
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = _temp_beside(dest)
+    try:
+        rows, _ = _stream_to_parquet(rebind_onto(expr, single_partition_backend()), tmp)
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return rows
+
+
 def materialize(
     project: str, content_hash: str, *, check_reproducible: bool = False, publish: bool = True
 ) -> Materialized:

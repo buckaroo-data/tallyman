@@ -332,6 +332,88 @@ def test_unit_data_id_ignores_an_empty_heal_digest(project: str, orders_src: str
     assert _running_manager()._load_body(project, worthy, None)["data_id"] == digest
 
 
+def _counted_manifests(monkeypatch, manifests: dict) -> dict[str, int]:
+    """Serve *manifests* from ``entry_manifest`` and count the reads of each hash."""
+    import tallyman_xorq.result_cache as result_cache
+
+    reads: dict[str, int] = {}
+
+    def entry_manifest(project: str, content_hash: str):
+        reads[content_hash] = reads.get(content_hash, 0) + 1
+        return manifests[content_hash]
+
+    monkeypatch.setattr(result_cache, "entry_manifest", entry_manifest)
+    return reads
+
+
+def _manifest(content_hash: str, *parents: str, digest: str | None = None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        content_hash=content_hash,
+        result_digest=digest,
+        unfaithful_heal_digest=None,
+        parents=[SimpleNamespace(hash=p) for p in parents] or None,
+    )
+
+
+def test_unit_data_id_reads_each_ancestor_manifest_once(monkeypatch):
+    """A cheap entry over two cheap parents that share a worthy grandparent (a diamond) reads the grandparent's
+    manifest once, not once per path to it."""
+    from tallyman_companion.buckaroo_lifecycle import _data_id
+
+    manifests = {
+        "a": _manifest("a", digest="arrow-sha256:a"),
+        "b": _manifest("b", "a"),
+        "c": _manifest("c", "a"),
+    }
+    reads = _counted_manifests(monkeypatch, manifests)
+
+    assert _data_id("p", _manifest("d", "b", "c")) == "arrow-sha256:a-b-arrow-sha256:a-c-d"
+    assert reads == {"a": 1, "b": 1, "c": 1}
+
+
+def test_unit_diff_data_id_reads_a_shared_parent_once(monkeypatch):
+    """Both sides of a diff over the same parent read that parent's manifest once."""
+    from tallyman_companion.buckaroo_lifecycle import diff_data_id
+
+    manifests = {
+        "a": _manifest("a", digest="arrow-sha256:a"),
+        "b": _manifest("b", "a"),
+        "c": _manifest("c", "a"),
+    }
+    reads = _counted_manifests(monkeypatch, manifests)
+
+    diff_data_id("p", "b", "c", ("region",))
+    assert reads == {"a": 1, "b": 1, "c": 1}
+
+
+def test_unit_force_reload_reads_the_entry_manifest_once(project: str, orders_src: str, monkeypatch):
+    """A forced reload builds the body and the timeout from one read of the entry's manifest."""
+    import tallyman_xorq.result_cache as result_cache
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    mgr = _running_manager()
+    mgr._client = type(
+        "Client",
+        (),
+        {"post": staticmethod(lambda *a, **kw: httpx.Response(200, request=httpx.Request("POST", "http://x")))},
+    )()
+
+    real = result_cache.entry_manifest
+    reads: list[str] = []
+
+    def entry_manifest(project: str, content_hash: str):
+        reads.append(content_hash)
+        return real(project, content_hash)
+
+    monkeypatch.setattr(result_cache, "entry_manifest", entry_manifest)
+    assert mgr.force_reload_session(project, worthy) is True
+    assert reads.count(worthy) == 1
+
+
 def test_unit_force_reload_skips_an_entry_with_no_manifest(project: str, orders_src: str):
     """A forced reload builds its body from the entry's manifest. With none to read, it returns False, as it does for
     any grid it could not refresh, and posts nothing to Buckaroo."""

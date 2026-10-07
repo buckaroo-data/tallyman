@@ -289,7 +289,9 @@ precise message and a retry.
    `mkdir(exist_ok=True)` — preserves an existing cache, never wipes it.
 5. **POST `/load_expr`** with `session=entry-<project>-<content_hash>`,
    `build_dir` (from step 3), `project_root=<catalog_dir>`,
-   `cache_storage_path=<stat_cache>`, and `row_order_column="__row_order"`.
+   `cache_storage_path=<stat_cache>`, `data_id`, `stats_delivery="deferred"`
+   (rows first, then the stats pushed after them) and
+   `row_order_column="__row_order"`.
    Buckaroo looks for the project's klasses (its summary stats,
    post-processing functions and display classes) in `stats/`,
    `post_processing/` and `display/` under `project_root`, which is

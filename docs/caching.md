@@ -498,7 +498,10 @@ it is never stale. There is no session file.
   paths, so Buckaroo is handed the same build after a restart, which is what its
   on-disk stat cache relies on. The body also
   carries `row_order_column`, the name `__row_order`, which Buckaroo 0.15.6
-  ignores, and `project_root`, where Buckaroo looks for the project's `stats/`,
+  ignores, `stats_delivery: "deferred"`, which has Buckaroo send the first rows
+  with the stats marked pending and push them as a `stats_update` once the rows
+  are sent (buckaroo ADR-002; the grid's client, buckaroo-js-core 0.15.10,
+  merges it), and `project_root`, where Buckaroo looks for the project's `stats/`,
   `post_processing/` and `display/` klasses. Tallyman sends
   `buckaroo_project_root`, the catalog dir, where it writes all three.
 - **After an unfaithful heal**: `_verify_self_heal` wipes the entry's stat
@@ -520,7 +523,10 @@ it is never stale. There is no session file.
   companion passes the path at `/load_expr` time), one cell per column and
   stat, keyed by `data_id` and a hash of the stat's code (buckaroo ADR-001).
   The companion sends the entry's `data_id`: `unfaithful_heal_digest`, else
-  `result_digest`, else the content hash for a cheap entry. Not cleared on a
+  `result_digest`; for a cheap entry, which has no snapshot, its parents' ids
+  and its own content hash (`<parent id>-<content hash>`), so a heal of the
+  parent changes the child's id; the content hash for an entry with neither.
+  Not cleared on a
   klass change. Always on, orthogonal to whether an entry is worthy or cheap.
 - **Diff stat cache**: `<project>/artifacts/catalog/diff_stat_cache/`
   `{a_hash[:12]}-{b_hash[:12]}/`, the same idea for a comparison session,
@@ -677,8 +683,9 @@ runtime backstop is `result_digest`: every heal verifies the repopulated
 snapshot against it before serving (`_verify_self_heal`), and an unfaithful heal
 pins the file in its manifest, wipes the entry's stat cache, records a durable
 error, and, in the companion, forces Buckaroo to reload the entry's grid. It
-does not reach the cheap entries that read the healed snapshot, whose rows
-change with it (#208). An engine or writer upgrade that changes results is
+does not reload the cheap entries that read the healed snapshot, whose rows
+change with it (#208). Their next open sends a new `data_id`, since the parent's
+changed, so their stats are recomputed and not served from the old rows. An engine or writer upgrade that changes results is
 attributed to the versions in `engine_versions`, and the remedy is a corpus
 rebuild. The second hole this section used to document — cold reads re-running
 `expr.py` and re-digesting live sources, serving edited bytes under the original

@@ -1,6 +1,6 @@
 # Diff view: where the time goes, and proposals to cut it
 
-Status: analysis and proposals (2026-10-03). Section 4a is implemented in #309; nothing else here is.
+Status: analysis and proposals (2026-10-03). Section 4a is implemented in #309 and B1 in #312; nothing else here is.
 Measurements were taken in-process with a scratch script that replays
 `api_diff_data` stage by stage and then replays what Buckaroo's
 `LoadExprHandler` does with the posted build (the same proxy
@@ -203,7 +203,7 @@ was up and a swap storm would have hit it.
 
 **B. Cut Buckaroo's stat work on the diff.**
 
-- B1. Pass `skip_stat_columns` for the hidden before-value `{col}` columns,
+- B1 (implemented in #312). Pass `skip_stat_columns` for the hidden before-value `{col}` columns,
   every `{col}_eq`, and `membership`. Buckaroo supports it today, and the
   handler comment names "a diff reusing each source column's stats" as its
   purpose. This removes roughly half of the per-column histogram queries.

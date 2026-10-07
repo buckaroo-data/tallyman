@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_companion.diff import diff_skip_stat_columns
 from tallyman_companion.diff_snapshot import open_diff_view, view_diff
 from tallyman_core import (
     ENTRY_BUILD_DIRNAME,
@@ -457,6 +458,7 @@ def _load_compare_view(
                     "build_dir": str(view.build_dir),
                     "no_browser": True,
                     "column_config_overrides": view.column_config_overrides,
+                    "skip_stat_columns": diff_skip_stat_columns(view.column_config_overrides),
                     "cache_storage_path": str(stat_cache),
                     "data_id": view.identity,
                     "stats_delivery": "deferred",

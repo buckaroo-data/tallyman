@@ -739,11 +739,14 @@ and `_abs_delta` columns. The route runs that join once
 rows each side reads and the join keys (`diff_snapshot.diff_identity`), so a heal
 gives another file. Buckaroo is handed a view build of that file, one read and
 no history of the join, as session `diff-<a12>-<b12>-<id12>`, and runs its
-statistics, pages and searches over the file. With a session loaded the route
-skips `full_diff`'s queries: the code and schema diffs are file reads and the
-three counts are a group-by over the file. Without Buckaroo, a key, or a file
-or session that loads, the page gets `full_diff`'s summaries. Diff sessions,
-unlike entry sessions, are remembered until Buckaroo restarts.
+statistics, pages and searches over the file. The post lists the columns the
+grid hides (each column's before-value and `_eq`, `membership`, `__row_order`) as
+`skip_stat_columns` (`tallyman_companion.diff.diff_skip_stat_columns`), so
+Buckaroo runs no statistic queries for columns no view draws. With a session
+loaded the route skips `full_diff`'s queries: the code and schema diffs are file
+reads and the three counts are a group-by over the file. Without Buckaroo, a
+key, or a file or session that loads, the page gets `full_diff`'s summaries.
+Diff sessions, unlike entry sessions, are remembered until Buckaroo restarts.
 
 **Promoted diffs.** `catalog_promote_diff` and the companion's promote route
 save a diff as an entry whose generated recipe is:

@@ -139,6 +139,21 @@ def strip_live_diff_color(overrides: dict) -> dict:
     return out
 
 
+def diff_skip_stat_columns(overrides: dict) -> list[str]:
+    """The compare grid's columns that no display shows a stat of: the ones its overrides hide.
+
+    Buckaroo runs a batch aggregate and one histogram query per column. A hidden column is never drawn, and no stat
+    of it is read by anything that is: the key and equality colors read row values (``color_categorical``'s
+    ``val_column`` is a cell), the before-value tooltip reads a cell, and only the delta columns' ``min``, ``max`` and
+    histogram bins are read, by ``diff_extras/display`` and ``color_map``, and those are never hidden. A skipped
+    column keeps its name, dtype and length and gets no stat queries.
+
+    Never put a visible column here: a column with no stats loses its displayer. Reading the hidden set off the same
+    overrides the grid is configured with keeps the two from drifting. Sorted, so the posted body is stable.
+    """
+    return sorted(col for col, cfg in overrides.items() if isinstance(cfg, dict) and cfg.get("merge_rule") == "hidden")
+
+
 def _marker_names(taken: set[str]) -> tuple[str, str]:
     """Names for the two side markers that no column of either side already has."""
 

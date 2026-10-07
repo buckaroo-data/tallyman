@@ -78,17 +78,24 @@ def test_the_diff_of_two_small_tables():
         ],
         data=[
             # in both, identical
-            [1,    100,  1.5,  1.5,  0.0,     0.0,   BOTH,        BOTH + EQUAL],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [1,         100,  1.5,    1.5,       0.0,              0.0,              BOTH,        BOTH + EQUAL],
             # in both, c_float went from 2.5 to 5.0: up 2.5, which is +100%
-            [2,    200,  2.5,  5.0,  1.0,     2.5,   BOTH,        BOTH + DIFFERENT],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [2,         200,  2.5,    5.0,       1.0,              2.5,              BOTH,        BOTH + DIFFERENT],
             # in both, c_float went from 3.5 to 3.0: down 0.5, which is -1/7
-            [3,    300,  3.5,  3.0,  -1 / 7,  -0.5,  BOTH,        BOTH + DIFFERENT],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [3,         300,  3.5,    3.0,       -1 / 7,           -0.5,             BOTH,        BOTH + DIFFERENT],
             # only in before: no after value, so no delta
-            [10,   1000, 10.5, NA,   NA,      NA,    ONLY_BEFORE, ONLY_BEFORE],
-            [11,   1100, 11.5, NA,   NA,      NA,    ONLY_BEFORE, ONLY_BEFORE],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [10,        1000, 10.5,   NA,        NA,               NA,               ONLY_BEFORE, ONLY_BEFORE],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [11,        1100, 11.5,   NA,        NA,               NA,               ONLY_BEFORE, ONLY_BEFORE],
             # only in after: no before value (and no b_int), so no delta
-            [20,   NA,   NA,   20.5, NA,      NA,    ONLY_AFTER,  ONLY_AFTER],
-            [21,   NA,   NA,   21.5, NA,      NA,    ONLY_AFTER,  ONLY_AFTER],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [20,        NA,   NA,     20.5,      NA,               NA,               ONLY_AFTER,  ONLY_AFTER],
+            # a_primary b_int c_float c_float_v2 c_float_pct_delta c_float_abs_delta membership   c_float_eq
+            [21,        NA,   NA,     21.5,      NA,               NA,               ONLY_AFTER,  ONLY_AFTER],
         ],
     )
     # fmt: on

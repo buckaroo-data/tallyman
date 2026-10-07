@@ -700,9 +700,10 @@ moves.
 A **promoted diff** is just an entry whose recipe pins two hashes
 (`build_diff_expr(a_hash, b_hash)`) — name-free, deterministic, and built
 through the ordinary write path. It contains a join, so it is worthy and is
-materialized like any other. The live diff grid, which is not an entry, still
-hands Buckaroo an unmaterialized join: ADR-007 D10, which would have built
-every diff as an entry before showing it, was moved out of
+materialized like any other. The live diff grid is not an entry. Its join is
+written once to a file under `compute_cache/diff_cache/`, and Buckaroo is handed
+a build that reads that file. ADR-007 D10, which would have built every diff as
+an entry before showing it, was moved out of
 `plans/ADR-007-tallyman-owned-materialization.md` to #188.
 
 ## Handing an entry to Buckaroo
@@ -904,8 +905,8 @@ change of the rule.
   a promoted diff re-runs Buckaroo's statistics on every open (#202); the
   forced reload after an unfaithful heal runs under the project lock and opens a
   session nobody asked for (#203); a klass reload posts once per entry from the
-  companion's event loop (#201); the live diff grid is an unmaterialized join
-  (#188).
+  companion's event loop (#201); the live diff's join is a cache file and not an
+  entry (#188).
 - **One writer at a time.** The project lock blocks with no timeout (#186), and
   two companion routes build on the event loop and freeze the UI while they wait
   (#190). The lock covers builds, materializations, checkpoints and resets

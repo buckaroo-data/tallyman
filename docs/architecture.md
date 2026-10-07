@@ -774,18 +774,24 @@ left behind, survives a failed re-add.
 1. The diff page resolves the version pair (by default V_{n-1} against V_n) and
    requests `/{project}/api/diff_data/{alias}/{va}/{vb}`.
 2. The companion reads both sides through `cached_result_expr`, so both sides'
-   files exist first, and computes the code, schema, statistics, head and keyed
-   diffs (`full_diff`). Those summaries still include `__row_order` as a data
-   column (#200).
-3. For the grid it builds a compare expression: an outer join of the two
-   versions on the diff key, with `__row_order` dropped from both sides, a
-   membership column (a only, b only, both), and per-column `{col}_eq`,
-   `{col}_pct_delta` and `{col}_abs_delta` columns. The expression is memoized
-   per pair and key (an LRU of 128, cleared on a reset or recalc).
-4. The compare build is posted to Buckaroo as session `diff-<a>-<b>` (the first
-   12 characters of each hash), with statistics cached per pair under
-   `diff_stat_cache/`. The join is not materialized first, so Buckaroo runs it
-   for every query of the diff grid (#188).
+   files exist first, and finds the diff key. With Buckaroo running and a key,
+   it builds a compare expression: an outer join of the two versions on the
+   key, with `__row_order` dropped from both sides, a membership column (a
+   only, b only, both), and per-column `{col}_eq`, `{col}_pct_delta` and
+   `{col}_abs_delta` columns.
+3. It runs that join once and writes the rows to
+   `compute_cache/diff_cache/<a12>-<b12>-<id12>.parquet`, where `<id12>` names
+   the rows each side reads and the join keys, so a heal that rewrites a
+   snapshot gives another file. A second open of the pair finds the file. The
+   code and schema diffs are file reads, and the three row counts are one
+   group-by over the file.
+4. Buckaroo is handed a view build of that file, one read and no history of the
+   join, as session `diff-<a12>-<b12>-<id12>`, with statistics cached per pair
+   under `diff_stat_cache/`. Its statistics, pages, sorts and searches all run
+   over the file. Without Buckaroo, or without a key, or when the file or the
+   session fails, the page gets the code, schema, statistics, head and keyed
+   diffs from `full_diff`, which still include `__row_order` as a data column
+   (#200).
 
 `catalog_promote_diff` and the diff page's promote button turn a diff into an
 entry of its own, whose recipe calls `build_diff_expr(a_hash, b_hash, keys)`.
@@ -795,7 +801,7 @@ It contains a join, so it is worthy and materialized like any other entry.
 
 `tallyman reset-to <step>` (CLI) and `POST /{project}/api/reset` (companion)
 call `reset_to`, described under [Checkpoint and reset](#checkpoint-and-reset).
-The companion then clears its in-memory result and compare memos and the
+The companion then clears its in-memory result memo and the
 `diff_stat_cache/` directory, reloads the project's Buckaroo sessions, and
 publishes `project_reset`. The CLI posts `project_reset` to the companion's
 `/internal/notify`, which does the same clean-up. `tallyman revisions` lists the
@@ -821,7 +827,8 @@ Row order and diffs:
 - #205: the canonical sort leaves nested columns out of its tie-break.
 - #206: the snapshot writer drops any column named `__row_order_right`,
   including one the author made.
-- #188: the live diff grid hands Buckaroo an unmaterialized join.
+- #188: the live diff's join is a cache file and not an entry, so promoting a
+  diff runs the join again, twice, and does not reuse the file.
 
 Heals and Buckaroo:
 

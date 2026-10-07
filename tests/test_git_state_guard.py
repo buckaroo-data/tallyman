@@ -268,16 +268,16 @@ def test_a_companion_builds_a_diffs_compare_grid_when_a_forked_git_would_crash(
     project, orders_src, tmp_path, monkeypatch
 ):
     from tallyman_companion import create_app
-    from tallyman_companion.app import _build_compare_expr
+    from tallyman_companion.diff_snapshot import open_diff_view
+    from tallyman_xorq.result_cache import cached_result_expr
 
     a = build_and_persist(project, _agg_code(orders_src)).content_hash
     b = build_and_persist(project, _agg_code(orders_src).replace("t.price.sum()", "t.price.max()")).content_hash
     _crash_forked_git(monkeypatch, tmp_path)
     create_app(project)
-    _build_compare_expr.cache_clear()  # keyed by hashes that another test's project can share
 
-    build_path, _ = _build_compare_expr(project, a, b, ("region",))
-    assert (build_path / "expr.yaml").is_file()
+    view = open_diff_view(project, a, b, ["region"], cached_result_expr(project, a), cached_result_expr(project, b))
+    assert (view.build_dir / "expr.yaml").is_file()
 
 
 def test_a_companion_re_hashes_a_recipe_when_a_forked_git_would_crash(project, orders_src, tmp_path, monkeypatch):

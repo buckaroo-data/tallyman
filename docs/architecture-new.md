@@ -733,9 +733,17 @@ answers 504, and time spent waiting for the execution lock does not count), and
 computes the summaries (`tallyman_xorq.diff.full_diff`). For the grid,
 `tallyman_companion.diff.build_compare_expr` builds an outer join on the key,
 with `__row_order` dropped from both sides and `membership`, `_eq`, `_pct_delta`
-and `_abs_delta` columns, posted as session `diff-<a12>-<b12>`. Diff sessions,
-unlike entry sessions, are remembered until Buckaroo restarts. The join is not
-materialized, so Buckaroo runs it for every grid query.
+and `_abs_delta` columns. The route runs that join once
+(`tallyman_companion.diff_snapshot`) and writes its rows to
+`compute_cache/diff_cache/<a12>-<b12>-<id12>.parquet`, where `<id12>` names the
+rows each side reads and the join keys (`diff_snapshot.diff_identity`), so a heal
+gives another file. Buckaroo is handed a view build of that file, one read and
+no history of the join, as session `diff-<a12>-<b12>-<id12>`, and runs its
+statistics, pages and searches over the file. With a session loaded the route
+skips `full_diff`'s queries: the code and schema diffs are file reads and the
+three counts are a group-by over the file. Without Buckaroo, a key, or a file
+or session that loads, the page gets `full_diff`'s summaries. Diff sessions,
+unlike entry sessions, are remembered until Buckaroo restarts.
 
 **Promoted diffs.** `catalog_promote_diff` and the companion's promote route
 save a diff as an entry whose generated recipe is:
@@ -846,7 +854,7 @@ Recalc and row order:
 The viewer:
 
 - #172: diff sessions are keyed by the two hashes with no project, so two projects holding the same source versions can share one.
-- #188: the live diff grid hands Buckaroo an unmaterialized join, which Buckaroo runs for every query.
+- #188: the live diff's join is a cache file and not an entry, so promoting a diff runs the join again, twice, and does not reuse the file.
 - #201: a klass reload posts `/reload_expr` once per catalog entry, one after another, from the event loop.
 - #202: every grid open posts `/load_expr`, so two opens at once both load, and a promoted diff runs Buckaroo's statistics again on every open.
 - #203: an unfaithful heal runs its checks and the forced Buckaroo reload while holding the project lock, and the reload opens a session nobody has open.

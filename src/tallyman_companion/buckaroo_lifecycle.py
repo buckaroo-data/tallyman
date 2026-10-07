@@ -106,21 +106,18 @@ def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) 
     return hashlib.sha256("\0".join([*parts, *keys]).encode()).hexdigest()
 
 
-def ensure_view_build(project: str, content_hash: str) -> Path:
-    """The stable per-entry directory holding the *view build* of a worthy entry's snapshot (ADR-007 D6).
+def ensure_parquet_view_build(snap: Path, dest: Path) -> Path:
+    """The stable directory *dest* holding the *view build* of the parquet file *snap* (ADR-007 D6).
 
     A view build is a xorq build whose whole graph is one step, "read this parquet file". Buckaroo's stat-cache keys
     include the build directory's path, so the directory is stable, written once and reused. A sibling marker records
-    the snapshot path the build was made for, so a project that moved (a clone at another path) regenerates it instead
-    of pointing Buckaroo at a path that is gone. The snapshot must exist (``ensure_materialized`` has run).
+    the file path the build was made for, so a project that moved (a clone at another path) regenerates it instead of
+    pointing Buckaroo at a path that is gone. The file must exist.
     """
     from xorq.expr.api import deferred_read_parquet
     from xorq.ibis_yaml.compiler import build_expr
 
-    from tallyman_xorq.materialize import snapshot_path
-
-    dest = entry_view_build_dir(project, content_hash)
-    snap = str(snapshot_path(project, content_hash))
+    snap = str(snap)
     marker = dest.with_name(dest.name + ".complete")
 
     def _fresh() -> bool:
@@ -143,6 +140,16 @@ def ensure_view_build(project: str, content_hash: str) -> Path:
             shutil.move(str(built), str(dest))
         marker.write_text(snap)
     return dest
+
+
+def ensure_view_build(project: str, content_hash: str) -> Path:
+    """The stable per-entry directory holding the view build of a worthy entry's snapshot (ADR-007 D6).
+
+    The snapshot must exist (``ensure_materialized`` has run).
+    """
+    from tallyman_xorq.materialize import snapshot_path
+
+    return ensure_parquet_view_build(snapshot_path(project, content_hash), entry_view_build_dir(project, content_hash))
 
 
 class BuckarooUnavailable(RuntimeError):
@@ -177,9 +184,9 @@ class BuckarooManager:
         self.companion_base_url = companion_base_url.rstrip("/") if companion_base_url else None
         self.proc: subprocess.Popen | None = None
         self._client = httpx.Client(timeout=5.0)
-        # Diff-compare session_ids (``diff-<a>-<b>``) Buckaroo has loaded this
+        # Diff-compare session_ids (``diff-<a>-<b>-<identity>``) Buckaroo has loaded this
         # lifetime. Reset on a Buckaroo restart: these sessions live only in the
-        # subprocess's RAM. (The live diff still posts an unmaterialized join, ADR-007 D10, #188.)
+        # subprocess's RAM. (The live diff posts a view build of the file its join was written to, ``diff_snapshot``.)
         self._loaded_diff_sessions: set[str] = set()
         self._buckaroo_started_at: float | None = None
         # Tmp dirs we created by expanding ${TALLYMAN_PROJECT_ROOT} placeholders

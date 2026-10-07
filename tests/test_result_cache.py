@@ -945,8 +945,7 @@ def test_reset_to_clears_result_plan_memo(project, orders_src, monkeypatch):
     """reset_to changes which entries exist (it retires and restores entry dirs, and leaves compute_cache alone,
     ADR-007 D14), so it must also invalidate the in-process ``_resolve_result_plan`` memo, which holds loaded builds
     (#80 / #96). A reactive reset layer needs this cache invalidated alongside the entry sweep, not left to
-    ``cached_result_expr``'s per-call ``ensure_materialized``: ``_build_compare_expr`` bakes a snapshot path with no
-    per-call existence re-check, so a stale plan compounds downstream.
+    ``cached_result_expr``'s per-call ``ensure_materialized``.
 
     A worthy entry whose snapshot exists is served without loading its build, so the memo is warmed through a cheap
     entry, whose plan is loaded on its first read.
@@ -964,87 +963,6 @@ def test_reset_to_clears_result_plan_memo(project, orders_src, monkeypatch):
 
     cs.reset_to(project, step)
     assert cached_result_expr.cache_info().currsize == 0
-
-
-def test_reset_endpoint_clears_compare_expr_memo(fresh_companion_app, project, orders_src, monkeypatch):
-    """The diff compare-expr LRU (``_build_compare_expr``) caches a serialized
-    build that bakes in each entry's snapshot path and — unlike
-    ``cached_result_expr`` — never re-checks ``path.exists()`` on a hit. A reset
-    changes which entries exist, and a cached compare build over entries it retired is stale,
-    so ``/api/reset`` must clear it alongside the result-plan
-    memo (#80).
-    """
-    from fastapi.testclient import TestClient
-
-    from tallyman_companion.app import _build_compare_expr
-    from tallyman_core import catalog_state as cs
-    from tallyman_core.aliases import history_for
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("shoe_sales", _agg_code(project))
-    step = cs.current_step(project)
-    catalog_revise("shoe_sales", _agg_avg_code(project))
-    a_h, b_h = history_for(project, "shoe_sales")
-
-    _build_compare_expr(project, a_h, b_h, ("region",))  # warm the compare memo
-    assert _build_compare_expr.cache_info().currsize == 1
-
-    c = TestClient(fresh_companion_app)
-    r = c.post(f"/{project}/api/reset", json={"ref": step})
-    assert r.status_code == 200, r.text
-    assert _build_compare_expr.cache_info().currsize == 0
-
-
-def test_notify_project_reset_evicts_the_compare_build(fresh_companion_app, project, orders_src, monkeypatch):
-    """The cross-process ``project_reset`` notify evicts the companion's compare build.
-
-    ``reset-to`` is normally run out of process (the ``tallyman reset-to`` CLI):
-    the CLI runs ``reset_to`` in its own short-lived process, then signals the
-    long-lived companion via ``POST /internal/notify {kind: project_reset}``.
-    ``_build_compare_expr`` froze each entry's snapshot path into a serialized build
-    with no per-call ``exists()`` recheck, and ``reset_to`` itself clears only
-    ``cached_result_expr``, never this companion-layer LRU — so without the
-    notify-path clear the compare build of entries the reset retired stays warm and the next diff view
-    serves it to buckaroo (#80/#96).
-
-    The dangling-read half of that regression is gone: a reset no longer deletes snapshots (ADR-007 D14), so the
-    stale build still executes over the files that exist. That is why this is hygiene rather than the
-    correctness gate it was, and why it pins the memo, not an error.
-
-    The flow mirrors production: ``cs.reset_to`` stands in for the CLI process's
-    reset (it does NOT reach the companion LRU), then the ``/internal/notify``
-    POST is the signal that must clear it.
-    """
-    from fastapi.testclient import TestClient
-    from xorq.ibis_yaml.compiler import load_expr
-
-    from tallyman_companion.app import _build_compare_expr
-    from tallyman_core import catalog_state as cs
-    from tallyman_core.aliases import history_for
-    from tallyman_xorq.result_cache import baked_snapshot_path
-
-    monkeypatch.setenv("TALLYMAN_PROJECT", project)
-    catalog_create("shoe_sales", _agg_code(project))
-    step = cs.current_step(project)  # only v1 exists at this step
-    catalog_revise("shoe_sales", _agg_avg_code(project))
-    a_h, b_h = history_for(project, "shoe_sales")
-
-    build_path, _ = _build_compare_expr(project, a_h, b_h, ("region",))  # warm + freeze b_h's path
-    snap_b = baked_snapshot_path(project, b_h)
-    assert snap_b is not None and snap_b.exists()
-
-    # Out-of-process CLI work: reset_to retires v2's entry but does not reach the companion's _build_compare_expr LRU,
-    # so the stale build stays. It still reads files that exist: the reset left compute_cache alone.
-    cs.reset_to(project, step)
-    assert snap_b.exists()
-    assert _build_compare_expr.cache_info().currsize == 1  # stale build survives reset_to
-    assert len(load_expr(str(build_path)).execute()) > 0
-
-    # The notify signal clears it, so the next /api/diff_data builds afresh.
-    c = TestClient(fresh_companion_app)
-    r = c.post("/internal/notify", json={"kind": "project_reset", "project": project})
-    assert r.status_code == 200, r.text
-    assert _build_compare_expr.cache_info().currsize == 0
 
 
 def test_notify_project_reset_clears_result_plan_memo(fresh_companion_app, project, orders_src, monkeypatch):

@@ -441,8 +441,8 @@ back together (#195).
 
 ### In-memory caches in the companion
 
-The first two are bounded LRUs over immutable keys, so eviction means a cheap
-rebuild and staleness is impossible; the third is a short TTL:
+The first is a pair of bounded LRUs over immutable keys, so eviction means a cheap
+rebuild and staleness is impossible; the second is a short TTL:
 
 - `cached_result_expr` — two memos. `_resolve_result_plan` is
   `lru_cache(256)` keyed `(project, content_hash)`: it holds a loaded build,
@@ -454,9 +454,6 @@ rebuild and staleness is impossible; the third is a short TTL:
   one input that stays mutable. The plan memo also keeps the build as it was
   loaded, which nothing reads again, so up to 256 unused DataFusion backends
   stay in memory (#210). The MCP server has the same two memos.
-- `_build_compare_expr` — `lru_cache(128)` keyed
-  `(project, a_hash, b_hash, keys)`; saves rebuilding diff outer-join
-  expressions. Build dirs land under `$TMPDIR/tallyman_diff_builds/`.
 - Disk-usage payload — per-project, 3-second TTL
   (`_DISK_USAGE_TTL` in `src/tallyman_companion/app.py`). The only
   time-based cache in tallyman; it coalesces filesystem walks during SSE
@@ -532,10 +529,19 @@ it is never stale. There is no session file.
   `{a_hash[:12]}-{b_hash[:12]}/`, the same idea for a comparison session,
   keyed by the entry pair. Re-opening the same diff reuses the per-column
   stats instead of recomputing over the full join. A reset or a recalc that
-  moved an alias deletes the whole directory. The live diff still posts an
-  unmaterialized join to Buckaroo (ADR-007 D10, which would have built every
-  diff as an entry first, was moved to #188). Its session ids,
-  `diff-<a[:12]>-<b[:12]>`, are remembered in the companion's memory and
+  moved an alias deletes the whole directory. The stats are computed over the
+  diff's file (next item), so the first open of a pair pays for them once.
+- **Diff file**: `compute_cache/diff_cache/<a12>-<b12>-<id12>.parquet`, the
+  join of one diff, written once by `write_expr_snapshot` (an atomic replace of a
+  complete file) and read by Buckaroo through a view build beside it,
+  `<stem>.view_build/`. `<id12>` is a digest of the rows each side reads (a
+  worthy entry's snapshot digest, or for a cheap entry its parents' digests and
+  its own hash) and the join keys, so an unfaithful heal or another key makes
+  another file, and no file is stale. Cache like the rest of `compute_cache/`: a
+  reset leaves it alone, anything may delete it, and the next open writes it
+  again. Nothing collects old ones. ADR-007 D10, which would have built every
+  diff as an entry first, was moved to #188. The session ids,
+  `diff-<a[:12]>-<b[:12]>-<id12>`, are remembered in the companion's memory and
   forgotten when the companion starts a Buckaroo whose `/health` reports a new
   `started` timestamp.
 

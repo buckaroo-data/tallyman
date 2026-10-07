@@ -1269,6 +1269,7 @@ def create_app(
                                 "column_config_overrides": overrides,
                                 "cache_storage_path": str(stat_cache),
                                 "data_id": diff_data_id(project, a_hash, b_hash, tuple(keys)),
+                                "stats_delivery": "deferred",
                                 "extra_grid_config": {"searchDebounceMs": 3000},
                                 "project_root": str(_diff_extras),
                             },

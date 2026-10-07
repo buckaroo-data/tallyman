@@ -67,9 +67,24 @@ _view_locks_guard = threading.Lock()
 _view_locks: dict[str, threading.Lock] = {}
 
 
-def _data_id(manifest) -> str:
-    """What Buckaroo keys an entry's stat cache by: the digest of the rows its grid reads."""
-    return manifest.unfaithful_heal_digest or manifest.result_digest or manifest.content_hash
+def _data_id(project: str, manifest) -> str:
+    """What Buckaroo keys an entry's stat cache by: the identity of the rows its grid reads.
+
+    A worthy entry's rows are its snapshot's, so the id is the digest of the file: the one the last unfaithful heal
+    wrote, else the one recorded at create. A cheap entry has no snapshot of its own. Its rows are its parents' rows
+    through its recipe, so the id is its parents' ids and its own content hash (``<parent id>-<content hash>``), and a
+    heal of a parent that rewrites the snapshot the child reads changes the child's id too. An entry with neither
+    sends its content hash.
+    """
+    own = manifest.unfaithful_heal_digest or manifest.result_digest
+    if own:
+        return own
+    if not manifest.parents:
+        return manifest.content_hash
+    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+    parent_ids = [_data_id(project, entry_manifest(project, p.hash)) for p in manifest.parents]
+    return "-".join([*parent_ids, manifest.content_hash])
 
 
 def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> str:
@@ -80,7 +95,7 @@ def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) 
     """
     from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-    parts = [_data_id(entry_manifest(project, h)) for h in (a_hash, b_hash)]
+    parts = [_data_id(project, entry_manifest(project, h)) for h in (a_hash, b_hash)]
     return hashlib.sha256("\0".join([*parts, *keys]).encode()).hexdigest()
 
 
@@ -498,10 +513,13 @@ class BuckarooManager:
             # recomputation on next /load_expr.
             "cache_storage_path": str(stat_cache),
             # The identity of the rows the grid reads, which keys Buckaroo's stat cache (buckaroo ADR-001 D2). The
-            # content hash names the recipe, and an unfaithful heal writes different rows under it, so a snapshot
-            # sends its digest: the one the last unfaithful heal wrote, else the one recorded at create. A cheap
-            # entry has no snapshot and sends its content hash. Older buckaroo ignores the field.
-            "data_id": _data_id(manifest),
+            # content hash names the recipe, and an unfaithful heal writes different rows under it, so see _data_id.
+            # Older buckaroo ignores the field.
+            "data_id": _data_id(project, manifest),
+            # Rows first, then the stats as a ``stats_update`` push (buckaroo ADR-002 D2). The grid's client,
+            # buckaroo-js-core 0.15.10+, merges it; a client that did not would get complete stats before its first
+            # message, as today. Older buckaroo ignores the field.
+            "stats_delivery": "deferred",
             # ADR-008 D8: the column with no ties that pages sort by (buckaroo-data/buckaroo#974). A page is
             # ORDER BY __row_order, or the user's keys and then __row_order, so the same request returns the same rows.
             # Buckaroo builds that predate the hint ignore it.

@@ -221,8 +221,9 @@ def test_unit_reload_project_sessions_skips_sessions_buckaroo_does_not_hold(
     project: str, orders_src: str, monkeypatch
 ):
     """A 404 (never opened, or idle-evicted) or a 400 (no longer an xorq session) from /reload_expr means "not open"
-    (ADR-007 D6): skipped and not counted, and the entry's stat cache is left alone. Only a grid that reloaded has its
-    stat cache cleared, so its next request recomputes the stats with the new klass."""
+    (ADR-007 D6): skipped and not counted. No entry's stat cache is cleared, the reloaded grid's included: Buckaroo
+    keys each cached stat by a hash of its code, so a new or edited klass misses on its own cells and the rest still
+    hit (buckaroo ADR-001, closes #177)."""
     from tallyman_core import get_alias
 
     live = build_and_persist(project, _code(project)).content_hash
@@ -252,9 +253,182 @@ def test_unit_reload_project_sessions_skips_sessions_buckaroo_does_not_hold(
     monkeypatch.setattr(mgr._client, "post", lambda url, **kw: _Response(status_for[url.rsplit("/", 1)[1]]))
 
     assert mgr.reload_project_sessions(project) == 1  # only the live grid reloaded
-    assert not (entry_stat_cache_dir(project, live) / "parquet").exists()  # its stale stats are gone
+    assert (entry_stat_cache_dir(project, live) / "parquet" / "stats.parquet").exists()
     assert (entry_stat_cache_dir(project, unopened) / "parquet" / "stats.parquet").exists()
     assert (entry_stat_cache_dir(project, not_xorq) / "parquet" / "stats.parquet").exists()
+
+
+def test_unit_load_body_sends_the_snapshot_digest_as_data_id(project: str, orders_src: str):
+    """Buckaroo keys its summary-stat cache by ``data_id``, the identity of the rows the grid reads (buckaroo ADR-001
+    D2). A worthy entry sends its snapshot's ``result_digest``; after an unfaithful heal, the digest that heal wrote,
+    since the snapshot now holds different rows under the same content hash. A cheap entry has no snapshot and sends
+    its content hash."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import entry_manifest
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    for h in (worthy, cheap):
+        ensure_materialized(project, h)
+    mgr = _running_manager()
+
+    digest = entry_manifest(project, worthy).result_digest
+    assert digest
+    assert mgr._load_body(project, worthy, None)["data_id"] == digest
+    path = entry_dir(project, worthy)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
+    assert mgr._load_body(project, worthy, None)["data_id"] == "arrow-sha256:healed"
+    parent = entry_manifest(project, cheap).parents[0].hash
+    assert mgr._load_body(project, cheap, None)["data_id"] == f"{entry_manifest(project, parent).result_digest}-{cheap}"
+
+
+def test_unit_data_id_of_a_cheap_entry_follows_its_parents_rows(project: str, orders_src: str):
+    """A cheap entry has no snapshot: its rows are its parent's rows through its recipe. Its id is the parent's id and
+    its own content hash, so an unfaithful heal of the parent, which rewrites the snapshot the child reads, changes the
+    child's id too. The child's own content hash does not move, and Buckaroo would keep serving stats for old rows."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.result_cache import entry_manifest
+
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    parent = entry_manifest(project, cheap).parents[0].hash
+    mgr = _running_manager()
+    before = mgr._load_body(project, cheap, None)["data_id"]
+
+    path = entry_dir(project, parent)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
+    after = mgr._load_body(project, cheap, None)["data_id"]
+    assert after == f"arrow-sha256:healed-{cheap}"
+    assert after != before
+
+
+def test_unit_load_body_asks_for_deferred_stats(project: str, orders_src: str):
+    """The grid's client merges ``stats_update`` (buckaroo-js-core 0.15.10), so Buckaroo sends rows first and pushes the
+    stats once they are sent (buckaroo ADR-002 D2). Both kinds of entry ask for it."""
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    cheap = build_and_persist(project, _cheap_code(project)).content_hash
+    for h in (worthy, cheap):
+        ensure_materialized(project, h)
+    mgr = _running_manager()
+    assert mgr._load_body(project, worthy, None)["stats_delivery"] == "deferred"
+    assert mgr._load_body(project, cheap, None)["stats_delivery"] == "deferred"
+
+
+def test_unit_data_id_ignores_an_empty_heal_digest(project: str, orders_src: str):
+    """An empty ``unfaithful_heal_digest`` is no pin: the id falls back to the digest recorded at create."""
+    from tallyman_core import read_manifest, write_manifest
+    from tallyman_xorq.materialize import ensure_materialized
+    from tallyman_xorq.result_cache import entry_manifest
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    path = entry_dir(project, worthy)
+    write_manifest(path, read_manifest(path).model_copy(update={"unfaithful_heal_digest": ""}))
+
+    digest = entry_manifest(project, worthy).result_digest
+    assert digest
+    assert _running_manager()._load_body(project, worthy, None)["data_id"] == digest
+
+
+def _counted_manifests(monkeypatch, manifests: dict) -> dict[str, int]:
+    """Serve *manifests* from ``entry_manifest`` and count the reads of each hash."""
+    import tallyman_xorq.result_cache as result_cache
+
+    reads: dict[str, int] = {}
+
+    def entry_manifest(project: str, content_hash: str):
+        reads[content_hash] = reads.get(content_hash, 0) + 1
+        return manifests[content_hash]
+
+    monkeypatch.setattr(result_cache, "entry_manifest", entry_manifest)
+    return reads
+
+
+def _manifest(content_hash: str, *parents: str, digest: str | None = None):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        content_hash=content_hash,
+        result_digest=digest,
+        unfaithful_heal_digest=None,
+        parents=[SimpleNamespace(hash=p) for p in parents] or None,
+    )
+
+
+def test_unit_data_id_reads_each_ancestor_manifest_once(monkeypatch):
+    """A cheap entry over two cheap parents that share a worthy grandparent (a diamond) reads the grandparent's
+    manifest once, not once per path to it."""
+    from tallyman_companion.buckaroo_lifecycle import _data_id
+
+    manifests = {
+        "a": _manifest("a", digest="arrow-sha256:a"),
+        "b": _manifest("b", "a"),
+        "c": _manifest("c", "a"),
+    }
+    reads = _counted_manifests(monkeypatch, manifests)
+
+    assert _data_id("p", _manifest("d", "b", "c")) == "arrow-sha256:a-b-arrow-sha256:a-c-d"
+    assert reads == {"a": 1, "b": 1, "c": 1}
+
+
+def test_unit_diff_data_id_reads_a_shared_parent_once(monkeypatch):
+    """Both sides of a diff over the same parent read that parent's manifest once."""
+    from tallyman_companion.buckaroo_lifecycle import diff_data_id
+
+    manifests = {
+        "a": _manifest("a", digest="arrow-sha256:a"),
+        "b": _manifest("b", "a"),
+        "c": _manifest("c", "a"),
+    }
+    reads = _counted_manifests(monkeypatch, manifests)
+
+    diff_data_id("p", "b", "c", ("region",))
+    assert reads == {"a": 1, "b": 1, "c": 1}
+
+
+def test_unit_force_reload_reads_the_entry_manifest_once(project: str, orders_src: str, monkeypatch):
+    """A forced reload builds the body and the timeout from one read of the entry's manifest."""
+    import tallyman_xorq.result_cache as result_cache
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    mgr = _running_manager()
+    mgr._client = type(
+        "Client",
+        (),
+        {"post": staticmethod(lambda *a, **kw: httpx.Response(200, request=httpx.Request("POST", "http://x")))},
+    )()
+
+    real = result_cache.entry_manifest
+    reads: list[str] = []
+
+    def entry_manifest(project: str, content_hash: str):
+        reads.append(content_hash)
+        return real(project, content_hash)
+
+    monkeypatch.setattr(result_cache, "entry_manifest", entry_manifest)
+    assert mgr.force_reload_session(project, worthy) is True
+    assert reads.count(worthy) == 1
+
+
+def test_unit_force_reload_skips_an_entry_with_no_manifest(project: str, orders_src: str):
+    """A forced reload builds its body from the entry's manifest. With none to read, it returns False, as it does for
+    any grid it could not refresh, and posts nothing to Buckaroo."""
+    from tallyman_core.manifest import ENTRY_MANIFEST_FILENAME
+    from tallyman_xorq.materialize import ensure_materialized
+
+    worthy = build_and_persist(project, _code(project)).content_hash
+    ensure_materialized(project, worthy)
+    (entry_dir(project, worthy) / ENTRY_MANIFEST_FILENAME).unlink()
+    mgr = _running_manager()
+    posted: list = []
+    mgr._client = type("Client", (), {"post": staticmethod(lambda *a, **kw: posted.append((a, kw)))})()
+
+    assert mgr.force_reload_session(project, worthy) is False
+    assert posted == []
 
 
 def test_unit_status_shape(project: str):

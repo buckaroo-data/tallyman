@@ -18,7 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+from tallyman_companion.buckaroo_lifecycle import BuckarooManager, diff_data_id
 from tallyman_companion.diff import build_compare_expr, strip_live_diff_color
 from tallyman_core import (
     ENTRY_BUILD_DIRNAME,
@@ -1268,6 +1268,8 @@ def create_app(
                                 "no_browser": True,
                                 "column_config_overrides": overrides,
                                 "cache_storage_path": str(stat_cache),
+                                "data_id": diff_data_id(project, a_hash, b_hash, tuple(keys)),
+                                "stats_delivery": "deferred",
                                 "extra_grid_config": {"searchDebounceMs": 3000},
                                 "project_root": str(_diff_extras),
                             },

@@ -427,10 +427,12 @@ def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
         at build differs from today's), the recipe's graph moving (#88), or a fixed graph that runs differently (#83);
       * the pin: ``manifest.unfaithful_heal_digest`` records the digest the heal wrote. The entry's bytes are not
         regenerable, so the Cache page's delete leaves its file alone. It is a fact of the entry, kept in the manifest
-        so it moves with the entry through a reset and outlasts the error banner's dismiss (#196);
+        so it moves with the entry through a reset and outlasts the error banner's dismiss (#196). A pin that cannot be
+        written fails the read with the write's error: without it nothing downstream can tell the rows changed;
       * a durable ``errors.jsonl`` record (``code="unfaithful_heal"``) — the UI badge's source;
-      * the entry's ``.buckaroo_stat_cache`` is wiped (ADR-006 D10): Buckaroo's summary stats key on expression
-        structure and stable paths (buckaroo#955), so stale stats would render beside the fresh rows;
+      * the entry's ``.buckaroo_stat_cache`` is wiped (ADR-006 D10). The pin changes the ``data_id`` the companion
+        sends for the entry and its cheap descendants, which keys Buckaroo's cached stats (buckaroo ADR-001), so the
+        old cells are never read again; the wipe removes the entry's scope that nothing will read;
       * registered hooks fire (companion: a forced reload of the open grid, and the SSE event).
     """
     recorded = _recorded_result_digest(project, content_hash)
@@ -455,10 +457,7 @@ def _verify_self_heal(project: str, content_hash: str, actual: str) -> None:
         actual,
         recorded,
     )
-    try:
-        _record_unfaithful_heal(project, content_hash, actual)
-    except Exception:
-        perf_log.warning("recording the unfaithful-heal pin in %s's manifest failed", content_hash, exc_info=True)
+    _record_unfaithful_heal(project, content_hash, actual)
     import shutil
 
     from tallyman_core.paths import entry_stat_cache_dir

@@ -206,7 +206,7 @@ directories from it. `entries.jsonl` records which dirs should exist so
 What is **not** written yet — these are lazy, and that is the whole point of
 the timeline:
 
-- **`<entry>/.buckaroo_stat_cache/parquet/`** — Buckaroo's summary stats.
+- **`<entry>/.buckaroo_stat_cache/parquet/v1/`** — Buckaroo's summary stats.
   Populated on the first `/load_expr`, by Buckaroo, at view time (§5).
 - **`<entry>/.xorq_view_build/`** — for a worthy entry, the build Buckaroo is
   handed (§5). Written on the first view.
@@ -289,7 +289,9 @@ precise message and a retry.
    `mkdir(exist_ok=True)` — preserves an existing cache, never wipes it.
 5. **POST `/load_expr`** with `session=entry-<project>-<content_hash>`,
    `build_dir` (from step 3), `project_root=<catalog_dir>`,
-   `cache_storage_path=<stat_cache>`, and `row_order_column="__row_order"`.
+   `cache_storage_path=<stat_cache>`, `data_id`, `stats_delivery="deferred"`
+   (rows first, then the stats pushed after them) and
+   `row_order_column="__row_order"`.
    Buckaroo looks for the project's klasses (its summary stats,
    post-processing functions and display classes) in `stats/`,
    `post_processing/` and `display/` under `project_root`, which is
@@ -301,7 +303,7 @@ precise message and a retry.
    hash, so tallyman keeps no session map and no session file.
 
 Because the stat cache is empty for a new entry, Buckaroo computes summary
-stats from scratch and **writes `<entry>/.buckaroo_stat_cache/parquet/`**;
+stats from scratch and **writes `<entry>/.buckaroo_stat_cache/parquet/v1/`**;
 this is the cold population. Buckaroo logs one line per run for it
 (`xorq stat cache […]: N hit(s), M miss(es), K snapshot(s) written …`) to its
 own `~/.buckaroo/logs/server.log`, and posts its per-load timings to the
@@ -397,24 +399,25 @@ the next visit:
    session, creates it.
 2. The **stable expanded build** (cheap entry) or **view build** (worthy entry)
    is already present with its marker → reused, no re-expansion.
-3. Buckaroo is handed the same `cache_storage_path`, finds
-   `.buckaroo_stat_cache/parquet/` populated, and the `ParquetSnapshotCache`
-   **hits** — summary stats are read from disk, not recomputed. (Warm signal:
-   `hits>0, misses=0` in `server.log`; `firstpull.summary_stats secs=Y` with
-   `Y ≪` the cold time.)
+3. Buckaroo is handed the same `cache_storage_path` and the same `data_id`,
+   finds the parts under `.buckaroo_stat_cache/parquet/v1/<scope_id>/`, and
+   reads every cell it needs from them, so nothing is recomputed. (Warm signal:
+   `cache_status=hit` and `cache_misses=0` on the `firstpull.summary_stats`
+   span, which now count cells, not queries.)
 
-The cache is meant to survive the restart because (a) nothing in the restart
-path deletes it, and (b) Buckaroo is handed the same build over the same files,
-so it computes the same stat-cache keys. In practice a first load after a
-restart has not been seen to hit it (#157).
-
-The only things that *invalidate* the stat cache are a klass-changing event (a
-summary-stat, post-processing or display change), a project reset, a recalc
-that moved an alias, and an unfaithful heal. All but the last route through
-`reload_project_sessions`, which POSTs `/reload_expr/<id>` for every entry of the
-project, one after another (a 404 or 400 means the grid is not open; #201), and
-clears the stat cache of each grid it reloaded (`_clear_stat_cache`). A plain
-restart is not such an event.
+Buckaroo keys each cached cell by the data's identity (`data_id`, which
+tallyman sends: the digest of the rows the grid reads) and by a hash of the
+stat's code, so the cache survives a restart and a klass change without
+tallyman deleting anything. A new or edited klass misses only its own cells
+and Buckaroo writes one more part for them (#177). The things that *invalidate*
+the stat cache are a change of `data_id` and a reset, which retires the entry
+directories. The only change of `data_id` within an entry is an unfaithful
+heal, which writes `unfaithful_heal_digest`; tallyman also wipes the entry's
+cache then, since nothing will read the old scope again. A klass change,
+a recalc that moved an alias, and a plain restart are not such events.
+`reload_project_sessions` still POSTs `/reload_expr/<id>` for every entry of
+the project, one after another (a 404 or 400 means the grid is not open; #201),
+so open grids pick up the new klass.
 
 Similarly, the snapshot of a worthy entry survives the restart untouched — it is
 named by the entry's content hash under `compute_cache/` — so

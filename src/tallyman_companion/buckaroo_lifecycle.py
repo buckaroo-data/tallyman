@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import atexit
 import contextlib
+import hashlib
 import json
 import logging
 import shutil
@@ -64,6 +65,45 @@ log = logging.getLogger("tallyman.buckaroo")
 # One view build is written per entry directory at a time (a per-path lock, like ``ensure_expanded_build``'s).
 _view_locks_guard = threading.Lock()
 _view_locks: dict[str, threading.Lock] = {}
+
+
+def _data_id(project: str, manifest, memo: dict[str, str] | None = None) -> str:
+    """What Buckaroo keys an entry's stat cache by: the identity of the rows its grid reads.
+
+    A worthy entry's rows are its snapshot's, so the id is the digest of the file: the one the last unfaithful heal
+    wrote, else the one recorded at create. A cheap entry has no snapshot of its own. Its rows are its parents' rows
+    through its recipe, so the id is its parents' ids and its own content hash (``<parent id>-<content hash>``), and a
+    heal of a parent that rewrites the snapshot the child reads changes the child's id too. An entry with neither
+    sends its content hash.
+
+    *memo* maps the hashes already resolved in this call to their ids, so an ancestor reached by several paths has its
+    manifest read once.
+    """
+    own = manifest.unfaithful_heal_digest or manifest.result_digest
+    if own:
+        return own
+    if not manifest.parents:
+        return manifest.content_hash
+    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+    memo = {} if memo is None else memo
+    for p in manifest.parents:
+        if p.hash not in memo:
+            memo[p.hash] = _data_id(project, entry_manifest(project, p.hash), memo)
+    return "-".join([*(memo[p.hash] for p in manifest.parents), manifest.content_hash])
+
+
+def diff_data_id(project: str, a_hash: str, b_hash: str, keys: tuple[str, ...]) -> str:
+    """What Buckaroo keys a compare view's stat cache by: the digests of both sides' rows, and the join keys.
+
+    Without one Buckaroo hashes the compare expression, which names each side's snapshot by path, so a heal that
+    rewrites a snapshot in place keeps serving the old cells (buckaroo ADR-001 D2).
+    """
+    from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
+    memo: dict[str, str] = {}
+    parts = [_data_id(project, entry_manifest(project, h), memo) for h in (a_hash, b_hash)]
+    return hashlib.sha256("\0".join([*parts, *keys]).encode()).hexdigest()
 
 
 def ensure_view_build(project: str, content_hash: str) -> Path:
@@ -339,9 +379,8 @@ class BuckarooManager:
         as "not open" (ADR-007 D6). That is one request per entry per klass change. The session stays alive and its
         klasses are updated in place — no page-load round-trip to /load_expr is needed.
 
-        After a successful reload the on-disk stat cache for that entry is cleared so the next widget request
-        recomputes all stats (including any newly added ones) from scratch. Without this, a stat added after the
-        session was first loaded would be absent from the cache and silently omitted from the display.
+        The entry's stat cache is kept. Buckaroo keys each cached stat by a hash of its code (buckaroo ADR-001), so a
+        new or edited klass misses on its own cells and recomputes only those (#177).
 
         Returns the number of sessions reloaded. Falls back to 0 (with a warning) if buckaroo isn't running or a
         reload call fails.
@@ -359,7 +398,6 @@ class BuckarooManager:
                 if resp.status_code in (404, 400):
                     continue  # Buckaroo does not hold this session (never opened, or idle-evicted)
                 resp.raise_for_status()
-                self._clear_stat_cache(project, content_hash)
                 reloaded += 1
                 log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
             except httpx.HTTPError as exc:
@@ -375,35 +413,23 @@ class BuckarooManager:
         """
         if not self.is_running or self.bound_port is None:
             return False
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+
         try:
-            body = self._load_body(project, content_hash, None)
+            manifest = entry_manifest(project, content_hash)
+            body = self._load_body(project, content_hash, None, manifest)
         except Exception as exc:
             log.warning("could not build a forced reload for %s: %s", content_hash, exc)
             return False
         body["force_reload"] = True
         try:
-            timeout = self._load_timeout(project, content_hash)
-            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=timeout)
+            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=self._load_timeout(manifest))
             resp.raise_for_status()
         except httpx.HTTPError as exc:
             log.warning("buckaroo forced reload failed for %s: %s", content_hash, exc)
             return False
         log.info("forced a reload of the grid for %s (unfaithful heal)", content_hash)
         return True
-
-    def _clear_stat_cache(self, project: str, content_hash: str) -> None:
-        """Delete cached stat parquet files for one entry.
-
-        The parquet files in ``.buckaroo_stat_cache/parquet/`` are written
-        by xorq's ParquetSnapshotCache.  After a klass reload the cache is
-        stale (it was built before the new stat existed) so we delete it
-        here.  The cache directory itself is left intact; buckaroo repopulates
-        it on the next widget request.
-        """
-        cache_dir = entry_stat_cache_dir(project, content_hash) / "parquet"
-        if cache_dir.is_dir():
-            shutil.rmtree(cache_dir, ignore_errors=True)
-            log.info("cleared stat cache for %s/%s", project, content_hash)
 
     # ------------------------------------------------------------------
     # session creation
@@ -454,23 +480,24 @@ class BuckarooManager:
         """
         return self.load_session(content_hash, project, column_config_overrides)["session_id"]
 
-    def _load_timeout(self, project: str, content_hash: str) -> float:
-        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
+    @staticmethod
+    def _load_timeout(manifest) -> float:
+        return 10.0 + (manifest.row_count or 0) / 1_000_000
 
-        row_count = entry_manifest(project, content_hash).row_count or 0
-        return 10.0 + row_count / 1_000_000
-
-    def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None) -> dict:
+    def _load_body(self, project: str, content_hash: str, column_config_overrides: dict | None, manifest=None) -> dict:
         """The ``/load_expr`` body for an entry whose files all exist.
 
         A worthy entry is handed a view build of its snapshot, so Buckaroo never executes an aggregate, join or sort on
         tallyman's behalf and never writes a snapshot (ADR-007 D6). A cheap entry is handed its own expanded build, a
-        stored definition over files that exist, which tallyman already executed in full when it was created.
+        stored definition over files that exist, which tallyman already executed in full when it was created. A caller
+        that also needs the entry's manifest (for :meth:`_load_timeout`) passes the one it read.
         """
         from tallyman_xorq.portable import ensure_expanded_build  # noqa: PLC0415
-        from tallyman_xorq.result_cache import cache_worthy  # noqa: PLC0415
+        from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-        if cache_worthy(project, content_hash):
+        if manifest is None:
+            manifest = entry_manifest(project, content_hash)
+        if manifest.cache_worthy:
             build_dir = ensure_view_build(project, content_hash)
         else:
             # Expand ${TALLYMAN_PROJECT_ROOT} to absolute paths into a stable per-entry dir (not a random tmp dir) so
@@ -494,6 +521,14 @@ class BuckarooManager:
             # Buckaroo 0.14.9+: persist computed summary stats to disk so they survive a Buckaroo restart without full
             # recomputation on next /load_expr.
             "cache_storage_path": str(stat_cache),
+            # The identity of the rows the grid reads, which keys Buckaroo's stat cache (buckaroo ADR-001 D2). The
+            # content hash names the recipe, and an unfaithful heal writes different rows under it, so see _data_id.
+            # Older buckaroo ignores the field.
+            "data_id": _data_id(project, manifest),
+            # Rows first, then the stats as a ``stats_update`` push (buckaroo ADR-002 D2). The grid's client,
+            # buckaroo-js-core 0.15.10+, merges it; a client that did not would get complete stats before its first
+            # message, as today. Older buckaroo ignores the field.
+            "stats_delivery": "deferred",
             # ADR-008 D8: the column with no ties that pages sort by (buckaroo-data/buckaroo#974). A page is
             # ORDER BY __row_order, or the user's keys and then __row_order, so the same request returns the same rows.
             # Buckaroo builds that predate the hint ignore it.
@@ -554,9 +589,11 @@ class BuckarooManager:
             }
         try:
             from tallyman_xorq.materialize import ensure_materialized  # noqa: PLC0415
+            from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
             ensure_materialized(project, content_hash)
-            payload = self._load_body(project, content_hash, column_config_overrides)
+            manifest = entry_manifest(project, content_hash)
+            payload = self._load_body(project, content_hash, column_config_overrides, manifest)
         except Exception as exc:
             log.warning("could not prepare %s for Buckaroo: %s", content_hash, exc)
             return {
@@ -564,7 +601,7 @@ class BuckarooManager:
                 "session_id": None,
                 "detail": f"Tallyman could not prepare this entry: {type(exc).__name__}: {exc}",
             }
-        _load_timeout = self._load_timeout(project, content_hash)
+        _load_timeout = self._load_timeout(manifest)
         _t_post = time.perf_counter()
         try:
             resp = self._client.post(f"{self.base_url}/load_expr", json=payload, timeout=_load_timeout)

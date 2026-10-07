@@ -297,6 +297,62 @@ def test_diff_route_default(fresh_companion_app, project: str, orders_src: str, 
     assert "head" in body["diff"]
 
 
+def _diff_load_bodies(app_factory, project: str, alias: str) -> list[dict]:
+    """The bodies the diff route POSTs to Buckaroo's ``/load_expr`` for one view of ``alias`` V1 to V2."""
+    from tallyman_companion.buckaroo_lifecycle import BuckarooManager
+
+    posted: list[dict] = []
+
+    class _Resp:
+        status_code = 200
+
+    class _Client:
+        def post(self, url, json=None, timeout=None):
+            posted.append(json)
+            return _Resp()
+
+    mgr = BuckarooManager()
+    mgr.bound_port = 65000
+    mgr.proc = type("FakeProc", (), {"poll": staticmethod(lambda: None)})()
+    mgr._client = _Client()
+    r = TestClient(app_factory(project, buckaroo=mgr)).get(f"/{project}/api/diff_data/{alias}/1/2")
+    assert r.status_code == 200
+    assert r.json()["compare_session"], "the compare view must have loaded"
+    return posted
+
+
+def test_diff_route_sends_data_id_from_both_snapshot_digests(project: str, orders_src: str, monkeypatch):
+    """Buckaroo keys the compare view's summary-stat cache by ``data_id`` (buckaroo ADR-001 D2). Without one it falls
+    back to a hash of the compare expression, which names each side's snapshot by path, so an unfaithful heal that
+    rewrites a snapshot in place keeps serving the old cells. The id is built from both sides' digests."""
+    from tallyman_companion import create_app
+    from tallyman_core import entry_dir, read_manifest, write_manifest
+    from tallyman_core.aliases import history_for
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+
+    first = _diff_load_bodies(create_app, project, "shoe_sales")[0]["data_id"]
+    assert isinstance(first, str) and first
+    assert _diff_load_bodies(create_app, project, "shoe_sales")[0]["data_id"] == first
+
+    b_dir = entry_dir(project, history_for(project, "shoe_sales")[1])
+    write_manifest(b_dir, read_manifest(b_dir).model_copy(update={"unfaithful_heal_digest": "arrow-sha256:healed"}))
+    assert _diff_load_bodies(create_app, project, "shoe_sales")[0]["data_id"] != first
+
+
+def test_diff_route_asks_for_deferred_stats(project: str, orders_src: str, monkeypatch):
+    """The compare grid uses the same client as an entry's, which merges ``stats_update`` (buckaroo ADR-002 D2)."""
+    from tallyman_companion import create_app
+
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    catalog_create("shoe_sales", _agg_code(project))
+    catalog_revise("shoe_sales", _filter_code(project))
+
+    assert _diff_load_bodies(create_app, project, "shoe_sales")[0]["stats_delivery"] == "deferred"
+
+
 def test_diff_route_explicit(fresh_companion_app, project: str, orders_src: str, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     catalog_create("shoe_sales", _agg_code(project))

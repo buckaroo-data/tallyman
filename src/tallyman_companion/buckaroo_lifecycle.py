@@ -56,6 +56,7 @@ from tallyman_core import (
     entry_view_build_dir,
     spawn,
 )
+from tallyman_core.activity import track
 from tallyman_core.net import port_in_use
 from tallyman_core.paths import buckaroo_project_root, project_dir
 from tallyman_xorq.row_order import ROW_ORDER
@@ -598,9 +599,10 @@ class BuckarooManager:
             from tallyman_xorq.materialize import ensure_materialized  # noqa: PLC0415
             from tallyman_xorq.result_cache import entry_manifest  # noqa: PLC0415
 
-            ensure_materialized(project, content_hash)
-            manifest = entry_manifest(project, content_hash)
-            payload = self._load_body(project, content_hash, column_config_overrides, manifest)
+            with track("prepare entry", content_hash[:12], project):
+                ensure_materialized(project, content_hash)
+                manifest = entry_manifest(project, content_hash)
+                payload = self._load_body(project, content_hash, column_config_overrides, manifest)
         except Exception as exc:
             log.warning("could not prepare %s for Buckaroo: %s", content_hash, exc)
             return {
@@ -611,9 +613,11 @@ class BuckarooManager:
         _load_timeout = self._load_timeout(manifest)
         _t_post = time.perf_counter()
         try:
-            resp = self._client.post(f"{self.base_url}/load_expr", json=payload, timeout=_load_timeout)
-            resp.raise_for_status()
-            session_id = resp.json()["session"]
+            # Buckaroo serves one request at a time, so this POST waits for any stats run already going on.
+            with track("buckaroo load_expr", content_hash[:12], project):
+                resp = self._client.post(f"{self.base_url}/load_expr", json=payload, timeout=_load_timeout)
+                resp.raise_for_status()
+                session_id = resp.json()["session"]
         except httpx.TimeoutException as exc:
             log.warning("buckaroo /load_expr timed out for %s: %s", content_hash, exc)
             return {

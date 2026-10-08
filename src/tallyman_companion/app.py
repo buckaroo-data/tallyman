@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import functools
+import inspect
 import json
 import logging
 import os
@@ -36,6 +38,7 @@ from tallyman_core import (
     resolve_project,
     version_of_hash,
 )
+from tallyman_core.activity import track, tracker
 from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
@@ -712,6 +715,58 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
+    def _announced(name: str, detail=None):
+        """Announce a route's blocking work to the header before it runs and record it when it ends (activity.py).
+
+        Defined here, not in activity.py, so the wrapper's globals are this module's: FastAPI resolves the route's
+        string annotations against them."""
+
+        def deco(fn):
+            def label(kw: dict) -> tuple[str, str | None]:
+                return (detail(kw) if detail else ""), kw.get("project")
+
+            if inspect.iscoroutinefunction(fn):
+
+                @functools.wraps(fn)
+                async def awrapper(*args, **kw):
+                    d, proj = label(kw)
+                    with track(name, d, proj):
+                        return await fn(*args, **kw)
+
+                return awrapper
+
+            @functools.wraps(fn)
+            def wrapper(*args, **kw):
+                d, proj = label(kw)
+                with track(name, d, proj):
+                    return fn(*args, **kw)
+
+            return wrapper
+
+        return deco
+
+    @app.on_event("startup")
+    async def _forward_activity_over_sse():
+        """Forward each action_start / action_end to the SSE subscribers. Actions start on worker threads, so the event
+        is handed to the loop."""
+        loop = asyncio.get_running_loop()
+
+        def _on_activity(event: dict) -> None:
+            def _fan_out() -> None:
+                for q in list(subscribers):
+                    q.put_nowait(event)
+
+            loop.call_soon_threadsafe(_fan_out)
+
+        tracker.add_listener(_on_activity)
+        app.state.activity_listener = _on_activity
+
+    @app.on_event("shutdown")
+    async def _stop_forwarding_activity():
+        listener = getattr(app.state, "activity_listener", None)
+        if listener is not None:
+            tracker.remove_listener(listener)
+
     # ADR-006 D7/D10: when a self-heal fails verification (result_cache writes the durable errors.jsonl record and
     # wipes the entry's stat cache itself), the companion additionally forces Buckaroo to re-run its pipeline for the
     # entry's grid, since an open session holds stats computed from the old rows (ADR-007 D6), and pushes the SSE event
@@ -1215,6 +1270,7 @@ def create_app(
         return RedirectResponse(f"/{project}/diff/{alias}/{va}/{vb}")
 
     @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
+    @_announced("diff data", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}")
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
         project = _validate_project(project)
@@ -1280,6 +1336,7 @@ def create_app(
         }
 
     @app.post("/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}")
+    @_announced("promote diff", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}")
     async def api_promote_diff(project: str, alias: str, va: int, vb: int):
         """Promote a diff between two versions to a first-class catalog entry."""
         if read_only:
@@ -1491,6 +1548,31 @@ def create_app(
         project = _validate_project(project)
         return {"project": project, "trace": trace, "spans": read_spans(project, trace=trace, limit=limit)}
 
+    @app.get("/{project}/api/timing")
+    def api_timing(project: str, window_s: float = 900.0):
+        """The companion's blocking actions and the spans Buckaroo posted back, on one clock (epoch ms).
+
+        An action still running has ``ended_ms`` null. Actions and spans that ended before ``now - window_s`` are left
+        out. A request that queued behind another session's stats shows as an action overlapping that session's
+        ``stats.complete`` span."""
+        project = _validate_project(project)
+        now_ms = time.time() * 1000
+        lo = now_ms - window_s * 1000
+        snap = tracker.snapshot()
+        actions = [
+            a
+            for a in snap["running"] + snap["recent"]
+            if a["project"] in (None, project) and (a["ended_ms"] is None or a["ended_ms"] >= lo)
+        ]
+        spans = [s for s in read_spans(project, limit=20_000) if s.get("t_end_ms", 0) >= lo]
+        return {
+            "project": project,
+            "now_ms": now_ms,
+            "window_s": window_s,
+            "actions": sorted(actions, key=lambda a: a["started_ms"]),
+            "spans": sorted(spans, key=lambda s: s["t_start_ms"]),
+        }
+
     @app.delete("/{project}/api/errors")
     def api_clear_errors(project: str):
         """Permanently drop all build-failure records for a project."""
@@ -1655,6 +1737,7 @@ def create_app(
         return {"ok": True}
 
     @app.put("/{project}/api/code/{alias}")
+    @_announced("save code", lambda kw: kw["alias"])
     async def put_code(project: str, alias: str, payload: dict):
         project = _validate_project(project)
         if read_only:
@@ -1739,6 +1822,7 @@ def create_app(
         return {**cell, "html": _render_markdown(cell["markdown"])}
 
     @app.post("/{project}/api/reset")
+    @_announced("reset project")
     async def api_reset(project: str, payload: dict):
         """Restore the project to a step number or label, then reload sessions.
 
@@ -1771,6 +1855,7 @@ def create_app(
         return {"ok": True, "step": step, "reloaded": reloaded}
 
     @app.get("/{project}/api/staleness")
+    @_announced("scan staleness")
     def api_staleness(project: str):
         """Staleness scan for every entry — the scan-on-load reactive surface.
 
@@ -1801,6 +1886,7 @@ def create_app(
         }
 
     @app.post("/{project}/api/recalc")
+    @_announced("recalc")
     async def api_recalc(project: str, payload: dict | None = None):
         """Recompute stale entries and their dependents in dependency order.
 

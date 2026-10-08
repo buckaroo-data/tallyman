@@ -56,6 +56,7 @@ from tallyman_core import (
     entry_view_build_dir,
     spawn,
 )
+from tallyman_core.buckaroo_versions import check_versions
 from tallyman_core.net import port_in_use
 from tallyman_core.paths import buckaroo_project_root, project_dir
 from tallyman_xorq.row_order import ROW_ORDER
@@ -189,6 +190,8 @@ class BuckarooManager:
         # subprocess's RAM. (The live diff posts a view build of the file its join was written to, ``diff_snapshot``.)
         self._loaded_diff_sessions: set[str] = set()
         self._buckaroo_started_at: float | None = None
+        # The version Buckaroo reports on /health, kept so GET /api/version can compare it to the pin.
+        self.server_version: str | None = None
         # Tmp dirs we created by expanding ${TALLYMAN_PROJECT_ROOT} placeholders
         # before POSTing /load_expr. Buckaroo holds the loaded xorq expression
         # open against these paths for the session lifetime, so we keep them
@@ -291,7 +294,10 @@ class BuckarooManager:
                 if r.status_code == 200:
                     health = r.json()
                     started_at = health.get("started")
-                    log.info("buckaroo ready on %s (started=%s)", self.base_url, started_at)
+                    self.server_version = health.get("version")
+                    log.info("buckaroo %s ready on %s (started=%s)", self.server_version, self.base_url, started_at)
+                    for problem in check_versions(self.server_version)["problems"]:
+                        log.error("buckaroo version mismatch: %s", problem)
                     # If this Buckaroo started fresh (different start time from
                     # what we last saw), its in-RAM sessions are gone — drop our
                     # bookkeeping so /load_expr runs again on first hit.

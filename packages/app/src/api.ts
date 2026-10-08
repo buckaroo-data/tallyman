@@ -1,3 +1,4 @@
+import type { TimingResponse } from "./activity";
 import type {
   Entry,
   AppError,
@@ -75,6 +76,9 @@ export const api = {
 
   telemetry: (project: string, trace: string): Promise<TelemetryResponse> =>
     get(`/${project}/api/telemetry?trace=${encodeURIComponent(trace)}`),
+
+  timing: (project: string, windowS = 900): Promise<TimingResponse> =>
+    get(`/${project}/api/timing?window_s=${windowS}`),
 
   diskUsage: (project: string): Promise<{ formatted: Record<string, string> }> =>
     get(`/${project}/api/disk_usage`),

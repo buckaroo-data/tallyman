@@ -23,6 +23,19 @@ fetch("/api/version")
           `revisions — the served dist is stale. Rebuild it (restart-tallyman rebuilds on restart) to re-sync.`,
       );
     }
+    // A Buckaroo server or renderer that is not the pinned version degrades without an error (the grid just waits
+    // for every summary stat before it shows rows), so say so on the page, not only in the console.
+    const problems: string[] = v?.buckaroo?.problems ?? [];
+    if (problems.length > 0) {
+      console.error(`tallyman: Buckaroo version mismatch:\n${problems.join("\n")}`);
+      const banner = document.createElement("div");
+      banner.setAttribute("role", "alert");
+      banner.style.cssText =
+        "position:sticky;top:0;z-index:99999;padding:8px 16px;background:#b3261e;color:#fff;" +
+        "font:13px/1.4 system-ui,sans-serif;white-space:pre-wrap";
+      banner.textContent = `Buckaroo version mismatch\n${problems.join("\n")}`;
+      document.body.prepend(banner);
+    }
   })
   .catch(() => {});
 

@@ -36,6 +36,7 @@ from tallyman_core import (
     resolve_project,
     version_of_hash,
 )
+from tallyman_core.buckaroo_versions import check_versions
 from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
@@ -675,8 +676,13 @@ def create_app(
 
     @app.get("/api/version")
     def api_version():
-        """The git revision this companion process was launched from (#132)."""
-        return {"component": "companion", **version_info()}
+        """The git revision this companion process was launched from (#132), and whether the Buckaroo server and
+        renderer match their pins. The SPA shows a banner when ``buckaroo.problems`` is not empty."""
+        return {
+            "component": "companion",
+            **version_info(),
+            "buckaroo": check_versions(getattr(buckaroo, "server_version", None)),
+        }
 
     def _current_project() -> str | None:
         return resolve_project() or seed

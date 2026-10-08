@@ -5,8 +5,11 @@ import {
   lastLabel,
   layoutTimeline,
   nowLabel,
+  queueWaitMs,
   reduceActivity,
+  traceLabel,
   type Action,
+  type Span,
 } from "./activity";
 
 // The header announces a blocking action before it runs ("now: …", from an
@@ -153,5 +156,61 @@ describe("layoutTimeline", () => {
 
   it("returns an empty layout for no rows", () => {
     expect(layoutTimeline([], 1000)).toEqual([]);
+  });
+});
+
+// The timing page shows how long a `buckaroo load_expr` POST waited before
+// Buckaroo's own handler began: Buckaroo serves one request at a time, so a POST
+// that arrives during another session's stats run starts late. The wait is the
+// gap between the POST starting (companion clock) and Buckaroo's `firstpull.load_expr`
+// span for the same entry starting (Buckaroo's clock, same machine).
+const span = (over: Partial<Span> = {}): Span => ({
+  trace: "entry-parking2-cc6487dd59df",
+  name: "firstpull.load_expr",
+  t_start_ms: 1_003_230,
+  t_end_ms: 1_003_270,
+  ...over,
+});
+
+describe("queueWaitMs", () => {
+  const post = action({ ended_ms: 1_003_270, status: "ok" });
+
+  it("is the gap between the POST starting and Buckaroo's load_expr span starting", () => {
+    expect(queueWaitMs(post, [span()])).toBe(3230);
+  });
+
+  it("is null for an action that is not a load_expr POST", () => {
+    expect(queueWaitMs(action({ name: "scan staleness", ended_ms: 1_000_100, status: "ok" }), [span()])).toBeNull();
+  });
+
+  it("is null until Buckaroo's span has arrived", () => {
+    expect(queueWaitMs(action(), [])).toBeNull();
+  });
+
+  it("ignores spans of other entries", () => {
+    expect(queueWaitMs(post, [span({ trace: "entry-parking2-71d4f4fc7932" })])).toBeNull();
+  });
+
+  it("ignores spans of an earlier load of the same entry", () => {
+    expect(queueWaitMs(post, [span({ t_start_ms: 900_000, t_end_ms: 900_040 })])).toBeNull();
+  });
+
+  it("ignores Buckaroo spans that are not the load_expr handler", () => {
+    expect(queueWaitMs(post, [span({ name: "stats.complete" })])).toBeNull();
+  });
+
+  it("is zero, not negative, when the clocks disagree by a few milliseconds", () => {
+    expect(queueWaitMs(post, [span({ t_start_ms: 999_990, t_end_ms: 1_000_030 })])).toBe(0);
+  });
+});
+
+describe("traceLabel", () => {
+  it("shows the content hash of an entry session", () => {
+    expect(traceLabel("entry-parking2-cc6487dd59df")).toBe("cc6487dd59df");
+  });
+
+  it("leaves other session ids as they are", () => {
+    expect(traceLabel("diff-aaaaaaaaaaaa-bbbbbbbbbbbb-cccccccccccc")).toBe("diff-aaaaaaaaaaaa-bbbbbbbbbbbb-cccccccccccc");
+    expect(traceLabel(null)).toBe("");
   });
 });

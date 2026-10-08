@@ -7,7 +7,8 @@ import { useSSE } from "../SSEContext";
 // What the companion and Buckaroo spent their time on, on one clock. The companion's blocking actions come from its
 // own tracker; Buckaroo's spans are the ones it posts back as each finishes (buckaroo#943). Buckaroo serves one request
 // at a time, so a `buckaroo load_expr` that arrives during another session's `stats.complete` shows as overlapping bars,
-// and the page says how long the POST waited before Buckaroo began handling it.
+// and the page says how long after the POST started Buckaroo began handling it (queueing plus the request's own
+// transfer and parsing, which this does not separate).
 
 const WINDOWS = [
   { label: "5 min", seconds: 300 },
@@ -42,7 +43,7 @@ function clock(ms: number): string {
 function buildRows(t: TimingResponse, aliasOf: (hash: string) => string): Row[] {
   const rows: Row[] = t.actions.map((a) => {
     const wait = queueWaitMs(a, t.spans);
-    const queued = wait !== null && wait >= 200 ? `waited ${formatDuration(wait)} in Buckaroo's queue before it began` : "";
+    const queued = wait !== null && wait >= 200 ? `Buckaroo began handling it ${formatDuration(wait)} after the POST started` : "";
     const detail = /^[0-9a-f]{12}$/.test(a.detail) ? aliasOf(a.detail) : a.detail;
     return {
       key: `a${a.id}`,
@@ -69,6 +70,21 @@ function buildRows(t: TimingResponse, aliasOf: (hash: string) => string): Row[] 
       });
     });
   return rows.sort((a, b) => a.start_ms - b.start_ms);
+}
+
+// Rows that start within BURST_GAP_MS of the latest end so far belong to one burst of activity. Each burst gets its own
+// time axis: on one axis for the whole window, a half-second action next to another half minutes later is a sliver.
+const BURST_GAP_MS = 2000;
+
+function groupBursts(rows: Row[], nowMs: number): Row[][] {
+  const bursts: Row[][] = [];
+  let latestEnd = -Infinity;
+  for (const r of rows) {
+    if (bursts.length === 0 || r.start_ms - latestEnd > BURST_GAP_MS) bursts.push([]);
+    bursts[bursts.length - 1].push(r);
+    latestEnd = Math.max(latestEnd, r.end_ms ?? nowMs);
+  }
+  return bursts;
 }
 
 export function TimingPage() {
@@ -119,7 +135,7 @@ export function TimingPage() {
     () => (data ? buildRows(data, (h) => aliases[h] ?? h) : []),
     [data, aliases],
   );
-  const layout = useMemo(() => layoutTimeline(rows, data?.now_ms ?? Date.now()), [rows, data]);
+  const bursts = useMemo(() => groupBursts(rows, data?.now_ms ?? Date.now()), [rows, data]);
 
   return (
     <div className="timing-page">
@@ -149,28 +165,37 @@ export function TimingPage() {
       {data !== null && rows.length === 0 && (
         <div className="meta">nothing in the last {WINDOWS.find((w) => w.seconds === windowS)?.label ?? `${windowS}s`}.</div>
       )}
-      {rows.length > 0 && (
+      {bursts.length > 0 && (
         <div className="timing-rows">
-          <div className="timing-axis meta">
-            {clock(rows[0].start_ms)} → {clock(Math.max(...rows.map((r) => r.end_ms ?? data!.now_ms)))}
-          </div>
-          {rows.map((r, i) => {
-            const ms = (r.end_ms ?? data!.now_ms) - r.start_ms;
+          {[...bursts].reverse().map((burst) => {
+            const nowMs = data!.now_ms;
+            const layout = layoutTimeline(burst, nowMs);
+            const last = Math.max(...burst.map((r) => r.end_ms ?? nowMs));
             return (
-              <div key={r.key} className={`timing-row ${r.lane}`}>
-                <span className="timing-start">{clock(r.start_ms)}</span>
-                <span className="span-name timing-name" title={r.label}>
-                  {r.label}
-                </span>
-                <span className="span-track">
-                  <span
-                    className={`span-bar ${r.lane}${r.failed ? " errored" : ""}${r.end_ms === null ? " running" : ""}`}
-                    style={{ left: `${layout[i].left}%`, width: `${layout[i].width}%` }}
-                    title={`${r.label} · ${formatDuration(ms)}`}
-                  />
-                </span>
-                <span className="span-ms timing-ms">{formatDuration(ms)}</span>
-                {r.note && <span className={`meta timing-note${r.failed ? " failed" : ""}`}>{r.note}</span>}
+              <div key={burst[0].key} className="timing-burst">
+                <div className="timing-axis meta">
+                  {clock(burst[0].start_ms)} → {clock(last)} · {formatDuration(last - burst[0].start_ms)}
+                </div>
+                {burst.map((r, i) => {
+                  const ms = (r.end_ms ?? nowMs) - r.start_ms;
+                  return (
+                    <div key={r.key} className={`timing-row ${r.lane}`}>
+                      <span className="timing-start">{clock(r.start_ms)}</span>
+                      <span className="span-name timing-name" title={r.label}>
+                        {r.label}
+                      </span>
+                      <span className="span-track">
+                        <span
+                          className={`span-bar ${r.lane}${r.failed ? " errored" : ""}${r.end_ms === null ? " running" : ""}`}
+                          style={{ left: `${layout[i].left}%`, width: `${layout[i].width}%` }}
+                          title={`${r.label} · ${formatDuration(ms)}`}
+                        />
+                      </span>
+                      <span className="span-ms timing-ms">{formatDuration(ms)}</span>
+                      {r.note && <span className={`meta timing-note${r.failed ? " failed" : ""}`}>{r.note}</span>}
+                    </div>
+                  );
+                })}
               </div>
             );
           })}

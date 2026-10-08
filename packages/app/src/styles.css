@@ -651,7 +651,9 @@ table.cache-table .muted { color: var(--muted); }
 .swatch.buckaroo, .span-bar.buckaroo { background: #73ae80; }
 .span-bar.running { animation: activity-pulse 1.2s ease-in-out infinite; }
 .timing-rows { display: flex; flex-direction: column; gap: 3px; }
-.timing-axis { margin-bottom: 2px; }
+.timing-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.timing-burst { margin-bottom: 14px; }
+.timing-axis { margin-bottom: 3px; }
 .timing-start { flex: 0 0 74px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
 .timing-name { flex: 0 0 300px; }
 .timing-ms { flex: 0 0 64px; }

@@ -14,7 +14,15 @@ import pytest
 from fastapi.testclient import TestClient
 
 from tallyman_companion import create_app
-from tallyman_core.buckaroo_versions import BUILD_INFO_NAME, check_versions
+
+BUILD_INFO_NAME = "build-info.json"
+
+
+def check_versions(*args, **kwargs):
+    # Imported on call so the file is collected, and its imports sort the same, whether or not the module exists yet.
+    from tallyman_core.buckaroo_versions import check_versions as real_check
+
+    return real_check(*args, **kwargs)
 
 
 def _repo(
@@ -107,6 +115,4 @@ def test_api_version_carries_the_buckaroo_report(project, orders_parquet, monkey
 
 @pytest.mark.parametrize("field", ["buckaroo", "buckaroo_js_core"])
 def test_this_repos_pins_are_readable(field):
-    from tallyman_core.buckaroo_versions import check_versions as real_check
-
-    assert real_check(None)["pins"][field]
+    assert check_versions(None)["pins"][field]

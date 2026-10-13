@@ -12,3 +12,9 @@ itself. There is no installed base and no third-party data on disk.
   The only catalogs are mine, and I'll rebuild them.
 - This is about not spending effort on migration/compat paths, not about
   lowering quality: still write correct code and tests for current behavior.
+
+## Reviewing sessions, hints and evals
+When asked to look at a past Claude session that used tallyman, to add or
+check error hints, or to run or extend the eval suite, read
+`docs/improving-from-sessions.md` first. It says where transcripts and error
+logs live, how a review is done, and what each kind of finding turns into.

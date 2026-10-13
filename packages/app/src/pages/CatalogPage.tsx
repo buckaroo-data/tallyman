@@ -135,7 +135,18 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
 
       <div className="prompt-row">
         <div className="prompt-text">
-          {manifest.prompt ? (
+          {manifest.user_prompt ? (
+            <>
+              <div className="user-prompt">
+                <strong>prompt:</strong> {manifest.user_prompt}
+              </div>
+              {manifest.prompt && (
+                <div className="meta prompt-summary">
+                  <strong>claude's summary:</strong> {manifest.prompt}
+                </div>
+              )}
+            </>
+          ) : manifest.prompt ? (
             <>
               <strong>prompt:</strong> {manifest.prompt}
             </>
@@ -151,7 +162,7 @@ function EntryDetailPane({ project, hash }: { project: string; hash: string }) {
           <ul>
             {prompt_history.map((p, i) => (
               <li key={i}>
-                <span className="meta">{p.at}</span> — {p.prompt}
+                <span className="meta">{p.at}</span> — {p.user_prompt ?? p.prompt}
               </li>
             ))}
           </ul>

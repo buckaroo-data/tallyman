@@ -56,6 +56,10 @@ class Manifest(BaseModel):
     project: str
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     prompt: str | None = None
+    # What the user typed that led to this entry, word for word, where ``prompt`` is the description the caller
+    # gave, which from the MCP server is the model's summary. None when the caller could not see it
+    # (``tallyman_mcp.transcript``).
+    user_prompt: str | None = None
     code_path: str = "expr.py"
     schema_path: str = ENTRY_SCHEMA_FILENAME
     row_count: int | None = None

@@ -36,21 +36,19 @@ from tallyman_xorq.portable import make_portable_inplace
 perf_log = logging.getLogger("tallyman.perf")
 
 
-def _append_prompt(project: str, content_hash: str, prompt: str | None) -> None:
+def _append_prompt(project: str, content_hash: str, prompt: str | None, user_prompt: str | None = None) -> None:
     """Append a prompt event to the entry's tracked ``prompts/<hash>.jsonl``.
 
     Relocated out of the (now gitignored) entry dir so the re-run history the
     UI disclosure shows survives a reset/clone — it is append-mutable provenance
     that the content-addressed recipe zip deliberately excludes.
     """
-    if not prompt:
+    if not prompt and not user_prompt:
         return
     from tallyman_core.paths import prompts_path
 
-    record = {
-        "prompt": prompt,
-        "at": datetime.now(timezone.utc).isoformat(),
-    }
+    record = {"prompt": prompt, **({"user_prompt": user_prompt} if user_prompt else {})}
+    record["at"] = datetime.now(timezone.utc).isoformat()
     p = prompts_path(project, content_hash)
     p.parent.mkdir(parents=True, exist_ok=True)
     # Atomic read-modify-write rather than an O_APPEND write: _append_prompt runs
@@ -439,11 +437,15 @@ def build_and_persist(
     code: str,
     expr_name: str = "expr",
     prompt: str | None = None,
+    user_prompt: str | None = None,
 ) -> BuildResult:
     """Compile user code with xorq, materialize a worthy entry's snapshot, write a catalog entry.
 
     The user code must bind a variable named `expr_name` (default "expr") to an
     ibis/xorq expression. Imports happen in a fresh module scope.
+
+    ``prompt`` is the description the caller gives the entry, which from the MCP server is the model's. ``user_prompt``
+    is what the user typed, verbatim, when the caller can see it (``tallyman_mcp.transcript``).
 
     The whole build holds the project's write lock (ADR-007 D11): one write at a time per project, so two builds of
     one entry cannot end with the failing one deleting the winner's directory, and a chained build waits for the
@@ -454,7 +456,7 @@ def build_and_persist(
     ensure_project(project)
     # The recipe's module lives as long as the build: build_expr pickles the UDFs it defines (``_imported_recipe``).
     with project_lock(project), contextlib.ExitStack() as recipe_scope:
-        return _build_and_persist(project, code, expr_name, prompt, recipe_scope)
+        return _build_and_persist(project, code, expr_name, prompt, user_prompt, recipe_scope)
 
 
 def _reading(expr, project: str) -> str:
@@ -526,7 +528,12 @@ def _execution_error(what: str, exc: Exception, code: str) -> BuildError:
 
 
 def _build_and_persist(
-    project: str, code: str, expr_name: str, prompt: str | None, recipe_scope: contextlib.ExitStack
+    project: str,
+    code: str,
+    expr_name: str,
+    prompt: str | None,
+    user_prompt: str | None,
+    recipe_scope: contextlib.ExitStack,
 ) -> BuildResult:
     from xorq.ibis_yaml.compiler import build_expr, load_expr
 
@@ -586,7 +593,7 @@ def _build_and_persist(
                 manifest_path = entry_manifest_path(project, content_hash)
                 if manifest_path.exists():
                     meta = json.loads(manifest_path.read_text())
-                    _append_prompt(project, content_hash, prompt)
+                    _append_prompt(project, content_hash, prompt, user_prompt)
                     return BuildResult(
                         content_hash=content_hash,
                         entry_path=target,
@@ -693,6 +700,7 @@ def _build_and_persist(
             content_hash=content_hash,
             project=project,
             prompt=prompt,
+            user_prompt=user_prompt,
             row_count=row_count,
             execute_seconds=execute_seconds,
             compile_seconds=compile_seconds,
@@ -726,7 +734,7 @@ def _build_and_persist(
         # The staged temp file is gone once it is published. If the build failed before then, it is removed here.
         if staged is not None:
             staged.path.unlink(missing_ok=True)
-    _append_prompt(project, content_hash, prompt)
+    _append_prompt(project, content_hash, prompt, user_prompt)
 
     if reproducible is False:
         lint_warnings = [

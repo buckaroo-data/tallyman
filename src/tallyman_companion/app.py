@@ -675,8 +675,14 @@ def create_app(
 
     @app.get("/api/version")
     def api_version():
-        """The git revision this companion process was launched from (#132)."""
-        return {"component": "companion", **version_info()}
+        """The git revision this companion process was launched from (#132), and the version the Buckaroo server it
+        runs reports (null when none is running). The SPA compares that with the renderer it bundles and the version
+        package.json pins."""
+        return {
+            "component": "companion",
+            **version_info(),
+            "buckaroo_server": buckaroo.server_version() if buckaroo else None,
+        }
 
     def _current_project() -> str | None:
         return resolve_project() or seed

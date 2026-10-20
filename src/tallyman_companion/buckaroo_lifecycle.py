@@ -305,6 +305,15 @@ class BuckarooManager:
         self.stop()
         raise BuckarooUnavailable("buckaroo did not respond to /health in time")
 
+    def server_version(self) -> str | None:
+        """The version Buckaroo reports on ``/health``, or None when it is not running or does not answer."""
+        if not self.is_running:
+            return None
+        try:
+            return self._client.get(f"{self.base_url}/health", timeout=1.0).json().get("version")
+        except httpx.HTTPError:
+            return None
+
     def _drain_stdout(self) -> None:
         if self.proc is None or self.proc.stdout is None:
             return

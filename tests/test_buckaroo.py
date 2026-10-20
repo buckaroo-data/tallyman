@@ -171,6 +171,37 @@ def _running_manager() -> BuckarooManager:
     return mgr
 
 
+def test_unit_server_version_is_what_health_reports(monkeypatch):
+    mgr = _running_manager()
+    asked: list[str] = []
+
+    class FakeResponse:
+        def json(self):
+            return {"status": "ok", "version": "0.15.10"}
+
+    def fake_get(url, **kwargs):
+        asked.append(url)
+        return FakeResponse()
+
+    monkeypatch.setattr(mgr._client, "get", fake_get)
+    assert mgr.server_version() == "0.15.10"
+    assert asked == ["http://127.0.0.1:65000/health"]
+
+
+def test_unit_server_version_is_none_when_not_running():
+    assert BuckarooManager().server_version() is None
+
+
+def test_unit_server_version_is_none_when_health_does_not_answer(monkeypatch):
+    mgr = _running_manager()
+
+    def refuse(url, **kwargs):
+        raise httpx.ConnectError("connection refused")
+
+    monkeypatch.setattr(mgr._client, "get", refuse)
+    assert mgr.server_version() is None
+
+
 def test_unit_reload_project_sessions_posts_one_reload_per_entry_of_the_project(
     project: str, orders_src: str, monkeypatch
 ):
@@ -968,6 +999,18 @@ def test_integration_load_expr_returns_nonzero_rows(project: str, orders_src: st
         body = resp.json()
         assert body["rows"] > 0, body
         assert [c["name"] for c in body["columns"]][-1] == "__row_order"
+    finally:
+        mgr.stop()
+
+
+@pytest.mark.integration
+def test_integration_server_version_is_the_installed_buckaroo():
+    import buckaroo
+
+    mgr = BuckarooManager(port=0, startup_timeout=15.0)
+    try:
+        mgr.start()
+        assert mgr.server_version() == buckaroo.__version__
     finally:
         mgr.stop()
 

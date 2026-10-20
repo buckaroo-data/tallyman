@@ -38,6 +38,7 @@ async function post<T>(url: string, body: unknown): Promise<T> {
 
 export const api = {
   projects: (): Promise<Projects> => get("/api/projects"),
+  version: (): Promise<{ buckaroo_server: string | null }> => get("/api/version"),
 
   switchProject: (name: string) =>
     post<{ previous: string | null; active: string }>("/api/projects/switch", { name }),

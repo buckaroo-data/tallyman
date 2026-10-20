@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { Routes, Route, Navigate, useNavigate, useParams } from "react-router-dom";
+import { BuckarooVersionBanner } from "./components/BuckarooVersionBanner";
 import { Header } from "./components/Header";
 import { NewEntryPill } from "./components/NewEntryPill";
 import { SSEProvider } from "./SSEContext";
@@ -40,6 +41,7 @@ function ProjectLayout({ children }: { children: React.ReactNode }) {
 export default function App() {
   return (
     <>
+      <BuckarooVersionBanner />
       <Routes>
         <Route
           path="/:project/*"

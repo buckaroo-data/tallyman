@@ -1,6 +1,7 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { execSync } from "node:child_process";
+import pkg from "./package.json";
 
 // Bake the git revision into the bundle so the running SPA knows which source it
 // was built from and can flag drift against the companion's /api/version (the
@@ -24,6 +25,8 @@ const apiTarget = `http://localhost:${process.env.TALLYMAN_API_PORT || "7860"}`;
 export default defineConfig({
   define: {
     __APP_GIT_REVISION__: JSON.stringify(gitRevision()),
+    // The buckaroo-js-core version package.json pins, so the page can compare it with the renderer it runs.
+    __BUCKAROO_JS_CORE_PIN__: JSON.stringify(pkg.dependencies["buckaroo-js-core"]),
   },
   plugins: [react()],
   server: {

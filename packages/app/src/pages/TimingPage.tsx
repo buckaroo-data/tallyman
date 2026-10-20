@@ -1,8 +1,16 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "react-router-dom";
-import { formatDuration, layoutTimeline, queueWaitMs, traceLabel, type TimingResponse } from "../activity";
+import {
+  aliasLabels,
+  formatDuration,
+  layoutTimeline,
+  queueWaitMs,
+  spanKey,
+  traceLabel,
+  type TimingResponse,
+} from "../activity";
 import { api } from "../api";
-import { useSSE } from "../SSEContext";
+import { useActivity, useSSE } from "../SSEContext";
 
 // What the companion and Buckaroo spent their time on, on one clock. The companion's blocking actions come from its
 // own tracker; Buckaroo's spans are the ones it posts back as each finishes (buckaroo#943). Buckaroo serves one request
@@ -55,12 +63,17 @@ function buildRows(t: TimingResponse, aliasOf: (hash: string) => string): Row[] 
       failed: a.status === "error",
     };
   });
+  // A key names what the span is, not where it sorts (see spanKey); two spans that are the same by that name get a suffix.
+  const seen = new Map<string, number>();
   t.spans
     .filter((s) => BUCKAROO_SPANS.has(s.name))
-    .forEach((s, i) => {
+    .forEach((s) => {
       const gen = s.attrs?.stats_gen;
+      const base = spanKey(s);
+      const n = seen.get(base) ?? 0;
+      seen.set(base, n + 1);
       rows.push({
-        key: `s${i}-${s.trace}-${s.name}-${s.t_start_ms}`,
+        key: n === 0 ? base : `${base}#${n}`,
         lane: "buckaroo",
         label: `${s.name.replace(/^firstpull\./, "")} ${aliasOf(traceLabel(s.trace))}`,
         start_ms: s.t_start_ms,
@@ -89,7 +102,8 @@ function groupBursts(rows: Row[], nowMs: number): Row[][] {
 
 export function TimingPage() {
   const { project } = useParams<{ project: string }>();
-  const { activity } = useSSE();
+  const { version } = useSSE();
+  const activity = useActivity();
   const [windowS, setWindowS] = useState(900);
   const [data, setData] = useState<TimingResponse | null>(null);
   const [aliases, setAliases] = useState<Record<string, string>>({});
@@ -99,13 +113,10 @@ export function TimingPage() {
     if (!project) return;
     api
       .entries(project)
-      .then((r) => {
-        const m: Record<string, string> = {};
-        for (const e of r.entries) if (e.alias) m[e.content_hash.slice(0, 12)] = e.alias;
-        setAliases(m);
-      })
+      .then((r) => setAliases(aliasLabels(r.entries)))
       .catch(() => {});
-  }, [project]);
+    // `version` moves when an entry is added or revised, so a hash from a load that just happened gets its name.
+  }, [project, version]);
 
   // Refetch when an action starts or ends, and every 2 s so Buckaroo's spans (which arrive as they finish) and a
   // running action's bar stay current.

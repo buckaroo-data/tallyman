@@ -40,7 +40,29 @@ export interface TimingResponse {
   spans: Span[];
 }
 
+// What the companion sends as the `activity` of an SSE `hello` event: its running actions and its recent ones, newest
+// first, for the project the stream was opened on.
+export interface ActivitySnapshot {
+  running: Action[];
+  recent: Action[];
+}
+
 export const emptyActivity: ActivityState = { running: [], last: null };
+
+// The header's state from a snapshot. A reconnecting tab takes it as the whole truth, so an `action_end` it missed
+// while disconnected cannot leave a stale running action behind.
+export function seedActivity(snapshot: ActivitySnapshot): ActivityState {
+  return {
+    running: [...snapshot.running].sort((a, b) => a.started_ms - b.started_ms),
+    last: snapshot.recent[0] ?? null,
+  };
+}
+
+// The SSE fan-out is shared by every project the companion serves; the header shows the open project's actions (and
+// the ones that name no project).
+export function isForProject(action: Action, project: string): boolean {
+  return action.project === null || action.project === project;
+}
 
 export function reduceActivity(state: ActivityState, ev: ActivityEvent): ActivityState {
   const others = state.running.filter((a) => a.id !== ev.action.id);
@@ -50,10 +72,13 @@ export function reduceActivity(state: ActivityState, ev: ActivityEvent): Activit
   return { running: others, last: ev.action };
 }
 
+// The unit is picked from the rounded value, so 999.6 ms reads "1.00 s" and 59.96 s reads "1m 0s".
 export function formatDuration(ms: number): string {
-  if (ms < 1000) return `${Math.round(ms)} ms`;
-  if (ms < 10_000) return `${(ms / 1000).toFixed(2)} s`;
-  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  if (Math.round(ms) < 1000) return `${Math.round(ms)} ms`;
+  const hundredths = Math.round(ms / 10) / 100;
+  if (hundredths < 10) return `${hundredths.toFixed(2)} s`;
+  const tenths = Math.round(ms / 100) / 10;
+  if (tenths < 60) return `${tenths.toFixed(1)} s`;
   const total = Math.round(ms / 1000);
   return `${Math.floor(total / 60)}m ${total % 60}s`;
 }
@@ -104,6 +129,25 @@ export function traceLabel(trace: string | null | undefined): string {
   return m ? m[1] : trace;
 }
 
+// A span has no id. Buckaroo posts it when it ends, so its position in a start-ordered list changes as longer spans
+// arrive late; what it is (session, name, start) does not.
+export function spanKey(s: Span): string {
+  return `${s.trace ?? ""}|${s.name}|${s.t_start_ms}`;
+}
+
+// Entries by the 12-character content hash the companion's actions and Buckaroo's session ids carry, labelled with their
+// alias, and with the version when the alias has several (each version is its own hash).
+export function aliasLabels(
+  entries: { content_hash: string; alias: string | null; version: number | null; version_count: number }[],
+): Record<string, string> {
+  const labels: Record<string, string> = {};
+  for (const e of entries) {
+    if (!e.alias) continue;
+    labels[e.content_hash.slice(0, 12)] = e.version !== null && e.version_count > 1 ? `${e.alias} v${e.version}` : e.alias;
+  }
+  return labels;
+}
+
 export interface TimelineRow {
   start_ms: number;
   end_ms: number | null;
@@ -119,8 +163,9 @@ export function layoutTimeline(rows: TimelineRow[], nowMs: number): { left: numb
   const start = Math.min(...rows.map((r) => r.start_ms));
   const end = Math.max(...rows.map((r) => r.end_ms ?? nowMs));
   const span = Math.max(end - start, 1);
-  return rows.map((r) => ({
-    left: ((r.start_ms - start) / span) * 100,
-    width: Math.max((((r.end_ms ?? nowMs) - r.start_ms) / span) * 100, MIN_WIDTH_PCT),
-  }));
+  return rows.map((r) => {
+    const width = Math.max((((r.end_ms ?? nowMs) - r.start_ms) / span) * 100, MIN_WIDTH_PCT);
+    // A minimum-width row at the very end is clamped to stay inside the track.
+    return { left: Math.min(((r.start_ms - start) / span) * 100, 100 - width), width };
+  });
 }

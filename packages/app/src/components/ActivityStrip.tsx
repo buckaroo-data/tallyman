@@ -1,13 +1,13 @@
 import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { lastLabel, nowLabel } from "../activity";
-import { useSSE } from "../SSEContext";
+import { useActivity } from "../SSEContext";
 
 // The companion's blocking actions in the header: what it is waiting on now (shown
 // the moment the action starts, with a running clock) and the last action to finish
 // with how long it took. The timing page has the whole history.
 export function ActivityStrip({ project }: { project: string }) {
-  const { activity } = useSSE();
+  const activity = useActivity();
   const [nowMs, setNowMs] = useState(() => Date.now());
   const busy = activity.running.length > 0;
 

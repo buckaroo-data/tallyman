@@ -1,37 +1,48 @@
 import { createContext, useContext, useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { emptyActivity, reduceActivity, type ActivityEvent, type ActivityState } from "./activity";
-import { api } from "./api";
+import {
+  emptyActivity,
+  isForProject,
+  reduceActivity,
+  seedActivity,
+  type Action,
+  type ActivityEvent,
+  type ActivitySnapshot,
+  type ActivityState,
+} from "./activity";
 import type { SSEEvent } from "./types";
 
 interface SSEState {
   status: "connecting" | "live" | "offline";
   version: number;
   lastEvent: SSEEvent | null;
-  // The companion's blocking actions: what is running now and the last to finish. These events do not bump `version`,
-  // which refetches the catalog and disk usage.
-  activity: ActivityState;
 }
 
 const SSEContext = createContext<SSEState>({
   status: "connecting",
   version: 0,
   lastEvent: null,
-  activity: emptyActivity,
 });
+
+// The companion's blocking actions: what is running now and the last to finish. Their own context, because they change
+// on every request while `status` and `version` do not, and only the header strip and the timing page read them. These
+// events do not bump `version`, which refetches the catalog and disk usage.
+const ActivityContext = createContext<ActivityState>(emptyActivity);
 
 export function SSEProvider({ project, children }: { project: string | null; children: React.ReactNode }) {
   const [state, setState] = useState<SSEState>({
     status: "connecting",
     version: 0,
     lastEvent: null,
-    activity: emptyActivity,
   });
+  const [activity, setActivity] = useState<ActivityState>(emptyActivity);
   const navigate = useNavigate();
 
   useEffect(() => {
+    // Another project starts with an empty header; the new stream's `hello` says what is running.
+    setActivity(emptyActivity);
     if (!project) {
-      setState({ status: "offline", version: 0, lastEvent: null, activity: emptyActivity });
+      setState({ status: "offline", version: 0, lastEvent: null });
       return;
     }
 
@@ -44,31 +55,20 @@ export function SSEProvider({ project, children }: { project: string | null; chi
       setState((s) => ({ ...s, status: "live", version: s.version + 1, lastEvent: { ...data, kind } }));
     };
 
-    // An action announced while this tab was not connected (or before it loaded) is not replayed, so a page load
-    // reads the companion's recent actions once to learn what is running and what finished last.
-    const seedActivity = () =>
-      api
-        .timing(project, 600)
-        .then((t) => {
-          let seeded = emptyActivity;
-          const byEnd = [...t.actions].sort((a, b) => (a.ended_ms ?? a.started_ms) - (b.ended_ms ?? b.started_ms));
-          for (const a of byEnd) {
-            seeded = reduceActivity(seeded, { kind: a.status === "running" ? "action_start" : "action_end", action: a });
-          }
-          // A live event that landed before this response is newer than it.
-          setState((s) => (s.activity.running.length || s.activity.last ? s : { ...s, activity: seeded }));
-        })
-        .catch(() => {});
-
+    // The fan-out is shared by every project the companion serves, so an action of another project is not this one's.
     const onAction = (e: MessageEvent, kind: ActivityEvent["kind"]) => {
-      const data = JSON.parse(e.data);
-      setState((s) => ({ ...s, activity: reduceActivity(s.activity, { kind, action: data.action }) }));
+      const { action } = JSON.parse(e.data) as { action: Action };
+      if (isForProject(action, project)) setActivity((a) => reduceActivity(a, { kind, action }));
     };
 
+    // An action announced while this tab was not connected is not replayed. The first event of every stream, the
+    // first connection and each reconnect alike, carries what is running and what finished last, and replaces the
+    // header's state: an `action_end` missed while disconnected would otherwise leave its action running here for good.
     es.addEventListener("hello", (e) => {
       console.log("[tallyman-sse] hello", (e as MessageEvent).data);
       setState((s) => ({ ...s, status: "live" }));
-      seedActivity();
+      const snapshot = (JSON.parse((e as MessageEvent).data) as { activity?: ActivitySnapshot }).activity;
+      if (snapshot) setActivity(seedActivity(snapshot));
     });
     es.addEventListener("action_start", (e) => onAction(e as MessageEvent, "action_start"));
     es.addEventListener("action_end", (e) => onAction(e as MessageEvent, "action_end"));
@@ -102,9 +102,17 @@ export function SSEProvider({ project, children }: { project: string | null; chi
     };
   }, [project, navigate]);
 
-  return <SSEContext.Provider value={state}>{children}</SSEContext.Provider>;
+  return (
+    <SSEContext.Provider value={state}>
+      <ActivityContext.Provider value={activity}>{children}</ActivityContext.Provider>
+    </SSEContext.Provider>
+  );
 }
 
 export function useSSE() {
   return useContext(SSEContext);
+}
+
+export function useActivity() {
+  return useContext(ActivityContext);
 }

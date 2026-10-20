@@ -31,9 +31,16 @@ UI's per-load span waterfall.
 from __future__ import annotations
 
 import json
+import os
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 
 from tallyman_core.paths import artifacts_dir, ensure_project
+
+# read_spans(received_since_ms=...) reads the file backward in blocks of this size, and keeps reading until a line is
+# this much older than the cutoff.
+_TAIL_BLOCK_BYTES = 256 * 1024
+_TAIL_SLACK_MS = 60_000
 
 # Records this size or larger are dropped rather than appended. A span record is
 # a handful of small fields; anything past this is a malformed or hostile body,
@@ -74,13 +81,40 @@ def record_span(project: str, record: dict) -> dict | None:
     return ev
 
 
+def _lines_newest_first(path) -> Iterator[bytes]:
+    """The file's lines from the last to the first, reading it in blocks from the end."""
+    with path.open("rb") as fh:
+        pos = fh.seek(0, os.SEEK_END)
+        partial = b""  # the head of the block read last: a line that continues into the block before it
+        while pos > 0:
+            step = min(_TAIL_BLOCK_BYTES, pos)
+            pos -= step
+            fh.seek(pos)
+            lines = (fh.read(step) + partial).split(b"\n")
+            partial = lines[0]
+            yield from reversed(lines[1:])
+        yield partial
+
+
+def _received_ms(ev: dict) -> float | None:
+    try:
+        return datetime.fromisoformat(ev["received_at"]).timestamp() * 1000
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def read_spans(
     project: str,
     *,
     trace: str | None = None,
     limit: int = 500,
+    received_since_ms: float | None = None,
 ) -> list[dict]:
     """Spans newest-first (by ``received_at``), optionally filtered to one ``trace``.
+
+    With ``received_since_ms`` (epoch ms), only spans received at or after it, and the file is read backward and
+    left unread past that point: lines are appended in the order they are received, so once one is a minute older
+    than the cutoff the rest are older still. The file only grows, so a caller that polls wants this.
 
     Tolerant of a partially-written trailing line (a concurrent append mid-read):
     a line that doesn't parse is skipped rather than failing the whole read.
@@ -89,7 +123,11 @@ def read_spans(
     if not p.exists():
         return []
     out: list[dict] = []
-    for line in p.read_text().splitlines():
+    if received_since_ms is None:
+        lines: Iterable[str | bytes] = p.read_text().splitlines()
+    else:
+        lines = _lines_newest_first(p)
+    for line in lines:
         line = line.strip()
         if not line:
             continue
@@ -97,6 +135,14 @@ def read_spans(
             ev = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(ev, dict):
+            continue
+        if received_since_ms is not None:
+            received = _received_ms(ev)
+            if received is not None and received < received_since_ms - _TAIL_SLACK_MS:
+                break
+            if received is None or received < received_since_ms:
+                continue
         if trace is not None and ev.get("trace") != trace:
             continue
         out.append(ev)

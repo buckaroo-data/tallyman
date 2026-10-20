@@ -398,18 +398,21 @@ class BuckarooManager:
         from tallyman_xorq.build import list_entries
 
         reloaded = 0
-        for entry in list_entries(project):
-            content_hash = entry["content_hash"]
-            session_id = self.session_id_for(project, content_hash)
-            try:
-                resp = self._client.post(f"{self.base_url}/reload_expr/{session_id}", timeout=5.0)
-                if resp.status_code in (404, 400):
-                    continue  # Buckaroo does not hold this session (never opened, or idle-evicted)
-                resp.raise_for_status()
-                reloaded += 1
-                log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
-            except httpx.HTTPError as exc:
-                log.warning("buckaroo /reload_expr failed for session %s: %s", session_id, exc)
+        # One action for the whole sweep: each POST waits behind whatever Buckaroo is running, and a pill per entry
+        # would flicker through the project's entries.
+        with track("buckaroo reload_expr", "", project):
+            for entry in list_entries(project):
+                content_hash = entry["content_hash"]
+                session_id = self.session_id_for(project, content_hash)
+                try:
+                    resp = self._client.post(f"{self.base_url}/reload_expr/{session_id}", timeout=5.0)
+                    if resp.status_code in (404, 400):
+                        continue  # Buckaroo does not hold this session (never opened, or idle-evicted)
+                    resp.raise_for_status()
+                    reloaded += 1
+                    log.info("reloaded klasses for session %s (hash %s)", session_id, content_hash)
+                except httpx.HTTPError as exc:
+                    log.warning("buckaroo /reload_expr failed for session %s: %s", session_id, exc)
         return reloaded
 
     def force_reload_session(self, project: str, content_hash: str) -> bool:
@@ -431,8 +434,9 @@ class BuckarooManager:
             return False
         body["force_reload"] = True
         try:
-            resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=self._load_timeout(manifest))
-            resp.raise_for_status()
+            with track("buckaroo load_expr", content_hash[:12], project):
+                resp = self._client.post(f"{self.base_url}/load_expr", json=body, timeout=self._load_timeout(manifest))
+                resp.raise_for_status()
         except httpx.HTTPError as exc:
             log.warning("buckaroo forced reload failed for %s: %s", content_hash, exc)
             return False

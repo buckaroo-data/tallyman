@@ -186,8 +186,12 @@ def test_load_session_announces_preparing_the_entry_then_the_post(project, order
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     h = _entry(project)
     started: list[str] = []
-    tracker.add_listener(lambda ev: started.append(ev["action"]["name"]) if ev["kind"] == "action_start" else None)
-    assert _bk(monkeypatch, _OkClient()).load_session(h, project)["status"] == "ok"
+    listener = lambda ev: started.append(ev["action"]["name"]) if ev["kind"] == "action_start" else None  # noqa: E731
+    tracker.add_listener(listener)
+    try:
+        assert _bk(monkeypatch, _OkClient()).load_session(h, project)["status"] == "ok"
+    finally:
+        tracker.remove_listener(listener)  # the tracker is process-wide: a listener left on it hears every later test
     assert started == ["prepare entry", "buckaroo load_expr"]
     last = tracker.snapshot()["recent"][0]
     assert last["name"] == "buckaroo load_expr"

@@ -1,12 +1,16 @@
 import { describe, it, expect } from "vitest";
 import {
+  aliasLabels,
   emptyActivity,
   formatDuration,
+  isForProject,
   lastLabel,
   layoutTimeline,
   nowLabel,
   queueWaitMs,
   reduceActivity,
+  seedActivity,
+  spanKey,
   traceLabel,
   type Action,
   type Span,
@@ -84,6 +88,16 @@ describe("formatDuration", () => {
   ])("%d ms -> %s", (ms, text) => {
     expect(formatDuration(ms)).toBe(text);
   });
+
+  // The unit is chosen from the rounded value, so a number never prints at the edge of the wrong unit.
+  it.each([
+    [999.6, "1.00 s"],
+    [9996, "10.0 s"],
+    [59_960, "1m 0s"],
+    [119_600, "2m 0s"],
+  ])("%d ms rounds up into the next unit: %s", (ms, text) => {
+    expect(formatDuration(ms)).toBe(text);
+  });
 });
 
 describe("labels", () => {
@@ -156,6 +170,86 @@ describe("layoutTimeline", () => {
 
   it("returns an empty layout for no rows", () => {
     expect(layoutTimeline([], 1000)).toEqual([]);
+  });
+
+  it("keeps a zero-length row at the end of the burst inside the track", () => {
+    const out = layoutTimeline([{ start_ms: 0, end_ms: 10_000 }, { start_ms: 10_000, end_ms: 10_000 }], 10_000);
+    expect(out[1].left + out[1].width).toBeLessThanOrEqual(100);
+  });
+});
+
+// A tab that reconnects learns what is running from the snapshot on the stream's first event, and takes it as the
+// whole truth: an action_end it missed while disconnected must not leave a 'now:' behind.
+describe("seedActivity", () => {
+  it("running is the snapshot's running, and last is the newest finished action", () => {
+    const newest = action({ id: 7, ended_ms: 1_000_900, status: "ok" });
+    const older = action({ id: 6, ended_ms: 1_000_300, status: "ok" });
+    const s = seedActivity({ running: [action({ id: 8 })], recent: [newest, older] });
+    expect(s.running.map((a) => a.id)).toEqual([8]);
+    expect(s.last?.id).toBe(7);
+  });
+
+  it("an empty snapshot clears a stale running action", () => {
+    const stale = reduceActivity(emptyActivity, { kind: "action_start", action: action({ id: 3 }) });
+    expect(stale.running).toHaveLength(1);
+    expect(seedActivity({ running: [], recent: [] })).toEqual(emptyActivity);
+  });
+
+  it("lists the longest-running action first", () => {
+    const s = seedActivity({
+      running: [action({ id: 2, started_ms: 1_000_500 }), action({ id: 1, started_ms: 1_000_000 })],
+      recent: [],
+    });
+    expect(s.running.map((a) => a.id)).toEqual([1, 2]);
+  });
+});
+
+describe("isForProject", () => {
+  it("is true for the open project's actions and for actions that name no project", () => {
+    expect(isForProject(action({ project: "parking2" }), "parking2")).toBe(true);
+    expect(isForProject(action({ project: null }), "parking2")).toBe(true);
+  });
+
+  it("is false for another project's action", () => {
+    expect(isForProject(action({ project: "nfl" }), "parking2")).toBe(false);
+  });
+});
+
+// The timing page keys a row by what the span is, not where it sorts: a long span that started early but is posted
+// when it ends sorts ahead of spans already shown, and a key that moves with position restarts every row after it.
+describe("spanKey", () => {
+  it("does not depend on the span's position in a list", () => {
+    const s = span({ name: "stats.complete", t_start_ms: 1_000_100, t_end_ms: 1_009_000 });
+    expect(spanKey(s)).toBe(spanKey({ ...s }));
+  });
+
+  it("differs between spans of one session that start at different times", () => {
+    expect(spanKey(span({ t_start_ms: 1 }))).not.toBe(spanKey(span({ t_start_ms: 2 })));
+  });
+
+  it("differs between spans of different sessions and names", () => {
+    expect(spanKey(span({ trace: "entry-p-aaaaaaaaaaaa" }))).not.toBe(spanKey(span({ trace: "entry-p-bbbbbbbbbbbb" })));
+    expect(spanKey(span({ name: "stats.complete" }))).not.toBe(spanKey(span()));
+  });
+});
+
+describe("aliasLabels", () => {
+  const entry = (hash: string, alias: string | null, version: number | null, version_count: number) => ({
+    content_hash: hash.padEnd(64, "0"),
+    alias,
+    version,
+    version_count,
+  });
+
+  it("names each version of an alias that has several", () => {
+    const labels = aliasLabels([entry("aaaaaaaaaaaa", "cars", 1, 3), entry("bbbbbbbbbbbb", "cars", 2, 3)]);
+    expect(labels["aaaaaaaaaaaa"]).toBe("cars v1");
+    expect(labels["bbbbbbbbbbbb"]).toBe("cars v2");
+  });
+
+  it("leaves an alias with one version unversioned, and skips entries with no alias", () => {
+    const labels = aliasLabels([entry("cccccccccccc", "trips", 1, 1), entry("dddddddddddd", null, null, 0)]);
+    expect(labels).toEqual({ cccccccccccc: "trips" });
   });
 });
 

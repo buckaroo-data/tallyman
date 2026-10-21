@@ -34,6 +34,31 @@ def test_api_version_reports_companion_revision(project, orders_parquet, monkeyp
     assert "dirty" in body
 
 
+class _BuckarooAt:
+    """A BuckarooManager-shaped stub whose server reports a fixed version."""
+
+    is_running = True
+
+    def __init__(self, version: str | None):
+        self._version = version
+
+    def server_version(self) -> str | None:
+        return self._version
+
+
+def test_api_version_reports_the_buckaroo_server_version(project, orders_parquet, monkeypatch):
+    # The SPA compares this with the renderer it is running and the version package.json pins.
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    c = TestClient(create_app(project, buckaroo=_BuckarooAt("0.15.10")))  # type: ignore[arg-type]
+    assert c.get("/api/version").json()["buckaroo_server"] == "0.15.10"
+
+
+def test_api_version_has_no_buckaroo_server_when_buckaroo_is_not_running(project, orders_parquet, monkeypatch):
+    monkeypatch.setenv("TALLYMAN_PROJECT", project)
+    c = TestClient(create_app(project))
+    assert c.get("/api/version").json()["buckaroo_server"] is None
+
+
 def test_revision_header_rides_every_response(project, orders_parquet, monkeypatch):
     monkeypatch.setenv("TALLYMAN_PROJECT", project)
     c = TestClient(create_app(project))

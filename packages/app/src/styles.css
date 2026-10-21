@@ -632,3 +632,31 @@ table.cache-table .muted { color: var(--muted); }
 .span-bar.errored { background: #c0564a; }
 .span-ms { flex: 0 0 52px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
 .span-attrs { flex: 0 0 auto; font-family: ui-monospace, monospace; }
+
+/* ── Blocking actions (header strip) and the timing page ── */
+.activity-strip { text-decoration: none; display: inline-flex; align-items: center; margin-right: 6px; }
+.activity-strip .pill { margin-right: 4px; font-variant-numeric: tabular-nums; }
+.pill.activity-now { color: #e0b45e; border-color: #e0b45e; animation: activity-pulse 1.2s ease-in-out infinite; }
+.pill.activity-last.failed { color: #c0564a; border-color: #c0564a; }
+@keyframes activity-pulse { 50% { opacity: 0.55; } }
+
+.timing-page { padding: 12px 16px; }
+.timing-page h2 { margin: 0 0 4px; }
+.timing-page p.meta { max-width: 760px; margin: 0 0 10px; }
+.timing-controls { display: flex; align-items: center; gap: 6px; margin-bottom: 10px; }
+.timing-controls button.active { border-color: var(--accent); color: var(--accent); }
+.timing-legend { margin-left: 12px; font-size: 12px; color: var(--muted); }
+.swatch { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 3px 0 8px; vertical-align: middle; }
+.swatch.companion, .span-bar.companion { background: var(--accent); }
+.swatch.buckaroo, .span-bar.buckaroo { background: #73ae80; }
+.span-bar.running { animation: activity-pulse 1.2s ease-in-out infinite; }
+.timing-rows { display: flex; flex-direction: column; gap: 3px; }
+.timing-row { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.timing-burst { margin-bottom: 14px; }
+.timing-axis { margin-bottom: 3px; }
+.timing-start { flex: 0 0 74px; color: var(--muted); font-variant-numeric: tabular-nums; font-size: 11px; }
+.timing-name { flex: 0 0 300px; }
+.timing-ms { flex: 0 0 64px; }
+.timing-note { flex: 0 0 auto; max-width: 320px; }
+.timing-note.failed { color: #c0564a; }
+.timing-row.buckaroo .timing-name { color: #73ae80; }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -11,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import markdown as md_lib
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -36,6 +37,7 @@ from tallyman_core import (
     resolve_project,
     version_of_hash,
 )
+from tallyman_core.activity import track, tracker
 from tallyman_core.events import list_sessions, read_events, record_event
 from tallyman_core.execution import execution_lock
 from tallyman_core.notebook import CellNotFound
@@ -450,21 +452,23 @@ def _load_compare_view(
 
             stat_cache = diff_stat_cache_dir(project, a_hash, b_hash)
             stat_cache.mkdir(parents=True, exist_ok=True)
-            resp = buckaroo._client.post(
-                f"{buckaroo.base_url}/load_expr",
-                json={
-                    "session": session_id,
-                    "build_dir": str(view.build_dir),
-                    "no_browser": True,
-                    "column_config_overrides": view.column_config_overrides,
-                    "cache_storage_path": str(stat_cache),
-                    "data_id": view.identity,
-                    "stats_delivery": "deferred",
-                    "extra_grid_config": {"searchDebounceMs": 3000},
-                    "project_root": str(Path(__file__).parent / "diff_extras"),
-                },
-                timeout=30.0,
-            )
+            # Buckaroo serves one request at a time, so this POST can wait behind another session's stats run.
+            with track("buckaroo load_expr", session_id, project):
+                resp = buckaroo._client.post(
+                    f"{buckaroo.base_url}/load_expr",
+                    json={
+                        "session": session_id,
+                        "build_dir": str(view.build_dir),
+                        "no_browser": True,
+                        "column_config_overrides": view.column_config_overrides,
+                        "cache_storage_path": str(stat_cache),
+                        "data_id": view.identity,
+                        "stats_delivery": "deferred",
+                        "extra_grid_config": {"searchDebounceMs": 3000},
+                        "project_root": str(Path(__file__).parent / "diff_extras"),
+                    },
+                    timeout=30.0,
+                )
             if resp.status_code != 200:
                 log.warning("diff /load_expr answered %s for %s", resp.status_code, session_id)
                 return None
@@ -718,6 +722,52 @@ def create_app(
         for q in list(subscribers):
             await q.put(event)
 
+    def _announced(name: str, detail=None, *, writes: bool = False):
+        """Announce a route's blocking work to the header before it runs and record it when it ends (activity.py).
+
+        Passed to a route as ``dependencies=[...]``. FastAPI runs a sync dependency on a worker thread, so announcing
+        does not wait for the event loop, and the route's body runs between the ``yield`` and the end of the ``with``.
+
+        A request for a project that does not exist, or a write in serve mode (``writes``), is refused before anything
+        is announced: it did no work, and every tab would otherwise show it as a failed action. ``detail`` gets the
+        route's path parameters, as strings."""
+
+        def announce(request: Request):
+            params = request.path_params
+            _validate_project(params["project"])
+            if writes and read_only:
+                raise HTTPException(403, "companion is in read-only (serve) mode")
+            with track(name, detail(params) if detail else "", params["project"]):
+                yield
+
+        return Depends(announce)
+
+    def _activity_of(project: str) -> dict:
+        """The tracker's running and recent actions that belong to ``project`` (or to none)."""
+        return {k: [a for a in v if a["project"] in (None, project)] for k, v in tracker.snapshot().items()}
+
+    @app.on_event("startup")
+    async def _forward_activity_over_sse():
+        """Forward each action_start / action_end to the SSE subscribers. Actions start on worker threads, so the event
+        is handed to the loop."""
+        loop = asyncio.get_running_loop()
+
+        def _on_activity(event: dict) -> None:
+            def _fan_out() -> None:
+                for q in list(subscribers):
+                    q.put_nowait(event)
+
+            loop.call_soon_threadsafe(_fan_out)
+
+        tracker.add_listener(_on_activity)
+        app.state.activity_listener = _on_activity
+
+    @app.on_event("shutdown")
+    async def _stop_forwarding_activity():
+        listener = getattr(app.state, "activity_listener", None)
+        if listener is not None:
+            tracker.remove_listener(listener)
+
     # ADR-006 D7/D10: when a self-heal fails verification (result_cache writes the durable errors.jsonl record and
     # wipes the entry's stat cache itself), the companion additionally forces Buckaroo to re-run its pipeline for the
     # entry's grid, since an open session holds stats computed from the old rows (ADR-007 D6), and pushes the SSE event
@@ -768,7 +818,7 @@ def create_app(
         if report.get("remap"):
             _invalidate_reset_caches(project)
             if buckaroo:
-                buckaroo.reload_project_sessions(project)
+                await run_in_threadpool(buckaroo.reload_project_sessions, project)
             # checkpoint_step is None on the auto path: the checkpoint middleware
             # commits the head advance + cascade as one revision *after* this
             # handler returns, so the step isn't known here. The SSE event carries
@@ -936,7 +986,9 @@ def create_app(
 
         async def event_stream():
             try:
-                yield {"event": "hello", "data": json.dumps({"project": project})}
+                # The snapshot is taken after the queue is subscribed, so every later start or end follows it in
+                # order; a reconnecting tab replaces its header state with it.
+                yield {"event": "hello", "data": json.dumps({"project": project, "activity": _activity_of(project)})}
                 while True:
                     if await request.is_disconnected():
                         break
@@ -1220,7 +1272,10 @@ def create_app(
             va = 1
         return RedirectResponse(f"/{project}/diff/{alias}/{va}/{vb}")
 
-    @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
+    @app.get(
+        "/{project}/api/diff_data/{alias}/{va:int}/{vb:int}",
+        dependencies=[_announced("diff data", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}")],
+    )
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
         project = _validate_project(project)
@@ -1285,14 +1340,17 @@ def create_app(
             "buckaroo_ws_base": buckaroo_ws_base_url,
         }
 
-    @app.post("/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}")
+    @app.post(
+        "/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}",
+        dependencies=[_announced("promote diff", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}", writes=True)],
+    )
     async def api_promote_diff(project: str, alias: str, va: int, vb: int):
         """Promote a diff between two versions to a first-class catalog entry."""
-        if read_only:
-            raise HTTPException(403, "companion is in read-only (serve) mode")
         project = _validate_project(project)
 
         import textwrap  # noqa: PLC0415
+
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
 
         from tallyman_companion.diff import compute_column_config_overrides  # noqa: PLC0415
         from tallyman_core.aliases import AliasExists, set_alias  # noqa: PLC0415
@@ -1321,14 +1379,14 @@ def create_app(
         b_idx, b_hash = b
 
         try:
-            keys = diff_keys(project, a_hash, b_hash) or []
+            keys = await run_in_threadpool(diff_keys, project, a_hash, b_hash) or []
         except PrimaryKeySearchTimeout as exc:
             raise HTTPException(504, detail=str(exc)) from exc
         if not keys:
             raise HTTPException(400, "no stable join key detected; cannot build keyed diff")
 
-        a_expr = cached_result_expr(project, a_hash)
-        b_expr = cached_result_expr(project, b_hash)
+        a_expr = await run_in_threadpool(cached_result_expr, project, a_hash)
+        b_expr = await run_in_threadpool(cached_result_expr, project, b_hash)
         column_config_overrides = compute_column_config_overrides(a_expr.schema(), b_expr.schema(), keys)
 
         target_alias = f"diff_{alias}_v{a_idx}_v{b_idx}"
@@ -1352,7 +1410,9 @@ def create_app(
         """)
 
         try:
-            result = _build_and_persist(project, code, prompt=f"promote diff {alias} V{a_idx}→V{b_idx}")
+            result = await run_in_threadpool(
+                _build_and_persist, project, code, prompt=f"promote diff {alias} V{a_idx}→V{b_idx}"
+            )
         except BuildError as exc:
             raise HTTPException(500, str(exc)) from exc
 
@@ -1496,6 +1556,38 @@ def create_app(
         """
         project = _validate_project(project)
         return {"project": project, "trace": trace, "spans": read_spans(project, trace=trace, limit=limit)}
+
+    @app.get("/{project}/api/timing")
+    def api_timing(project: str, window_s: float = 900.0):
+        """The companion's blocking actions and the spans Buckaroo posted back, on one clock (epoch ms).
+
+        An action still running has ``ended_ms`` null. Actions and spans that ended before ``now - window_s`` are left
+        out. A request that queued behind another session's stats shows as an action overlapping that session's
+        ``stats.complete`` span."""
+        project = _validate_project(project)
+        now_ms = time.time() * 1000
+        lo = now_ms - window_s * 1000
+        mine = _activity_of(project)
+        actions = [a for a in mine["running"] + mine["recent"] if a["ended_ms"] is None or a["ended_ms"] >= lo]
+
+        # POST /api/telemetry stores any dict, so a span's times are not trusted to be numbers.
+        def _ms(v) -> bool:
+            return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+
+        # A span is received after it ends, so one that ended inside the window was received inside it too: the file
+        # is read backward only that far (a minute of slack), not parsed whole on every poll.
+        spans = [
+            s
+            for s in read_spans(project, received_since_ms=lo - 60_000, limit=20_000)
+            if _ms(s.get("t_start_ms")) and _ms(s.get("t_end_ms")) and s["t_end_ms"] >= lo
+        ]
+        return {
+            "project": project,
+            "now_ms": now_ms,
+            "window_s": window_s,
+            "actions": sorted(actions, key=lambda a: a["started_ms"]),
+            "spans": sorted(spans, key=lambda s: s["t_start_ms"]),
+        }
 
     @app.delete("/{project}/api/errors")
     def api_clear_errors(project: str):
@@ -1660,11 +1752,11 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {"ok": True}
 
-    @app.put("/{project}/api/code/{alias}")
+    @app.put("/{project}/api/code/{alias}", dependencies=[_announced("save code", lambda kw: kw["alias"], writes=True)])
     async def put_code(project: str, alias: str, payload: dict):
         project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
+        from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
         from tallyman_core import carry_forward_entry_config  # noqa: PLC0415
         from tallyman_core import get_alias as _get_alias  # noqa: PLC0415
         from tallyman_core import set_alias as _set_alias  # noqa: PLC0415
@@ -1684,7 +1776,7 @@ def create_app(
         if not code.strip():
             raise HTTPException(400, "code is empty")
         try:
-            res = _build_and_persist(project, code, prompt=payload.get("prompt") or None)
+            res = await run_in_threadpool(_build_and_persist, project, code, prompt=payload.get("prompt") or None)
         except BuildError as exc:
             from tallyman_core import record_error as _record_error  # noqa: PLC0415
 
@@ -1744,7 +1836,7 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {**cell, "html": _render_markdown(cell["markdown"])}
 
-    @app.post("/{project}/api/reset")
+    @app.post("/{project}/api/reset", dependencies=[_announced("reset project", writes=True)])
     async def api_reset(project: str, payload: dict):
         """Restore the project to a step number or label, then reload sessions.
 
@@ -1752,8 +1844,6 @@ def create_app(
         does not append a new step. (A timeline scrubber in the SPA calls this.)
         """
         project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
         ref = (payload or {}).get("ref")
         if ref is None:
             raise HTTPException(400, "ref required: a step number or a label")
@@ -1771,12 +1861,12 @@ def create_app(
         # compare-expr LRU is a companion-layer cache it can't reach, so invalidate
         # the companion caches here (#80). Shared with the cross-process notify path.
         _invalidate_reset_caches(project)
-        reloaded = buckaroo.reload_project_sessions(project) if buckaroo else 0
+        reloaded = await run_in_threadpool(buckaroo.reload_project_sessions, project) if buckaroo else 0
         step = current_step(project)
         await publish({"kind": "project_reset", "step": step})
         return {"ok": True, "step": step, "reloaded": reloaded}
 
-    @app.get("/{project}/api/staleness")
+    @app.get("/{project}/api/staleness", dependencies=[_announced("scan staleness")])
     def api_staleness(project: str):
         """Staleness scan for every entry — the scan-on-load reactive surface.
 
@@ -1806,7 +1896,7 @@ def create_app(
             "orphan_stale": orphan_stale,
         }
 
-    @app.post("/{project}/api/recalc")
+    @app.post("/{project}/api/recalc", dependencies=[_announced("recalc", writes=True)])
     async def api_recalc(project: str, payload: dict | None = None):
         """Recompute stale entries and their dependents in dependency order.
 
@@ -1818,8 +1908,6 @@ def create_app(
         publishes a ``recalc`` event so open views refetch.
         """
         project = _validate_project(project)
-        if read_only:
-            raise HTTPException(403, "serve mode")
         payload = payload or {}
         dry_run = bool(payload.get("dry_run", True))
         roots = payload.get("roots")
@@ -1837,7 +1925,7 @@ def create_app(
         if not dry_run and report.remap:
             _invalidate_reset_caches(project)
             if buckaroo:
-                buckaroo.reload_project_sessions(project)
+                await run_in_threadpool(buckaroo.reload_project_sessions, project)
             await publish(_recalc_sse_event(report.remap, report.checkpoint_step))
         return asdict(report)
 
@@ -1878,7 +1966,9 @@ def create_app(
                 # independent of the buckaroo subprocess.
                 _invalidate_reset_caches(project_name)
             if buckaroo:
-                reloaded = buckaroo.reload_project_sessions(project_name)
+                from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
+
+                reloaded = await run_in_threadpool(buckaroo.reload_project_sessions, project_name)
                 log.info("reloaded klasses in %d buckaroo session(s) for project %s", reloaded, project_name)
         # Republish a recalc in the canonical {kind, remap, step} shape so the
         # cross-process notify path emits the identical event /api/recalc does;

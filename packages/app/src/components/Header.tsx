@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../api";
 import { useSSE } from "../SSEContext";
+import { ActivityStrip } from "./ActivityStrip";
 
 export function Header() {
   const { project } = useParams<{ project?: string }>();
@@ -81,9 +82,12 @@ export function Header() {
           <Link to={`/${project}/notebook`}>notebook</Link>
           <Link to={`/${project}/cache`}>cache</Link>
           <Link to={`/${project}/log`}>log</Link>
+          <Link to={`/${project}/timing`}>timing</Link>
           <Link to="/projects">projects</Link>
         </nav>
       )}
+
+      {project && <ActivityStrip project={project} />}
 
       {diskFormatted && (
         <span className="pill" style={{ cursor: "default" }}>

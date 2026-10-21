@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link, useParams } from "react-router-dom";
+import { layoutTimeline } from "../activity";
 import { api } from "../api";
 import { useSSE } from "../SSEContext";
 import type { ActivityLog, LogEvent, TelemetrySpan } from "../types";
@@ -89,14 +90,13 @@ function SpanWaterfall({ project, trace }: { project: string; trace: string }) {
   const ordered = [...spans].sort((a, b) => a.t_start_ms - b.t_start_ms);
   const t0 = Math.min(...ordered.map((s) => s.t_start_ms));
   const t1 = Math.max(...ordered.map((s) => s.t_end_ms));
-  const span = Math.max(t1 - t0, 0.001); // guard divide-by-zero on a zero-width set
+  const layout = layoutTimeline(ordered.map((s) => ({ start_ms: s.t_start_ms, end_ms: s.t_end_ms })), t1);
 
   return (
     <div className="span-waterfall">
       <div className="meta">grid-load timeline · {Math.round(t1 - t0)}ms total</div>
       {ordered.map((s, i) => {
-        const left = ((s.t_start_ms - t0) / span) * 100;
-        const width = Math.max(((s.t_end_ms - s.t_start_ms) / span) * 100, 0.5);
+        const { left, width } = layout[i];
         const ms = Math.round(s.t_end_ms - s.t_start_ms);
         const attrs = fmtAttrs(s.attrs);
         const errored = s.attrs?.errored === "true" || s.attrs?.errored === true;

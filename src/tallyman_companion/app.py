@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import functools
-import inspect
 import json
 import logging
 import math
@@ -14,7 +12,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import markdown as md_lib
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -721,38 +719,22 @@ def create_app(
     def _announced(name: str, detail=None, *, writes: bool = False):
         """Announce a route's blocking work to the header before it runs and record it when it ends (activity.py).
 
+        Passed to a route as ``dependencies=[...]``. FastAPI runs a sync dependency on a worker thread, so announcing
+        does not wait for the event loop, and the route's body runs between the ``yield`` and the end of the ``with``.
+
         A request for a project that does not exist, or a write in serve mode (``writes``), is refused before anything
-        is announced: it did no work, and every tab would otherwise show it as a failed action.
+        is announced: it did no work, and every tab would otherwise show it as a failed action. ``detail`` gets the
+        route's path parameters, as strings."""
 
-        Defined here, not in activity.py, so the wrapper's globals are this module's: FastAPI resolves the route's
-        string annotations against them."""
+        def announce(request: Request):
+            params = request.path_params
+            _validate_project(params["project"])
+            if writes and read_only:
+                raise HTTPException(403, "companion is in read-only (serve) mode")
+            with track(name, detail(params) if detail else "", params["project"]):
+                yield
 
-        def deco(fn):
-            def label(kw: dict) -> tuple[str, str | None]:
-                _validate_project(kw["project"])
-                if writes and read_only:
-                    raise HTTPException(403, "companion is in read-only (serve) mode")
-                return (detail(kw) if detail else ""), kw["project"]
-
-            if inspect.iscoroutinefunction(fn):
-
-                @functools.wraps(fn)
-                async def awrapper(*args, **kw):
-                    d, proj = label(kw)
-                    with track(name, d, proj):
-                        return await fn(*args, **kw)
-
-                return awrapper
-
-            @functools.wraps(fn)
-            def wrapper(*args, **kw):
-                d, proj = label(kw)
-                with track(name, d, proj):
-                    return fn(*args, **kw)
-
-            return wrapper
-
-        return deco
+        return Depends(announce)
 
     def _activity_of(project: str) -> dict:
         """The tracker's running and recent actions that belong to ``project`` (or to none)."""
@@ -1284,8 +1266,10 @@ def create_app(
             va = 1
         return RedirectResponse(f"/{project}/diff/{alias}/{va}/{vb}")
 
-    @app.get("/{project}/api/diff_data/{alias}/{va:int}/{vb:int}")
-    @_announced("diff data", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}")
+    @app.get(
+        "/{project}/api/diff_data/{alias}/{va:int}/{vb:int}",
+        dependencies=[_announced("diff data", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}")],
+    )
     def api_diff_data(project: str, alias: str, va: int, vb: int):
         """Diff data as JSON for the React SPA."""
         project = _validate_project(project)
@@ -1350,8 +1334,10 @@ def create_app(
             "buckaroo_ws_base": buckaroo_ws_base_url,
         }
 
-    @app.post("/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}")
-    @_announced("promote diff", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}", writes=True)
+    @app.post(
+        "/{project}/api/promote_diff/{alias}/{va:int}/{vb:int}",
+        dependencies=[_announced("promote diff", lambda kw: f"{kw['alias']} v{kw['va']} vs v{kw['vb']}", writes=True)],
+    )
     async def api_promote_diff(project: str, alias: str, va: int, vb: int):
         """Promote a diff between two versions to a first-class catalog entry."""
         project = _validate_project(project)
@@ -1760,8 +1746,7 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {"ok": True}
 
-    @app.put("/{project}/api/code/{alias}")
-    @_announced("save code", lambda kw: kw["alias"], writes=True)
+    @app.put("/{project}/api/code/{alias}", dependencies=[_announced("save code", lambda kw: kw["alias"], writes=True)])
     async def put_code(project: str, alias: str, payload: dict):
         project = _validate_project(project)
         from starlette.concurrency import run_in_threadpool  # noqa: PLC0415
@@ -1845,8 +1830,7 @@ def create_app(
         await publish({"kind": "notebook_changed"})
         return {**cell, "html": _render_markdown(cell["markdown"])}
 
-    @app.post("/{project}/api/reset")
-    @_announced("reset project", writes=True)
+    @app.post("/{project}/api/reset", dependencies=[_announced("reset project", writes=True)])
     async def api_reset(project: str, payload: dict):
         """Restore the project to a step number or label, then reload sessions.
 
@@ -1876,8 +1860,7 @@ def create_app(
         await publish({"kind": "project_reset", "step": step})
         return {"ok": True, "step": step, "reloaded": reloaded}
 
-    @app.get("/{project}/api/staleness")
-    @_announced("scan staleness")
+    @app.get("/{project}/api/staleness", dependencies=[_announced("scan staleness")])
     def api_staleness(project: str):
         """Staleness scan for every entry — the scan-on-load reactive surface.
 
@@ -1907,8 +1890,7 @@ def create_app(
             "orphan_stale": orphan_stale,
         }
 
-    @app.post("/{project}/api/recalc")
-    @_announced("recalc", writes=True)
+    @app.post("/{project}/api/recalc", dependencies=[_announced("recalc", writes=True)])
     async def api_recalc(project: str, payload: dict | None = None):
         """Recompute stale entries and their dependents in dependency order.
 

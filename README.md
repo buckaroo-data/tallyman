@@ -3,7 +3,7 @@
 Tallyman — a data science environment designed for coding agents. Stop squinting at slow tables in a terminal; turn on the lights and see your data.
 
 Watch this introduction to tallyman video to get a better sense of it:
-[Tallyman introduction[(https://youtu.be/1b2J7bcA_zE?si=dmJSqhRyAURW70Af)
+[Tallyman introduction](https://youtu.be/1b2J7bcA_zE?si=dmJSqhRyAURW70Af)
 
 Two windows: Claude Code in one, a browser in the other. You work by defining a set of named results that can depend on each other, then making sure those results live up to their name. You describe them; the agent writes the queries. You tell it what `likely_customers` should mean, and a moment later the answer is a table in the browser at full size, sortable and searchable, with statistics over every column. Your prompt sits above the query the agent wrote, so you read your intent, the code that came out of it, and the result together. You notice it's catching people who already churned, so you sharpen the sentence and the agent revises the query. Everything built on top of that name updates to match, fast enough that you don't lose your place. How big the data is, what has already been computed, and what needs recomputing never enter into it.
 
